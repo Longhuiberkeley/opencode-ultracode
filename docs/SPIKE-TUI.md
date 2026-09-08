@@ -115,3 +115,76 @@ Evidence: `spike/out/server-probe.jsonl`, `spike/out/server-probe-install-config
 - **D12:** metadata stamp is not exposed on session records or `session.created` (`dataKeys` have title/agent, no metadata). TUI join must use the **title fallback** as the real contract, not a fallback. Widening `SessionCtx.create` with `metadata` stays type-correct but will not round-trip on this build.
 - **D6:** proceed with `src/run-events.ts` on `session.tool.called` / `success` / `failed`, dedupe `data.id`, ignore events older than `startedAt`. Do not wait for `session.idle`/`session.status`.
 - **D10:** `install.sh` can drop a re-export into `.opencode/plugins/<id>/`; `--write-config` is optional on this build, not required for load.
+
+## Addendum 2026-09-08 (phase 0-tui, build 0.0.0-beta-19271, plugin pkg 0.0.0-beta-19289)
+
+Interactive PTY probe. TSX entry: `spike/scratch/.opencode/plugins/probe/tui.tsx` (`package.json` `exports["./tui"]` = `./tui.tsx`). Fallback entry (unused this run): `tui.ts`. Runner: `scripts/tui-probe.sh` (python PTY, sends keys, kills the child). Primary capture: `spike/out/tui-probe-20260908T142622Z.ansi` + `.txt`, `spike/out/tui-probe.jsonl`, `spike/out/tui-probe-server.jsonl`. Earlier paint-only capture: `spike/out/tui-probe-20260908T142439Z.*`.
+
+### Verdict table
+
+| Item | Verdict | Evidence | Snippet / jsonl kind |
+| --- | --- | --- | --- |
+| (0) D13 GATE: `.tsx` + solid JSX loads+paints | **VERIFIED** | `tui-probe.jsonl` `tui-module-evaluated` `entry=tui.tsx` `jsxImportSource=solid-js`; stripped text contains `UCPROBE-CHIP` | `{"entry":"tui.tsx","jsxImportSource":"solid-js","pragma":true}`. Dynamic `import("solid-js")` **fails** (`Cannot find package 'solid-js'`) — host bun transpiles JSX; plugin does **not** need a local `solid-js` install. |
+| (1) Chip paint `prompt.footer.status` | **VERIFIED** | `tui-probe-20260908T142622Z.txt` / `.ansi`; `slot-chip-ok` | `UCPROBE-CHIP` in footer (sometimes split around other footer cells as `UCPROB…E-CHIP`) |
+| (2) `session.panel` + palette command | **VERIFIED** | `keymap-probeish` label `after-navigate`; `command-run` id `ultracode.inspect` from `ctrl+g`; `panel-open` `ok:true`; stripped `UCPROBE-PANEL` | Command: `{id:"ultracode.inspect", palette:true, bind:"ctrl+g", slash:{name:"ucprobe"}, shortcuts:["ctrl+g"]}`. `panel-render` input keys: `close,focus,focused,name,presentation,sessionID,toggleFullscreen,width`. |
+| (3) `dialog.show` two-col + `set` + onClose/esc | **VERIFIED** | stripped dialog frame; `dialog-show-ok`; `dialog-set-ok`; `dialog-onclose` ×2 after sent ESC | `UCPROBE-DIALOG` + `col1-status` / `col2-agent` / `col1-phase` / `col2-tokens`. `ui.dialog.set({size:"large", centered:true})` did not throw. ESC → `{"via":"callback"}`. Visual A/B of size vs default not captured. |
+| (4) `keymap.layer` ownership | **VERIFIED** (semantics captured) | `layer-from-setup-error`; `layer-key` from `component-panel` only after dialog closed | **setup():** throws `Error: Keymap.Provider is missing`. **Rendered component (slot/panel):** registers; `keymap.commands()` lists layer ids. **While dialog open:** layer handlers do **not** receive keys (zero `layer-key` between `dialog-show-ok` and `dialog-onclose`; `after-dialog-show` commands drop plugin layer ids). **After close:** `z` received (`from":"component-panel"`, `dialogOpen:false`). **priority:** panel layer 90 beat chip 80 (receipts from `component-panel`). **target:** not exercised (no Renderable). **Leak:** `z` bound on the layer; three `zzz-after-esc` presses logged as `layer-key` and did not appear as prompt text. |
+| (5) D4 `client.session.command` | **VERIFIED** | `client-session-command` + server `command-invoked` | TUI input `{sessionID, command:"ultracode", text:"help"}` (`threw:null`). Server execute: `{sessionID, prompt:{text:"help"}, delivery:"steer"}`. Child drill ran (`tui-child-final`). |
+| (6) D8/R18 `data.on` / client store | **VERIFIED** | `data-listen` / `data-on` / `data-session-list` | See event list + client entry below. **title + outcome + tokens are client-visible. `metadata` is `null` on the client store too** (same as server `ctx.session.get`). `parentID` also `null` for a `session.create` child. |
+
+### G0 recommendation: **GO**
+
+(0) TSX paint, (1) chip, (2) panel + keystroke `ultracode.inspect`, (3) dialog.show two-column + onClose, (4) layer ownership all captured. Overlay (Phase 3) is unblocked on this binary. Production `keymap.layer` **must** live inside a mounted slot/panel/dialog component, never `setup()`. Dialog overlay **replaces** reachable plugin layers — overlay keys need a layer registered **inside the dialog render**, and even then `keymap.commands()` during an open host dialog did not list plugin commands (host dialog owns the keymap). v1 inspect (chip + `session.panel` + palette) does not depend on dialog-layer keys.
+
+### JSX / toolchain recipe (what worked)
+
+1. Plugin TUI entry is a **`.tsx` file** (`exports["./tui"]: "./tui.tsx"`).
+2. File pragma: `/** @jsxImportSource solid-js */`.
+3. Scratch tsconfig (next to the plugin, so bun does not inherit the repo tsconfig): `"jsx": "preserve"`, `"jsxImportSource": "solid-js"`.
+4. Paint with OpenTUI intrinsics: `<text>UCPROBE-CHIP</text>`, `<box flexDirection="row">…</box>`. No `import "solid-js"` / `@opentui/solid` required for this binary — those specifiers **do not resolve** from the plugin directory (`runtime-import-fail`). The host compiler supplies the JSX runtime.
+5. `.ts` + `createComponent` / `solid-js/jsx-runtime` was **not needed**. Keep `tui.ts` only as a loader-error fallback.
+
+### Exact API shapes learned
+
+**`ui.dialog.show`** (matches `@opencode/plugin` 19289 d.ts, live):
+
+```ts
+ui.dialog.show(render: () => JSX.Element, onClose?: () => void): void
+ui.dialog.set({ size?: "medium" | "large" | "xlarge", centered?: boolean }): void
+ui.dialog.clear(): void
+```
+
+`onClose` fires on ESC.
+
+**`keymap.layer` ownership:** `keymap.layer(() => KeymapLayer)` is owned by the **calling Solid component**. `setup()` is not a component → `Keymap.Provider is missing`. Call it from `ui.slot` / panel / dialog `render`. `enabled` may be a thunk. `priority` is numeric (higher won). No push/pop (`keymap.mode` is the exclusive-mode API). Host dialog open ⇒ plugin layers are not reachable.
+
+**`client.session.command` input** (promise client, live):
+
+```ts
+await context.client.session.command({
+  sessionID: parentID,      // string
+  command: "ultracode",     // registered ctx.command name
+  text: "help",             // becomes invocation.prompt.text
+  // optional: files, agents, skills, delivery?: "steer" | "queue" | null
+})
+```
+
+Server command `execute` receives `{ sessionID, prompt: { text }, delivery }` — **not** a top-level `text` field.
+
+**Palette open chord:** `command.palette.show` shortcuts `["ctrl+p"]`.
+
+### Client session entry (D8)
+
+`data.session.list()` after child completed (`kind=data-session-list` label `after-command`). Child keys:
+
+`agent, cost, id, location, outcome, projectID, subpath, time, title, tokens`
+
+Full child: `title="probe-tui-child"`, `outcome="succeeded"`, `tokens={input,output,reasoning,cache}`, `agent="general"`, `time={created,updated,idle}`, **`metadata` absent/`null`**, **`parentID` null**, no `model` at session level.
+
+**`data.listen` / `data.on` types observed** while server created/prompted/completed the child:
+
+`session.created`, `session.inbox.enqueued`, `session.inbox.delivered`, `session.execution.started`, `session.instructions.updated`, `session.step.started`, `session.reasoning.started`, `session.reasoning.delta`, `session.reasoning.ended`, `session.text.started`, `session.text.delta`, `session.text.ended`, `session.step.streamed`, `session.step.ended`, `session.usage.updated`, `session.execution.succeeded`, plus `session.tool.called` / `session.tool.input.started` / `session.tool.input.ended` / `session.tool.failed`.
+
+No `session.idle` / `session.status` on the **client** bus either (matches phase 0-server). Completion signal = `session.execution.succeeded` + `data.session.get/list().outcome`.
+
+**Plan impact:** D13 gate passed — Phase 2 TUI v1 may use `.tsx` + `jsxImportSource: "solid-js"` without adding `solid-js` to the plugin runtime (host provides JSX). D12 metadata is also missing from the **client** store; join on title. D4 transport shape confirmed. Overlay keys (Phase 3) must register `keymap.layer` inside the dialog component; do not expect chip-layer keys to fire while `dialog.show` is up.

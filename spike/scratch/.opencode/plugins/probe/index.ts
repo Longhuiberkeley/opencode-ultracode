@@ -459,6 +459,77 @@ export default Plugin.define({
           }
         },
       })
+      let tuiChildStarted = false
+      const runTuiChild = async (invocation: { sessionID?: string; prompt?: { text?: string } }, name: string) => {
+        log("command-invoked", {
+          name,
+          sessionID: invocation?.sessionID ?? null,
+          text: invocation?.prompt?.text ?? null,
+          invocationKeys: keysOf(invocation),
+          invocation: JSON.parse(safeJson(invocation)),
+        })
+        if (tuiChildStarted) {
+          log("tui-child-skip-duplicate", { name })
+          return
+        }
+        tuiChildStarted = true
+        try {
+          const created = await ctx.session.create({
+            title: "probe-tui-child",
+            agent: "general",
+            metadata: UC_META,
+          } as Parameters<typeof ctx.session.create>[0])
+          log("tui-child-created", {
+            id: created?.id,
+            keys: keysOf(created),
+            metadata: (created as { metadata?: unknown })?.metadata ?? null,
+            title: created?.title ?? null,
+          })
+          if (created?.id) {
+            await step(
+              "tui-child-prompt",
+              () => ctx.session.prompt({ sessionID: created.id, text: "Reply with exactly: PROBE_OK" }),
+              60_000,
+            )
+            await step("tui-child-wait", () => ctx.session.wait({ sessionID: created.id }), 60_000)
+            const got = await ctx.session.get({ sessionID: created.id })
+            log("tui-child-final", {
+              keys: keysOf(got),
+              title: (got as { title?: unknown })?.title ?? null,
+              outcome: (got as { outcome?: unknown })?.outcome ?? null,
+              tokens: (got as { tokens?: unknown })?.tokens ?? null,
+              metadata: (got as { metadata?: unknown })?.metadata ?? null,
+            })
+          }
+        } catch (e) {
+          log("tui-child-error", String(e))
+        }
+        log("command-invoked-done", { name })
+      }
+      try {
+        editor.add({
+          name: "ultracode",
+          description: "Phase 0-tui probe: log command invocation + spawn a child session",
+          execute: async (invocation: { sessionID?: string; prompt?: { text?: string } }) => {
+            await runTuiChild(invocation, "ultracode")
+          },
+        })
+        log("command-add-ultracode-ok", {})
+      } catch (e) {
+        log("command-add-ultracode-error", String(e))
+      }
+      try {
+        editor.add({
+          name: "probe_tui",
+          description: "Phase 0-tui probe fallback command (same as ultracode log+child)",
+          execute: async (invocation: { sessionID?: string; prompt?: { text?: string } }) => {
+            await runTuiChild(invocation, "probe_tui")
+          },
+        })
+        log("command-add-probe_tui-ok", {})
+      } catch (e) {
+        log("command-add-probe_tui-error", String(e))
+      }
     })
 
     try {
