@@ -1,35 +1,44 @@
 /**
  * Builder A tests — src/storage.ts: project-scoped KV snapshots, script/result
  * artifacts, saved-workflow pairs + trust gate, precedence, name validation,
- * path/symlink safety, KV cursor pagination.
+ * shared lstat-aware containment resolver (symlinks fail closed), KV cursor
+ * pagination, fresh composition loader.
  */
 import { test } from "node:test"
 import assert from "node:assert/strict"
 import { createHash } from "node:crypto"
-import { StorageImpl, WORKFLOW_NAME_RE, normalizePath } from "../src/storage.ts"
+import { StorageImpl, WORKFLOW_NAME_RE, normalizePath, resolveContainedPath } from "../src/storage.ts"
 import type { FsLike, Json, KvLike, RunRecord } from "../src/types.ts"
 import { FakeFs, FakeKv } from "./fakes.ts"
 
 const PROJECT = "/project"
 const PERSONAL = "/home/u/.config/opencode/workflows"
+const PERSONAL_ANCHOR = "/home/u/.config/opencode"
 const PROJECT_WF = "/project/.opencode/workflows"
 const PID = "proj-123"
-// Keys are project-scoped: runs/<pid>/<id>, results/<pid>/<id>, trust/<pid>/<name>.
-const RUNS_KEY = (id: string) => `runs/${PID}/${id}`
-const RESULTS_KEY = (id: string) => `results/${PID}/${id}`
-const TRUST_KEY = (name: string) => `trust/${PID}/${name}`
+const PID_KEY = `p${createHash("sha256").update(PID).digest("hex").slice(0, 16)}`
+// Keys are project-scoped (hashed pid): runs/<pid>/<id>, results/<pid>/<id>, trust/<pid>/<name>.
+const RUNS_KEY = (id: string) => `runs/${PID_KEY}/${id}`
+const RESULTS_KEY = (id: string) => `results/${PID_KEY}/${id}`
 
-function makeStorage(overrides: { kv?: KvLike; fs?: FsLike; projectID?: string } = {}) {
+function makeStorage(overrides: { kv?: KvLike; fs?: FsLike; projectID?: string; projectRoot?: string } = {}) {
   const kv = overrides.kv ?? new FakeKv()
   const fs = overrides.fs ?? new FakeFs()
+  const projectRoot = overrides.projectRoot ?? PROJECT
   const storage = new StorageImpl({
     kv,
     fs,
-    projectRoot: PROJECT,
+    projectRoot,
     personalWorkflowDir: PERSONAL,
     projectID: overrides.projectID ?? PID,
   })
-  return { storage, kv, fs: fs as FakeFs }
+  return { storage, kv, fs: fs as FakeFs, projectRoot }
+}
+
+/** Seed the trusted anchors so the containment resolver can realpath them. */
+function seedAnchors(fs: FakeFs): void {
+  fs.files.set(`${PROJECT}/.anchor`, "")
+  fs.files.set(`${PERSONAL_ANCHOR}/.anchor`, "")
 }
 
 function makeRun(overrides: Partial<RunRecord> = {}): RunRecord {
@@ -82,7 +91,6 @@ test("saveRun stores the full record under runs/<pid>/<id> and seeds loadRuns", 
   storage.saveRun(run)
   const stored = (await kv.get(RUNS_KEY("run_test1"))) as Json
   assert.deepEqual(stored, JSON.parse(JSON.stringify(run)))
-  // nothing omitted
   assert.deepEqual(Object.keys(stored as object).sort(), Object.keys(JSON.parse(JSON.stringify(run))).sort())
 
   const loaded = storage.loadRuns()
@@ -94,6 +102,14 @@ test("saveRun stores the full record under runs/<pid>/<id> and seeds loadRuns", 
   assert.deepEqual(scanned[0], JSON.parse(JSON.stringify(run)))
 })
 
+test("pid key segment is a stable sha256 hash (injective across project ids)", async () => {
+  const kv = new FakeKv()
+  const { storage } = makeStorage({ kv, projectID: "weird id/with slash+plus" })
+  storage.saveRun(makeRun())
+  const expected = `p${createHash("sha256").update("weird id/with slash+plus").digest("hex").slice(0, 16)}`
+  assert.deepEqual([...kv.store.keys()], [`runs/${expected}/run_test1`])
+})
+
 test("KV keys are scoped by project id — no cross-project contamination", async () => {
   const kvA = new FakeKv()
   const { storage: a } = makeStorage({ kv: kvA, projectID: "project-a" })
@@ -103,14 +119,6 @@ test("KV keys are scoped by project id — no cross-project contamination", asyn
   const bRuns = await b.loadRunsAsync()
   assert.deepEqual(aRuns.map((r) => r.id), ["run_only_a"])
   assert.deepEqual(bRuns.map((r) => r.id), []) // reconciliation sees only its own project
-})
-
-test("project ids are sanitized into safe key segments", async () => {
-  const kv = new FakeKv()
-  const { storage } = makeStorage({ kv, projectID: "weird id/with slash+plus" })
-  storage.saveRun(makeRun())
-  const keys = [...kv.store.keys()]
-  assert.deepEqual(keys, ["runs/weird-id-with-slash-plus/run_test1"])
 })
 
 test("saveRun updates are last-write-wins and sorted by startedAt", async () => {
@@ -174,11 +182,12 @@ test("saveRun never throws when the KV backend fails", () => {
 })
 
 // ---------------------------------------------------------------------------
-// Script artifacts (fs)
+// Script artifacts (fs) + containment
 // ---------------------------------------------------------------------------
 
 test("writeScriptArtifact writes <projectRoot>/.opencode/workflows/runs/<runID>.js", async () => {
   const { storage, fs } = makeStorage()
+  seedAnchors(fs)
   const path = await storage.writeScriptArtifact("run_abc123", "return 1")
   assert.equal(path, `${PROJECT_WF}/runs/run_abc123.js`)
   assert.equal(await fs.readFile(`${PROJECT_WF}/runs/run_abc123.js`), "return 1")
@@ -186,20 +195,41 @@ test("writeScriptArtifact writes <projectRoot>/.opencode/workflows/runs/<runID>.
 
 test("writeScriptArtifact rejects unsafe run ids", async () => {
   const { storage, fs } = makeStorage()
+  seedAnchors(fs)
   for (const bad of ["../evil", "a/b", "..", "run..x", ".hidden", "", "x".repeat(200)]) {
     assert.equal(await storage.writeScriptArtifact(bad, "s"), undefined, `runID ${JSON.stringify(bad)}`)
   }
   assert.equal((await fs.readdir(`${PROJECT_WF}/runs`)).length, 0)
 })
 
+test("writeScriptArtifact rejects a symlinked runs/ dir that escapes the project (fail closed)", async () => {
+  const { storage, fs } = makeStorage()
+  seedAnchors(fs)
+  await fs.writeFile(`${PROJECT_WF}/legit.js`, "x") // materialize the dirs
+  fs.symlinks.set(`${PROJECT_WF}/runs`, "/outside-runs")
+  await fs.writeFile("/outside-runs/.keep", "x") // the symlink target EXISTS (not dangling)
+  assert.equal(await storage.writeScriptArtifact("run_x", "s"), undefined)
+  assert.equal(await fs.exists("/outside-runs/run_x.js"), false)
+})
+
+test("writeScriptArtifact rejects a dangling runs/ symlink (fail closed)", async () => {
+  const { storage, fs } = makeStorage()
+  seedAnchors(fs)
+  await fs.writeFile(`${PROJECT_WF}/legit.js`, "x")
+  fs.symlinks.set(`${PROJECT_WF}/runs`, "/outside-runs") // target does NOT exist
+  assert.equal(await storage.writeScriptArtifact("run_x", "s"), undefined)
+})
+
 test("writeScriptArtifact swallows fs errors and returns undefined", async () => {
   const base = new FakeFs()
+  seedAnchors(base)
   const failing: FsLike = {
     mkdir: (p) => base.mkdir(p),
     readFile: (p) => base.readFile(p),
     exists: (p) => base.exists(p),
     readdir: (p) => base.readdir(p),
     realpath: (p) => base.realpath(p),
+    lstat: (p) => base.lstat(p),
     writeFile: async () => {
       throw new Error("disk full")
     },
@@ -241,6 +271,7 @@ test("loadResultArtifactFresh falls back to KV when the cache misses", async () 
 
 test("saveWorkflow writes the js + json pair; manifest.name is the filename key", async () => {
   const { storage, fs } = makeStorage()
+  seedAnchors(fs)
   const saved = await storage.saveWorkflow("alpha", "return 1", {
     name: "ignored-display-name", // storage forces manifest.name = key (review fix)
     description: "demo",
@@ -265,6 +296,7 @@ test("saveWorkflow writes the js + json pair; manifest.name is the filename key"
 
 test("saveWorkflow(personal) writes into the personal dir", async () => {
   const { storage, fs } = makeStorage()
+  seedAnchors(fs)
   const saved = await storage.saveWorkflow("beta", "return 2", { name: "beta", source: "personal" })
   assert.equal(saved.manifest.source, "personal")
   assert.equal(await fs.exists(`${PERSONAL}/beta.js`), true)
@@ -273,10 +305,11 @@ test("saveWorkflow(personal) writes into the personal dir", async () => {
 
 test("saveWorkflow rejects invalid names without writing files", async () => {
   const { storage, fs } = makeStorage()
+  seedAnchors(fs)
   for (const bad of ["UPPER", "-lead", "_lead", "a/b", "../evil", "", "x".repeat(65), "has space", "café"]) {
     await assert.rejects(() => storage.saveWorkflow(bad, "s", { name: bad, source: "project" }), /invalid workflow name/)
   }
-  assert.equal(await fs.exists(PROJECT_WF), false) // nothing created
+  assert.equal(await fs.exists(`${PROJECT_WF}/alpha.js`), false) // nothing written
 })
 
 test("loadWorkflow throws on invalid names and returns undefined for unknown names", () => {
@@ -288,17 +321,19 @@ test("loadWorkflow throws on invalid names and returns undefined for unknown nam
 
 test("trust gate: untrusted until trusted; trust -> load; edit -> blocked; re-trust -> load", async () => {
   const { storage, fs } = makeStorage()
+  seedAnchors(fs)
   await storage.saveWorkflow("gamma", "return 1", { name: "gamma", source: "project" })
   await storage.refreshWorkflows()
 
   // First run: not trusted yet.
   assert.throws(() => storage.loadWorkflow("gamma"), /is not trusted \(new or changed since approval\)/)
-  assert.throws(() => storage.loadWorkflow("gamma"), /\/ultracode trust gamma|\/workflow trust gamma/)
+  assert.throws(() => storage.loadWorkflow("gamma"), /\/ultracode trust gamma/)
 
-  // Approve the current version.
+  // Approve the current version — the ack carries the COMPUTED digest.
   const trusted = await storage.trustWorkflow("gamma")
-  assert.equal(trusted?.script, "return 1")
-  assert.deepEqual(storage.loadWorkflow("gamma")?.script, "return 1")
+  assert.equal(trusted?.workflow.script, "return 1")
+  assert.equal(trusted?.digest, createHash("sha256").update("return 1").digest("hex"))
+  assert.equal(storage.loadWorkflow("gamma")?.script, "return 1")
 
   // Edit the script on disk -> digest differs -> blocked again.
   await fs.writeFile(`${PROJECT_WF}/gamma.js`, "return 2 // changed")
@@ -312,8 +347,12 @@ test("trust gate: untrusted until trusted; trust -> load; edit -> blocked; re-tr
 
 test("trust records are project-scoped", async () => {
   const kv = new FakeKv()
-  const { storage: a } = makeStorage({ kv, projectID: "project-a" })
-  const { storage: b } = makeStorage({ kv, projectID: "project-b" })
+  const fsA = new FakeFs()
+  seedAnchors(fsA)
+  const fsB = new FakeFs()
+  seedAnchors(fsB)
+  const { storage: a } = makeStorage({ kv, fs: fsA, projectID: "project-a" })
+  const { storage: b } = makeStorage({ kv, fs: fsB, projectID: "project-b" })
   await a.saveWorkflow("alpha", "return a", { name: "alpha", source: "project" })
   await b.saveWorkflow("alpha", "return b", { name: "alpha", source: "project" })
   await a.refreshWorkflows()
@@ -325,6 +364,7 @@ test("trust records are project-scoped", async () => {
 
 test("trustWorkflow: unknown name -> undefined; name-mismatched pair -> throws", async () => {
   const { storage, fs } = makeStorage()
+  seedAnchors(fs)
   assert.equal(await storage.trustWorkflow("missing"), undefined)
   await writePair(fs, PROJECT_WF, "drifted", "return 1", { name: "other-name" })
   await storage.refreshWorkflows()
@@ -333,22 +373,85 @@ test("trustWorkflow: unknown name -> undefined; name-mismatched pair -> throws",
 
 test("hand-written sample pairs (empty hash) are untrusted until trusted — no bypass", async () => {
   const { storage, fs } = makeStorage()
+  seedAnchors(fs)
   await writePair(fs, PROJECT_WF, "sample", "return 'sample'")
   await storage.refreshWorkflows()
   assert.throws(() => storage.loadWorkflow("sample"), /is not trusted/)
-  await storage.trustWorkflow("sample")
+  const trusted = await storage.trustWorkflow("sample")
+  assert.equal(trusted?.digest, createHash("sha256").update("return 'sample'").digest("hex"))
   assert.equal(storage.loadWorkflow("sample")?.script, "return 'sample'")
 })
 
 test("loadWorkflow throws when manifest.name doesn't match the filename key", async () => {
   const { storage, fs } = makeStorage()
+  seedAnchors(fs)
   await writePair(fs, PROJECT_WF, "drifted", "return 1", { name: "other-name" })
   await storage.refreshWorkflows()
   assert.throws(() => storage.loadWorkflow("drifted"), /does not match filename "drifted"/)
 })
 
+test("workflowTrustState: unknown / untrusted (changed) / trusted", async () => {
+  const { storage, fs } = makeStorage()
+  seedAnchors(fs)
+  assert.equal(storage.workflowTrustState("nope"), "unknown")
+  await writePair(fs, PROJECT_WF, "alpha", "return 1")
+  await storage.refreshWorkflows()
+  assert.equal(storage.workflowTrustState("alpha"), "untrusted")
+  await storage.trustWorkflow("alpha")
+  assert.equal(storage.workflowTrustState("alpha"), "trusted")
+  await fs.writeFile(`${PROJECT_WF}/alpha.js`, "return 2 // changed")
+  await storage.refreshWorkflows()
+  assert.equal(storage.workflowTrustState("alpha"), "untrusted") // changed since approval
+})
+
+// ---------------------------------------------------------------------------
+// Fresh composition loader (snapshot-per-call)
+// ---------------------------------------------------------------------------
+
+test("loadWorkflowFresh reads disk + KV directly, without prior refreshWorkflows", async () => {
+  const { storage, fs } = makeStorage()
+  seedAnchors(fs)
+  await writePair(fs, PROJECT_WF, "fresh", "return 1")
+  // No refreshWorkflows call: the fresh path must still see the pair...
+  await assert.rejects(() => storage.loadWorkflowFresh("fresh"), /is not trusted/)
+  // ...and the cached path must not (cache was never warmed).
+  assert.equal(storage.loadWorkflow("fresh"), undefined)
+  await storage.trustWorkflow("fresh")
+  const loaded = await storage.loadWorkflowFresh("fresh")
+  assert.equal(loaded?.script, "return 1")
+  // Success updates the caches so subsequent sync loads agree.
+  assert.equal(storage.loadWorkflow("fresh")?.script, "return 1")
+})
+
+test("loadWorkflowFresh is snapshot-per-call: edits block without any refresh", async () => {
+  const { storage, fs } = makeStorage()
+  seedAnchors(fs)
+  await writePair(fs, PROJECT_WF, "fresh", "return 1")
+  await storage.trustWorkflow("fresh")
+  assert.equal((await storage.loadWorkflowFresh("fresh"))?.script, "return 1")
+  await fs.writeFile(`${PROJECT_WF}/fresh.js`, "return 2 // changed")
+  await assert.rejects(() => storage.loadWorkflowFresh("fresh"), /is not trusted/) // no refresh needed
+  await storage.trustWorkflow("fresh")
+  assert.equal((await storage.loadWorkflowFresh("fresh"))?.script, "return 2 // changed")
+})
+
+test("loadWorkflowFresh honors precedence and unknown names", async () => {
+  const { storage, fs } = makeStorage()
+  seedAnchors(fs)
+  assert.equal(await storage.loadWorkflowFresh("missing"), undefined)
+  await writePair(fs, PERSONAL, "both", "personal")
+  await writePair(fs, PROJECT_WF, "both", "project")
+  await storage.trustWorkflow("both") // trusts the project copy (precedence)
+  assert.equal((await storage.loadWorkflowFresh("both"))?.script, "project")
+})
+
+// ---------------------------------------------------------------------------
+// refreshWorkflows + precedence
+// ---------------------------------------------------------------------------
+
 test("refreshWorkflows: project dir overrides personal dir on name collision", async () => {
   const { storage, fs } = makeStorage()
+  seedAnchors(fs)
   await writePair(fs, PERSONAL, "alpha", "personal alpha")
   await writePair(fs, PERSONAL, "only-personal", "personal only")
   await writePair(fs, PROJECT_WF, "alpha", "project alpha")
@@ -357,7 +460,6 @@ test("refreshWorkflows: project dir overrides personal dir on name collision", a
 
   const names = storage.listWorkflows().map((w) => `${w.manifest.name}:${w.manifest.source}`).sort()
   assert.deepEqual(names, ["alpha:project", "only-personal:personal", "only-project:project"])
-  // Listing shows what's on disk; loading anything still requires trust.
   await storage.trustWorkflow("alpha")
   assert.equal(storage.loadWorkflow("alpha")?.script, "project alpha")
   await storage.trustWorkflow("only-personal")
@@ -366,6 +468,7 @@ test("refreshWorkflows: project dir overrides personal dir on name collision", a
 
 test("refreshWorkflows skips incomplete pairs and non-workflow files", async () => {
   const { storage, fs } = makeStorage()
+  seedAnchors(fs)
   await fs.writeFile(`${PROJECT_WF}/no-manifest.js`, "x")
   await fs.writeFile(`${PROJECT_WF}/no-script.json`, "{}")
   await fs.writeFile(`${PROJECT_WF}/notes.txt`, "not a workflow")
@@ -376,57 +479,120 @@ test("refreshWorkflows skips incomplete pairs and non-workflow files", async () 
 })
 
 // ---------------------------------------------------------------------------
-// Symlink containment (fail closed)
+// Symlink containment for workflow writes (fail closed)
 // ---------------------------------------------------------------------------
 
-/** FakeFs with "symlinks": each link path exists and realpath-resolves elsewhere. */
-class SymlinkFs extends FakeFs {
-  private readonly links: Map<string, string>
-  constructor(links: Map<string, string>) {
-    super()
-    this.links = links
-  }
-  override async exists(path: string): Promise<boolean> {
-    if (this.links.has(this.normalize(path))) return true
-    return super.exists(path)
-  }
-  async realpath(path: string): Promise<string> {
-    return this.links.get(this.normalize(path)) ?? this.normalize(path)
-  }
-}
-
-test("saveWorkflow rejects when the workflows dir symlink-escapes the project root", async () => {
-  // /project/.opencode "exists" and realpath-resolves to /elsewhere (symlink).
-  const fs = new SymlinkFs(new Map([["/project/.opencode", "/elsewhere"]]))
-  const { storage } = makeStorage({ fs })
+test("saveWorkflow rejects a symlinked workflows dir that escapes the project root", async () => {
+  const { storage, fs } = makeStorage()
+  seedAnchors(fs)
+  fs.symlinks.set(`${PROJECT}/.opencode`, "/elsewhere")
+  await fs.writeFile("/elsewhere/.keep", "x") // the symlink target EXISTS
   await assert.rejects(
     () => storage.saveWorkflow("evil", "return 1", { name: "evil", source: "project" }),
-    /refusing to write outside/,
+    /refusing to write workflow "evil"/,
   )
 })
 
-test("saveWorkflow accepts when the project root itself is a symlink (resolved consistently)", async () => {
-  // Whole project viewed through a symlink: /proj -> /data/proj. Both the
-  // anchor and the target resolve through it, so writes proceed.
-  const fs = new SymlinkFs(new Map([["/proj", "/data/proj"]]))
-  const storage = new StorageImpl({
-    kv: new FakeKv(),
-    fs,
-    projectRoot: "/proj",
-    personalWorkflowDir: PERSONAL,
-    projectID: PID,
-  })
-  const saved = await storage.saveWorkflow("ok", "return 1", { name: "ok", source: "project" })
-  assert.equal(saved.manifest.name, "ok")
+test("saveWorkflow rejects a DANGLING symlinked workflows dir (target outside, not yet existing)", async () => {
+  const { storage, fs } = makeStorage()
+  seedAnchors(fs)
+  fs.symlinks.set(`${PROJECT}/.opencode`, "/outside") // target does NOT exist
+  await assert.rejects(
+    () => storage.saveWorkflow("evil", "return 1", { name: "evil", source: "project" }),
+    /dangling|refusing/,
+  )
+  assert.equal(await fs.exists("/outside/evil.js"), false)
+})
+
+test("saveWorkflow rejects a dangling <name>.js symlink pointing outside (final component)", async () => {
+  const { storage, fs } = makeStorage()
+  seedAnchors(fs)
+  await writePair(fs, PROJECT_WF, "real", "x") // materialize dirs with a legit pair
+  fs.symlinks.set(`${PROJECT_WF}/evil.js`, "/outside/target.js") // dangling outside link
+  await assert.rejects(
+    () => storage.saveWorkflow("evil", "return 1", { name: "evil", source: "project" }),
+    /refusing to write workflow "evil"/,
+  )
+})
+
+test("saveWorkflow rejects an EXISTING outside <name>.js symlink (write-through escape)", async () => {
+  const { storage, fs } = makeStorage()
+  seedAnchors(fs)
+  await writePair(fs, PROJECT_WF, "real", "x")
+  fs.symlinks.set(`${PROJECT_WF}/evil.js`, "/outside/target.js")
+  await fs.writeFile("/outside/target.js", "existing") // target exists outside the anchor
+  await assert.rejects(
+    () => storage.saveWorkflow("evil", "return 1", { name: "evil", source: "project" }),
+    /resolves outside|refusing/,
+  )
+  assert.equal(await fs.readFile("/outside/target.js"), "existing") // untouched
 })
 
 test("saveWorkflow(personal) rejects when the personal workflows dir is a symlink", async () => {
-  const fs = new SymlinkFs(new Map([[PERSONAL, "/etc"]]))
-  const { storage } = makeStorage({ fs })
+  const { storage, fs } = makeStorage()
+  seedAnchors(fs)
+  fs.symlinks.set(PERSONAL, "/etc-stub")
+  await fs.writeFile("/etc-stub/.keep", "x")
   await assert.rejects(
     () => storage.saveWorkflow("evil", "return 1", { name: "evil", source: "personal" }),
-    /refusing to write outside/,
+    /refusing to write workflow "evil"/,
   )
+})
+
+test("saveWorkflow accepts inside-the-anchor symlinks and symlinked project roots", async () => {
+  // Project root itself is a symlink — anchor and target resolve consistently.
+  const fs = new FakeFs()
+  fs.symlinks.set("/proj", "/data/proj")
+  await fs.writeFile("/data/proj/.anchor", "x")
+  const { storage } = makeStorage({ fs, projectRoot: "/proj" })
+  const saved = await storage.saveWorkflow("ok", "return 1", { name: "ok", source: "project" })
+  assert.equal(saved.manifest.name, "ok")
+
+  // A symlink INSIDE the anchor pointing inside the anchor is legitimate.
+  const { storage: s2, fs: fs2 } = makeStorage()
+  seedAnchors(fs2)
+  fs2.symlinks.set(`${PROJECT}/.opencode`, `${PROJECT}/real-opencode`)
+  await fs2.writeFile(`${PROJECT}/real-opencode/.keep`, "x")
+  const saved2 = await s2.saveWorkflow("ok2", "return 2", { name: "ok2", source: "project" })
+  assert.equal(saved2.manifest.name, "ok2")
+})
+
+// ---------------------------------------------------------------------------
+// resolveContainedPath (direct)
+// ---------------------------------------------------------------------------
+
+test("resolveContainedPath: ok for existing and new paths inside the anchor", async () => {
+  const fs = new FakeFs()
+  seedAnchors(fs)
+  await fs.writeFile(`${PROJECT_WF}/alpha.js`, "x")
+  assert.deepEqual(await resolveContainedPath(fs, PROJECT, `${PROJECT_WF}/alpha.js`), { ok: true, path: `${PROJECT_WF}/alpha.js` })
+  const newFile = await resolveContainedPath(fs, PROJECT, `${PROJECT_WF}/new/deep/file.js`)
+  assert.equal(newFile.ok, true) // new tail under a resolved-inside chain
+  assert.deepEqual(await resolveContainedPath(fs, PROJECT, PROJECT), { ok: true, path: PROJECT })
+})
+
+test("resolveContainedPath: lexical escapes, unresolvable anchors and errors reject", async () => {
+  const fs = new FakeFs()
+  seedAnchors(fs)
+  const escape = await resolveContainedPath(fs, PROJECT, "/etc/passwd")
+  assert.equal(escape.ok, false)
+  assert.match(escape.error, /not inside/)
+  const noAnchor = await resolveContainedPath(fs, "/missing-root", "/missing-root/x")
+  assert.equal(noAnchor.ok, false) // fail closed when the anchor can't be resolved
+})
+
+test("resolveContainedPath: dangling and escaping symlinks reject (no lexical fallback)", async () => {
+  const fs = new FakeFs()
+  seedAnchors(fs)
+  await fs.writeFile(`${PROJECT_WF}/real.js`, "x")
+  fs.symlinks.set(`${PROJECT_WF}/dangling.js`, "/outside/missing.js")
+  const dangling = await resolveContainedPath(fs, PROJECT, `${PROJECT_WF}/dangling.js`)
+  assert.equal(dangling.ok, false)
+  fs.symlinks.set(`${PROJECT_WF}/escape.js`, "/outside/exists.js")
+  await fs.writeFile("/outside/exists.js", "x")
+  const escaping = await resolveContainedPath(fs, PROJECT, `${PROJECT_WF}/escape.js`)
+  assert.equal(escaping.ok, false)
+  assert.match(escaping.error, /resolves outside/)
 })
 
 // ---------------------------------------------------------------------------

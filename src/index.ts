@@ -18,7 +18,7 @@ import { homedir } from "node:os"
 import { fileURLToPath } from "node:url"
 import { loadOptions } from "./config.ts"
 import { RegistryImpl } from "./registry.ts"
-import { StorageImpl, normalizePath } from "./storage.ts"
+import { StorageImpl, normalizePath, resolveContainedPath } from "./storage.ts"
 import { validateToolInput } from "./tool-input.ts"
 import type {
   FsLike,
@@ -40,10 +40,6 @@ interface RegistrationLike {
 // ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
-
-/** Module-level skill state — the prompt hook must never push an
- *  unregistered skill id into prompts (it can break admission). */
-let skillInstalled = false
 
 function warn(message: string, err?: unknown): void {
   try {
@@ -186,6 +182,10 @@ export default Plugin.define({
     for (const w of warnings) warn(`config warning — ${w}`)
 
     let disposed = false
+    // Instance-local skill state: the prompt hook must never push an
+    // unregistered skill id into prompts (it can break admission). Never
+    // inherited across plugin reloads.
+    let skillInstalled = false
 
     // ---- capabilities (plain interfaces; everything stays node-testable) ----
     const projectRoot = normalizePath(String(ctx.location?.project?.directory ?? process.cwd()))
@@ -233,6 +233,15 @@ export default Plugin.define({
         }
       },
       realpath: async (path) => await fsp.realpath(path),
+      lstat: async (path) => {
+        try {
+          const stats = await fsp.lstat(path)
+          return { isSymbolicLink: () => stats.isSymbolicLink() }
+        } catch (err) {
+          if (err instanceof Error && (err as { code?: string }).code === "ENOENT") return undefined
+          throw err
+        }
+      },
     }
 
     const sessions: SessionCtx = {
@@ -297,7 +306,15 @@ export default Plugin.define({
     let supervisorError: string | undefined
     try {
       const mod = await import("./supervisor.ts")
-      supervisor = new mod.SupervisorImpl({ registry, storage, sessions, options })
+      // Composition seam (Builder B): workflow() bridge calls go through this
+      // async loader — snapshot-per-call fresh disk reads, trust-checked.
+      supervisor = new mod.SupervisorImpl({
+        registry,
+        storage,
+        sessions,
+        options,
+        loadWorkflowFresh: (name: string) => storage.loadWorkflowFresh(name),
+      })
     } catch (err) {
       supervisorError =
         "workflow tool unavailable: the supervisor module failed to load " +
@@ -576,7 +593,14 @@ export default Plugin.define({
           parts.push("**Saved workflows**")
           parts.push(
             saved.length
-              ? saved.map((w) => `- \`${w.manifest.name}\` — ${w.manifest.description ?? "(no description)"} [${w.manifest.source}]`).join("\n")
+              ? saved
+                  .map((w) => {
+                    const state = storage.workflowTrustState(w.manifest.name)
+                    const stateText =
+                      state === "trusted" ? "trusted" : state === "untrusted" ? "untrusted (changed)" : "unknown"
+                    return `- \`${w.manifest.name}\` — ${w.manifest.description ?? "(no description)"} [${w.manifest.source} · ${stateText}]`
+                  })
+                  .join("\n")
               : "(none — save one with `/ultracode save <runID> <name>`)",
           )
           parts.push("")
@@ -669,7 +693,7 @@ export default Plugin.define({
             }
             await say(
               sessionID,
-              `Trusted workflow \`${rest}\` (current version, sha256 ${trusted.manifest.hash.slice(0, 12)}…) — it can now be run with { workflow: "${rest}" }.`,
+              `Trusted workflow \`${rest}\` (current version, sha256 ${trusted.digest.slice(0, 12)}…) — it can now be run with { workflow: "${rest}" }.`,
             )
           } catch (err) {
             await say(sessionID, `error: could not trust workflow — ${describeError(err)}`)
@@ -818,6 +842,7 @@ export default Plugin.define({
       if (filePresent) {
         await ctx.skill.transform((editor) => {
           try {
+            skillInstalled = false // defensive: reset before any replay
             const existing = editor.get("ultracode") as { location?: string } | undefined
             if (existing && existing.location !== skillPath) {
               warn(`skill id "ultracode" is already registered at ${String(existing.location)} — not overriding it`)
@@ -844,37 +869,27 @@ export default Plugin.define({
 
     // ---- permission hook (only when NOT delegating every ask to the user) ----
     if (options.permissions !== "ask") {
-      const realpathProjectRoot = await (async () => {
+      /**
+       * Symlink-aware containment via the shared lstat resolver: file: URLs
+       * parsed with fileURLToPath (no string slicing), components walked with
+       * lstat, symlinks realpath'd. Resolution failure (dangling link, fs
+       * error, unclassifiable resource) FAILS CLOSED — no auto-allow.
+       */
+      const resourceInsideProject = async (resource: string): Promise<boolean> => {
         try {
-          return normalizePath(await fs.realpath(projectRoot))
-        } catch {
-          return normalizePath(projectRoot)
-        }
-      })()
-      /** Parse a resource into an absolute path; undefined = unclassifiable (fail closed). */
-      const parseResourcePath = async (resource: string): Promise<string | undefined> => {
-        try {
-          let path: string
+          let path: string | undefined
           if (resource.startsWith("file:")) {
             path = fileURLToPath(new URL(resource))
           } else if (resource.startsWith("/")) {
             path = resource
           } else {
-            return undefined
+            return false // relative/opaque — unclassifiable => fail closed
           }
-          try {
-            return normalizePath(await fs.realpath(path))
-          } catch {
-            return normalizePath(path) // not on disk (yet) — lexical check
-          }
+          const resolved = await resolveContainedPath(fs, projectRoot, path)
+          return resolved.ok
         } catch {
-          return undefined
+          return false
         }
-      }
-      const isInsideProject = async (resource: string): Promise<boolean> => {
-        const resolved = await parseResourcePath(resource)
-        if (resolved === undefined) return false
-        return resolved === realpathProjectRoot || resolved.startsWith(realpathProjectRoot + "/")
       }
       try {
         const reg = await ctx.permission.hook("evaluate", async (event) => {
@@ -894,8 +909,12 @@ export default Plugin.define({
             if (options.permissions === "autoEditsWorkflow") {
               const resources = Array.isArray(ev.resources) ? ev.resources : []
               if (resources.length === 0) return
-              const inside = await Promise.all(resources.map((r) => (typeof r === "string" ? isInsideProject(r) : Promise.resolve(false))))
-              if (!inside.every(Boolean)) return // unclassifiable/escaped => no auto-allow
+              const inside = await Promise.all(resources.map((r) => (typeof r === "string" ? resourceInsideProject(r) : Promise.resolve(false))))
+              if (!inside.every(Boolean)) return
+              // The async fs checks above open a window where the run could
+              // have finalized — re-verify active ownership immediately
+              // before allowing.
+              if (!registry.isOwnedActive(sessionID)) return
               ev.effect = "allow"
               return
             }
@@ -915,6 +934,7 @@ export default Plugin.define({
     // ---- cleanup ----
     return () => {
       disposed = true
+      skillInstalled = false
       controller.abort()
       for (const reg of registrations) {
         try {

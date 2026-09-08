@@ -112,9 +112,37 @@ export class FakeFs implements FsLike {
     return [...out].filter((x) => x !== ".keep")
   }
 
-  /** Fakes have no symlinks — realpath is normalize (additive, Builder A review fix). */
+  /** Symlinks this fake tracks: absolute normalized path -> target (additive, Builder A review fix). */
+  symlinks = new Map<string, string>()
+
+  private async lstatImpl(path: string): Promise<{ isSymbolicLink(): boolean } | undefined> {
+    const n = this.normalize(path)
+    if (this.symlinks.has(n)) return { isSymbolicLink: () => true }
+    if (this.files.has(n)) return { isSymbolicLink: () => false }
+    for (const key of this.files.keys()) {
+      if (key.startsWith(n + "/")) return { isSymbolicLink: () => false } // implicit directory
+    }
+    return undefined
+  }
+
+  async lstat(path: string): Promise<{ isSymbolicLink(): boolean } | undefined> {
+    return this.lstatImpl(path)
+  }
+
+  /** node-like realpath: resolves tracked symlinks per component; throws when the final path is missing. */
   async realpath(path: string): Promise<string> {
-    return this.normalize(path)
+    const parts = this.normalize(path).split("/").filter((p) => p !== "")
+    let cur = ""
+    for (const part of parts) {
+      const next = cur + "/" + part
+      const link = this.symlinks.get(next)
+      cur = link !== undefined ? this.normalize(link) : next
+    }
+    if (cur === "") cur = "/"
+    if ((await this.lstatImpl(cur)) === undefined) {
+      throw new Error(`ENOENT: realpath ${this.normalize(path)} -> ${cur}`)
+    }
+    return cur
   }
 }
 

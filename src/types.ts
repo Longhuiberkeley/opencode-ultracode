@@ -463,8 +463,13 @@ export interface FsLike {
   readFile(path: string): Promise<string>
   exists(path: string): Promise<boolean>
   readdir(path: string): Promise<string[]>
-  /** Resolve symlinks (node:fs realpath). Fakes: normalize(). */
+  /** Resolve symlinks (node:fs realpath); throws on missing paths. */
   realpath(path: string): Promise<string>
+  /**
+   * lstat without following symlinks; resolves to undefined when the path does
+   * not exist (ENOENT mapped), throws on other errors.
+   */
+  lstat(path: string): Promise<{ isSymbolicLink(): boolean } | undefined>
 }
 
 export function randomRunID(): string {

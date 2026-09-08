@@ -78,6 +78,73 @@ export function sha256(text: string): string {
   return createHash("sha256").update(text, "utf8").digest("hex")
 }
 
+// ---------------------------------------------------------------------------
+// Shared lstat-aware containment resolver (review fix C-High)
+// ---------------------------------------------------------------------------
+
+export type ResolveResult = { ok: true; path: string } | { ok: false; error: string }
+
+function errText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err)
+}
+
+/**
+ * Walk `target`'s components from the trusted `anchor`, lstat'ing each
+ * existing one:
+ *  - symlink component => resolve via realpath; reject when it dangles or
+ *    resolves outside the anchor;
+ *  - first missing component => the remaining tail is a NEW path, allowed
+ *    only because every ancestor up to here resolved inside the anchor;
+ *  - any fs error => reject (fail closed — never fall back to lexical paths).
+ *
+ * Used by saveWorkflow, run script-artifact writes and the permission
+ * containment check (index.ts).
+ */
+export async function resolveContainedPath(fs: FsLike, anchor: string, target: string): Promise<ResolveResult> {
+  const anchorLex = normalizePath(anchor)
+  const targetLex = normalizePath(target)
+  if (targetLex !== anchorLex && !targetLex.startsWith(anchorLex + "/")) {
+    return { ok: false, error: `target ${targetLex} is not inside ${anchorLex}` }
+  }
+  let anchorReal: string
+  try {
+    anchorReal = normalizePath(await fs.realpath(anchorLex))
+  } catch (err) {
+    return { ok: false, error: `cannot resolve anchor ${anchorLex}: ${errText(err)}` }
+  }
+  const parts = targetLex.slice(anchorLex.length).split("/").filter((p) => p !== "")
+  let current = anchorReal
+  for (let i = 0; i < parts.length; i++) {
+    const next = `${current}/${parts[i]}`
+    let stat: { isSymbolicLink(): boolean } | undefined
+    try {
+      stat = await fs.lstat(next)
+    } catch (err) {
+      return { ok: false, error: `lstat failed for ${next}: ${errText(err)}` }
+    }
+    if (stat === undefined) {
+      // Missing from here on: a NEW path whose resolved ancestor chain (up to
+      // `current`) is verified-inside by construction.
+      return { ok: true, path: normalizePath(`${current}/${parts.slice(i).join("/")}`) }
+    }
+    if (stat.isSymbolicLink()) {
+      let real: string
+      try {
+        real = normalizePath(await fs.realpath(next))
+      } catch (err) {
+        return { ok: false, error: `dangling or unresolvable symlink ${next}: ${errText(err)}` }
+      }
+      if (real !== anchorReal && !real.startsWith(anchorReal + "/")) {
+        return { ok: false, error: `symlink ${next} resolves outside ${anchorLex}: ${real}` }
+      }
+      current = real
+      continue
+    }
+    current = next
+  }
+  return { ok: true, path: current }
+}
+
 export class StorageError extends Error {}
 
 function requireValidWorkflowName(name: string): void {
@@ -88,9 +155,10 @@ function requireValidWorkflowName(name: string): void {
   }
 }
 
-/** KV key segment for a project id (defensive charset restriction). */
+/** KV key segment for a project id: hashed (injective), short, stable. */
 function pidSegment(projectID: string): string {
-  return projectID.replace(/[^\w.-]+/g, "-").slice(0, 128) || "default"
+  // Old (sanitized-string) keys are intentionally orphaned — runs are history.
+  return `p${sha256(projectID).slice(0, 16)}`
 }
 
 /** Deep JSON round-trip (drops undefined props, guarantees JSON-safe value). */
@@ -211,6 +279,9 @@ export class StorageImpl implements Storage {
     if (typeof runID !== "string" || !RUN_ID_RE.test(runID) || runID.includes("..")) return undefined
     const path = joinInside(this.runsArtifactDir, `${runID}.js`, "script artifact")
     try {
+      // Symlink-aware containment (a symlinked runs/ dir fails closed).
+      const resolved = await resolveContainedPath(this.fs, this.projectRoot, path)
+      if (!resolved.ok) return undefined
       await this.mkdir(this.runsArtifactDir)
       await this.fs.writeFile(path, script)
       return path
@@ -262,45 +333,63 @@ export class StorageImpl implements Storage {
     requireValidWorkflowName(name)
     const cached = this.workflowCache.get(name)
     if (!cached) return undefined
-    if (cached.nameMismatch) {
-      throw new StorageError(
-        `workflow "${name}": manifest name ${JSON.stringify(cached.workflow.manifest.name)} does not match ` +
-          `filename "${name}" — re-save the workflow`,
-      )
-    }
-    const trusted = this.trustDigests.get(name)
-    const digest = sha256(cached.workflow.script)
-    if (trusted !== digest) {
-      throw new StorageError(
-        `workflow "${name}" is not trusted (new or changed since approval). ` +
-          `Run /workflow trust ${name} to approve the current version.`,
-      )
-    }
+    if (cached.nameMismatch) throwMismatch(name, cached.workflow.manifest.name)
+    this.assertTrusted(name, cached.workflow.script, this.trustDigests.get(name))
     return cached.workflow
   }
 
+  /** Trust state for listings — same digest comparison as loadWorkflow. */
+  workflowTrustState(name: string): "trusted" | "untrusted" | "unknown" {
+    const cached = this.workflowCache.get(name)
+    if (!cached) return "unknown"
+    return this.trustDigests.get(name) === sha256(cached.workflow.script) ? "trusted" : "untrusted"
+  }
+
   /**
-   * Approve the CURRENT on-disk version of a workflow: fresh-reads the pair by
-   * precedence (project wins), computes the digest and writes the trust record.
-   * Returns the approved workflow, or undefined when not found.
+   * Snapshot-per-call load for the workflow() composition path: reads the pair
+   * from disk directly (project wins) and checks the trust record straight
+   * from the KV — never the possibly-stale caches. Updates both caches on
+   * success so subsequent sync loads agree. Throws on name/trust violations
+   * exactly like loadWorkflow; undefined when not found.
    */
-  async trustWorkflow(name: string): Promise<SavedWorkflow | undefined> {
+  async loadWorkflowFresh(name: string): Promise<SavedWorkflow | undefined> {
     requireValidWorkflowName(name)
     const entry =
       (await this.readWorkflowPair(this.projectWorkflowDir, name, "project")) ??
       (await this.readWorkflowPair(this.personalWorkflowDir, name, "personal"))
     if (!entry) return undefined
-    if (entry.nameMismatch) {
-      throw new StorageError(
-        `workflow "${name}": manifest name ${JSON.stringify(entry.workflow.manifest.name)} does not match ` +
-          `filename "${name}" — re-save the workflow before trusting it`,
-      )
+    if (entry.nameMismatch) throwMismatch(name, entry.workflow.manifest.name)
+    let trusted: string | undefined
+    try {
+      trusted = (await this.kv.get(`${this.trustPrefix}/${name}`)) as string | undefined
+    } catch {
+      trusted = undefined // fail closed
     }
+    if (typeof trusted !== "string") trusted = undefined
+    this.assertTrusted(name, entry.workflow.script, trusted)
+    this.trustDigests.set(name, sha256(entry.workflow.script))
+    this.workflowCache.set(name, entry)
+    return entry.workflow
+  }
+
+  /**
+   * Approve the CURRENT on-disk version of a workflow: fresh-reads the pair by
+   * precedence (project wins), computes the digest and writes the trust record.
+   * Returns the approved workflow AND the computed digest (manifest.hash may
+   * be empty/stale for hand-written pairs), or undefined when not found.
+   */
+  async trustWorkflow(name: string): Promise<{ workflow: SavedWorkflow; digest: string } | undefined> {
+    requireValidWorkflowName(name)
+    const entry =
+      (await this.readWorkflowPair(this.projectWorkflowDir, name, "project")) ??
+      (await this.readWorkflowPair(this.personalWorkflowDir, name, "personal"))
+    if (!entry) return undefined
+    if (entry.nameMismatch) throwMismatch(name, entry.workflow.manifest.name)
     const digest = sha256(entry.workflow.script)
     await this.kv.set(`${this.trustPrefix}/${name}`, digest)
     this.trustDigests.set(name, digest)
     this.workflowCache.set(name, entry)
-    return entry.workflow
+    return { workflow: entry.workflow, digest }
   }
 
   async saveWorkflow(
@@ -327,13 +416,16 @@ export class StorageImpl implements Storage {
     }
     const scriptPath = joinInside(dir, `${name}.js`, "workflow script")
     const manifestPath = joinInside(dir, `${name}.json`, "workflow manifest")
-    // Symlink containment: resolve the existing ancestor chain and fail closed
-    // if the real target escapes the trusted anchor for that source
-    // (project root for project saves, the personal config dir's parent for
-    // personal saves — so a symlinked workflows dir itself is rejected).
+    // Shared lstat-aware containment (symlink escapes and dangling links fail
+    // closed). Trusted anchor: project root for project saves, the personal
+    // config dir's parent for personal saves.
     const anchor = source === "project" ? this.projectRoot : dirnameNormalized(this.personalWorkflowDir)
-    await this.assertWriteContained(anchor, scriptPath)
-    await this.assertWriteContained(anchor, manifestPath)
+    for (const target of [scriptPath, manifestPath]) {
+      const resolved = await resolveContainedPath(this.fs, anchor, target)
+      if (!resolved.ok) {
+        throw new StorageError(`refusing to write workflow "${name}": ${resolved.error}`)
+      }
+    }
     await this.mkdir(dir)
     await this.fs.writeFile(scriptPath, script)
     await this.fs.writeFile(manifestPath, JSON.stringify(full, null, 2) + "\n")
@@ -404,45 +496,13 @@ export class StorageImpl implements Storage {
     }
   }
 
-  /**
-   * Fail-closed symlink containment: resolve `target`'s deepest existing
-   * ancestor through realpath and require the resolved path to stay inside the
-   * realpath-resolved base.
-   */
-  private async assertWriteContained(base: string, target: string): Promise<void> {
-    const realBase = await this.resolveExisting(base)
-    const realTarget = await this.resolveExisting(target)
-    if (realTarget !== realBase && !realTarget.startsWith(realBase + "/")) {
-      throw new StorageError(
-        `refusing to write outside ${normalizePath(base)}: ${normalizePath(target)} resolves to ${realTarget}`,
-      )
-    }
-  }
-
-  /** Path with its deepest existing ancestor realpath-resolved (suffix kept lexical). */
-  private async resolveExisting(path: string): Promise<string> {
-    const normalized = normalizePath(path)
-    const suffix: string[] = []
-    let cur = normalized
-    while (cur !== "/" && cur !== "") {
-      let exists = false
-      try {
-        exists = await this.fs.exists(cur)
-      } catch {
-        exists = false
-      }
-      if (exists) break
-      const parent = dirnameNormalized(cur)
-      suffix.unshift(cur.slice(parent.length + 1))
-      cur = parent
-    }
-    let real: string
-    try {
-      real = normalizePath(await this.fs.realpath(cur))
-    } catch {
-      throw new StorageError(`cannot resolve real path of ${normalized}`)
-    }
-    return suffix.length === 0 ? real : normalizePath(`${real}/${suffix.join("/")}`)
+  /** Trust gate: throw unless `trusted` matches the current script digest. */
+  private assertTrusted(name: string, script: string, trusted: string | undefined): void {
+    if (trusted === sha256(script)) return
+    throw new StorageError(
+      `workflow "${name}" is not trusted (new or changed since approval). ` +
+        `Run /ultracode trust ${name} to approve the current version.`,
+    )
   }
 
   private upsertRunsCache(record: RunRecord): void {
@@ -464,6 +524,13 @@ function parseRunRecord(value: unknown): RunRecord | undefined {
     ...(v as unknown as RunRecord),
     agents: Array.isArray(v["agents"]) ? (v["agents"] as RunRecord["agents"]) : [],
   }
+}
+
+function throwMismatch(name: string, manifestName: string): never {
+  throw new StorageError(
+    `workflow "${name}": manifest name ${JSON.stringify(manifestName)} does not match ` +
+      `filename "${name}" — re-save the workflow`,
+  )
 }
 
 function parseManifest(raw: unknown, source: "project" | "personal"): SavedWorkflowManifest | undefined {
