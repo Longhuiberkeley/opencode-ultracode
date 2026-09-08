@@ -269,8 +269,8 @@ export function storageWorkflowLoader(storage: Storage): WorkflowLoader {
     loadWorkflowFresh?: (name: string) => Promise<SavedWorkflow | undefined>
   }).loadWorkflowFresh
   if (typeof fresh === "function") {
-    // Defensive unwrap: A's in-flight loadWorkflowFresh returns
-    // { workflow, digest }; the seam normalizes both shapes.
+    // Defensive unwrap: tolerates loaders that return either SavedWorkflow
+    // directly (current shape) or wrapped as { workflow }.
     return async (name: string) => {
       const raw = (await fresh.call(storage, name)) as SavedWorkflow | { workflow: SavedWorkflow } | undefined
       if (raw === undefined || raw === null) return undefined
