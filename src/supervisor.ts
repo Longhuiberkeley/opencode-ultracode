@@ -18,6 +18,7 @@ import type {
   RunOutcome,
   RunRecord,
   RunStatus,
+  SavedWorkflow,
   SessionCtx,
   Storage,
   Supervisor,
@@ -28,7 +29,8 @@ import { addTokens, emptyTokens } from "./types.ts"
 import { buildEnvelope, resultFits } from "./serialize.ts"
 import { createSessionDriver } from "./sessions.ts"
 import type { SessionDriver } from "./sessions.ts"
-import { AgentRunner, getWorkflowComposer } from "./primitives.ts"
+import { AgentRunner, getWorkflowComposer, storageWorkflowLoader } from "./primitives.ts"
+import type { WorkflowLoader } from "./primitives.ts"
 import { validateScriptSource } from "./worker-script.ts"
 import { spawnWorker } from "./worker-host.ts"
 import type { WorkerHandle, WorkerResult } from "./worker-host.ts"
@@ -48,6 +50,12 @@ export interface SupervisorDeps {
   /** Optional overrides (tests). Defaults: 15s settle grace, 5s stop-kill grace. */
   settleGraceMs?: number
   stopKillGraceMs?: number
+  /**
+   * Async saved-workflow loader for workflow() composition (fresh-disk,
+   * trust-checked; Builder A seam). Defaults to Storage.loadWorkflowFresh when
+   * present, else the cached Storage.loadWorkflow. Index wiring is A's/lead's.
+   */
+  loadWorkflowFresh?: WorkflowLoader
 }
 
 interface RunState {
@@ -57,8 +65,8 @@ interface RunState {
   children: Set<string>
   /** Children whose agent() call has not settled yet (interrupt candidates). */
   live: Set<string>
-  /** Never-rejecting child cleanup promises (late-child interrupts, etc.). */
-  cleanup: Array<Promise<void>>
+  /** Still-pending, never-rejecting child cleanup promises (late-child interrupts). */
+  cleanup: Set<Promise<void>>
   /** True once the run stops accepting/tracking new children (settle phase). */
   closed: boolean
   inFlight: number
@@ -112,6 +120,7 @@ export class SupervisorImpl implements Supervisor {
   private readonly settleGraceMs: number
   private readonly stopKillMs: number
   private readonly driver: SessionDriver
+  private readonly workflowLoader: WorkflowLoader
   private readonly runs = new Map<string, RunState>()
   private disposed = false
 
@@ -124,6 +133,9 @@ export class SupervisorImpl implements Supervisor {
     this.stopKillMs = deps.stopKillGraceMs ?? STOP_KILL_GRACE_MS
     // Driver construction performs no session calls — safe outside executors.
     this.driver = createSessionDriver(deps.sessions)
+    // Composition seam: injected fresh loader wins; else prefer
+    // Storage.loadWorkflowFresh when present, else the cached loadWorkflow.
+    this.workflowLoader = deps.loadWorkflowFresh ?? storageWorkflowLoader(deps.storage)
   }
 
   // -------------------------------------------------------------------------
@@ -179,11 +191,12 @@ export class SupervisorImpl implements Supervisor {
                 signal: hooks.signal,
                 onSessionID: (sessionID) => {
                   if (state.closed) {
-                    // Late child of an already-settling run: never gain
-                    // ownership — best-effort interrupt and drop it. The
-                    // driver's post-create abort check keeps it unprompted.
-                    state.cleanup.push(this.interruptChild(sessionID))
-                    return
+                    // Late child of an already-settling run: refuse
+                    // registration — the driver cancels that call BEFORE any
+                    // prompt (RunClosedError) and interrupts best-effort; the
+                    // child never gains ownership or enters the live set.
+                    this.trackCleanup(state, this.interruptChild(sessionID))
+                    return "rejected" as const
                   }
                   created = sessionID
                   state.children.add(sessionID)
@@ -194,6 +207,7 @@ export class SupervisorImpl implements Supervisor {
                     // registry bookkeeping must not break the call
                   }
                   hooks.onSessionID(sessionID)
+                  return undefined
                 },
               })
               .finally(() => {
@@ -349,7 +363,7 @@ export class SupervisorImpl implements Supervisor {
       controller: new AbortController(),
       children: new Set<string>(),
       live: new Set<string>(),
-      cleanup: [],
+      cleanup: new Set<Promise<void>>(),
       closed: false,
       inFlight: 0,
       ambientPhase: undefined,
@@ -372,7 +386,7 @@ export class SupervisorImpl implements Supervisor {
     if (fn === "workflow") {
       const name = typeof args[0] === "string" ? args[0] : ""
       const depth = typeof args[2] === "number" ? args[2] : 0
-      const composed = await getWorkflowComposer(this.storage, name, args[1], depth)
+      const composed = await getWorkflowComposer(this.workflowLoader, name, args[1], depth)
       return composed as unknown as Json
     }
     throw new Error(`unknown bridge call: ${fn}`)
@@ -404,6 +418,15 @@ export class SupervisorImpl implements Supervisor {
           throw err
         },
       )
+  }
+
+  /** Track a never-rejecting cleanup promise; remove it from the set when done. */
+  private trackCleanup(state: RunState, cleanup: Promise<void>): void {
+    state.cleanup.add(cleanup)
+    void cleanup.then(
+      () => state.cleanup.delete(cleanup),
+      () => state.cleanup.delete(cleanup),
+    )
   }
 
   private handleEvent(state: RunState, kind: string, data: Json, parent: ParentContext): void {
@@ -445,25 +468,27 @@ export class SupervisorImpl implements Supervisor {
 
   /**
    * Wait for in-flight bridge calls AND tracked child cleanup promises within
-   * the grace; then abort danglers (their driver races interrupt the child
-   * sessions) and give the abort a brief soft window to land. Returns the
-   * number of cleanup promises still pending after the grace.
+   * the grace (exiting early once both drain); then abort danglers (their
+   * driver races interrupt the child sessions) and give the abort a brief
+   * soft window to land. Returns the count of STILL-PENDING cleanup work:
+   * unresolved cleanup promises plus unresolved bridge/session-creation
+   * work in flight at finalize — the honest "(N cleanup pending)" number.
    */
   private async settle(state: RunState): Promise<number> {
     const deadline = Date.now() + this.settleGraceMs
-    while ((state.inFlight > 0 || state.cleanup.length > 0) && Date.now() < deadline) {
+    while ((state.inFlight > 0 || state.cleanup.size > 0) && Date.now() < deadline) {
       await delay(25)
     }
     if (state.inFlight > 0) {
       // Dangling calls (fire-and-forget agent()): interrupt their sessions
-      // via the run abort; late creates are handled by the closed flag.
+      // via the run abort; late creates are refused by the closed flag.
       state.controller.abort()
       const softDeadline = Date.now() + 500
-      while ((state.inFlight > 0 || state.cleanup.length > 0) && Date.now() < softDeadline) {
+      while ((state.inFlight > 0 || state.cleanup.size > 0) && Date.now() + 25 <= softDeadline) {
         await delay(25)
       }
     }
-    return state.cleanup.length
+    return state.cleanup.size + Math.max(0, state.inFlight)
   }
 
   private finalize(runID: string, final: FinalOutcome): RunOutcome {

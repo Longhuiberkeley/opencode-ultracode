@@ -6,7 +6,7 @@
 import test from "node:test"
 import assert from "node:assert/strict"
 import { createSessionDriver } from "../src/sessions.ts"
-import { AgentCallError } from "../src/sessions.ts"
+import { AgentCallError, RunClosedError } from "../src/sessions.ts"
 import { FakeSessionCtx } from "./fakes.ts"
 import type { ScriptedReply } from "./fakes.ts"
 import type { ContextMessage, SessionCtx, TokenUsage } from "../src/types.ts"
@@ -291,6 +291,38 @@ test("runAgent: no interrupt when the run completes before abort", async () => {
   ctrl.abort() // after completion: no effect
   assert.equal(result.text, "fast")
   assert.deepEqual(fake.interrupts, [])
+})
+
+test("runAgent: rejected registration (run closed) => interrupt + RunClosedError before any prompt", async () => {
+  const { fake, driver } = makeDriver([{ text: "never used" }])
+  await assert.rejects(
+    driver.runAgent(input(), ["general"], {
+      signal: new AbortController().signal,
+      onSessionID: () => "rejected" as const,
+    }),
+    (err: unknown) =>
+      err instanceof RunClosedError &&
+      err.kind === "abort" &&
+      /run closed while this agent was being created/.test(err.message),
+  )
+  const session = [...fake.sessions.values()][0]
+  assert.equal(session.prompts, 0) // never prompted
+  assert.deepEqual(fake.interrupts, [session.id]) // interrupted best-effort
+})
+
+test("runAgent: accepted registration proceeds normally", async () => {
+  const { fake, driver } = makeDriver([{ text: "ok" }])
+  const registrations: Array<"accepted" | "rejected" | void> = []
+  const result = await driver.runAgent(input(), ["general"], {
+    signal: new AbortController().signal,
+    onSessionID: (id) => {
+      registrations.push(undefined)
+      void id
+    },
+  })
+  assert.equal(result.text, "ok")
+  assert.deepEqual(registrations, [undefined])
+  assert.equal(fake.interrupts.length, 0)
 })
 
 // ---------------------------------------------------------------------------

@@ -5,9 +5,10 @@
  */
 import test from "node:test"
 import assert from "node:assert/strict"
-import { AgentRunner, Semaphore, getWorkflowComposer, parallelHelper, pipelineHelper } from "../src/primitives.ts"
+import { AgentRunner, Semaphore, getWorkflowComposer, parallelHelper, pipelineHelper, storageWorkflowLoader } from "../src/primitives.ts"
 import type { AgentRunnerOptions } from "../src/primitives.ts"
 import type { AgentResult } from "../src/types.ts"
+import type { SavedWorkflow, Storage } from "../src/types.ts"
 import type { AgentRunHooks, AgentRunInput, SessionDriver } from "../src/sessions.ts"
 import { AgentCallError } from "../src/sessions.ts"
 import { FakeRegistry, FakeStorage } from "./fakes.ts"
@@ -303,13 +304,13 @@ test("phase labeling: falls back to 'workflow' when no phase known", async () =>
 })
 
 // ---------------------------------------------------------------------------
-// Workflow composer (depth cap)
+// Workflow composer (depth cap + async loader seam)
 // ---------------------------------------------------------------------------
 
-test("composer: loads saved workflow at depth 0", async () => {
+test("composer: loads saved workflow at depth 0 (storage fallback loader)", async () => {
   const storage = new FakeStorage()
   await storage.saveWorkflow("helper", "return 41 + 1", { name: "helper", source: "project", description: "d" })
-  const composed = await getWorkflowComposer(storage, "helper", { x: 1 }, 0)
+  const composed = await getWorkflowComposer(storageWorkflowLoader(storage), "helper", { x: 1 }, 0)
   assert.equal(composed.script, "return 41 + 1")
   assert.equal(composed.meta.name, "helper")
   assert.equal(composed.meta.description, "d")
@@ -318,12 +319,57 @@ test("composer: loads saved workflow at depth 0", async () => {
 test("composer: depth > 0 rejected with nested-composition error", async () => {
   const storage = new FakeStorage()
   await storage.saveWorkflow("helper", "return 1", { name: "helper", source: "project" })
-  await assert.rejects(getWorkflowComposer(storage, "helper", undefined, 1), /nested composition beyond depth 1/)
+  const loader = storageWorkflowLoader(storage)
+  await assert.rejects(getWorkflowComposer(loader, "helper", undefined, 1), /nested composition beyond depth 1/)
+  // Depth cap fires BEFORE the loader is even consulted:
+  await assert.rejects(getWorkflowComposer(async () => {
+    throw new Error("loader must not run")
+  }, "helper", undefined, 2), /nested composition beyond depth 1/)
 })
 
 test("composer: unknown workflow rejected", async () => {
   const storage = new FakeStorage()
-  await assert.rejects(getWorkflowComposer(storage, "nope", undefined, 0), /unknown workflow "nope"/)
+  const loader = storageWorkflowLoader(storage)
+  await assert.rejects(getWorkflowComposer(loader, "nope", undefined, 0), /unknown workflow "nope"/)
+})
+
+test("composer: injected async loader — fresh value used per call", async () => {
+  let loads = 0
+  const loader = async (name: string): Promise<SavedWorkflow | undefined> => {
+    loads++
+    return {
+      manifest: { version: 1, name, hash: "", source: "project", savedAt: 0 },
+      script: `return ${loads};`,
+    }
+  }
+  const first = await getWorkflowComposer(loader, "w")
+  const second = await getWorkflowComposer(loader, "w")
+  assert.equal(first.script, "return 1;")
+  assert.equal(second.script, "return 2;") // fresh per composition call
+  assert.equal(loads, 2)
+})
+
+test("composer: loader rejection surfaces verbatim (script-visible error)", async () => {
+  const loader = async (): Promise<SavedWorkflow | undefined> => {
+    throw new Error("trust check failed: script hash mismatch")
+  }
+  await assert.rejects(getWorkflowComposer(loader, "w", undefined, 0), /trust check failed: script hash mismatch/)
+})
+
+test("storageWorkflowLoader: prefers loadWorkflowFresh when present, cached fallback otherwise", async () => {
+  const storage = new FakeStorage()
+  await storage.saveWorkflow("cached", "return 'cached';", { name: "cached", source: "project" })
+  const fallback = storageWorkflowLoader(storage)
+  assert.equal((await fallback("cached"))?.script, "return 'cached';")
+
+  const withFresh = Object.assign(storage, {
+    loadWorkflowFresh: async (name: string): Promise<SavedWorkflow | undefined> => ({
+      manifest: { version: 1, name, hash: "", source: "project", savedAt: 0 },
+      script: `return 'fresh:${name}';`,
+    }),
+  }) as Storage
+  const fresh = storageWorkflowLoader(withFresh)
+  assert.equal((await fresh("cached"))?.script, "return 'fresh:cached';")
 })
 
 // ---------------------------------------------------------------------------

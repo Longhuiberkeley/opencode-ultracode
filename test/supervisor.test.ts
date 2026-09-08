@@ -191,7 +191,7 @@ test("supervisor: dispose stops active runs", async () => {
 // child titles.
 // ---------------------------------------------------------------------------
 
-test("supervisor: late-created child after finalize => interrupted, never owned, run finalizes", async () => {
+test("supervisor: late-created child after finalize => marker N=1, never prompted, never owned", async () => {
   const registry = new FakeRegistry()
   const storage = new FakeStorage()
   const inner = new FakeSessionCtx()
@@ -215,16 +215,88 @@ test("supervisor: late-created child after finalize => interrupted, never owned,
   const outcome = await pending // settle grace expires, run finalizes anyway
   assert.equal(outcome.run.status, "succeeded")
   assert.equal(outcome.envelope.status, "succeeded")
+  // Honest accounting: the unresolved creation still in flight at finalize
+  // counts as pending cleanup (N=1) even though no cleanup promise was pushed.
+  assert.equal(outcome.envelope.stopReason, "(1 cleanup pending)")
 
-  // The deferred create() resolves AFTER finalize:
+  // The deferred create() resolves AFTER finalize: registration is refused —
+  // the driver cancels that call BEFORE any prompt and interrupts best-effort.
   releaseGate()
   await waitFor(() => inner.interrupts.length > 0, "late child interrupt")
+  const child = [...inner.sessions.values()][0]
+  assert.ok(child, "late child session exists")
+  assert.equal(child.prompts, 0, "late child was never prompted")
   assert.ok(inner.interrupts.length >= 1, "late child interrupted best-effort")
   // Never gained ownership — not active, not even historically:
   assert.equal(registry.owned.size, 0)
   assert.equal(registry.everOwned.size, 0)
   // ...and the run record stayed finalized:
   assert.equal(registry.get(outcome.run.id)?.status, "succeeded")
+})
+
+test("supervisor: child created DURING settle grace => cancelled before prompt, settle exits early, no marker", async () => {
+  const registry = new FakeRegistry()
+  const storage = new FakeStorage()
+  const inner = new FakeSessionCtx()
+  inner.push({ text: "unused reply" })
+  let releaseGate!: () => void
+  const gate = new Promise<void>((resolve) => {
+    releaseGate = resolve
+  })
+  const supervisor = new SupervisorImpl({
+    registry,
+    storage,
+    sessions: new GatedCreateSessions(inner, gate),
+    options: { ...DEFAULT_OPTIONS, timeoutMs: 5_000 },
+    settleGraceMs: 1_500, // long grace — must NOT be burned
+    stopKillGraceMs: 100,
+  })
+  const parent: ParentContext = { sessionID: "ses_p", report: () => {} }
+  const pending = supervisor.start({ script: `agent("late"); return "ok";` }, parent)
+  // Let the script finish + the settle phase begin with the gated create pending.
+  await waitFor(() => registry.activeRuns().length > 0, "run creation")
+  await tick(150)
+
+  const t0 = Date.now()
+  releaseGate() // create() resolves DURING the settle grace
+  const outcome = await pending
+  const elapsed = Date.now() - t0
+
+  // Registration refused -> driver threw RunClosedError before prompting ->
+  // cleanup (interrupt) completed -> settle exited early, honest zero marker.
+  assert.equal(outcome.envelope.status, "succeeded")
+  assert.equal(outcome.envelope.stopReason, undefined)
+  assert.ok(elapsed < 700, `settle exited early (took ${elapsed}ms of the 1500ms grace)`)
+  const child = [...inner.sessions.values()][0]
+  assert.ok(child)
+  assert.equal(child.prompts, 0, "child was never prompted (cancelled before prompt)")
+  assert.ok(inner.interrupts.length >= 1, "child interrupted best-effort")
+  assert.equal(registry.owned.size, 0, "child never gained ownership")
+  // The cancelled call surfaced as a script-visible agent error (record interrupted).
+  assert.ok(["interrupted", "failed"].includes(outcome.run.agents[0].status))
+  assert.equal(outcome.run.agents[0].status, "interrupted")
+})
+
+test("supervisor: workflow() composition uses the injected loadWorkflowFresh dep", async () => {
+  const ctx = makeSupervisor()
+  const loads: string[] = []
+  const supervisor = new SupervisorImpl({
+    registry: ctx.registry,
+    storage: ctx.storage,
+    sessions: ctx.sessions,
+    options: ctx.options,
+    loadWorkflowFresh: async (name) => {
+      loads.push(name)
+      return {
+        manifest: { version: 1, name, hash: "", source: "project", savedAt: 0 },
+        script: "return 40 + 2;",
+      }
+    },
+  })
+  const outcome = await supervisor.start({ script: `return await workflow("helper", null);` }, ctx.parent)
+  assert.equal(outcome.envelope.status, "succeeded")
+  assert.equal(outcome.envelope.result, 42)
+  assert.deepEqual(loads, ["helper"])
 })
 
 test("supervisor: stop during settle grace reports stopped, not succeeded", async () => {

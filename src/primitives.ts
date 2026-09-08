@@ -6,7 +6,16 @@
  *
  * Builder B module.
  */
-import type { AgentOpts, AgentRecord, AgentResult, Json, Registry, Storage, WorkflowMeta } from "./types.ts"
+import type {
+  AgentOpts,
+  AgentRecord,
+  AgentResult,
+  Json,
+  Registry,
+  SavedWorkflow,
+  Storage,
+  WorkflowMeta,
+} from "./types.ts"
 import type { SessionDriver } from "./sessions.ts"
 import { AgentCallError } from "./sessions.ts"
 import { validateScriptSource } from "./worker-script.ts"
@@ -248,14 +257,42 @@ export interface ComposedWorkflow {
 }
 
 /**
+ * Async saved-workflow loader — the composition seam. `loadWorkflowFresh`
+ * (disk-direct, trust-checked; Builder A) is preferred when present on the
+ * Storage; the synchronous cached `loadWorkflow` is the fallback. Fresh-disk
+ * semantics per composition call.
+ */
+export type WorkflowLoader = (name: string) => Promise<SavedWorkflow | undefined>
+
+export function storageWorkflowLoader(storage: Storage): WorkflowLoader {
+  const fresh = (storage as {
+    loadWorkflowFresh?: (name: string) => Promise<SavedWorkflow | undefined>
+  }).loadWorkflowFresh
+  if (typeof fresh === "function") {
+    // Defensive unwrap: A's in-flight loadWorkflowFresh returns
+    // { workflow, digest }; the seam normalizes both shapes.
+    return async (name: string) => {
+      const raw = (await fresh.call(storage, name)) as SavedWorkflow | { workflow: SavedWorkflow } | undefined
+      if (raw === undefined || raw === null) return undefined
+      const maybe = raw as { workflow?: SavedWorkflow }
+      if (typeof maybe.workflow === "object" && maybe.workflow !== null) return maybe.workflow
+      return raw as SavedWorkflow
+    }
+  }
+  return (name: string) => Promise.resolve(storage.loadWorkflow(name))
+}
+
+/**
  * Bridge handler for `workflow(name, args)` calls from the worker. Loads the
- * saved workflow and returns its script for nested execution at depth 1.
- * A composition request arriving at depth > 0 is rejected ("nested
- * composition beyond depth 1") — enforced host-side, worker-side depth is
- * advisory only.
+ * saved workflow through the injected async loader (fresh per call) and
+ * returns its script for nested execution at depth 1. A composition request
+ * arriving at depth > 0 is rejected ("nested composition beyond depth 1") —
+ * enforced host-side, worker-side depth is advisory only. Loader failures
+ * (unknown name, trust-check rejections) surface verbatim as agent-style
+ * errors to the script.
  */
 export async function getWorkflowComposer(
-  storage: Storage,
+  loader: WorkflowLoader,
   name: string,
   args?: Json,
   depth = 0,
@@ -264,7 +301,7 @@ export async function getWorkflowComposer(
   if (depth > 0) {
     throw new Error("nested composition beyond depth 1")
   }
-  const saved = await storage.loadWorkflow(name)
+  const saved = await loader(name)
   if (!saved) {
     throw new Error(`unknown workflow "${name}" — not found in project or personal workflow directories`)
   }

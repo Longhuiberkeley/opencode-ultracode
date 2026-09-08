@@ -28,6 +28,19 @@ export class AgentCallError extends Error {
   }
 }
 
+/**
+ * Typed failure raised when a child session registers after its run closed:
+ * the child was never prompted, never gained ownership, and is interrupted
+ * best-effort. Extends AgentCallError("abort") so the runner records the
+ * agent as interrupted (not failed).
+ */
+export class RunClosedError extends AgentCallError {
+  constructor(message: string) {
+    super("abort", message)
+    this.name = "RunClosedError"
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Driver interface
 // ---------------------------------------------------------------------------
@@ -44,8 +57,13 @@ export interface AgentRunInput {
 }
 
 export interface AgentRunHooks {
-  /** Fires IMMEDIATELY after session.create resolves (before any prompt). */
-  onSessionID(sessionID: string): void
+  /**
+   * Fires IMMEDIATELY after session.create resolves (before any prompt).
+   * Return "rejected" to refuse registration (run closed): the driver then
+   * interrupts that child best-effort and throws RunClosedError BEFORE any
+   * prompt — the child never gains ownership and is never prompted.
+   */
+  onSessionID(sessionID: string): "accepted" | "rejected" | void
   /** Abort: prompt/wait race an abort-driven rejection + best-effort interrupt. */
   signal: AbortSignal
 }
@@ -93,7 +111,15 @@ export function createSessionDriver(sessions: SessionCtx, options: SessionDriver
       agent,
     })
     const sessionID = created.id
-    hooks.onSessionID(sessionID)
+    const registration = hooks.onSessionID(sessionID)
+    if (registration === "rejected") {
+      // Registration refused (run closed): interrupt the orphaned child
+      // best-effort and bail BEFORE prompting — no ownership, no prompt.
+      await interruptSafe(sessions, sessionID)
+      throw new RunClosedError(
+        `workflow run closed while this agent was being created (session ${sessionID}) — it was never started`,
+      )
+    }
 
     // Re-check abort after create — interrupt best-effort and bail.
     if (hooks.signal.aborted) {
