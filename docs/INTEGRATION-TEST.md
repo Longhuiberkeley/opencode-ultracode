@@ -51,6 +51,18 @@ Run after Builders A/B/C merge. Unit tests must be green first: `npm test`, `npx
 - [ ] Events include `tui-import-ok`, `tui-setup`, `slot-append-ok` for `prompt.footer.status` and `session.panel`
 - [ ] Compare dump to `docs/SPIKE-TUI.md` if OpenCode version ≠ beta-19271
 
+## 9b. Transport e2e evidence — environment caveat
+
+`scripts/tui-probe.sh --live` enforces paint, selection-repaint (new-marker assertion), pagination
+and — when a real run spawns inside the probe window — transport receipts (`pause <runID>` /
+`stop <runID>` in the server jsonl) plus the parent's `stopped` envelope. The transport leg is
+FLAKY when a global ultracode plugin coexists with the scratch re-export (both register
+`ultracode_run`; execution ownership alternates) or when model latency exceeds the window. Then
+the runner prints `F12 transport SKIPPED: paint-only fallback` and exits 0 with
+`transport_skipped=1` — a skipped leg is reported, never silent. Receipts for a real run
+(`run_v3gmythjq6tr`, 2026-09-08) are in commit 4cbbde7's spike/out jsonl; re-capture in a clean
+environment (no global ultracode plugin) to re-prove the stopped-outcome assertion.
+
 ## 10. TUI checklist (v1 inspect + G1)
 
 Verified binary: **opencode2 0.0.0-beta-19271** (plugin pkg pin 0.0.0-beta-19289). Captures are

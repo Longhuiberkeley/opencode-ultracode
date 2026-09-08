@@ -285,7 +285,7 @@ when no host dialog is open. `ui.dialog.prompt` is used only for the save-name f
 | Tokens | yes | Per-agent from the client store (A2) |
 | Model | partial | Live in `/ultracode show`. TUI: on-demand for the **selected** row via session messages; "-" on other rows until selected. |
 | Tools | partial | Live in `/ultracode show` (`AgentRecord.toolCalls` reducer). TUI: on-demand for the **selected** row (tool parts); "-" elsewhere. |
-| Pause | yes | Key `p` → pause/resume. TUI pause state is **intent-based** (updated only after `session.command` resolves; rejection → error toast, no toggle). `session.synthetic` ack events were **not** observed on the TUI bus during live p/x on beta-19271; `parseRunAck` is ready if they appear. |
+| Pause | yes | Key `p` → pause/resume. TUI pause state is **intent-based** (updated only after `session.command` resolves; rejection → error toast, no toggle). `session.synthetic` ack events were **not** observed on the TUI bus during live p/x on beta-19271; `parseRunAck` is ready if they appear. Transport e2e (receipts + `stopped` envelope) is enforced by `scripts/tui-probe.sh --live` but reports `transport SKIPPED` when no real run spawns in the probe window (flaky with a coexisting global ultracode plugin — see docs/INTEGRATION-TEST.md §9b). |
 | Pagination | yes | Page height 10; `N of M` / ↓ when more rows |
 | Stop | yes | Key `x` → `/ultracode stop` |
 | Pause | yes | Key `p` → pause/resume |
