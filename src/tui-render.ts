@@ -491,14 +491,12 @@ export type CycleRunSelectionResult = {
 
 function selectionForRun(
   selMap: Readonly<Record<string, InspectSelection>>,
+  parentSessionID: string | undefined,
   runID: string,
 ): InspectSelection | undefined {
-  const direct = selMap[runID]
-  if (direct) return direct
-  for (const value of Object.values(selMap)) {
-    if (value.runID === runID) return value
-  }
-  return undefined
+  // Exact (parent, run) key only: borrowing another parent's entry for the
+  // same run would restore a selection the open parent never made.
+  return selMap[selectionMapKey(parentSessionID, runID)]
 }
 
 /**
@@ -510,6 +508,7 @@ export function cycleRunSelection(
   runs: readonly RunView[],
   currentRunID: string | undefined,
   dir: number,
+  openParentID?: string,
 ): CycleRunSelectionResult {
   const n = runs.length
   if (n === 0) return { runID: undefined, selection: { ...UNSEEN_RUN_SELECTION } }
@@ -518,7 +517,7 @@ export function cycleRunSelection(
   const step = ((dir % n) + n) % n
   const next = runs[(idx + step) % n]!
   const runID = next.runID
-  const stored = selectionForRun(selMap, runID)
+  const stored = selectionForRun(selMap, openParentID, runID)
   if (stored) {
     return {
       runID,

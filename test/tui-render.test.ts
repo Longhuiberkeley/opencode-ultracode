@@ -29,6 +29,7 @@ import {
   runningRunCount,
   selectForOpen,
   selectedSessionID,
+  selectionMapKey,
   UNSEEN_RUN_SELECTION,
   settleCandidate,
   shouldEnableTui,
@@ -548,18 +549,48 @@ test("cycleRunSelection: cycling into unseen shorter run initializes defaults", 
     ["run_long", "run_short"],
   )
   const selMap = {
-    run_long: { phase: "all", offset: 2, selected: 11, runID: "run_long", parentSessionID: "ses_p", rowInWindow: 9 },
+    [selectionMapKey("ses_p", "run_long")]: {
+      phase: "all", offset: 2, selected: 11, runID: "run_long", parentSessionID: "ses_p", rowInWindow: 9,
+    },
   }
-  const intoShort = cycleRunSelection(selMap, runs, "run_long", 1)
+  const intoShort = cycleRunSelection(selMap, runs, "run_long", 1, "ses_p")
   assert.equal(intoShort.runID, "run_short")
   assert.deepEqual(intoShort.selection, { ...UNSEEN_RUN_SELECTION })
   assert.equal(intoShort.selection.selected, 0)
   assert.equal(intoShort.selection.rowInWindow, 0)
 
-  const back = cycleRunSelection(selMap, runs, "run_short", -1)
+  const back = cycleRunSelection(selMap, runs, "run_short", -1, "ses_p")
   assert.equal(back.runID, "run_long")
   assert.equal(back.selection.selected, 11)
   assert.equal(back.selection.offset, 2)
+})
+
+test("cycleRunSelection: per-parent selection restoration (no cross-parent borrow)", () => {
+  const mk = (run: string, parent: string): SessionView[] => [
+    { id: `${run}_${parent}_0`, title: `[uc:${run} a1 p:${parent}] x`, outcome: "succeeded", time: { created: 1 } },
+    { id: `${run}_${parent}_1`, title: `[uc:${run} a2 p:${parent}] y`, outcome: "succeeded", time: { created: 2 } },
+    { id: `${run}_${parent}_2`, title: `[uc:${run} a3 p:${parent}] z`, outcome: "succeeded", time: { created: 3 } },
+  ]
+  const runs = groupRuns([...mk("run_r", "ses_P"), ...mk("run_r", "ses_Q")])
+  // same runID observed under two parents yields one grouped run; selections are per (parent, run)
+  const selMap = {
+    [selectionMapKey("ses_P", "run_r")]: {
+      phase: "all", offset: 0, selected: 2, runID: "run_r", parentSessionID: "ses_P", rowInWindow: 2,
+    },
+    [selectionMapKey("ses_Q", "run_r")]: {
+      phase: "-", offset: 0, selected: 0, runID: "run_r", parentSessionID: "ses_Q", rowInWindow: 0,
+    },
+    [selectionMapKey("ses_Q", "run_other")]: {
+      phase: "all", offset: 0, selected: 1, runID: "run_other", parentSessionID: "ses_Q", rowInWindow: 1,
+    },
+  }
+  const fromQ = cycleRunSelection(selMap, runs, "run_other", 1, "ses_Q")
+  assert.equal(fromQ.runID, "run_r")
+  assert.equal(fromQ.selection.phase, "-")
+  assert.equal(fromQ.selection.selected, 0)
+  const fromP = cycleRunSelection(selMap, runs, undefined, 0, "ses_P")
+  assert.equal(fromP.runID, "run_r")
+  assert.equal(fromP.selection.selected, 2)
 })
 
 test("inspectModel: marker index equals normalized selected; selectedSessionID is highlighted row", () => {

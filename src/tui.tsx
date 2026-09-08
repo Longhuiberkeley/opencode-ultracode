@@ -582,7 +582,7 @@ export default Plugin.define({
           const m = model()
           if (m.runs.length === 0) return
           const parent = openParent()
-          const cycled = cycleRunSelection(selMap, m.runs, m.run?.runID, delta)
+          const cycled = cycleRunSelection(selMap, m.runs, m.run?.runID, delta, parent)
           commitSel({
             parentSessionID: parent,
             runID: cycled.runID,
