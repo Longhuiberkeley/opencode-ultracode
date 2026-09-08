@@ -1,10 +1,10 @@
 # Authoring workflow scripts
 
-The complete reference for writing scripts for the `workflow` tool — for the model that authors
+The complete reference for writing scripts for the `ultracode_run` tool — for the model that authors
 them and for humans curating saved workflows. The condensed version the model sees at runtime is
 the `Ultracode` skill; this document is the long form.
 
-- [The workflow tool](#the-workflow-tool)
+- [The ultracode_run tool](#the-ultracode_run-tool)
 - [The script model](#the-script-model)
 - [Globals reference](#globals-reference)
 - [meta fields](#meta-fields)
@@ -19,7 +19,12 @@ the `Ultracode` skill; this document is the long form.
 
 ---
 
-## The workflow tool
+## The ultracode_run tool
+
+The model invokes the `ultracode_run` tool (it is received as a normal tool despite the
+namespaced registration name). The skill attaches automatically only when the prompt **starts
+with** `ultracode` (e.g. `ultracode: audit X`, `ultracode do X`); plain-language workflow requests
+reach the same tool by the model's own judgment.
 
 Two input shapes (a union — anything else is rejected, extra keys included):
 
@@ -38,7 +43,7 @@ Two input shapes (a union — anything else is rejected, extra keys included):
   (`import` / `export` / `require`) are rejected up front.
 - `meta` / `args` (optional): JSON. `args` is capped at **64 KB** serialized. Both are injected
   into the script as the globals `meta` and `args` — they never appear in the script source.
-- `name` (optional): display name for the run record and `/workflow` output.
+- `name` (optional): display name for the run record and `/ultracode` output.
 
 ### Saved run
 
@@ -48,15 +53,16 @@ Two input shapes (a union — anything else is rejected, extra keys included):
 
 - Loads the saved pair `<name>.js` + `<name>.json` (project dir beats personal dir; names match
   `^[a-z0-9][a-z0-9-_]{0,63}$`).
-- If the script's sha256 no longer matches the manifest's `hash` (someone edited the file after
-  it was saved), the run is refused until you re-save it or pass
-  `"confirm": true` in the tool input. This is the trust gate for repo-shared workflows.
+- **Trust gate:** saved workflows (samples included) run only after a one-time user approval via
+  `/ultracode trust <name>`, which stores an approved digest of the script's current content.
+  Editing the script afterwards invalidates trust — the run is refused until re-approved. There
+  is no `confirm` flag; approval is an explicit user action, not a model decision.
 - Agents listed in the manifest's `requires` are preflighted: a missing agent fails the call
   *before any session spawns*, with the list of agents that do exist.
 
 The tool call returns only when the run finishes (success, failure, stop, or timeout) — never
-while agents are live. Runs cannot nest: a `workflow` tool call from a session owned by a running
-workflow is rejected.
+while agents are live. Runs cannot nest: an `ultracode_run` call from a session owned by a
+running workflow is rejected.
 
 ## The script model
 
@@ -120,6 +126,9 @@ agent(prompt: string, opts?: {
 
 Semantics and failure modes:
 
+- **Session naming:** child sessions are titled `[uc:xxxxxxxx] label` (short run tag + your
+  `opts.label` or phase) so they group visibly in the session list. Pick meaningful labels.
+
 - **Concurrency / queueing:** at most `concurrency` (default 8) child sessions run at once;
   further calls wait FIFO. Queued calls are rejected if the run stops while they wait.
 - **Agent resolution:** explicit `opts.agent` missing from the server's agent list => the call
@@ -130,7 +139,7 @@ Semantics and failure modes:
 - **Schema mode:** see [below](#structured-output-with-optsschema). Invalid output after one
   repair round rejects the call.
 - One `agent()` call = one run-record entry ("a1", "a2", ...) with its own tokens and
-  `effectiveModel` — visible in `/workflow show`.
+  `effectiveModel` — visible in `/ultracode show`.
 
 Design guidance: prompts should state the role, the exact input, and the exact output contract;
 keep each under a few hundred words; put bulk data (JSON arrays) at the end after instructions.
@@ -180,7 +189,7 @@ const rated = await pipeline(files,
   concurrent code, always pass `opts.phase` explicitly; use ambient `phase()` only in straight-line
   sections (it reads nicely there).
 - `progress(text)`: emits a human-readable line into the run's progress log (throttled ~500 ms,
-  surfaced through tool progress and `/workflow show`). Use it at phase boundaries and inside
+  surfaced through tool progress and `/ultracode show`). Use it at phase boundaries and inside
   bounded loops ("pass 3: 4 issues left").
 
 ### `workflow(name, args?) -> Promise<Json>`
@@ -192,8 +201,10 @@ Loads and runs a **saved** workflow inside the current run, resolves with its JS
   `maxAgents` budget, same wall-clock timeout, same stop/abort semantics.
 - Its `meta.requires` is NOT re-preflighted at compose time (the outer run is already live) —
   a missing agent surfaces as an agent-resolution error from its first `agent()` call.
-- Unknown name, unreadable files, or a hash mismatch => the call rejects (inside the script, so
-  catch it if degradation is acceptable).
+- Unknown name or unreadable files => the call rejects (inside the script, so catch it if
+  degradation is acceptable). An untrusted workflow (never approved, or edited since approval)
+  rejects the *outer* tool call before the run starts, with the instruction to run
+  `/ultracode trust <name>` — relay that to the user rather than retrying.
 
 ```js
 const research = await workflow("deep-research", { topic: args.topic })
@@ -228,7 +239,7 @@ throws before its first `agent()` call costs zero tokens. `meta` is read-only me
 
 ## meta fields
 
-Provided in tool input (`meta`), surfaced in run records and `/workflow`; saved into manifests.
+Provided in tool input (`meta`), surfaced in run records and `/ultracode`; saved into manifests.
 
 | Field | Type | Meaning |
 | --- | --- | --- |
@@ -396,7 +407,11 @@ for depth.
 ### 8. Write-safe serialization (the meta-pattern)
 
 A clean context is **not** filesystem isolation. Parallel read-only agents are safe; parallel
-*write* agents race on the same worktree. The pattern every writing workflow follows:
+*write* agents race on the same worktree. All workflow children share ONE checkout: two write
+agents touching overlapping files (or even the same directory) will conflict, and a lost update
+is indistinguishable from success. Either **serialize** write agents (below) or **split
+ownership** so each concurrent writer owns disjoint files/directories and the prompts say so
+explicitly. The pattern every writing workflow follows:
 
 ```js
 // reads: fan out freely
@@ -410,7 +425,10 @@ for (const plan of notes.filter(Boolean)) {
 }
 ```
 
-Until worktree isolation lands (roadmap), this is the only safe way to write.
+Note also: a child that spawns helpers through opencode's *native* subagent tool escapes this
+run's caps and permission scoping (see README known limitations) — keep modifying agents
+serialized regardless. Until worktree isolation lands (roadmap), serialization or explicit
+ownership splits are the only safe ways to write.
 
 ## A complete annotated example
 
@@ -537,18 +555,19 @@ The script's return value is the workflow's product:
   instances.
 - It must be **small**: if the serialized form exceeds `maxResultChars` (default 65536 chars),
   the envelope carries a `preview` (the first `maxResultChars` characters of pretty-printed JSON)
-  plus `truncated: true`, and the full value is persisted as an artifact (`results/<runID>` in
-  plugin storage; the envelope still names the run). Return summaries + pointers, not dumps.
+  plus `truncated: true` and a `resultArtifactKey`; the full value is persisted in plugin
+  storage and can be printed with `/ultracode result <runID>`. Return summaries + pointers, not
+  dumps.
 - Shape is yours, but convention: `{ report: string, stats: { ...counts } }` or
   `{ findings: [...bounded], stats: {...} }`. Keep arrays bounded (`slice`) before returning.
 
 ## Run envelope fields
 
-What the `workflow` tool returns to the parent session (always valid JSON):
+What the `ultracode_run` tool returns to the parent session (always valid JSON):
 
 | Field | Type | Present | Meaning |
 | --- | --- | --- | --- |
-| `runID` | string | always | `run_` + 12 random base32 chars; use with `/workflow` commands. |
+| `runID` | string | always | `run_` + 12 random base32 chars; use with `/ultracode` commands. |
 | `name` | string | if set | Run display name (tool `name` or saved workflow name). |
 | `status` | string | always | `succeeded` \| `failed` \| `stopped` \| `interrupted` (final states only — the tool returns after finalization). |
 | `durationMs` | number | always | Wall-clock duration. |
@@ -557,9 +576,10 @@ What the `workflow` tool returns to the parent session (always valid JSON):
 | `result` | JSON | when it fit | The script's return value (see the return contract). |
 | `preview` | string | when truncated | First `maxResultChars` chars of the pretty-printed result. |
 | `truncated` | boolean | always | Whether `result` was replaced by `preview`. |
+| `resultArtifactKey` | string | when truncated | Storage key of the persisted full result; print it with `/ultracode result <runID>`. |
 | `scriptPath` | string | when persisted | Absolute path of the run's script artifact. |
 | `workflowName` | string | when saved-run | The saved workflow that was executed. |
-| `error` | string | on failure | The failing error (script throw, validation, preflight, timeout). |
+| `error` | string | on failure | The failing error (script throw, validation, preflight, timeout, untrusted workflow). |
 | `stopReason` | string | when stopped/interrupted | e.g. `"server restart"` for reconciled orphans. |
 
 ## Caps
@@ -589,34 +609,38 @@ round) + merges + synthesizes should keep `items x stages + overhead` comfortabl
 3. **Dry-run the plumbing.** Replace judgment prompts with trivially-satisfiable ones
    ("Return one signal: kind smell, detail test, file x, confidence 1") to verify merge/dedupe
    logic before paying for real analysis.
-4. **Read `/workflow show <runID>`.** Per-agent status, requested vs effective agent, model,
+4. **Read `/ultracode show <runID>`.** Per-agent status, requested vs effective agent, model,
    tokens — this is where silent agent-resolution failures and pin drift show up.
 5. **Watch the envelope.** `agents.failed > 0` with `status: "succeeded"` means your script
    tolerated failures (parallel-null) — decide whether that was right.
 6. **Assert on stats.** Saved workflows return `stats` precisely so you (and tests) can check
    counts without parsing prose. The repo's own test suite executes the samples against fake
    agents this way (`test/skill-content.test.ts`).
-7. **Rehearse the abort path.** `/workflow stop` mid-run should leave the envelope coherent
+7. **Rehearse the abort path.** `/ultracode stop` mid-run should leave the envelope coherent
    (`stopped`, interrupted children counted). If your merge logic assumes no nulls, it will show
    here.
+8. **Trust before first saved run.** After copying or editing a saved workflow (samples
+   included), the first `{ workflow: "name" }` call is refused until the user runs
+   `/ultracode trust <name>`. Budget that step into manual test passes.
 
 ## Samples and manifests
 
 `workflows/samples/` ships three ready pairs (copy both files into
-`<project>/.opencode/workflows/` to use them):
+`<project>/.opencode/workflows/`, review them, then `/ultracode trust <name>` — samples go
+through the same one-time approval as any saved workflow):
 
 | Name | args | Phases | Agents |
 | --- | --- | --- | --- |
 | `deep-research` | `{ topic, angles? }` (default angles: technical, market, criticism) | research, verify, skeptic, synthesize | explore + general |
-| `code-audit` | `{ modules, focus? }` | scan, review | explore + general |
+| `code-audit` | `{ modules, focus? }` — returns reviewed `findings` plus reviewer-failed batches separately as `unverified` | scan, review | explore + general |
 | `fact-check` | `{ draft, sources }` | extract, verify, skeptic, report | general |
 
 Manifest = `SavedWorkflowManifest` (v1): `version`, `name`, `description`, `phases`, `requires`,
 `hash` (sha256 of the script), `source` (`project` \| `personal`), `savedAt`, optional
-`savedFromRunID`. Create them with `/workflow save <runID> <name>` — it computes the hash.
+`savedFromRunID`. Create them with `/ultracode save <runID> <name>` — it computes the hash.
 
 Sample manifests ship with `"hash": ""` — the loader tolerates the **empty** hash specifically
-for these reviewed, in-repo samples. The moment you edit a sample in your project dir, either
-re-save it (real hash, no more prompts) or expect the confirm gate on every run. That gate is
-the point: saved workflows are executable content, and a changed script should never run
-silently.
+for these reviewed, in-repo samples. Trust, not the hash, is what gates execution: approval is
+bound to the script's content digest, and editing the script invalidates it until re-approved
+(`/ultracode trust <name>`). That gate is the point: saved workflows are executable content, and
+a changed script should never run silently.

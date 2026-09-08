@@ -10,16 +10,19 @@ multi-agent recipe, the model writes the orchestration on the fly and a runtime 
 
 ## How it works
 
-1. Your prompt contains the keyword **`ultracode`** (or asks to "use a workflow"). The
-   `Ultracode` skill auto-attaches and teaches the model the script API.
-2. The model calls the **`workflow`** tool with `{ script, name?, meta?, args? }` for an inline
-   run, or `{ workflow: "name", args? }` for a saved workflow.
+1. Your prompt **starts with** the keyword `ultracode` (e.g. `ultracode: audit src/auth` or
+   `ultracode do X and verify it`). The `Ultracode` skill auto-attaches and teaches the model the
+   script API. Natural-language requests ("use a workflow to ...") work too — the model can always
+   choose to author one — but only the start-of-prompt keyword *auto-attaches* the skill.
+2. The model invokes the **`ultracode_run`** tool with `{ script, name?, meta?, args? }` for an
+   inline run, or `{ workflow: "name", args? }` for a saved workflow.
 3. The runtime validates the script (plain JS async-function body — no module syntax), preflights
    the agents declared in `meta.requires`, then executes it in a worker thread with injected
    globals: `agent`, `parallel`, `pipeline`, `phase`, `progress`, `workflow`, `sleep`, `console`,
    plus `args` and `meta` from the tool input.
 4. Each `agent(prompt, opts)` call spawns a fresh subagent session (own context window, own model
-   per your agent config) and waits for it. Caps are enforced: concurrency, total agents, wall
+   per your agent config) and waits for it. Child sessions are titled `[uc:xxxxxxxx] label` so
+   they group visibly in your session list. Caps are enforced: concurrency, total agents, wall
    clock.
 5. The script returns a small JSON value. Only that value plus a run envelope re-enters your
    session — child transcripts never pollute your context.
@@ -28,8 +31,8 @@ multi-agent recipe, the model writes the orchestration on the fly and a runtime 
 
 | Claude Code concept | Here |
 | --- | --- |
-| Keyword-triggered workflow skill | `ultracode` keyword attaches the `Ultracode` skill via a prompt hook |
-| Model-authored JS orchestration | The `workflow` tool takes a script (async function body) |
+| Keyword-triggered workflow skill | Start-of-prompt `ultracode` keyword attaches the `Ultracode` skill via a prompt hook |
+| Model-authored JS orchestration | The `ultracode_run` tool takes a script (async function body) |
 | Subagent execution | Every `agent()` call creates a real opencode session (spike-verified APIs) |
 | Structural verification patterns | Verifier + skeptic + judge patterns; see `docs/AUTHORING.md` |
 | Reusable workflows | Saved workflows by name, composable one level deep via `workflow()` |
@@ -38,23 +41,28 @@ multi-agent recipe, the model writes the orchestration on the fly and a runtime 
 
 **This is trusted-code execution.** Be deliberate about which scripts you run.
 
-- **The worker is an availability boundary, NOT a security sandbox.** It exists so a runaway
+- **Exactly what executes where:** scripts run via `new Function` inside a `node:worker_threads`
+  worker, with ordinary worker globals **minus shadowed network/DOM APIs** — `fetch`,
+  `WebSocket`, `XMLHttpRequest`, `navigator`, and `importScripts` are shadowed with throwing
+  stubs, and the module tokens `import` / `export` / `require` are rejected up front. The script
+  sees the injected workflow globals (`agent`, `parallel`, `pipeline`, `phase`, `progress`,
+  `workflow`, `sleep`, `console`, `args`, `meta`) plus pure JS builtins.
+- **That is availability isolation, NOT a security sandbox.** The worker exists so a runaway
   loop, a hung promise, or an oversized fan-out can be terminated (`worker.terminate()` kills a
   busy loop in ~2ms, verified in the spike) without taking down the server. It is not a
-  capability-isolated VM.
-- **Scripts get no fs, shell, or network APIs in the worker** — only the injected globals listed
-  above (plus an allowlist of pure JS builtins like `JSON` and `Math`). But this is *enforced by
-  omission*, not by a hard sandbox boundary: the worker runs in-process Node, and memory is not
-  bounded. Treat workflow scripts like any other code you would run.
-- **Saved workflows are executable content.** A `.js` file under `.opencode/workflows/` runs with
-  whatever permissions your agents have. Every saved workflow carries a `sha256` hash of its
-  script in its manifest; if the script changes on disk after it was saved, running it requires
-  an explicit confirmation (`{ workflow: "name", args: {...}, confirm: true }`) or a re-save.
-  Review workflow diffs in code review like any other code.
+  capability-isolated VM, the isolation is **enforced by omission** rather than a hard boundary,
+  and **memory is not bounded**. Treat workflow scripts like any other code you would run.
+- **Saved workflows are executable content, gated by the trust store.** A `.js` file under
+  `.opencode/workflows/` runs with whatever permissions your agents have. Every saved workflow
+  (samples included) requires a **one-time user approval** via `/ultracode trust <name>`, which
+  records an approved digest of the script content. Editing the script invalidates trust until it
+  is re-approved — a changed workflow never runs silently. Review workflow diffs in code review
+  like any other code.
 - **Child sessions are real agents.** They inherit your config. The default permission mode
   `"ask"` keeps edit approval manual for workflow children. `autoEditsWorkflow` auto-approves
   edit-class actions for active run children scoped to the project root; `noEditTools` denies
-  edit-class tools for active run children outright. See [Options](#options).
+  edit-class tools for active run children outright. See [Options](#options) and
+  [Known limitations](#known-limitations).
 - **Isolation caveat for authors:** a "clean context" is NOT filesystem isolation. Two agents
   that write files concurrently will race on the same worktree. Orchestration scripts must
   serialize write agents (see `docs/AUTHORING.md`).
@@ -80,6 +88,13 @@ above covers it. If the plugin silently fails to load, check the server logs for
 `disabled plugin after transform failure` (a throwing registration disables the whole plugin;
 every registration here is wrapped, but check logs first when in doubt).
 
+Recommended `.gitignore` entries for projects using the plugin:
+
+```gitignore
+.opencode/workflows/runs/   # per-run script artifacts — noise, don't commit
+# do NOT ignore .opencode/workflows/ itself if you share saved workflows via the repo
+```
+
 ## Options
 
 All optional; defaults shown. Unknown keys are ignored (with a warning in logs), bad values fall
@@ -91,8 +106,8 @@ back to defaults.
 | `concurrency` | number | `8` | Max concurrently *running* child sessions per run. Additional `agent()` calls queue FIFO. |
 | `maxAgents` | number | `200` | Max total `agent()` calls per run (a runaway fan-out fails the run instead of burning tokens forever). |
 | `timeoutMs` | number | `3600000` | Wall-clock limit per run (60 min). On timeout: children interrupted, worker terminated, run finalized. |
-| `permissions` | string | `"ask"` | `ask` (default permission flow for children), `autoEditsWorkflow` (auto-approve edit-class actions for active run children inside the project root), `noEditTools` (deny edit-class tools for active run children). |
-| `maxResultChars` | number | `65536` | Max serialized result returned to the session; larger results come back as a preview + `truncated: true`, full value persisted as an artifact. |
+| `permissions` | string | `"ask"` | `ask` (default permission flow for children — recommended), `autoEditsWorkflow` (auto-approve edit-class actions for active run children inside the project root), `noEditTools` (deny edit-class tools for active run children). |
+| `maxResultChars` | number | `65536` | Max serialized result returned to the session; larger results come back as a preview + `truncated: true`, full value retrievable via `/ultracode result <runID>`. |
 
 ```json
 {
@@ -114,18 +129,27 @@ back to defaults.
 
 ## Usage
 
-Any prompt containing `ultracode` auto-attaches the authoring skill. Phrasing that also works:
-"use a workflow", "run a workflow for ...", or describing a task that obviously needs many
-parallel agents.
+The skill auto-attaches when the prompt **starts with** `ultracode` followed by whitespace, a
+colon, or the end of the prompt. Before/after:
 
-Examples:
+| Prompt | Auto-attach? |
+| --- | --- |
+| `ultracode: audit src/auth and src/db for security issues` | yes |
+| `ultracode do a deep research pass on agent evals` | yes |
+| `ultracode` | yes (bare keyword) |
+| `please ultracode the audit` | **no** — mid-sentence mentions don't attach |
+| `look at opencode-ultracode/docs` | **no** — paths and names don't attach |
+| `use a workflow to fact-check this draft` | no auto-attach, but the model may still author one |
 
-- `ultracode research the state of WASM audio engines and verify every claim before reporting`
-- `ultracode audit src/auth and src/db for security issues, adversarially reviewed`
-- `use a workflow to fact-check this blog draft against these three sources`
-- `run the deep-research workflow on agent evals, angles: technical, market, criticism`
+Examples that work:
 
-The model will call the `workflow` tool, e.g.:
+- `ultracode: research the state of WASM audio engines and verify every claim before reporting`
+- `ultracode do an adversarial security audit of auth and db, reviewed in batches`
+- `ultracode: fact-check this blog draft against these three sources`
+- `run the deep-research workflow on agent evals, angles: technical, market, criticism` (plain
+  language — the model resolves it to a saved workflow)
+
+The model invokes the `ultracode_run` tool, e.g.:
 
 ```json
 { "workflow": "deep-research", "args": { "topic": "agent evals" } }
@@ -148,14 +172,19 @@ The tool returns when the run finishes, with an envelope:
 }
 ```
 
-## Commands: `/workflow` (alias `/workflows`)
+## Commands: `/ultracode` (canonical)
+
+`/workflow` and `/workflows` are aliases, registered only when those command names are free on
+your install.
 
 | Command | Effect |
 | --- | --- |
-| `/workflow` | Summary: active runs, recent runs (status, agents, tokens), and saved workflows. |
-| `/workflow stop <runID>` | Graceful stop: no new agent calls, children interrupted, worker terminated after a grace period. |
-| `/workflow show <runID>` | The script, the per-agent table (status, requested vs effective agent, model, tokens), and result/error. |
-| `/workflow save <runID> <name>` | Save a run's script as a named workflow (writes `.js` + `.json` manifest into the project workflow dir). |
+| `/ultracode` | Summary: active runs, recent runs (status, agents, tokens), and saved workflows (with trust state). |
+| `/ultracode stop <runID>` | Graceful stop: no new agent calls, children interrupted, worker terminated after a grace period. |
+| `/ultracode show <runID>` | The script, the per-agent table (status, requested vs effective agent, model, tokens), and result/error. |
+| `/ultracode result <runID>` | Print the **full** result of a run whose envelope came back truncated. |
+| `/ultracode save <runID> <name>` | Save a run's script as a named workflow (writes `.js` + `.json` manifest into the project workflow dir). |
+| `/ultracode trust <name>` | One-time approval for a saved workflow: stores an approved digest of its current content. Editing the script later invalidates it until re-approved. |
 
 ## Cost control
 
@@ -167,7 +196,7 @@ Workflows multiply tokens. Controls, in order of leverage:
    (`explore`), strong agent for judgment/synthesis (`general` or your `reviewer`).
 2. **Pins hot-reload.** Re-pinning an agent mid-run applies to the *next spawned agent* —
    already-running sessions keep their model. You can retune a long run without stopping it.
-3. **Watch the tokens.** Every envelope carries summed token usage; `/workflow show <runID>`
+3. **Watch the tokens.** Every envelope carries summed token usage; `/ultracode show <runID>`
    breaks it down per agent, including the `effectiveModel` each child actually ran (see
    Troubleshooting for pin drift).
 4. **Cap the fan-out in the script.** Good scripts bound items (`slice(0, 12)`), claims, and
@@ -179,35 +208,58 @@ Workflows multiply tokens. Controls, in order of leverage:
   `version`, `name`, `description`, `phases`, `requires`, `hash`, `source`, `savedAt`).
 - Locations: `<project>/.opencode/workflows/` **beats** `~/.config/opencode/workflows/` on name
   collisions. Names match `^[a-z0-9][a-z0-9-_]{0,63}$`; no path traversal.
-- **Sharing:** commit `.opencode/workflows/` to your repo. Collaborators get a hash-confirmation
-  prompt the first time (or whenever the script changed since it was saved) — that is the trust
-  gate, by design.
+- **Trust:** running a saved workflow requires a one-time `/ultracode trust <name>`. Trust is
+  bound to the script's *content digest* — edit the file and the run is refused until you
+  re-trust. This is the trust gate for repo-shared workflows, by design.
+- **Sharing:** commit `.opencode/workflows/` (the pairs, not `runs/`) to your repo.
+  Collaborators approve each workflow once with `/ultracode trust <name>` after reviewing it.
 - **Samples:** `workflows/samples/` ships `deep-research`, `code-audit`, and `fact-check` pairs
-  that use only stock agents. Copy both files into your project's `.opencode/workflows/` to use
-  them. Sample manifests carry `hash: ""` — the loader tolerates the empty hash for these
-  reviewed, in-repo samples; user-saved workflows always get a real hash.
+  that use only stock agents. Copy both files into your project's `.opencode/workflows/`, review
+  them, then `/ultracode trust <name>` — samples are gated by the same trust flow as any other
+  saved workflow. Sample manifests carry `hash: ""` (the loader tolerates the empty hash for
+  these reviewed, in-repo samples); user-saved workflows always get a real hash.
 - Saved workflows can be composed one level deep from another script via `workflow(name, args)`.
 
 ## Stock installs (zero config)
 
 A default bootstrapped opencode install has the `general` (general-purpose) and `explore` (fast
-codebase exploration) subagents — every sample and the default `agent` option work out of the box.
+codebase exploration) subagents — every sample and the default `agent` option work out of the box
+(once trusted).
 
 Fresh **server-only** setups can report an empty agent list (built-ins materialize only after
 client bootstrap — verified in the spike). In that case the run preflight fails fast with the
 list of available agents and guidance instead of spawning a broken run.
 
+## Known limitations
+
+- **No auto-cancel of children when the parent session is interrupted.** Interrupting the parent
+  prompt does not by itself stop a running workflow — use `/ultracode stop <runID>` (the
+  envelope still arrives when the run finalizes).
+- **Children using opencode's native subagent tool escape per-run caps and permissions.** If a
+  workflow child spawns its own subagents through opencode's built-in delegation, those
+  grandchildren are not counted against `concurrency` / `maxAgents` and do not pass through this
+  plugin's permission scoping. Keep modifying agents serialized regardless.
+- **Permission auto-modes are not policy-monotonic with other plugins.** `autoEditsWorkflow`
+  allows some actions this plugin's children request, but another plugin's hooks may still deny
+  or ask; combined effects are not guaranteed to be stricter-than-ask in every configuration.
+  `"ask"` is the recommended default.
+- **Scripts are trusted code** (see Security) — the worker is an availability boundary, not a
+  sandbox; memory is unbounded.
+
 ## Troubleshooting
 
 | Symptom | What's going on / what to do |
 | --- | --- |
-| Plugin doesn't load, no `workflow` tool | Check server logs for `disabled plugin after transform failure` — a throwing registration disables the plugin. Re-check config path and `npm install`. If the supervisor module failed to import, the tool is disabled with an explanatory message rather than half-working. |
+| Plugin doesn't load, no `ultracode_run` tool | Check server logs for `disabled plugin after transform failure` — a throwing registration disables the plugin. Re-check config path and `npm install`. If the supervisor module failed to import, the tool is disabled with an explanatory message rather than half-working. |
+| Skill doesn't attach | The keyword must START the prompt (`ultracode: ...` / `ultracode do ...`). Mid-sentence mentions and paths like `opencode-ultracode` deliberately don't trigger. |
+| Saved workflow refused: "not trusted" | Expected after first copy or after any edit. Review the script, then `/ultracode trust <name>`. Trust is content-bound; re-trust after every intentional edit. |
 | The model hangs on a prompt | Session-driving must never happen inside plugin `setup()` (admission deadlock — spike-verified). The plugin is built around that rule; if you still see a hang, capture logs and report. |
-| `/workflow stop` seems ignored | Stop is graceful: in-flight agent calls get a grace period, children are interrupted, then the worker terminates. The envelope arrives when the run actually finalizes. |
-| Child ran the "wrong" model (pin drift) | Agent pins may not load in standalone server contexts (spike-verified). Runs record `effectiveModel` per agent — check `/workflow show`. Re-pin and it applies to the next spawned agent. |
-| Result came back truncated | The script returned more than `maxResultChars`. Raise the option, or make the script return a summary + pointer; the full value is persisted as an artifact key in the envelope. |
+| `/ultracode stop` seems ignored | Stop is graceful: in-flight agent calls get a grace period, children are interrupted, then the worker terminates. The envelope arrives when the run actually finalizes. |
+| Child ran the "wrong" model (pin drift) | Agent pins may not load in standalone server contexts (spike-verified). Runs record `effectiveModel` per agent — check `/ultracode show`. Re-pin and it applies to the next spawned agent. |
+| Result came back truncated | The script returned more than `maxResultChars`. The envelope carries a `preview` and a `resultArtifactKey`; print the full value with `/ultracode result <runID>`, raise the option, or return a summary instead of a dump. |
 | Run status `interrupted` after restart | Persisted `running`/`stopping` runs are marked `interrupted` on plugin load. There is no auto-replay; re-run the workflow. |
-| Nested `workflow` tool call rejected | By design: sessions owned by a running workflow cannot start their own runs (no recursion). |
+| Nested `ultracode_run` tool call rejected | By design: sessions owned by a running workflow cannot start their own runs (no recursion). |
+| `/workflow` or `/workflows` does nothing | Those are best-effort aliases registered only when the names are free — another plugin may own them. Use the canonical `/ultracode`. |
 | `npm test` fails with "Cannot find module .../test" | Node 22.13 quirk with `--test <dir>`. Run `node --experimental-strip-types --test` (auto-discovery) or pass the test file(s) directly. |
 
 ## Roadmap
@@ -224,6 +276,7 @@ npm test              # node --experimental-strip-types --test test/
 npm run typecheck     # tsc --noEmit
 ```
 
-Layout: `src/` (plugin code), `workflows/samples/` (sample workflow pairs), `docs/CONTRACTS.md`
+Layout: `src/` (plugin code), `skills/ultracode.md` (static mirror of the skill content — the
+registered skill location), `workflows/samples/` (sample workflow pairs), `docs/CONTRACTS.md`
 (module ownership), `docs/SPIKE-FINDINGS.md` (verified platform facts), `docs/AUTHORING.md` (the
 script authoring reference), `test/` (unit tests with fakes — no live server needed).

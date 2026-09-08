@@ -62,6 +62,25 @@ test("skill content contains no provider or model ids", () => {
   assert.doesNotMatch(SKILL_CONTENT, /\b(opus|sonnet)\b|\b(gpt|claude)-/i, "model family name in skill")
 })
 
+test("skill content teaches coexistence with domain skills", () => {
+  assert.ok(SKILL_CONTENT.includes("execution mechanism"), "must position the skill as mechanism-only")
+  assert.ok(SKILL_CONTENT.includes("ONE orchestration mechanism"), "must forbid double fan-out")
+  assert.match(SKILL_CONTENT, /do NOT inherit/i, "children must not be assumed to inherit skills")
+})
+
+test("skill content names the ultracode_run tool and start-of-prompt trigger examples", () => {
+  assert.ok(SKILL_CONTENT.includes("ultracode_run"), "tool is invoked as ultracode_run")
+  assert.doesNotMatch(SKILL_CONTENT, /`workflow` tool/, "stale tool name")
+  assert.match(SKILL_CONTENT, /starts with ultracode/, "trigger is start-of-prompt only")
+  assert.ok(SKILL_CONTENT.includes("ultracode: audit the auth module"), "start-of-prompt example")
+})
+
+test("static skill file skills/ultracode.md mirrors SKILL_CONTENT exactly", () => {
+  const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..")
+  const file = readFileSync(path.join(repoRoot, "skills", "ultracode.md"), "utf8")
+  assert.equal(file, SKILL_CONTENT, "skills/ultracode.md is the registered skill location — keep it in sync")
+})
+
 // ---------------------------------------------------------------------------
 // Sample scripts: syntax, module-free, stock agents only
 // ---------------------------------------------------------------------------
@@ -309,13 +328,45 @@ test("code-audit sample executes end to end (dedupe, batch review, severity sort
   })
   const result = (await h.run(readSample("code-audit", "js"), { modules: ["src/auth", "src/db"] })) as {
     findings: Array<{ file: string; severity: string }>
+    unverified: unknown[]
   }
   assert.equal(stat(result, "raw"), 2, "case-insensitive dup collapses")
   assert.equal(stat(result, "kept"), 1)
   assert.equal(stat(result, "rejected"), 1)
+  assert.equal(stat(result, "unverified"), 0, "happy path: nothing unverified")
+  assert.deepEqual(result.unverified, [])
   assert.equal(result.findings.length, 1)
   assert.equal(result.findings[0].file, "src/auth.ts")
   assert.equal(result.findings[0].severity, "high")
+})
+
+test("code-audit marks reviewer-failed batches as unverified instead of promoting them", async () => {
+  const h = makeHarness(async (_prompt, opts) => {
+    if (String(opts.phase) === "scan") {
+      return {
+        text: "",
+        data: {
+          findings: [
+            { file: "src/auth.ts", severity: "high", issue: "Off-by-one in retry loop", suggestion: "use <= attempts" },
+            { file: "src/db.ts", severity: "critical", issue: "SQL string concatenation", suggestion: "parameterize" },
+          ],
+        },
+      }
+    }
+    if (String(opts.phase) === "review") throw new Error("reviewer unavailable")
+    throw new Error(`unexpected phase ${String(opts.phase)}`)
+  })
+  const result = (await h.run(readSample("code-audit", "js"), { modules: ["src/auth"] })) as {
+    findings: unknown[]
+    unverified: Array<{ file: string; unverified: boolean }>
+  }
+  assert.equal(result.findings.length, 0, "nothing is silently promoted to reviewed findings")
+  assert.equal(result.unverified.length, 2, "the failed batch surfaces as unverified")
+  assert.ok(result.unverified.every((f) => f.unverified === true), "each item carries the flag")
+  assert.equal(stat(result, "raw"), 2)
+  assert.equal(stat(result, "kept"), 0)
+  assert.equal(stat(result, "rejected"), 0)
+  assert.equal(stat(result, "unverified"), 2)
 })
 
 test("code-audit sample returns early when scans find nothing", async () => {
@@ -324,9 +375,12 @@ test("code-audit sample returns early when scans find nothing", async () => {
   )
   const result = (await h.run(readSample("code-audit", "js"), { modules: ["src/empty"] })) as {
     findings: unknown[]
+    unverified: unknown[]
   }
   assert.deepEqual(result.findings, [])
+  assert.deepEqual(result.unverified, [])
   assert.equal(stat(result, "raw"), 0)
+  assert.equal(stat(result, "unverified"), 0)
 })
 
 test("code-audit sample fails fast on missing modules", async () => {

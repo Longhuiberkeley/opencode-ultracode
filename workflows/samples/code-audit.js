@@ -1,5 +1,7 @@
 // code-audit: one explorer per module, merge and dedupe findings, then an
 // adversarial reviewer re-examines each batch and rejects weak findings.
+// Findings whose reviewer FAILED are returned separately as unverified —
+// never silently promoted to reviewed findings.
 // Tool input: { workflow: "code-audit", args: { modules: ["auth", "db"], focus?: "error handling" } }
 // Agents (stock): explore for scanning, general for adversarial review.
 
@@ -89,7 +91,11 @@ for (const run of scans) {
   }
 }
 if (findings.length === 0) {
-  return { findings: [], stats: { modules: modules, scanned: modules.length, raw: 0, kept: 0, rejected: 0 } }
+  return {
+    findings: [],
+    unverified: [],
+    stats: { modules: modules, scanned: modules.length, raw: 0, kept: 0, rejected: 0, unverified: 0 },
+  }
 }
 
 phase("review")
@@ -110,11 +116,12 @@ const reviews = await parallel(
 )
 const kept = []
 const rejected = []
+const unverified = []
 reviews.forEach((run, bi) => {
   const batch = batches[bi]
   if (!run || !run.data) {
-    // reviewer failed: keep the batch rather than silently dropping findings
-    for (const f of batch) kept.push(f)
+    // reviewer failed: surface the batch as unverified instead of silently promoting it
+    for (const f of batch) unverified.push({ ...f, unverified: true })
     return
   }
   const keepIdx = new Set((run.data.kept || []).map((n) => Math.trunc(Number(n))))
@@ -129,11 +136,13 @@ kept.sort((a, b) => SEVERITIES.indexOf(b.severity) - SEVERITIES.indexOf(a.severi
 
 return {
   findings: kept.slice(0, 40),
+  unverified: unverified.slice(0, 40),
   stats: {
     modules: modules,
     scanned: modules.length,
     raw: findings.length,
     kept: kept.length,
     rejected: rejected.length,
+    unverified: unverified.length,
   },
 }
