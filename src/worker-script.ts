@@ -92,8 +92,16 @@ function callHost(fn, args) {
   return new Promise(function (resolve, reject) {
     callSeq += 1;
     var id = callSeq;
-    pending.set(id, { resolve: resolve, reject: reject });
-    post({ type: "call", id: id, fn: fn, args: args });
+    var entry = { resolve: resolve, reject: reject };
+    pending.set(id, entry);
+    try {
+      port.postMessage({ type: "call", id: id, fn: fn, args: args });
+    } catch (e) {
+      // Structured-clone failure (uncloneable arg): drop the pending entry and
+      // reject so agent()/workflow() fail promptly instead of hanging forever.
+      pending.delete(id);
+      reject(new Error("ultracode: bridge call could not be delivered: " + errMsg(e)));
+    }
   });
 }
 
@@ -117,11 +125,24 @@ function makeStep(stage, index) {
   return function (value) { return stage(value, index); };
 }
 
+// Network/DOM escape hatches are shadowed by throwing stubs (defense in depth
+// on top of host-side script validation, which bans these identifiers).
+function unavailableStub(name) {
+  return function () {
+    throw new Error("ultracode: " + name + " is not available in workflow scripts");
+  };
+}
+
 function makeGlobals(depth, args, meta) {
   return {
     agent: function (prompt, opts) {
       return callHost("agent", [prompt, opts || {}]);
     },
+    fetch: unavailableStub("fetch"),
+    WebSocket: unavailableStub("WebSocket"),
+    XMLHttpRequest: unavailableStub("XMLHttpRequest"),
+    navigator: unavailableStub("navigator"),
+    importScripts: unavailableStub("importScripts"),
     parallel: function (thunks) {
       return Promise.all(thunks.map(function (thunk) {
         return Promise.resolve().then(thunk).catch(function (e) {
@@ -172,9 +193,17 @@ async function runScript(script, meta, args, depth) {
 
 function finish(ok, value, error) {
   if (settled) return;
+  // Build the completion payload FIRST (a throwing getter in the return value
+  // must become a failure payload, not a lost done message + watchdog wait).
+  var payload;
+  try {
+    if (ok) payload = { type: "done", ok: true, value: sanitize(value, new WeakSet()) };
+    else payload = { type: "done", ok: false, error: error };
+  } catch (e) {
+    payload = { type: "done", ok: false, error: "completion payload could not be built: " + errMsg(e) };
+  }
   settled = true;
-  if (ok) post({ type: "done", ok: true, value: sanitize(value, new WeakSet()) });
-  else post({ type: "done", ok: false, error: error });
+  post(payload);
 }
 
 port.on("message", function (msg) {
@@ -213,7 +242,19 @@ export type ScriptCheck = { ok: true } | { ok: false; error: string }
 export const MAX_SCRIPT_CHARS = 512 * 1024
 
 /** Identifiers that must not be referenced anywhere in a user script. */
-const BANNED_IDENTIFIERS = new Set(["process", "require", "globalThis", "Function", "WebAssembly"])
+const BANNED_IDENTIFIERS = new Set([
+  "process",
+  "require",
+  "globalThis",
+  "Function",
+  "WebAssembly",
+  // network/DOM escape hatches (shadowed by throwing stubs in the worker too)
+  "fetch",
+  "WebSocket",
+  "XMLHttpRequest",
+  "navigator",
+  "importScripts",
+])
 
 function isIdentStart(c: string): boolean {
   return (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || c === "_" || c === "$"
@@ -272,7 +313,8 @@ function nextMeaningfulChar(src: string, start: number): string {
  *
  * Rejects: ESM `export` / `import` at statement starts (and dynamic `import(`),
  * references to `process` / `require` / `globalThis` / `Function` /
- * `WebAssembly`, and scripts over 512 KB. `while (true) {}` and friends are
+ * `WebAssembly` / `fetch` / `WebSocket` / `XMLHttpRequest` / `navigator` /
+ * `importScripts`, and scripts over 512 KB. `while (true) {}` and friends are
  * ALLOWED — worker termination handles runaway scripts (availability boundary).
  *
  * The tokenizer is deliberately simple (strings / template literals / comments

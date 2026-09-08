@@ -59,8 +59,10 @@ export class Semaphore {
         return
       }
       if (this.active < this.limit) {
+        // Synchronous acquisition: no queue entry, so no abort listener to
+        // register (the holder isn't auto-released on abort; a listener here
+        // would leak — the queued path below owns listener cleanup).
         this.active++
-        if (signal) signal.addEventListener("abort", waiter.onAbort, { once: true })
         resolve()
         return
       }

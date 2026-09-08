@@ -9,7 +9,7 @@ import { createSessionDriver } from "../src/sessions.ts"
 import { AgentCallError } from "../src/sessions.ts"
 import { FakeSessionCtx } from "./fakes.ts"
 import type { ScriptedReply } from "./fakes.ts"
-import type { TokenUsage } from "../src/types.ts"
+import type { ContextMessage, SessionCtx, TokenUsage } from "../src/types.ts"
 import type { AgentRunInput, SessionDriver } from "../src/sessions.ts"
 
 const tick = (ms = 5): Promise<void> => new Promise((r) => setTimeout(r, ms))
@@ -54,14 +54,33 @@ test("runAgent: happy path — create, register sessionID immediately, extract t
   assert.equal(session.prompts, 1)
 })
 
-test("runAgent: title falls back label -> phase -> 'workflow agent'", async () => {
+test("runAgent: title falls back label -> phase -> 'agent'", async () => {
   const a = makeDriver([{ text: "x" }])
   await a.driver.runAgent(input({ phase: "extract" }), ["general"], hooks())
   assert.equal([...a.fake.sessions.values()][0].title, "extract")
 
   const b = makeDriver([{ text: "x" }])
   await b.driver.runAgent(input(), ["general"], hooks())
-  assert.equal([...b.fake.sessions.values()][0].title, "workflow agent")
+  assert.equal([...b.fake.sessions.values()][0].title, "agent")
+})
+
+test("runAgent: titles carry the [uc:<runTag>] prefix", async () => {
+  const a = makeDriver([{ text: "x" }])
+  await a.driver.runAgent(input({ label: "seeker", runTag: "ab12cd34" }), ["general"], hooks())
+  assert.equal([...a.fake.sessions.values()][0].title, "[uc:ab12cd34] seeker")
+
+  const b = makeDriver([{ text: "x" }])
+  await b.driver.runAgent(input({ phase: "extract", runTag: "ab12cd34" }), ["general"], hooks())
+  assert.equal([...b.fake.sessions.values()][0].title, "[uc:ab12cd34] extract")
+
+  const c = makeDriver([{ text: "x" }])
+  await c.driver.runAgent(input({ runTag: "ab12cd34" }), ["general"], hooks())
+  assert.equal([...c.fake.sessions.values()][0].title, "[uc:ab12cd34] agent")
+
+  // No runTag (direct driver use): plain title.
+  const d = makeDriver([{ text: "x" }])
+  await d.driver.runAgent(input({ label: "solo" }), ["general"], hooks())
+  assert.equal([...d.fake.sessions.values()][0].title, "solo")
 })
 
 test("runAgent: unknown explicit agent fails fast, listing available agents, no session created", async () => {
@@ -172,6 +191,41 @@ test("runAgent: schema mode — one repair round (bad reply then good)", async (
   assert.match(repairMsg.text ?? "", /Output only the corrected JSON/)
 })
 
+test("runAgent: schema repair refreshes text/model/tokens from the REPAIRED response", async () => {
+  const { driver } = makeDriver([
+    {
+      text: "not json at all",
+      model: { providerID: "p", id: "attempt-1" },
+      tokens: { input: 11, output: 7, reasoning: 0, cache: { read: 0, write: 0 } },
+    },
+    {
+      text: '{"answer": "42"}',
+      model: { providerID: "p", id: "attempt-2" },
+      tokens: { input: 99, output: 5, reasoning: 0, cache: { read: 0, write: 0 } },
+    },
+  ])
+  const result = await driver.runAgent(input({ schema: SCHEMA }), ["general"], hooks())
+  assert.deepEqual(result.data, { answer: "42" })
+  // .text/.model/.tokens must describe attempt 2, consistent with .data:
+  assert.equal(result.text, '{"answer": "42"}')
+  assert.deepEqual(result.model, { providerID: "p", id: "attempt-2" })
+  assert.deepEqual(result.tokens, { input: 99, output: 5, reasoning: 0, cache: { read: 0, write: 0 } })
+})
+
+test("runAgent: schema mode — valid first reply keeps attempt-1 metadata", async () => {
+  const { driver } = makeDriver([
+    {
+      text: '{"answer": "42"}',
+      model: { providerID: "p", id: "only-attempt" },
+      tokens: { input: 4, output: 2, reasoning: 0, cache: { read: 0, write: 0 } },
+    },
+  ])
+  const result = await driver.runAgent(input({ schema: SCHEMA }), ["general"], hooks())
+  assert.deepEqual(result.data, { answer: "42" })
+  assert.equal(result.text, '{"answer": "42"}')
+  assert.deepEqual(result.model, { providerID: "p", id: "only-attempt" })
+})
+
 test("runAgent: schema mode — fenced JSON accepted without repair", async () => {
   const { fake, driver } = makeDriver([{ text: '```json\n{"answer": "ok"}\n```' }])
   const result = await driver.runAgent(input({ schema: SCHEMA }), ["general"], hooks())
@@ -237,4 +291,65 @@ test("runAgent: no interrupt when the run completes before abort", async () => {
   ctrl.abort() // after completion: no effect
   assert.equal(result.text, "fast")
   assert.deepEqual(fake.interrupts, [])
+})
+
+// ---------------------------------------------------------------------------
+// Extraction honesty (succeeded outcome must yield a real assistant reply)
+// ---------------------------------------------------------------------------
+
+function makeMinimalSessions(overrides: {
+  outcome?: string
+  context: () => Promise<ReadonlyArray<ContextMessage>>
+}): SessionCtx {
+  const base = new FakeSessionCtx()
+  return {
+    create: async (i) => base.create(i),
+    get: async () => ({ id: "ses_min", outcome: overrides.outcome ?? "succeeded" }),
+    prompt: async () => ({ id: "msg_min" }),
+    wait: async () => {},
+    context: overrides.context,
+    interrupt: async () => {},
+  }
+}
+
+test("runAgent: succeeded outcome + context fetch failure => typed extraction error", async () => {
+  const sessions = makeMinimalSessions({
+    context: async () => {
+      throw new Error("context backend down")
+    },
+  })
+  const driver = createSessionDriver(sessions)
+  await assert.rejects(
+    driver.runAgent(input(), ["general"], hooks()),
+    (err: unknown) =>
+      err instanceof AgentCallError &&
+      err.kind === "extraction" &&
+      /failed to read session context: context backend down/.test(err.message),
+  )
+})
+
+test("runAgent: succeeded outcome + no assistant message => typed extraction error", async () => {
+  const sessions = makeMinimalSessions({
+    context: async () => [{ id: "msg_only_user", type: "user", text: "hello?" }],
+  })
+  const driver = createSessionDriver(sessions)
+  await assert.rejects(
+    driver.runAgent(input(), ["general"], hooks()),
+    (err: unknown) =>
+      err instanceof AgentCallError && err.kind === "extraction" && /no assistant message/.test(err.message),
+  )
+})
+
+test("runAgent: failed outcome + context failure still reports the outcome error", async () => {
+  const sessions = makeMinimalSessions({
+    outcome: "failed",
+    context: async () => {
+      throw new Error("context backend down")
+    },
+  })
+  const driver = createSessionDriver(sessions)
+  await assert.rejects(
+    driver.runAgent(input(), ["general"], hooks()),
+    (err: unknown) => err instanceof AgentCallError && err.kind === "outcome" && /outcome "failed"/.test(err.message),
+  )
 })

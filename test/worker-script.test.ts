@@ -111,6 +111,16 @@ test("validation: banned references rejected", () => {
   assert.equal(validateScriptSource("const m = import('node:fs'); return m;").ok, false) // dynamic import(
 })
 
+test("validation: network/DOM identifiers banned (sandbox hardening)", () => {
+  assert.equal(validateScriptSource('return fetch("http://x");').ok, false)
+  assert.equal(validateScriptSource("return new WebSocket('w://x');").ok, false)
+  assert.equal(validateScriptSource("return new XMLHttpRequest();").ok, false)
+  assert.equal(validateScriptSource("const ua = navigator.userAgent; return ua;").ok, false)
+  assert.equal(validateScriptSource("importScripts('a.js'); return 1;").ok, false)
+  // ...but as strings they are fine:
+  assert.deepEqual(validateScriptSource('const doc = "see the fetch docs"; return doc;'), { ok: true })
+})
+
 test("validation: while(true) allowed, size cap enforced, empty rejected", () => {
   assert.deepEqual(validateScriptSource("await sleep(10); while (true) {}"), { ok: true })
   const fits = `return "${"a".repeat(MAX_SCRIPT_CHARS - 20)}";`
@@ -342,4 +352,45 @@ test("worker: gate-closed bridge call rejects inside the worker", async () => {
   )
   assert.equal(result.ok, false)
   assert.match(result.error ?? "", /run stopping/)
+})
+
+test("worker: network/DOM stubs throw clean errors (no real network attempt)", async () => {
+  const result = await runInWorker(`
+    try {
+      await fetch("http://127.0.0.1:9/never-reached");
+      return "networked?!";
+    } catch (e) {
+      return String(e);
+    }
+  `)
+  assert.equal(result.ok, true)
+  assert.match(String(result.value), /ultracode: fetch is not available in workflow scripts/)
+})
+
+test("worker: return value with throwing getter fails fast (completion payload guarded)", async () => {
+  const started = Date.now()
+  const result = await runInWorker(`
+    const o = {};
+    Object.defineProperty(o, "boom", { get: function () { throw new Error("getter kaboom"); }, enumerable: true });
+    return { nested: o };
+  `)
+  assert.equal(result.ok, false)
+  assert.match(result.error ?? "", /completion payload could not be built/)
+  assert.match(result.error ?? "", /getter kaboom/)
+  assert.ok(Date.now() - started < 2000, "fails fast — no watchdog wait")
+})
+
+test("worker: uncloneable bridge arg rejects agent() promptly (no hang)", async () => {
+  const started = Date.now()
+  const result = await runInWorker(`
+    try {
+      await agent("hi", { weird: function () {} });
+      return "delivered?!";
+    } catch (e) {
+      return "caught: " + e.message;
+    }
+  `)
+  assert.equal(result.ok, true)
+  assert.match(String(result.value), /ultracode: bridge call could not be delivered/)
+  assert.ok(Date.now() - started < 2000, "rejected promptly — no hang")
 })

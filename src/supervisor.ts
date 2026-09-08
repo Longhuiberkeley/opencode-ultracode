@@ -53,12 +53,21 @@ export interface SupervisorDeps {
 interface RunState {
   runID: string
   controller: AbortController
+  /** Every child sessionID ever created for this run (historical). */
   children: Set<string>
+  /** Children whose agent() call has not settled yet (interrupt candidates). */
+  live: Set<string>
+  /** Never-rejecting child cleanup promises (late-child interrupts, etc.). */
+  cleanup: Array<Promise<void>>
+  /** True once the run stops accepting/tracking new children (settle phase). */
+  closed: boolean
   inFlight: number
   ambientPhase: string | undefined
   stopReason: string | undefined
   doneReceived: boolean
   worker: WorkerHandle | undefined
+  /** Delayed stop-kill timer (worker termination + outstanding interrupts). */
+  killTimer: ReturnType<typeof setTimeout> | undefined
   done: Promise<void>
   resolveDone: () => void
 }
@@ -75,12 +84,23 @@ function errorMessage(err: unknown): string {
   return String(err)
 }
 
+/** Visible marker for child cleanup still pending after the settle grace. */
+function cleanupMarker(pending: number): string | undefined {
+  return pending > 0 ? `(${pending} cleanup pending)` : undefined
+}
+
+function withCleanupMarker(reason: string | undefined, pending: number): string | undefined {
+  const marker = cleanupMarker(pending)
+  if (marker === undefined) return reason
+  return reason === undefined ? marker : `${reason} ${marker}`
+}
+
 function delay(ms: number): Promise<void> {
+  // REF'd timer: settle waits are actively awaited by start()/stop() callers;
+  // an unref'd timer lets the event loop drain mid-wait (node:test treats the
+  // pending run promise as a leak and aborts; a plugin process is unaffected).
   return new Promise((resolve) => {
-    const t = setTimeout(() => resolve(), ms)
-    if (typeof (t as { unref?: () => void }).unref === "function") {
-      ;(t as { unref: () => void }).unref()
-    }
+    setTimeout(() => resolve(), ms)
   })
 }
 
@@ -131,6 +151,8 @@ export class SupervisorImpl implements Supervisor {
       workflowName: input.workflowName,
     })
     const runID = record.id
+    // Short run tag for interpretable child titles: "[uc:<tag>] <label>".
+    const runTag = runID.replace(/^run_/, "").slice(0, 8)
     const state = this.makeState(runID)
     this.runs.set(runID, state)
 
@@ -146,23 +168,40 @@ export class SupervisorImpl implements Supervisor {
         // artifact persistence is best-effort
       }
 
-      // 3.-4. AgentRunner over a driver wrapper that tracks child sessions
-      // and registry ownership (ambient phase tracked via state).
+      // 3.-4. AgentRunner over a driver wrapper that tracks child sessions,
+      // registry ownership (ambient phase tracked via state) and late children.
       const runner = new AgentRunner({
         driver: {
-          runAgent: (agentInput, availableAgents, hooks) =>
-            this.driver.runAgent(agentInput, availableAgents, {
-              signal: hooks.signal,
-              onSessionID: (sessionID) => {
-                state.children.add(sessionID)
-                try {
-                  this.registry.markOwned(runID, sessionID)
-                } catch {
-                  // registry bookkeeping must not break the call
-                }
-                hooks.onSessionID(sessionID)
-              },
-            }),
+          runAgent: (agentInput, availableAgents, hooks) => {
+            let created: string | undefined
+            return this.driver
+              .runAgent({ ...agentInput, runTag }, availableAgents, {
+                signal: hooks.signal,
+                onSessionID: (sessionID) => {
+                  if (state.closed) {
+                    // Late child of an already-settling run: never gain
+                    // ownership — best-effort interrupt and drop it. The
+                    // driver's post-create abort check keeps it unprompted.
+                    state.cleanup.push(this.interruptChild(sessionID))
+                    return
+                  }
+                  created = sessionID
+                  state.children.add(sessionID)
+                  state.live.add(sessionID)
+                  try {
+                    this.registry.markOwned(runID, sessionID)
+                  } catch {
+                    // registry bookkeeping must not break the call
+                  }
+                  hooks.onSessionID(sessionID)
+                },
+              })
+              .finally(() => {
+                // Outstanding-only semantics: settled calls remove their child
+                // from the live set so later interrupts never touch them.
+                if (created !== undefined) state.live.delete(created)
+              })
+          },
         },
         registry: this.registry,
         runID,
@@ -195,30 +234,38 @@ export class SupervisorImpl implements Supervisor {
         ;(watchdog as { unref: () => void }).unref()
       }
 
-      // 7. Await the script outcome.
+      // 7. Await the script outcome. The worker has settled by now — cancel
+      // any pending delayed stop-kill (main flow handles children from here).
       let outcome: WorkerResult
       try {
         outcome = await worker.start()
       } finally {
         state.doneReceived = true
+        this.cancelKillTimer(state)
       }
 
-      // 8. Settle: close the gate, wait in-flight calls (grace), then abort.
+      // 8. Settle: close the run (no new children/ownership), wait for
+      // in-flight bridge calls and tracked child cleanup within the grace,
+      // then abort danglers.
+      state.closed = true
       worker.closeGate()
-      await this.settleInFlight(state)
+      const pendingCleanup = await this.settle(state)
 
-      // 9. Final status.
+      // 9. Final status — an accepted stop always wins over the script
+      // outcome (finality belongs to the run, not the worker's done message).
       if (state.stopReason !== undefined) {
-        final = { status: "stopped", stopReason: state.stopReason }
+        final = { status: "stopped", stopReason: withCleanupMarker(state.stopReason, pendingCleanup) }
       } else if (outcome.ok) {
-        final = { status: "succeeded", result: outcome.value }
+        final = { status: "succeeded", result: outcome.value, stopReason: cleanupMarker(pendingCleanup) }
       } else {
-        final = { status: "failed", error: outcome.error }
+        final = { status: "failed", error: outcome.error, stopReason: cleanupMarker(pendingCleanup) }
       }
     } catch (err) {
+      state.closed = true
       final = { status: "failed", error: errorMessage(err) }
     } finally {
       if (watchdog !== undefined) clearTimeout(watchdog)
+      this.cancelKillTimer(state)
       this.runs.delete(runID)
       state.resolveDone()
       if (worker !== undefined) void worker.terminate(this.stopKillMs).catch(() => {})
@@ -237,25 +284,30 @@ export class SupervisorImpl implements Supervisor {
     const run = this.registry.get(runID)
     if (!run || run.status !== "running") return false
     if (!this.registry.setStatus(runID, "stopping", { stopReason: reason })) return false
-    if (!state.doneReceived) state.stopReason = reason
+    // Finality belongs to the run: record the stop reason even when the
+    // worker already posted done (a stop accepted during settle must not
+    // later report success).
+    state.stopReason = reason
     // Reject queued semaphore waits + abort in-flight agent sessions.
     state.controller.abort()
     state.worker?.closeGate()
-    // Terminate the worker after the grace period (fire-and-forget; the main
-    // start() flow finalizes once the worker settles), then interrupt any
-    // children still live.
-    void (async () => {
-      await delay(this.stopKillMs)
-      const w = state.worker
-      if (w) await w.terminate(this.stopKillMs).catch(() => {})
-      for (const sessionID of state.children) {
-        try {
-          await this.sessions.interrupt({ sessionID, continue: false })
-        } catch {
-          // best-effort
+    // Delayed stop-kill: if the worker ignores the abort (e.g. while(true)),
+    // force termination after the grace, then interrupt only OUTSTANDING
+    // children (the live set — historical children are never touched). The
+    // timer is canceled when the run completes (see start()).
+    state.killTimer = setTimeout(() => {
+      state.killTimer = undefined
+      void (async () => {
+        const w = state.worker
+        if (w) await w.terminate(this.stopKillMs).catch(() => {})
+        for (const sessionID of [...state.live]) {
+          await this.interruptChild(sessionID)
         }
-      }
-    })()
+      })()
+    }, this.stopKillMs)
+    if (typeof (state.killTimer as { unref?: () => void }).unref === "function") {
+      ;(state.killTimer as { unref: () => void }).unref()
+    }
     return true
   }
 
@@ -296,11 +348,15 @@ export class SupervisorImpl implements Supervisor {
       runID,
       controller: new AbortController(),
       children: new Set<string>(),
+      live: new Set<string>(),
+      cleanup: [],
+      closed: false,
       inFlight: 0,
       ambientPhase: undefined,
       stopReason: undefined,
       doneReceived: false,
       worker: undefined,
+      killTimer: undefined,
       done,
       resolveDone,
     }
@@ -372,16 +428,42 @@ export class SupervisorImpl implements Supervisor {
     }
   }
 
-  /** Wait for in-flight bridge calls up to the grace deadline, then abort them. */
-  private async settleInFlight(state: RunState): Promise<void> {
+  /** Best-effort, never-rejecting interrupt of a child session. */
+  private interruptChild(sessionID: string): Promise<void> {
+    return this.sessions.interrupt({ sessionID, continue: false }).then(
+      () => {},
+      () => {},
+    )
+  }
+
+  private cancelKillTimer(state: RunState): void {
+    if (state.killTimer !== undefined) {
+      clearTimeout(state.killTimer)
+      state.killTimer = undefined
+    }
+  }
+
+  /**
+   * Wait for in-flight bridge calls AND tracked child cleanup promises within
+   * the grace; then abort danglers (their driver races interrupt the child
+   * sessions) and give the abort a brief soft window to land. Returns the
+   * number of cleanup promises still pending after the grace.
+   */
+  private async settle(state: RunState): Promise<number> {
     const deadline = Date.now() + this.settleGraceMs
-    while (state.inFlight > 0 && Date.now() < deadline) {
+    while ((state.inFlight > 0 || state.cleanup.length > 0) && Date.now() < deadline) {
       await delay(25)
     }
     if (state.inFlight > 0) {
-      // Dangling calls (fire-and-forget agent()): interrupt their sessions.
+      // Dangling calls (fire-and-forget agent()): interrupt their sessions
+      // via the run abort; late creates are handled by the closed flag.
       state.controller.abort()
+      const softDeadline = Date.now() + 500
+      while ((state.inFlight > 0 || state.cleanup.length > 0) && Date.now() < softDeadline) {
+        await delay(25)
+      }
     }
+    return state.cleanup.length
   }
 
   private finalize(runID: string, final: FinalOutcome): RunOutcome {

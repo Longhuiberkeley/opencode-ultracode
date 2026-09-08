@@ -122,6 +122,24 @@ test("semaphore: pre-aborted signal rejects immediately", async () => {
   await assert.rejects(sem.acquire(ctrl.signal), /run stopping/)
 })
 
+test("semaphore: abort AFTER synchronous acquire is a no-op (no listener leak)", async () => {
+  const sem = new Semaphore(1)
+  const ctrl = new AbortController()
+  await sem.acquire(ctrl.signal) // acquired synchronously — no abort listener registered
+  ctrl.abort() // fires later: must not affect the permit holder
+  assert.equal(sem.running, 1)
+  assert.equal(sem.queued, 0)
+  sem.release()
+  assert.equal(sem.running, 0)
+  // Fully functional afterwards; no stray side effects from the late abort:
+  const ctrl2 = new AbortController()
+  await sem.acquire(ctrl2.signal)
+  assert.equal(sem.running, 1)
+  sem.release()
+  await sem.acquire()
+  sem.release()
+})
+
 // ---------------------------------------------------------------------------
 // AgentRunner: cap + concurrency + registry bookkeeping
 // ---------------------------------------------------------------------------

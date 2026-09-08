@@ -5,14 +5,14 @@
  * Builder B module. Never called from plugin setup() — only from tool/command
  * executors (deadlock rule).
  */
-import type { AgentResult, ContextMessage, Json, SessionCtx } from "./types.ts"
+import type { AgentResult, ContextMessage, Json, SessionCtx, TokenUsage } from "./types.ts"
 import { extractJson, validateJsonSchemaValue } from "./serialize.ts"
 
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
 
-export type AgentErrorKind = "agent" | "outcome" | "abort" | "schema"
+export type AgentErrorKind = "agent" | "outcome" | "abort" | "schema" | "extraction"
 
 /** Typed agent-call failure (registry records `error`, callers may branch on kind). */
 export class AgentCallError extends Error {
@@ -39,6 +39,8 @@ export interface AgentRunInput {
   phase?: string
   schema?: Json
   defaultAgent: string
+  /** Run tag (runID sans prefix, first 8 chars) for interpretable child titles. */
+  runTag?: string
 }
 
 export interface AgentRunHooks {
@@ -61,6 +63,15 @@ export interface SessionDriverOptions {
   errorTextSnippetChars?: number
 }
 
+/** Result of structured-output resolution (fields present when repaired). */
+interface StructuredOutcome {
+  data: Json
+  repaired: boolean
+  text?: string
+  model?: AgentResult["model"]
+  tokens?: TokenUsage
+}
+
 // ---------------------------------------------------------------------------
 // Implementation
 // ---------------------------------------------------------------------------
@@ -78,7 +89,7 @@ export function createSessionDriver(sessions: SessionCtx, options: SessionDriver
 
     // 2. Create the child session; register the ID immediately.
     const created = await sessions.create({
-      title: input.label || input.phase || "workflow agent",
+      title: buildChildTitle(input),
       agent,
     })
     const sessionID = created.id
@@ -93,53 +104,99 @@ export function createSessionDriver(sessions: SessionCtx, options: SessionDriver
     // 3. Prompt -> wait (racing the abort signal).
     await promptAndWait(sessions, sessionID, buildPromptText(input.prompt, input.schema), hooks.signal)
 
-    // 4. Outcome + last assistant message.
+    // 4. Outcome + last assistant message. A failed outcome is the primary
+    // error; a succeeded outcome with a missing/unreadable assistant message
+    // is a typed extraction error (never an empty successful reply).
     const info = await sessions.get({ sessionID })
-    const last = await lastAssistant(sessions, sessionID)
-    const text = assistantText(last)
+    const first = await readAssistantReply(sessions, sessionID, info.outcome)
     if (info.outcome !== "succeeded") {
       throw new AgentCallError(
         "outcome",
-        `agent session outcome "${info.outcome ?? "unknown"}"${text ? `: ${snippet(text, snippetChars)}` : ""}`,
-        text,
+        `agent session outcome "${info.outcome ?? "unknown"}"${first.text ? `: ${snippet(first.text, snippetChars)}` : ""}`,
+        first.text,
       )
     }
     const result: AgentResult = {
-      text,
+      text: first.text,
       sessionID,
-      agent: last?.agent,
-      model: last?.model ?? null,
-      tokens: info.tokens ?? last?.tokens,
+      agent: first.message?.agent,
+      model: first.message?.model ?? null,
+      tokens: info.tokens ?? first.message?.tokens,
     }
 
     // 5. Schema mode: tolerant extraction + validate + ONE repair round.
+    // After a successful repair, .text/.model/.tokens describe the REPAIRED
+    // response (attempt 2), consistent with .data.
     if (input.schema !== undefined) {
-      const data = await resolveStructured(sessions, sessionID, input.schema, text, hooks.signal)
-      result.data = data
+      const structured = await resolveStructured(sessions, sessionID, input.schema, first, hooks.signal)
+      result.data = structured.data
+      if (structured.repaired) {
+        result.text = structured.text ?? first.text
+        result.model = structured.model ?? null
+        result.tokens = structured.tokens
+      }
     }
     return result
+  }
+
+  interface AssistantReply {
+    text: string
+    message: ContextMessage | undefined
+  }
+
+  /**
+   * Read the last assistant message of a settled turn. Throws typed extraction
+   * errors when the context fetch fails or no assistant message exists — but
+   * only for succeeded outcomes (callers surface the outcome error first).
+   */
+  async function readAssistantReply(
+    sessions: SessionCtx,
+    sessionID: string,
+    outcome: string | undefined,
+  ): Promise<AssistantReply> {
+    let messages: ReadonlyArray<ContextMessage>
+    try {
+      messages = await sessions.context({ sessionID })
+    } catch (err) {
+      if (outcome === "succeeded") {
+        throw new AgentCallError("extraction", `failed to read session context: ${errorMessage(err)}`)
+      }
+      return { text: "", message: undefined }
+    }
+    let last: ContextMessage | undefined
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].type === "assistant") {
+        last = messages[i]
+        break
+      }
+    }
+    if (!last && outcome === "succeeded") {
+      throw new AgentCallError("extraction", `no assistant message in session ${sessionID} (outcome "succeeded")`)
+    }
+    return { text: assistantText(last), message: last }
   }
 
   /**
    * Structured-output resolution: extract -> validate; on failure run exactly
    * ONE repair round (second prompt carrying the validation error), then
-   * re-extract + re-validate or throw a typed schema error.
+   * re-extract + re-validate or throw a typed schema error. On success via
+   * repair, the returned text/model/tokens describe the REPAIRED response.
    */
   async function resolveStructured(
     sessions: SessionCtx,
     sessionID: string,
     schema: Json,
-    firstText: string,
+    first: AssistantReply,
     signal: AbortSignal,
-  ): Promise<Json> {
+  ): Promise<StructuredOutcome> {
     let problem: string
-    const first = extractJson(firstText)
-    if (first.ok) {
-      const check = validateJsonSchemaValue(schema, first.value)
-      if (check.ok) return first.value
+    const extracted = extractJson(first.text)
+    if (extracted.ok) {
+      const check = validateJsonSchemaValue(schema, extracted.value)
+      if (check.ok) return { data: extracted.value, repaired: false }
       problem = check.error
     } else {
-      problem = first.error
+      problem = extracted.error
     }
 
     // ONE repair round: re-prompt with the validation error, then re-validate.
@@ -149,24 +206,29 @@ export function createSessionDriver(sessions: SessionCtx, options: SessionDriver
       "Output only the corrected JSON value — no prose, no markdown fences."
     await promptAndWait(sessions, sessionID, buildPromptText(repairPrompt, schema), signal)
     const info = await sessions.get({ sessionID })
-    const last = await lastAssistant(sessions, sessionID)
-    const text = assistantText(last)
+    const reply = await readAssistantReply(sessions, sessionID, info.outcome)
     if (info.outcome !== "succeeded") {
       throw new AgentCallError(
         "outcome",
-        `agent session outcome "${info.outcome ?? "unknown"}" during schema repair${text ? `: ${snippet(text, snippetChars)}` : ""}`,
-        text,
+        `agent session outcome "${info.outcome ?? "unknown"}" during schema repair${reply.text ? `: ${snippet(reply.text, snippetChars)}` : ""}`,
+        reply.text,
       )
     }
-    const second = extractJson(text)
+    const second = extractJson(reply.text)
     if (!second.ok) {
-      throw new AgentCallError("schema", `structured output repair failed: ${second.error}`, text)
+      throw new AgentCallError("schema", `structured output repair failed: ${second.error}`, reply.text)
     }
     const secondCheck = validateJsonSchemaValue(schema, second.value)
     if (!secondCheck.ok) {
-      throw new AgentCallError("schema", `structured output still invalid after repair: ${secondCheck.error}`, text)
+      throw new AgentCallError("schema", `structured output still invalid after repair: ${secondCheck.error}`, reply.text)
     }
-    return second.value
+    return {
+      data: second.value,
+      repaired: true,
+      text: reply.text,
+      model: reply.message?.model ?? null,
+      tokens: info.tokens ?? reply.message?.tokens,
+    }
   }
 
   return { runAgent }
@@ -253,17 +315,15 @@ async function interruptSafe(sessions: SessionCtx, sessionID: string): Promise<v
   }
 }
 
-async function lastAssistant(sessions: SessionCtx, sessionID: string): Promise<ContextMessage | undefined> {
-  let messages: ReadonlyArray<ContextMessage>
-  try {
-    messages = await sessions.context({ sessionID })
-  } catch {
-    return undefined
-  }
-  for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i].type === "assistant") return messages[i]
-  }
-  return undefined
+function errorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message
+  return String(err)
+}
+
+/** Child session title: `[uc:<runTag>] <label || phase || "agent">` (interpretable + groupable). */
+export function buildChildTitle(input: { label?: string; phase?: string; runTag?: string }): string {
+  const base = input.label || input.phase || "agent"
+  return input.runTag === undefined ? base : `[uc:${input.runTag}] ${base}`
 }
 
 /** Concat of content parts where part.type === "text" (verified extraction rule). */

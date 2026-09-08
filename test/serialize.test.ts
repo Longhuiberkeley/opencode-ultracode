@@ -269,6 +269,26 @@ test("buildEnvelope: large result preview is a prefix of pretty JSON", () => {
   assert.equal(env.preview, pretty.slice(0, 64))
 })
 
+test("buildEnvelope: truncated result carries resultArtifactKey", () => {
+  const env = buildEnvelope(
+    fakeRun({ result: { a: "12345" }, resultArtifactKey: "results/run_test1" }),
+    12,
+  )
+  assert.equal(env.truncated, true)
+  assert.equal(env.preview !== undefined, true)
+  assert.equal(env.resultArtifactKey, "results/run_test1")
+})
+
+test("buildEnvelope: non-truncated result omits resultArtifactKey", () => {
+  const env = buildEnvelope(
+    fakeRun({ result: { a: 1 }, resultArtifactKey: "results/run_test1" }),
+    1000,
+  )
+  assert.equal(env.truncated, false)
+  assert.deepEqual(env.result, { a: 1 })
+  assert.equal(env.resultArtifactKey, undefined)
+})
+
 test("buildEnvelope: error + stopReason + tokens carried", () => {
   const env = buildEnvelope(
     fakeRun({
