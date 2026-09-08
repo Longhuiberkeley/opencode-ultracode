@@ -91,6 +91,47 @@ function runIDFromTitles(titles: string[]): string | undefined {
   return undefined
 }
 
+/** Pull RunEnvelope-shaped { runID, status } objects out of parent message text. */
+function extractEnvelopeRecords(texts: string[]): Array<{ runID: string; status: string }> {
+  const records: Array<{ runID: string; status: string }> = []
+  const seen = new Set<string>()
+  const consider = (value: unknown): void => {
+    if (!value || typeof value !== "object") return
+    if (Array.isArray(value)) {
+      for (const item of value) consider(item)
+      return
+    }
+    const rec = value as { runID?: unknown; status?: unknown }
+    if (typeof rec.runID === "string" && typeof rec.status === "string") {
+      const key = `${rec.runID}\0${rec.status}`
+      if (!seen.has(key)) {
+        seen.add(key)
+        records.push({ runID: rec.runID, status: rec.status })
+      }
+    }
+  }
+  for (const text of texts) {
+    const trimmed = text.trim()
+    if (!trimmed) continue
+    try {
+      consider(JSON.parse(trimmed))
+      continue
+    } catch {
+      // surrounding prose / acks
+    }
+    const start = trimmed.indexOf("{")
+    const end = trimmed.lastIndexOf("}")
+    if (start >= 0 && end > start) {
+      try {
+        consider(JSON.parse(trimmed.slice(start, end + 1)))
+      } catch {
+        // ignore non-envelope text
+      }
+    }
+  }
+  return records
+}
+
 function messageTexts(raw: unknown): string[] {
   const rec = raw && typeof raw === "object" ? (raw as { data?: unknown }) : undefined
   const list = Array.isArray(rec?.data) ? rec.data : Array.isArray(raw) ? raw : []
@@ -156,20 +197,17 @@ async function dumpParentMessages(context: AnyCtx, parentID: string | undefined,
     return
   }
   const texts = messageTexts(raw)
-  let stopped = false
   for (const text of texts) {
     const ack = parseRunAck(text)
-    if (ack?.kind === "stopped" && (!runID || !ack.runID || ack.runID === runID)) stopped = true
-    if (runID && /stopped/i.test(text) && text.includes(runID)) stopped = true
-    if (runID && /^Stopping run/.test(text) && text.includes(runID)) stopped = true
+    if (ack) {
+      log("live-run-ack", ack)
+      logTo(PARENT_MSG_OUT, "live-run-ack", ack)
+    }
   }
-  const payload = { sessionID: parentID, runID: runID ?? null, stopped, texts, raw: raw ?? null }
+  const records = extractEnvelopeRecords(texts)
+  const payload = { sessionID: parentID, runID: runID ?? null, records, texts, raw: raw ?? null }
   log("live-parent-final-messages", payload)
   logTo(PARENT_MSG_OUT, "live-parent-final-messages", payload)
-  if (stopped && runID) {
-    log("live-run-stopped", { runID, sessionID: parentID })
-    logTo(PARENT_MSG_OUT, "live-run-stopped", { runID, sessionID: parentID, status: "stopped" })
-  }
 }
 
 async function watchForRun(context: AnyCtx, parentID: string | undefined): Promise<void> {

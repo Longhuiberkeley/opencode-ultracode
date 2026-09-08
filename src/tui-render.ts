@@ -477,6 +477,60 @@ export type InspectSelection = {
   phase: string
   offset: number
   selected: number
+  /** Visible-window row; unused runs initialize to 0. */
+  rowInWindow?: number
+}
+
+/** Defaults for a run that has never been selected. */
+export const UNSEEN_RUN_SELECTION = { phase: "all", offset: 0, selected: 0, rowInWindow: 0 } as const
+
+export type CycleRunSelectionResult = {
+  runID: string | undefined
+  selection: { phase: string; offset: number; selected: number; rowInWindow: number }
+}
+
+function selectionForRun(
+  selMap: Readonly<Record<string, InspectSelection>>,
+  runID: string,
+): InspectSelection | undefined {
+  const direct = selMap[runID]
+  if (direct) return direct
+  for (const value of Object.values(selMap)) {
+    if (value.runID === runID) return value
+  }
+  return undefined
+}
+
+/**
+ * Cycle `[` / `]` across runs. Unseen runs do not inherit the previous run's
+ * raw selected/offset — they start at all/0/0/0.
+ */
+export function cycleRunSelection(
+  selMap: Readonly<Record<string, InspectSelection>>,
+  runs: readonly RunView[],
+  currentRunID: string | undefined,
+  dir: number,
+): CycleRunSelectionResult {
+  const n = runs.length
+  if (n === 0) return { runID: undefined, selection: { ...UNSEEN_RUN_SELECTION } }
+  let idx = currentRunID ? runs.findIndex((r) => r.runID === currentRunID) : 0
+  if (idx < 0) idx = 0
+  const step = ((dir % n) + n) % n
+  const next = runs[(idx + step) % n]!
+  const runID = next.runID
+  const stored = selectionForRun(selMap, runID)
+  if (stored) {
+    return {
+      runID,
+      selection: {
+        phase: stored.phase,
+        offset: stored.offset,
+        selected: stored.selected,
+        rowInWindow: stored.rowInWindow ?? 0,
+      },
+    }
+  }
+  return { runID, selection: { ...UNSEEN_RUN_SELECTION } }
 }
 
 export function selectionMapKey(parentSessionID: string | undefined, runID: string | undefined): string {

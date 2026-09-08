@@ -8,6 +8,9 @@
 #         Types a real authoring prompt, waits for [uc:] children, captures
 #         inspector frames, then sends p/x. Fake run_livepaint is paint-only
 #         fallback (WARNING; transport assertions skipped).
+# --selftest: pipe a synthetic ANSI frame with "✓ succeeded" through screen
+#         reconstruction; glyph must survive into the .txt snapshot and
+#         new-marker comparison. --live runs --selftest first and fails on it.
 # --dialog-keys: G1 gate — open ui.dialog.show and try to receive keys inside it.
 #
 # --live assertions (nonzero exit when any fail, unless paint-fallback WARNING):
@@ -25,10 +28,12 @@ set -uo pipefail
 
 LIVE=0
 DIALOG_KEYS=0
+SELFTEST=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --live) LIVE=1; shift ;;
     --dialog-keys) DIALOG_KEYS=1; shift ;;
+    --selftest) SELFTEST=1; shift ;;
     *) break ;;
   esac
 done
@@ -36,6 +41,7 @@ done
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SCRATCH="$REPO_ROOT/spike/scratch"
 OUT_DIR="$REPO_ROOT/spike/out"
+SCREEN_HELPER="$OUT_DIR/tui-probe-screenbytes.py"
 PREFIX="tui-probe"
 if [[ "$LIVE" -eq 1 ]]; then
   PREFIX="tui-live"
@@ -135,6 +141,181 @@ open(p,"a").write("\n")
 print("exports[.] =", main)
 print("exports[./tui] =", tui)
 ' "$PKG" "$main" "$tui"
+}
+
+write_screen_helper() {
+  mkdir -p "$OUT_DIR"
+  cat > "$SCREEN_HELPER" << 'PY'
+"""Shared PTY screen reconstruction for tui-probe (live dump + --selftest)."""
+
+def _utf8_char_at(raw: bytes, i: int) -> tuple[str, int]:
+    n = len(raw)
+    ch = raw[i]
+    if ch < 0x80:
+        return chr(ch), i + 1
+    if 0xC2 <= ch <= 0xDF and i + 1 < n:
+        chunk = raw[i : i + 2]
+        try:
+            return chunk.decode("utf-8"), i + 2
+        except UnicodeDecodeError:
+            pass
+    if 0xE0 <= ch <= 0xEF and i + 2 < n:
+        chunk = raw[i : i + 3]
+        try:
+            return chunk.decode("utf-8"), i + 3
+        except UnicodeDecodeError:
+            pass
+    if 0xF0 <= ch <= 0xF4 and i + 3 < n:
+        chunk = raw[i : i + 4]
+        try:
+            return chunk.decode("utf-8"), i + 4
+        except UnicodeDecodeError:
+            pass
+    return "\ufffd", i + 1
+
+
+def screen_bytes(raw: bytes, nrows: int, ncols: int) -> bytes:
+    """Best-effort current-screen snapshot (in-place cursor updates). UTF-8 glyphs kept."""
+    lines = [[" "] * ncols for _ in range(nrows)]
+    r = c = 0
+    i = 0
+    n = len(raw)
+
+    def clip():
+        nonlocal r, c
+        r = min(max(0, r), nrows - 1)
+        c = min(max(0, c), ncols - 1)
+
+    while i < n:
+        ch = raw[i]
+        if ch == 0x1B and i + 1 < n:
+            nxt = raw[i + 1]
+            if nxt == 0x5B:  # CSI
+                j = i + 2
+                while j < n and not (0x40 <= raw[j] <= 0x7E):
+                    j += 1
+                if j >= n:
+                    break
+                final = chr(raw[j])
+                params = raw[i + 2 : j].decode("ascii", "replace")
+                nums = []
+                for part in params.split(";"):
+                    if part.isdigit():
+                        nums.append(int(part))
+                if final == "H" or final == "f":
+                    r = (nums[0] - 1) if len(nums) > 0 and nums[0] else 0
+                    c = (nums[1] - 1) if len(nums) > 1 and nums[1] else 0
+                    clip()
+                elif final == "A":
+                    r -= nums[0] if nums else 1
+                    clip()
+                elif final == "B":
+                    r += nums[0] if nums else 1
+                    clip()
+                elif final == "C":
+                    c += nums[0] if nums else 1
+                    clip()
+                elif final == "D":
+                    c -= nums[0] if nums else 1
+                    clip()
+                elif final == "J":
+                    mode = nums[0] if nums else 0
+                    if mode == 2 or mode == 3:
+                        lines = [[" "] * ncols for _ in range(nrows)]
+                        r = c = 0
+                    elif mode == 0:
+                        for x in range(c, ncols):
+                            lines[r][x] = " "
+                        for rr in range(r + 1, nrows):
+                            lines[rr] = [" "] * ncols
+                elif final == "K":
+                    mode = nums[0] if nums else 0
+                    if mode == 0:
+                        for x in range(c, ncols):
+                            lines[r][x] = " "
+                    elif mode == 1:
+                        for x in range(0, c + 1):
+                            lines[r][x] = " "
+                    else:
+                        lines[r] = [" "] * ncols
+                i = j + 1
+                continue
+            if nxt == 0x5D:  # OSC
+                j = i + 2
+                while j < n and raw[j] not in (0x07, 0x1B):
+                    j += 1
+                if j < n and raw[j] == 0x1B and j + 1 < n and raw[j + 1] == 0x5C:
+                    i = j + 2
+                else:
+                    i = j + 1
+                continue
+            i += 2
+            continue
+        if ch == 0x0A:
+            r = min(r + 1, nrows - 1)
+            c = 0
+            i += 1
+            continue
+        if ch == 0x0D:
+            c = 0
+            i += 1
+            continue
+        if ch == 0x08:
+            c = max(0, c - 1)
+            i += 1
+            continue
+        if ch == 0x09:
+            c = min(ncols - 1, (c // 8 + 1) * 8)
+            i += 1
+            continue
+        if ch < 32 or ch == 0x7F:
+            i += 1
+            continue
+        char, nxt_i = _utf8_char_at(raw, i)
+        if 0 <= r < nrows and 0 <= c < ncols:
+            lines[r][c] = char
+        c += 1
+        if c >= ncols:
+            c = 0
+            r = min(r + 1, nrows - 1)
+        i = nxt_i
+    return ("\n".join("".join(row).rstrip() for row in lines).rstrip() + "\n").encode("utf-8")
+PY
+}
+
+run_selftest() {
+  echo "== selftest utf8 screen capture =="
+  write_screen_helper
+  local pre="$OUT_DIR/tui-probe-selftest-before-complete.txt"
+  local post="$OUT_DIR/tui-probe-selftest-after-complete.txt"
+  local snap="$OUT_DIR/tui-probe-selftest.txt"
+  python3 - "$SCREEN_HELPER" "$pre" "$post" "$snap" << 'PY' || return 1
+import importlib.util, sys
+helper, pre_p, post_p, snap_p = sys.argv[1:5]
+spec = importlib.util.spec_from_file_location("tui_probe_screen", helper)
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+rows, cols = 40, 120
+pre_raw = b"\x1b[2J\x1b[Hrunning agent...\r\n"
+post_raw = b"\x1b[2J\x1b[H\x1b[32m\xe2\x9c\x93 succeeded\x1b[0m\r\n"
+pre = mod.screen_bytes(pre_raw, rows, cols)
+post = mod.screen_bytes(post_raw, rows, cols)
+open(pre_p, "wb").write(pre)
+open(post_p, "wb").write(post)
+open(snap_p, "wb").write(post)
+text = post.decode("utf-8")
+print(f"selftest snapshot -> {snap_p}")
+if "\u2713" not in text and "✓" not in text:
+    print("selftest FAIL: completion glyph missing from utf-8 snapshot")
+    print(repr(text[:200]))
+    raise SystemExit(1)
+if "succeeded" not in text:
+    print("selftest FAIL: 'succeeded' missing from snapshot")
+    raise SystemExit(1)
+print("selftest glyph survived into .txt snapshot")
+PY
+  assert_new_marker "$pre" "$post" '[✓✗■]' || return 1
+  echo "selftest ok"
 }
 
 assert_new_marker() {
@@ -280,21 +461,45 @@ if not stop_ok:
     print("F12 FAIL: server jsonl missing command-invoked stop <liveRunID>")
     ok = False
 
-stopped = False
+def extract_envelopes(text):
+    recs = []
+    if not isinstance(text, str):
+        return recs
+    dec = json.JSONDecoder()
+    i = 0
+    while i < len(text):
+        start = text.find("{", i)
+        if start < 0:
+            break
+        try:
+            obj, end = dec.raw_decode(text, start)
+        except json.JSONDecodeError:
+            i = start + 1
+            continue
+        i = max(end, start + 1)
+        if isinstance(obj, dict) and isinstance(obj.get("runID"), str) and isinstance(obj.get("status"), str):
+            recs.append(obj)
+    return recs
+
+records = []
 for r in parent_rows + tui_rows:
-    kind = r.get("kind")
+    if r.get("kind") != "live-parent-final-messages":
+        continue
     data = r.get("data") or {}
-    if kind in ("live-run-stopped", "live-parent-final-messages", "live-run-ack"):
-        if data.get("stopped") is True or data.get("status") == "stopped" or data.get("kind") == "stopped":
-            if not run_id or data.get("runID") in (None, run_id) or str(data.get("runID")) == run_id:
-                stopped = True
-        texts_m = data.get("texts") if isinstance(data.get("texts"), list) else []
-        blob = " ".join(str(x) for x in texts_m) + json.dumps(data, default=str)
-        if run_id and "stopped" in blob.lower() and run_id in blob:
-            stopped = True
-print("F12 parent stopped-status:", stopped, "file=", parent_msg)
+    recs = data.get("records")
+    if isinstance(recs, list):
+        for item in recs:
+            if isinstance(item, dict):
+                records.append(item)
+    texts_m = data.get("texts") if isinstance(data.get("texts"), list) else []
+    for t in texts_m:
+        records.extend(extract_envelopes(t))
+stopped = bool(run_id) and any(
+    rec.get("runID") == run_id and rec.get("status") == "stopped" for rec in records
+)
+print("F12 parent stopped-status:", stopped, "file=", parent_msg, "records=", len(records))
 if not stopped:
-    print("F12 FAIL: parent messages/ack missing status stopped for", run_id)
+    print("F12 FAIL: parent messages missing envelope status stopped for", run_id)
     ok = False
 if not ok:
     raise SystemExit(1)
@@ -418,14 +623,19 @@ open(sys.argv[2],"wb").write(text)
 
 run_pty() {
   echo "== pty mode: send keystrokes, capture ANSI =="
-  python3 - "$SCRATCH" "$ANSI" "$STRIPPED" "$TTY_LOG" "$OUT" <<'PY'
-import errno, fcntl, json, os, pty, re, select, signal, struct, sys, time, termios
+  write_screen_helper
+  python3 - "$SCRATCH" "$ANSI" "$STRIPPED" "$TTY_LOG" "$OUT" "$SCREEN_HELPER" <<'PY'
+import errno, fcntl, importlib.util, json, os, pty, re, select, signal, struct, sys, time, termios
 
-scratch, ansi_path, stripped_path, tty_log_path, jsonl_path = sys.argv[1:6]
+scratch, ansi_path, stripped_path, tty_log_path, jsonl_path, helper_path = sys.argv[1:8]
 cols, rows = 120, 40
 seq0 = os.environ.get("TUI_PROBE_SEQ", "default")
 deadline = time.time() + (180 if seq0 == "live" else 70)
 buf = bytearray()
+_spec = importlib.util.spec_from_file_location("tui_probe_screen", helper_path)
+_mod = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_mod)
+screen_bytes = _mod.screen_bytes
 
 def stripped_bytes():
     text = re.sub(
@@ -434,108 +644,6 @@ def stripped_bytes():
         bytes(buf),
     )
     return re.sub(rb"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", b"", text)
-
-def screen_bytes(raw: bytes, nrows: int, ncols: int) -> bytes:
-    """Best-effort current-screen snapshot (in-place cursor updates)."""
-    lines = [[" "] * ncols for _ in range(nrows)]
-    r = c = 0
-    i = 0
-    n = len(raw)
-    def clip():
-        nonlocal r, c
-        r = min(max(0, r), nrows - 1)
-        c = min(max(0, c), ncols - 1)
-    while i < n:
-        ch = raw[i]
-        if ch == 0x1B and i + 1 < n:
-            nxt = raw[i + 1]
-            if nxt == 0x5B:  # CSI
-                j = i + 2
-                while j < n and not (0x40 <= raw[j] <= 0x7E):
-                    j += 1
-                if j >= n:
-                    break
-                final = chr(raw[j])
-                params = raw[i + 2 : j].decode("ascii", "replace")
-                nums = []
-                for part in params.split(";"):
-                    if part.isdigit():
-                        nums.append(int(part))
-                if final == "H" or final == "f":
-                    r = (nums[0] - 1) if len(nums) > 0 and nums[0] else 0
-                    c = (nums[1] - 1) if len(nums) > 1 and nums[1] else 0
-                    clip()
-                elif final == "A":
-                    r -= nums[0] if nums else 1
-                    clip()
-                elif final == "B":
-                    r += nums[0] if nums else 1
-                    clip()
-                elif final == "C":
-                    c += nums[0] if nums else 1
-                    clip()
-                elif final == "D":
-                    c -= nums[0] if nums else 1
-                    clip()
-                elif final == "J":
-                    mode = nums[0] if nums else 0
-                    if mode == 2 or mode == 3:
-                        lines = [[" "] * ncols for _ in range(nrows)]
-                        r = c = 0
-                    elif mode == 0:
-                        for x in range(c, ncols):
-                            lines[r][x] = " "
-                        for rr in range(r + 1, nrows):
-                            lines[rr] = [" "] * ncols
-                elif final == "K":
-                    mode = nums[0] if nums else 0
-                    if mode == 0:
-                        for x in range(c, ncols):
-                            lines[r][x] = " "
-                    elif mode == 1:
-                        for x in range(0, c + 1):
-                            lines[r][x] = " "
-                    else:
-                        lines[r] = [" "] * ncols
-                i = j + 1
-                continue
-            if nxt == 0x5D:  # OSC
-                j = i + 2
-                while j < n and raw[j] not in (0x07, 0x1B):
-                    j += 1
-                if j < n and raw[j] == 0x1B and j + 1 < n and raw[j + 1] == 0x5C:
-                    i = j + 2
-                else:
-                    i = j + 1
-                continue
-            i += 2
-            continue
-        if ch == 0x0A:
-            r = min(r + 1, nrows - 1)
-            c = 0
-            i += 1
-            continue
-        if ch == 0x0D:
-            c = 0
-            i += 1
-            continue
-        if ch == 0x08:
-            c = max(0, c - 1)
-            i += 1
-            continue
-        if ch == 0x09:
-            c = min(ncols - 1, (c // 8 + 1) * 8)
-            i += 1
-            continue
-        if 32 <= ch < 127:
-            if 0 <= r < nrows and 0 <= c < ncols:
-                lines[r][c] = chr(ch)
-            c += 1
-            if c >= ncols:
-                c = 0
-                r = min(r + 1, nrows - 1)
-        i += 1
-    return ("\n".join("".join(row).rstrip() for row in lines).rstrip() + "\n").encode()
 
 def dump():
     open(ansi_path, "wb").write(buf)
@@ -855,6 +963,14 @@ restore_pkg() {
     cp "$TUI_BAK" "$PROBE_DIR/tui.tsx" 2>/dev/null || true
   fi
 }
+
+if [[ "$SELFTEST" -eq 1 && "$LIVE" -eq 0 ]]; then
+  run_selftest
+  exit $?
+fi
+if [[ "$LIVE" -eq 1 ]]; then
+  run_selftest || exit 1
+fi
 
 trap 'cleanup_strays; restore_pkg' EXIT
 

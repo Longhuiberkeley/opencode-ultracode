@@ -10,6 +10,7 @@ import {
   agentRows,
   applySettleTick,
   cacheDecision,
+  cycleRunSelection,
   defaultRunIndex,
   detailsCacheEntry,
   detailsFromMessages,
@@ -28,6 +29,7 @@ import {
   runningRunCount,
   selectForOpen,
   selectedSessionID,
+  UNSEEN_RUN_SELECTION,
   settleCandidate,
   shouldEnableTui,
   shortRunID,
@@ -527,6 +529,56 @@ test("planSettleCheck: completion then silence → due after quietMs; event befo
   fired.run_x = 1
   lastChange.run_x = 1000
   assert.deepEqual(planSettleCheck(fired, lastChange, 99_000, 5000), [])
+})
+
+test("cycleRunSelection: cycling into unseen shorter run initializes defaults", () => {
+  const long: SessionView[] = Array.from({ length: 12 }, (_, i) => ({
+    id: `ses_long_${i}`,
+    title: `[uc:run_long a${i + 1} p:ses_p] L${i}`,
+    outcome: "succeeded",
+    time: { created: i },
+  }))
+  const short: SessionView[] = [
+    { id: "ses_short_0", title: "[uc:run_short a1 p:ses_p] S0", outcome: "succeeded", time: { created: 100 } },
+    { id: "ses_short_1", title: "[uc:run_short a2 p:ses_p] S1", outcome: "succeeded", time: { created: 101 } },
+  ]
+  const runs = groupRuns([...long, ...short])
+  assert.deepEqual(
+    runs.map((r) => r.runID),
+    ["run_long", "run_short"],
+  )
+  const selMap = {
+    run_long: { phase: "all", offset: 2, selected: 11, runID: "run_long", parentSessionID: "ses_p", rowInWindow: 9 },
+  }
+  const intoShort = cycleRunSelection(selMap, runs, "run_long", 1)
+  assert.equal(intoShort.runID, "run_short")
+  assert.deepEqual(intoShort.selection, { ...UNSEEN_RUN_SELECTION })
+  assert.equal(intoShort.selection.selected, 0)
+  assert.equal(intoShort.selection.rowInWindow, 0)
+
+  const back = cycleRunSelection(selMap, runs, "run_short", -1)
+  assert.equal(back.runID, "run_long")
+  assert.equal(back.selection.selected, 11)
+  assert.equal(back.selection.offset, 2)
+})
+
+test("inspectModel: marker index equals normalized selected; selectedSessionID is highlighted row", () => {
+  const sessions: SessionView[] = [
+    { id: "ses_0", title: "[uc:run_s a1 p:ses_p] A", outcome: "succeeded", time: { created: 0 } },
+    { id: "ses_1", title: "[uc:run_s a2 p:ses_p] B", outcome: "succeeded", time: { created: 1 } },
+  ]
+  const model = inspectModel(sessions, { offset: 0, selected: 11, parentSessionID: "ses_p" }, 1000)
+  assert.equal(model.rows.length, 2)
+  assert.equal(model.selected, 1)
+  assert.equal(model.rowInWindow, 1)
+  assert.equal(model.offset + model.rowInWindow, model.selected)
+  assert.equal(selectedSessionID(model), "ses_1")
+  assert.equal(selectedSessionID(model), model.sessionIDs[model.selected])
+  assert.equal(model.selectedSessionID, selectedSessionID(model))
+
+  const top = inspectModel(sessions, { offset: 0, selected: 0, parentSessionID: "ses_p" }, 1000)
+  assert.equal(top.rowInWindow, 0)
+  assert.equal(selectedSessionID(top), "ses_0")
 })
 
 test("parseRunAck", () => {

@@ -22,6 +22,7 @@ import {
   inspectPhaseList,
   inspectSelFromSelection,
   parseRunAck,
+  cycleRunSelection,
   selectForOpen,
   selectionMapKey,
   shouldEnableTui,
@@ -579,16 +580,17 @@ export default Plugin.define({
         const cycleRun = (delta: number): void => {
           if (disposed) return
           const m = model()
-          const n = m.runs.length
-          if (n === 0) return
-          const next = m.runs[(m.runIndex + delta + n) % n]
+          if (m.runs.length === 0) return
           const parent = openParent()
-          const stored = selMap[selectionMapKey(parent, next?.runID)]
-          if (stored) {
-            commitSel({ ...stored, runID: next?.runID, parentSessionID: parent })
-            return
-          }
-          commitSel({ ...sel(), runID: next?.runID, parentSessionID: parent })
+          const cycled = cycleRunSelection(selMap, m.runs, m.run?.runID, delta)
+          commitSel({
+            parentSessionID: parent,
+            runID: cycled.runID,
+            phase: cycled.selection.phase,
+            offset: cycled.selection.offset,
+            selected: cycled.selection.selected,
+            rowInWindow: cycled.selection.rowInWindow,
+          })
         }
 
         const drill = (): void => {
@@ -736,7 +738,7 @@ export default Plugin.define({
                       {model().window
                         .map((cells, i) => {
                           const abs = model().offset + i
-                          const mark = abs === sel().selected ? ">" : " "
+                          const mark = i === model().rowInWindow ? ">" : " "
                           return `${mark} ${abs + 1} ${cells.join("  ")}`
                         })
                         .join("\n")}
