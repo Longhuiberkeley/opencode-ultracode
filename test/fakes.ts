@@ -21,7 +21,7 @@ import type {
   WorkflowMeta,
 } from "../src/types.ts"
 import { createHash } from "node:crypto"
-import { emptyTokens } from "../src/types.ts"
+import { emptyTokens, isActiveRunStatus } from "../src/types.ts"
 
 // ---------------------------------------------------------------------------
 // Fake KV
@@ -183,19 +183,27 @@ export class FakeSessionCtx implements SessionCtx {
       tokens: TokenUsage
       interrupted: boolean
       prompts: number
+      metadata?: Record<string, unknown>
     }
   >()
   /** Records interrupt calls for abort tests. */
   interrupts: string[] = []
   /** When true, `wait` never resolves on its own (tests must abort). */
   hangWait = false
+  /** Optional delay for wait() (pause/in-flight tests). */
+  waitDelayMs = 0
+  private pendingWaits: Array<() => void> = []
 
   push(reply: ScriptedReply): this {
     this.replies.push(reply)
     return this
   }
 
-  async create(input: { title?: string; agent?: string }): Promise<{ id: string; agent?: string }> {
+  async create(input: {
+    title?: string
+    agent?: string
+    metadata?: Record<string, unknown>
+  }): Promise<{ id: string; agent?: string }> {
     const id = `ses_fake${++sessionCounter}`
     this.sessions.set(id, {
       id,
@@ -206,6 +214,7 @@ export class FakeSessionCtx implements SessionCtx {
       tokens: emptyTokens(),
       interrupted: false,
       prompts: 0,
+      metadata: input.metadata,
     })
     return { id, agent: input.agent }
   }
@@ -250,9 +259,20 @@ export class FakeSessionCtx implements SessionCtx {
     const s = this.sessions.get(input.sessionID)
     if (!s) throw new Error(`unknown session ${input.sessionID}`)
     if (this.hangWait) {
-      await new Promise(() => {}) // never resolves; tests abort
+      await new Promise<void>((resolve) => {
+        this.pendingWaits.push(resolve)
+      })
       return
     }
+    if (this.waitDelayMs > 0) {
+      await new Promise<void>((resolve) => setTimeout(resolve, this.waitDelayMs))
+    }
+  }
+
+  /** Release hangWait waiters (does not clear hangWait). */
+  releaseHangs(): void {
+    const pending = this.pendingWaits.splice(0)
+    for (const resolve of pending) resolve()
   }
 
   async context(input: { sessionID: string }): Promise<ReadonlyArray<ContextMessage>> {
@@ -377,8 +397,10 @@ export class FakeRegistry implements Registry {
       .slice(0, limit)
   }
 
+  sessionAgents = new Map<string, { runID: string; agentID: string }>()
+
   activeRuns(): RunRecord[] {
-    return [...this.runs.values()].filter((r) => r.status === "running" || r.status === "stopping")
+    return [...this.runs.values()].filter((r) => isActiveRunStatus(r.status))
   }
 
   setStatus(runID: string, status: RunStatus, extra?: { error?: string; stopReason?: string }): boolean {
@@ -440,7 +462,7 @@ export class FakeRegistry implements Registry {
     const runID = this.owned.get(sessionID)
     if (!runID) return false
     const run = this.runs.get(runID)
-    return run !== undefined && (run.status === "running" || run.status === "stopping")
+    return run !== undefined && isActiveRunStatus(run.status)
   }
 
   wasEverOwned(sessionID: string): boolean {
@@ -451,18 +473,35 @@ export class FakeRegistry implements Registry {
     const runID = this.owned.get(sessionID)
     if (!runID) return undefined
     const run = this.runs.get(runID)
-    return run !== undefined && (run.status === "running" || run.status === "stopping") ? run : undefined
+    return run !== undefined && isActiveRunStatus(run.status) ? run : undefined
+  }
+
+  bindAgentSession(runID: string, agentID: string, sessionID: string): void {
+    this.sessionAgents.set(sessionID, { runID, agentID })
+  }
+
+  agentForSession(sessionID: string): { runID: string; agentID: string } | undefined {
+    return this.sessionAgents.get(sessionID)
   }
 
   reconcileOrphans(): void {
     for (const run of this.runs.values()) {
-      if (run.status === "running" || run.status === "stopping") {
+      if (isActiveRunStatus(run.status)) {
         run.status = "interrupted"
         run.stopReason = "server restart"
         run.endedAt = Date.now()
       }
     }
   }
+}
+
+/** Tiny event-feed helper for run-events tests. */
+export function fakeToolEvent(
+  type: string,
+  sessionID: string | undefined,
+  id: string | undefined,
+): { type: string; data?: { sessionID?: string; id?: string } } {
+  return { type, data: { sessionID, id } }
 }
 
 // ---------------------------------------------------------------------------

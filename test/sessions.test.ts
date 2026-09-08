@@ -5,7 +5,7 @@
  */
 import test from "node:test"
 import assert from "node:assert/strict"
-import { createSessionDriver } from "../src/sessions.ts"
+import { createSessionDriver, buildChildTitle, parseChildTitle } from "../src/sessions.ts"
 import { AgentCallError, RunClosedError } from "../src/sessions.ts"
 import { FakeSessionCtx } from "./fakes.ts"
 import type { ScriptedReply } from "./fakes.ts"
@@ -64,23 +64,88 @@ test("runAgent: title falls back label -> phase -> 'agent'", async () => {
   assert.equal([...b.fake.sessions.values()][0].title, "agent")
 })
 
-test("runAgent: titles carry the [uc:<runTag>] prefix", async () => {
+test("runAgent: titles carry the [uc:<runID> <ord> <phase>] prefix", async () => {
   const a = makeDriver([{ text: "x" }])
-  await a.driver.runAgent(input({ label: "seeker", runTag: "ab12cd34" }), ["general"], hooks())
-  assert.equal([...a.fake.sessions.values()][0].title, "[uc:ab12cd34] seeker")
+  await a.driver.runAgent(
+    input({ label: "seeker", runID: "run_ab12cd34efgh", ord: "a1" }),
+    ["general"],
+    hooks(),
+  )
+  assert.equal([...a.fake.sessions.values()][0].title, "[uc:run_ab12cd34efgh a1] seeker")
 
   const b = makeDriver([{ text: "x" }])
-  await b.driver.runAgent(input({ phase: "extract", runTag: "ab12cd34" }), ["general"], hooks())
-  assert.equal([...b.fake.sessions.values()][0].title, "[uc:ab12cd34] extract")
+  await b.driver.runAgent(
+    input({ phase: "extract", runID: "run_ab12cd34efgh", ord: "a1" }),
+    ["general"],
+    hooks(),
+  )
+  assert.equal([...b.fake.sessions.values()][0].title, "[uc:run_ab12cd34efgh a1 extract] extract")
 
   const c = makeDriver([{ text: "x" }])
-  await c.driver.runAgent(input({ runTag: "ab12cd34" }), ["general"], hooks())
-  assert.equal([...c.fake.sessions.values()][0].title, "[uc:ab12cd34] agent")
+  await c.driver.runAgent(input({ runID: "run_ab12cd34efgh", ord: "a1" }), ["general"], hooks())
+  assert.equal([...c.fake.sessions.values()][0].title, "[uc:run_ab12cd34efgh a1] agent")
 
-  // No runTag (direct driver use): plain title.
+  const e = makeDriver([{ text: "x" }])
+  await e.driver.runAgent(
+    input({ label: "seeker", phase: "extract", runID: "run_ab12cd34efgh", ord: "a2" }),
+    ["general"],
+    hooks(),
+  )
+  assert.equal([...e.fake.sessions.values()][0].title, "[uc:run_ab12cd34efgh a2 extract] seeker")
+
+  // No runID (direct driver use): plain title.
   const d = makeDriver([{ text: "x" }])
   await d.driver.runAgent(input({ label: "solo" }), ["general"], hooks())
   assert.equal([...d.fake.sessions.values()][0].title, "solo")
+})
+
+test("buildChildTitle / parseChildTitle round-trip + legacy parse", () => {
+  const full = buildChildTitle({ runID: "run_abc123def456", ord: "a3", phase: "extract", label: "seeker" })
+  assert.equal(full, "[uc:run_abc123def456 a3 extract] seeker")
+  assert.deepEqual(parseChildTitle(full), {
+    runID: "run_abc123def456",
+    ord: "a3",
+    phase: "extract",
+    label: "seeker",
+  })
+
+  const noPhase = buildChildTitle({ runID: "run_abc123def456", ord: "a1", label: "probe" })
+  assert.equal(noPhase, "[uc:run_abc123def456 a1] probe")
+  assert.deepEqual(parseChildTitle(noPhase), {
+    runID: "run_abc123def456",
+    ord: "a1",
+    phase: undefined,
+    label: "probe",
+  })
+
+  // Legacy `[uc:<tag>] label` — runID=tag, ord/phase undefined.
+  assert.deepEqual(parseChildTitle("[uc:ab12cd34] seeker"), {
+    runID: "ab12cd34",
+    ord: undefined,
+    phase: undefined,
+    label: "seeker",
+  })
+  assert.equal(parseChildTitle("plain title"), undefined)
+})
+
+test("runAgent: stamps D12 metadata on create (never read back)", async () => {
+  const { fake, driver } = makeDriver([{ text: "x" }])
+  await driver.runAgent(
+    input({
+      label: "seeker",
+      phase: "extract",
+      runID: "run_x",
+      ord: "a1",
+      parentSessionID: "ses_p",
+      workflowName: "demo",
+    }),
+    ["general"],
+    hooks(),
+  )
+  const session = [...fake.sessions.values()][0]
+  assert.deepEqual(session.metadata, {
+    uc: { v: 1, run: "run_x", ord: "a1", phase: "extract", label: "seeker", wf: "demo", parent: "ses_p" },
+  })
 })
 
 test("runAgent: unknown explicit agent fails fast, listing available agents, no session created", async () => {

@@ -6,7 +6,7 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 import { RegistryImpl } from "../src/registry.ts"
 import type { AgentRecord, RunRecord, TokenUsage } from "../src/types.ts"
-import { emptyTokens } from "../src/types.ts"
+import { emptyTokens, isActiveRunStatus } from "../src/types.ts"
 
 function tokens(input: number, output: number): TokenUsage {
   return { input, output, reasoning: 0, cache: { read: 0, write: 0 } }
@@ -202,6 +202,41 @@ test("markOwned after finish() does not grant active ownership (ownership leak f
   assert.equal(registry.wasEverOwned("ses_late"), false)
 })
 
+test("isActiveRunStatus is running|stopping|paused only", () => {
+  assert.equal(isActiveRunStatus("running"), true)
+  assert.equal(isActiveRunStatus("stopping"), true)
+  assert.equal(isActiveRunStatus("paused"), true)
+  assert.equal(isActiveRunStatus("succeeded"), false)
+  assert.equal(isActiveRunStatus("failed"), false)
+  assert.equal(isActiveRunStatus("stopped"), false)
+  assert.equal(isActiveRunStatus("interrupted"), false)
+})
+
+test("paused is an active status: markOwned / isOwnedActive / runForActiveSession / activeRuns", () => {
+  const { registry } = makeRegistry()
+  const run = registry.create({ parentSessionID: "ses", script: "s" })
+  registry.setStatus(run.id, "paused")
+  registry.markOwned(run.id, "ses_paused_child")
+  assert.equal(registry.isOwnedActive("ses_paused_child"), true)
+  assert.equal(registry.runForActiveSession("ses_paused_child")?.id, run.id)
+  assert.deepEqual(registry.activeRuns().map((r) => r.id), [run.id])
+  registry.finish(run.id, { status: "stopped" })
+  assert.equal(registry.isOwnedActive("ses_paused_child"), false)
+  assert.equal(registry.runForActiveSession("ses_paused_child"), undefined)
+  assert.deepEqual(registry.activeRuns(), [])
+})
+
+test("bindAgentSession survives run finalize", () => {
+  const { registry } = makeRegistry()
+  const run = registry.create({ parentSessionID: "ses", script: "s" })
+  registry.addAgent(run.id, { status: "pending" })
+  registry.bindAgentSession(run.id, "a1", "ses_child")
+  assert.deepEqual(registry.agentForSession("ses_child"), { runID: run.id, agentID: "a1" })
+  registry.finish(run.id, { status: "succeeded" })
+  assert.deepEqual(registry.agentForSession("ses_child"), { runID: run.id, agentID: "a1" })
+  assert.equal(registry.agentForSession("ses_unknown"), undefined)
+})
+
 test("markOwned on a stopping run still works, but not after it finalizes", () => {
   const { registry } = makeRegistry()
   const run = registry.create({ parentSessionID: "ses", script: "s" })
@@ -294,7 +329,7 @@ test("a throwing persist callback never escapes", () => {
 // reconcileOrphans
 // ---------------------------------------------------------------------------
 
-test("reconcileOrphans flips running|stopping runs to interrupted (server restart)", () => {
+test("reconcileOrphans flips running|stopping|paused runs to interrupted (server restart)", () => {
   const running = persistedRun({
     id: "run_a",
     status: "running",
@@ -306,12 +341,13 @@ test("reconcileOrphans flips running|stopping runs to interrupted (server restar
     ],
   })
   const stopping = persistedRun({ id: "run_b", status: "stopping", startedAt: 2, endedAt: undefined })
+  const paused = persistedRun({ id: "run_p", status: "paused", startedAt: 2.5, endedAt: undefined })
   const done = persistedRun({ id: "run_c", status: "succeeded", startedAt: 3 })
   const junk = { id: "run_junk", status: 5 } as unknown as RunRecord
-  const { registry, persisted } = makeRegistry({ throttleMs: 0, loader: () => [running, stopping, done, junk] })
+  const { registry, persisted } = makeRegistry({ throttleMs: 0, loader: () => [running, stopping, paused, done, junk] })
 
   const flipped = registry.reconcileOrphans()
-  assert.equal(flipped, 2)
+  assert.equal(flipped, 3)
 
   const a = registry.get("run_a")
   assert.equal(a?.status, "interrupted")
@@ -323,12 +359,16 @@ test("reconcileOrphans flips running|stopping runs to interrupted (server restar
   assert.equal(b?.status, "interrupted")
   assert.equal(b?.stopReason, "server restart")
 
+  const p = registry.get("run_p")
+  assert.equal(p?.status, "interrupted")
+  assert.equal(p?.stopReason, "server restart")
+
   const c = registry.get("run_c")
   assert.equal(c?.status, "succeeded") // untouched
   assert.equal(c?.stopReason, undefined)
 
   // Only flipped records are written back (run_c + junk contribute nothing).
-  assert.deepEqual(persisted.map((r) => r.id), ["run_a", "run_b"])
+  assert.deepEqual(persisted.map((r) => r.id), ["run_a", "run_b", "run_p"])
   assert.equal(persisted[0]!.status, "interrupted")
 })
 

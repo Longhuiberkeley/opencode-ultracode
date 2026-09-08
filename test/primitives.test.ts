@@ -189,6 +189,7 @@ test("agent runner: registry lifecycle pending -> running -> succeeded", async (
   assert.equal(run.agents[0].status, "running")
   assert.equal(run.agents[0].sessionID, "ses_new")
   assert.equal(registry.isOwnedActive("ses_new"), false) // ownership marked by the supervisor wrapper, not the runner
+  assert.deepEqual(registry.agentForSession("ses_new"), { runID: run.id, agentID: run.agents[0].id })
   const tokens = { input: 5, output: 6, reasoning: 0, cache: { read: 1, write: 0 } }
   calls[0].resolve({ text: "out", sessionID: "ses_new", agent: "explore", model: { providerID: "p", id: "m" }, tokens })
   const res = await p

@@ -84,10 +84,18 @@ export type WorkflowToolInput = InlineRunInput | SavedRunInput
 export type RunStatus =
   | "running"
   | "stopping"
+  | "paused"
   | "succeeded"
   | "failed"
   | "stopped"
   | "interrupted"
+
+export type ActiveRunStatus = "running" | "stopping" | "paused"
+
+/** True while a run still owns sessions and is a valid implicit-target. */
+export function isActiveRunStatus(s: RunStatus): s is ActiveRunStatus {
+  return s === "running" || s === "stopping" || s === "paused"
+}
 
 export type AgentStatus = "pending" | "running" | "succeeded" | "failed" | "interrupted"
 
@@ -117,6 +125,8 @@ export interface AgentRecord {
   endedAt?: number
   /** Parsed structured output when opts.schema was provided. */
   data?: Json
+  /** Unique tool-call count for this agent's session (from run-events reducer). */
+  toolCalls?: number
 }
 
 export interface RunRecord {
@@ -343,7 +353,14 @@ export interface Registry {
   /** Durable provenance (survives run completion). */
   wasEverOwned(sessionID: string): boolean
   runForActiveSession(sessionID: string): RunRecord | undefined
-  /** On plugin load: mark persisted running/stopping runs as interrupted (no auto-replay). */
+  /**
+   * Bind a child session to an agent for the life of the process (survives
+   * run finalize — provenance for tool-count events).
+   */
+  bindAgentSession(runID: string, agentID: string, sessionID: string): void
+  /** Reverse lookup for event routing. Survives finalize. */
+  agentForSession(sessionID: string): { runID: string; agentID: string } | undefined
+  /** On plugin load: mark persisted running/stopping/paused runs as interrupted (no auto-replay). */
   reconcileOrphans(): void
 }
 
@@ -403,8 +420,20 @@ export interface Supervisor {
    * (success, failure, stop, or timeout) — never while agents are live.
    */
   start(input: { script: string; meta?: WorkflowMeta; args?: Json; name?: string; workflowName?: string }, parent: ParentContext): Promise<RunOutcome>
+  /**
+   * Same spawn path as start(), but returns the runID immediately. `done`
+   * settles with the envelope (never rejects after the run is created).
+   */
+  startDetached(
+    input: { script: string; meta?: WorkflowMeta; args?: Json; name?: string; workflowName?: string },
+    parent: ParentContext,
+  ): { runID: string; done: Promise<RunOutcome> }
   /** Idempotent stop. Returns false if runID unknown or already final. */
   stop(runID: string, reason: string): boolean
+  /** Close admission of new agent() calls. Returns false if not running. */
+  pause(runID: string): boolean
+  /** Reopen admission. Returns false if not paused. */
+  resume(runID: string): boolean
   stopAll(reason: string): void
   isOwnedSession(sessionID: string): boolean
   activeRuns(): RunRecord[]
@@ -423,7 +452,11 @@ export interface Supervisor {
 
 /** Mirror of the verified plugin session methods (see docs/SPIKE-FINDINGS.md). */
 export interface SessionCtx {
-  create(input: { title?: string; agent?: string }): Promise<{ id: string; agent?: string }>
+  create(input: {
+    title?: string
+    agent?: string
+    metadata?: Record<string, unknown>
+  }): Promise<{ id: string; agent?: string }>
   get(input: { sessionID: string }): Promise<{
     id: string
     agent?: string

@@ -25,7 +25,7 @@ import type {
   UltracodeOptions,
   WorkflowMeta,
 } from "./types.ts"
-import { addTokens, emptyTokens } from "./types.ts"
+import { addTokens, emptyTokens, isActiveRunStatus } from "./types.ts"
 import { buildEnvelope, resultFits } from "./serialize.ts"
 import { createSessionDriver } from "./sessions.ts"
 import type { SessionDriver } from "./sessions.ts"
@@ -58,6 +58,13 @@ export interface SupervisorDeps {
   loadWorkflowFresh?: WorkflowLoader
 }
 
+interface PauseWaiter {
+  resolve(): void
+  reject(err: Error): void
+  onAbort(): void
+  signal: AbortSignal
+}
+
 interface RunState {
   runID: string
   controller: AbortController
@@ -78,6 +85,13 @@ interface RunState {
   killTimer: ReturnType<typeof setTimeout> | undefined
   done: Promise<void>
   resolveDone: () => void
+  parent: ParentContext
+  startedAt: number
+  paused: boolean
+  pausedAt: number | undefined
+  pausedMs: number
+  watchdog: ReturnType<typeof setTimeout> | undefined
+  pauseWaiters: PauseWaiter[]
 }
 
 type FinalOutcome = {
@@ -139,20 +153,31 @@ export class SupervisorImpl implements Supervisor {
   }
 
   // -------------------------------------------------------------------------
-  // start
+  // start / startDetached
   // -------------------------------------------------------------------------
 
   async start(
     input: { script: string; meta?: WorkflowMeta; args?: Json; name?: string; workflowName?: string },
     parent: ParentContext,
   ): Promise<RunOutcome> {
+    const { done } = this.startDetached(input, parent)
+    return await done
+  }
+
+  startDetached(
+    input: { script: string; meta?: WorkflowMeta; args?: Json; name?: string; workflowName?: string },
+    parent: ParentContext,
+  ): { runID: string; done: Promise<RunOutcome> } {
     if (this.disposed) throw new Error("supervisor disposed")
+    if (this.registry.isOwnedActive(parent.sessionID)) {
+      throw new Error("nested workflow runs are not allowed")
+    }
 
     // 1. Validate the script host-side, before any spawn.
     const check = validateScriptSource(input.script)
     if (!check.ok) throw new Error(`invalid workflow script: ${check.error}`)
 
-    // 2. Registry record + script artifact.
+    // 2. Registry record. Spawn continues on the returned `done` promise.
     const record = this.registry.create({
       parentSessionID: parent.sessionID,
       parentAgent: parent.agent,
@@ -163,13 +188,20 @@ export class SupervisorImpl implements Supervisor {
       workflowName: input.workflowName,
     })
     const runID = record.id
-    // Short run tag for interpretable child titles: "[uc:<tag>] <label>".
-    const runTag = runID.replace(/^run_/, "").slice(0, 8)
-    const state = this.makeState(runID)
+    const state = this.makeState(runID, parent)
     this.runs.set(runID, state)
+    const done = this.executeRun(record, input, parent, state)
+    return { runID, done }
+  }
 
+  private async executeRun(
+    record: RunRecord,
+    input: { script: string; meta?: WorkflowMeta; args?: Json; name?: string; workflowName?: string },
+    parent: ParentContext,
+    state: RunState,
+  ): Promise<RunOutcome> {
+    const runID = record.id
     let worker: WorkerHandle | undefined
-    let watchdog: ReturnType<typeof setTimeout> | undefined
     let final: FinalOutcome
 
     try {
@@ -187,29 +219,38 @@ export class SupervisorImpl implements Supervisor {
           runAgent: (agentInput, availableAgents, hooks) => {
             let created: string | undefined
             return this.driver
-              .runAgent({ ...agentInput, runTag }, availableAgents, {
-                signal: hooks.signal,
-                onSessionID: (sessionID) => {
-                  if (state.closed) {
-                    // Late child of an already-settling run: refuse
-                    // registration — the driver cancels that call BEFORE any
-                    // prompt (RunClosedError) and interrupts best-effort; the
-                    // child never gains ownership or enters the live set.
-                    this.trackCleanup(state, this.interruptChild(sessionID))
-                    return "rejected" as const
-                  }
-                  created = sessionID
-                  state.children.add(sessionID)
-                  state.live.add(sessionID)
-                  try {
-                    this.registry.markOwned(runID, sessionID)
-                  } catch {
-                    // registry bookkeeping must not break the call
-                  }
-                  hooks.onSessionID(sessionID)
-                  return undefined
+              .runAgent(
+                {
+                  ...agentInput,
+                  runID,
+                  parentSessionID: parent.sessionID,
+                  workflowName: input.workflowName,
                 },
-              })
+                availableAgents,
+                {
+                  signal: hooks.signal,
+                  onSessionID: (sessionID) => {
+                    if (state.closed) {
+                      // Late child of an already-settling run: refuse
+                      // registration — the driver cancels that call BEFORE any
+                      // prompt (RunClosedError) and interrupts best-effort; the
+                      // child never gains ownership or enters the live set.
+                      this.trackCleanup(state, this.interruptChild(sessionID))
+                      return "rejected" as const
+                    }
+                    created = sessionID
+                    state.children.add(sessionID)
+                    state.live.add(sessionID)
+                    try {
+                      this.registry.markOwned(runID, sessionID)
+                    } catch {
+                      // registry bookkeeping must not break the call
+                    }
+                    hooks.onSessionID(sessionID)
+                    return undefined
+                  },
+                },
+              )
               .finally(() => {
                 // Outstanding-only semantics: settled calls remove their child
                 // from the live set so later interrupts never touch them.
@@ -234,19 +275,14 @@ export class SupervisorImpl implements Supervisor {
         args: input.args,
         meta: input.meta,
         handlers: {
-          onCall: (fn, args) => this.trackInFlight(state, () => this.dispatch(fn, args, runner)),
+          onCall: (fn, args) => this.trackInFlight(state, () => this.dispatch(fn, args, runner, state)),
           onEvent: (kind, data) => this.handleEvent(state, kind, data, parent),
         },
       })
       state.worker = worker
 
-      // 6. Watchdog -> stop(runID, "timeout").
-      watchdog = setTimeout(() => {
-        this.stop(runID, "timeout")
-      }, this.options.timeoutMs)
-      if (typeof (watchdog as { unref?: () => void }).unref === "function") {
-        ;(watchdog as { unref: () => void }).unref()
-      }
+      // 6. Watchdog -> stop(runID, "timeout"). Suspended while paused.
+      this.armWatchdog(state)
 
       // 7. Await the script outcome. The worker has settled by now — cancel
       // any pending delayed stop-kill (main flow handles children from here).
@@ -278,7 +314,7 @@ export class SupervisorImpl implements Supervisor {
       state.closed = true
       final = { status: "failed", error: errorMessage(err) }
     } finally {
-      if (watchdog !== undefined) clearTimeout(watchdog)
+      this.clearWatchdog(state)
       this.cancelKillTimer(state)
       this.runs.delete(runID)
       state.resolveDone()
@@ -296,8 +332,10 @@ export class SupervisorImpl implements Supervisor {
     const state = this.runs.get(runID)
     if (!state) return false
     const run = this.registry.get(runID)
-    if (!run || run.status !== "running") return false
+    if (!run || !isActiveRunStatus(run.status) || run.status === "stopping") return false
     if (!this.registry.setStatus(runID, "stopping", { stopReason: reason })) return false
+    state.paused = false
+    this.clearWatchdog(state)
     // Finality belongs to the run: record the stop reason even when the
     // worker already posted done (a stop accepted during settle must not
     // later report success).
@@ -322,6 +360,36 @@ export class SupervisorImpl implements Supervisor {
     if (typeof (state.killTimer as { unref?: () => void }).unref === "function") {
       ;(state.killTimer as { unref: () => void }).unref()
     }
+    return true
+  }
+
+  pause(runID: string): boolean {
+    const state = this.runs.get(runID)
+    if (!state) return false
+    const run = this.registry.get(runID)
+    if (!run || run.status !== "running") return false
+    if (!this.registry.setStatus(runID, "paused")) return false
+    state.paused = true
+    state.pausedAt = Date.now()
+    this.clearWatchdog(state)
+    this.safeParentReport(state, `paused ${runID}`)
+    return true
+  }
+
+  resume(runID: string): boolean {
+    const state = this.runs.get(runID)
+    if (!state) return false
+    const run = this.registry.get(runID)
+    if (!run || run.status !== "paused") return false
+    if (!this.registry.setStatus(runID, "running")) return false
+    if (state.pausedAt !== undefined) {
+      state.pausedMs += Date.now() - state.pausedAt
+      state.pausedAt = undefined
+    }
+    state.paused = false
+    this.armWatchdog(state)
+    this.resumePauseWaiters(state)
+    this.safeParentReport(state, `resumed ${runID}`)
     return true
   }
 
@@ -353,7 +421,7 @@ export class SupervisorImpl implements Supervisor {
   // internals
   // -------------------------------------------------------------------------
 
-  private makeState(runID: string): RunState {
+  private makeState(runID: string, parent: ParentContext): RunState {
     let resolveDone!: () => void
     const done = new Promise<void>((resolve) => {
       resolveDone = resolve
@@ -373,11 +441,19 @@ export class SupervisorImpl implements Supervisor {
       killTimer: undefined,
       done,
       resolveDone,
+      parent,
+      startedAt: Date.now(),
+      paused: false,
+      pausedAt: undefined,
+      pausedMs: 0,
+      watchdog: undefined,
+      pauseWaiters: [],
     }
   }
 
-  private async dispatch(fn: string, args: Json[], runner: AgentRunner): Promise<Json> {
+  private async dispatch(fn: string, args: Json[], runner: AgentRunner, state: RunState): Promise<Json> {
     if (fn === "agent") {
+      await this.waitIfPaused(state)
       const prompt = typeof args[0] === "string" ? args[0] : ""
       const opts = this.coerceAgentOpts(args[1])
       const result = await runner.call(prompt, opts)
@@ -463,6 +539,78 @@ export class SupervisorImpl implements Supervisor {
     if (state.killTimer !== undefined) {
       clearTimeout(state.killTimer)
       state.killTimer = undefined
+    }
+  }
+
+  private safeParentReport(state: RunState, status: string): void {
+    try {
+      state.parent.report(status)
+    } catch {
+      // reporting must never break a run
+    }
+  }
+
+  private remainingTimeoutMs(state: RunState): number {
+    const now = Date.now()
+    const pausedNow = state.paused && state.pausedAt !== undefined ? now - state.pausedAt : 0
+    const elapsed = now - state.startedAt - state.pausedMs - pausedNow
+    return this.options.timeoutMs - elapsed
+  }
+
+  private armWatchdog(state: RunState): void {
+    this.clearWatchdog(state)
+    if (state.paused) return
+    const remaining = this.remainingTimeoutMs(state)
+    if (remaining <= 0) {
+      this.stop(state.runID, "timeout")
+      return
+    }
+    state.watchdog = setTimeout(() => {
+      this.stop(state.runID, "timeout")
+    }, remaining)
+    if (typeof (state.watchdog as { unref?: () => void }).unref === "function") {
+      ;(state.watchdog as { unref: () => void }).unref()
+    }
+  }
+
+  private clearWatchdog(state: RunState): void {
+    if (state.watchdog !== undefined) {
+      clearTimeout(state.watchdog)
+      state.watchdog = undefined
+    }
+  }
+
+  /** New agent() calls wait here while paused; queued semaphore waiters are unaffected. */
+  private waitIfPaused(state: RunState): Promise<void> {
+    if (state.controller.signal.aborted) {
+      return Promise.reject(new Error("run stopping"))
+    }
+    if (!state.paused) return Promise.resolve()
+    return new Promise<void>((resolve, reject) => {
+      const waiter: PauseWaiter = {
+        resolve: () => resolve(),
+        reject,
+        signal: state.controller.signal,
+        onAbort: () => {
+          const idx = state.pauseWaiters.indexOf(waiter)
+          if (idx >= 0) state.pauseWaiters.splice(idx, 1)
+          reject(new Error("run stopping"))
+        },
+      }
+      if (state.controller.signal.aborted) {
+        reject(new Error("run stopping"))
+        return
+      }
+      state.pauseWaiters.push(waiter)
+      state.controller.signal.addEventListener("abort", waiter.onAbort, { once: true })
+    })
+  }
+
+  private resumePauseWaiters(state: RunState): void {
+    const waiters = state.pauseWaiters.splice(0)
+    for (const w of waiters) {
+      w.signal.removeEventListener("abort", w.onAbort)
+      w.resolve()
     }
   }
 

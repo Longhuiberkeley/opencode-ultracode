@@ -46,7 +46,11 @@ class GatedCreateSessions implements SessionCtx {
     this.gate = gate
   }
 
-  async create(i: { title?: string; agent?: string }): Promise<{ id: string; agent?: string }> {
+  async create(i: {
+    title?: string
+    agent?: string
+    metadata?: Record<string, unknown>
+  }): Promise<{ id: string; agent?: string }> {
     await this.gate
     return this.inner.create(i)
   }
@@ -339,7 +343,7 @@ test("supervisor: normal completion cancels the delayed interrupt — no interru
   assert.deepEqual(ctx.sessions.interrupts, [])
 })
 
-test("supervisor: child session titles carry the [uc:<runTag>] prefix", async () => {
+test("supervisor: child session titles carry the [uc:<runID> <ord>] prefix", async () => {
   const ctx = makeSupervisor()
   ctx.sessions.push({ text: "hi" })
   const outcome = await ctx.supervisor.start(
@@ -349,6 +353,136 @@ test("supervisor: child session titles carry the [uc:<runTag>] prefix", async ()
   const sessionID = outcome.run.agents[0].sessionID
   assert.ok(sessionID)
   const title = ctx.sessions.sessions.get(sessionID)?.title
-  // FakeRegistry ids are run_fake<N> -> tag "fake<N>" (first 8 chars sans prefix)
-  assert.match(title ?? "", /^\[uc:fake\d+\] probe$/)
+  // FakeRegistry ids are run_fake<N>; no explicit/ambient phase → phase segment omitted.
+  assert.match(title ?? "", /^\[uc:run_fake\d+ a1\] probe$/)
+  assert.deepEqual(ctx.registry.agentForSession(sessionID), { runID: outcome.run.id, agentID: "a1" })
+})
+
+test("supervisor: startDetached returns runID before finalize; done settles with envelope", async () => {
+  const ctx = makeSupervisor()
+  const { runID, done } = ctx.supervisor.startDetached({ script: `return 7;` }, ctx.parent)
+  assert.match(runID, /^run_/)
+  assert.equal(ctx.registry.get(runID)?.status, "running")
+  const outcome = await done
+  assert.equal(outcome.envelope.runID, runID)
+  assert.equal(outcome.envelope.status, "succeeded")
+  assert.equal(outcome.envelope.result, 7)
+})
+
+test("supervisor: startDetached rejects nested-owned parents", async () => {
+  const ctx = makeSupervisor()
+  const other = ctx.registry.create({ parentSessionID: "ses_other", script: "s" })
+  ctx.registry.markOwned(other.id, ctx.parent.sessionID)
+  assert.throws(
+    () => ctx.supervisor.startDetached({ script: `return 1;` }, ctx.parent),
+    /nested workflow runs are not allowed/,
+  )
+  assert.equal(ctx.registry.runs.size, 1) // only the pre-existing run
+})
+
+test("supervisor: pause queues new agent() until resume; in-flight completes", async () => {
+  const ctx = makeSupervisor()
+  ctx.sessions.push({ text: "AFTER" })
+  const { runID, done } = ctx.supervisor.startDetached(
+    { script: `await sleep(80); const r = await agent("after pause", { label: "late" }); return r.text;` },
+    ctx.parent,
+  )
+  await waitFor(() => ctx.registry.activeRuns().length > 0, "run creation")
+  assert.equal(ctx.supervisor.pause(runID), true)
+  assert.equal(ctx.registry.get(runID)?.status, "paused")
+  assert.ok(ctx.reports.some((s) => s.startsWith("paused ")))
+  await tick(200) // sleep finished; agent() blocked on pause gate
+  assert.equal(ctx.sessions.sessions.size, 0, "new agent() not admitted while paused")
+  assert.equal(ctx.supervisor.resume(runID), true)
+  assert.equal(ctx.registry.get(runID)?.status, "running")
+  assert.ok(ctx.reports.some((s) => s.startsWith("resumed ")))
+  const outcome = await done
+  assert.equal(outcome.envelope.status, "succeeded")
+  assert.equal(outcome.envelope.result, "AFTER")
+  assert.equal(ctx.sessions.sessions.size, 1)
+})
+
+test("supervisor: in-flight agent completes while paused", async () => {
+  const ctx = makeSupervisor()
+  ctx.sessions.push({ text: "INFLIGHT" })
+  ctx.sessions.waitDelayMs = 200
+  const { runID, done } = ctx.supervisor.startDetached(
+    { script: `return (await agent("go", { label: "live" })).text;` },
+    ctx.parent,
+  )
+  await waitFor(() => ctx.sessions.sessions.size > 0, "in-flight child")
+  assert.equal(ctx.supervisor.pause(runID), true)
+  const outcome = await done
+  assert.equal(outcome.envelope.status, "succeeded")
+  assert.equal(outcome.envelope.result, "INFLIGHT")
+})
+
+test("supervisor: queued semaphore waiter stays queued while paused, runs on resume", async () => {
+  const ctx = makeSupervisor({ concurrency: 1 })
+  ctx.sessions.push({ text: "one" })
+  ctx.sessions.push({ text: "two" })
+  ctx.sessions.hangWait = true
+  const { runID, done } = ctx.supervisor.startDetached(
+    {
+      script: `
+        const a = agent("one", { label: "first" });
+        const b = agent("two", { label: "second" });
+        return { a: (await a).text, b: (await b).text };
+      `,
+    },
+    ctx.parent,
+  )
+  await waitFor(() => ctx.sessions.sessions.size === 1, "first child in-flight")
+  assert.equal(ctx.supervisor.pause(runID), true)
+  await tick(80)
+  assert.equal(ctx.sessions.sessions.size, 1, "queued waiter did not start a session")
+  assert.equal(ctx.supervisor.resume(runID), true)
+  await tick(80)
+  assert.equal(ctx.sessions.sessions.size, 1, "queued waiter still waiting for the slot")
+  ctx.sessions.hangWait = false
+  ctx.sessions.releaseHangs()
+  const outcome = await done
+  assert.equal(outcome.envelope.status, "succeeded")
+  const result = outcome.envelope.result as { a?: string; b?: string }
+  assert.equal(result.a, "one")
+  assert.equal(result.b, "two")
+})
+
+test("supervisor: stop during pause finalizes stopped with no cleanup-pending marker", async () => {
+  const ctx = makeSupervisor({ concurrency: 1 })
+  ctx.sessions.hangWait = true
+  const { runID, done } = ctx.supervisor.startDetached(
+    {
+      script: `
+        const a = agent("one");
+        const b = agent("two");
+        return { a: (await a).text, b: (await b).text };
+      `,
+    },
+    ctx.parent,
+  )
+  await waitFor(() => ctx.sessions.sessions.size === 1, "first child")
+  assert.equal(ctx.supervisor.pause(runID), true)
+  assert.equal(ctx.supervisor.stop(runID, "user request"), true)
+  const outcome = await done
+  assert.equal(outcome.envelope.status, "stopped")
+  assert.equal(outcome.envelope.stopReason, "user request")
+  assert.ok(!String(outcome.envelope.stopReason).includes("cleanup pending"))
+})
+
+test("supervisor: watchdog suspends while paused then settles after resume", async () => {
+  const ctx = makeSupervisor({ timeoutMs: 180 })
+  const { runID, done } = ctx.supervisor.startDetached(
+    { script: `await sleep(60000); return 1;` },
+    ctx.parent,
+  )
+  await waitFor(() => ctx.registry.activeRuns().length > 0, "run creation")
+  assert.equal(ctx.supervisor.pause(runID), true)
+  await tick(400) // past the original 180ms deadline
+  assert.equal(ctx.registry.get(runID)?.status, "paused")
+  assert.equal(ctx.registry.get(runID)?.endedAt, undefined)
+  assert.equal(ctx.supervisor.resume(runID), true)
+  const outcome = await done
+  assert.equal(outcome.envelope.status, "stopped")
+  assert.equal(outcome.envelope.stopReason, "timeout")
 })

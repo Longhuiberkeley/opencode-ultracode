@@ -52,8 +52,14 @@ export interface AgentRunInput {
   phase?: string
   schema?: Json
   defaultAgent: string
-  /** Run tag (runID sans prefix, first 8 chars) for interpretable child titles. */
-  runTag?: string
+  /** Full run id for child titles `[uc:<runID> <ord> <phase>] <label>`. */
+  runID?: string
+  /** Agent ordinal within the run ("a1", "a2", ...). */
+  ord?: string
+  /** Parent (invocation) session — stamped on create metadata only. */
+  parentSessionID?: string
+  /** Saved-workflow name, when launched via {workflow: "name"}. */
+  workflowName?: string
 }
 
 export interface AgentRunHooks {
@@ -109,6 +115,7 @@ export function createSessionDriver(sessions: SessionCtx, options: SessionDriver
     const created = await sessions.create({
       title: buildChildTitle(input),
       agent,
+      metadata: stampChildMetadata(input),
     })
     const sessionID = created.id
     const registration = hooks.onSessionID(sessionID)
@@ -346,10 +353,63 @@ function errorMessage(err: unknown): string {
   return String(err)
 }
 
-/** Child session title: `[uc:<runTag>] <label || phase || "agent">` (interpretable + groupable). */
-export function buildChildTitle(input: { label?: string; phase?: string; runTag?: string }): string {
-  const base = input.label || input.phase || "agent"
-  return input.runTag === undefined ? base : `[uc:${input.runTag}] ${base}`
+/**
+ * Child session title (A1 primary contract):
+ *   `[uc:<fullRunID> <ord> <phase>] <label>`
+ * Phase segment omitted when absent: `[uc:<runID> <ord>] <label>`.
+ * Direct driver use (no runID) is a plain label.
+ */
+export function buildChildTitle(input: {
+  label?: string
+  phase?: string
+  runID?: string
+  ord?: string
+}): string {
+  const label = input.label || input.phase || "agent"
+  if (input.runID === undefined) return label
+  const inner = input.ord === undefined
+    ? input.runID
+    : input.phase
+      ? `${input.runID} ${input.ord} ${input.phase}`
+      : `${input.runID} ${input.ord}`
+  return `[uc:${inner}] ${label}`
+}
+
+/**
+ * Parse a child title. Tolerant of the legacy `[uc:<tag>] label` shape
+ * (runID=tag, ord/phase undefined). Returns undefined when the title is
+ * not a `[uc:…]` child title.
+ */
+export function parseChildTitle(title: string): {
+  runID?: string
+  ord?: string
+  phase?: string
+  label?: string
+} | undefined {
+  const m = /^\[uc:([^\]]+)\](?:\s+(.*))?$/.exec(title)
+  if (!m) return undefined
+  const inner = m[1]!.trim()
+  if (!inner) return undefined
+  const label = m[2]
+  const parts = inner.split(/\s+/).filter((p) => p.length > 0)
+  if (parts.length === 1) {
+    return { runID: parts[0], ord: undefined, phase: undefined, label }
+  }
+  if (parts.length === 2) {
+    return { runID: parts[0], ord: parts[1], phase: undefined, label }
+  }
+  return { runID: parts[0], ord: parts[1], phase: parts.slice(2).join(" "), label }
+}
+
+/** D12 stamp — written on create, never read back (A1). */
+function stampChildMetadata(input: AgentRunInput): Record<string, unknown> | undefined {
+  if (input.runID === undefined) return undefined
+  const uc: Record<string, unknown> = { v: 1, run: input.runID, parent: input.parentSessionID }
+  if (input.ord !== undefined) uc.ord = input.ord
+  if (input.phase !== undefined) uc.phase = input.phase
+  if (input.label !== undefined) uc.label = input.label
+  if (input.workflowName !== undefined) uc.wf = input.workflowName
+  return { uc }
 }
 
 /** Concat of content parts where part.type === "text" (verified extraction rule). */

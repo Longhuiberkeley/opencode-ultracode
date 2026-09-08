@@ -21,7 +21,7 @@ multi-agent recipe, the model writes the orchestration on the fly and a runtime 
    globals: `agent`, `parallel`, `pipeline`, `phase`, `progress`, `workflow`, `sleep`, `console`,
    plus `args` and `meta` from the tool input.
 4. Each `agent(prompt, opts)` call spawns a fresh subagent session (own context window, own model
-   per your agent config) and waits for it. Child sessions are titled `[uc:xxxxxxxx] label` so
+   per your agent config) and waits for it. Child sessions are titled `[uc:<runID> <ord> <phase>] label` so
    they group visibly in your session list. Caps are enforced: concurrency, total agents, wall
    clock.
 5. The script returns a small JSON value. Only that value plus a run envelope re-enters your

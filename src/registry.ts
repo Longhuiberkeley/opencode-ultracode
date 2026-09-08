@@ -10,7 +10,7 @@
  * Single-threaded JS — no locks needed (CONTRACTS.md).
  */
 import type { AgentRecord, Json, Registry, RunRecord, RunStatus, WorkflowMeta } from "./types.ts"
-import { addTokens, emptyTokens, randomRunID } from "./types.ts"
+import { addTokens, emptyTokens, isActiveRunStatus, randomRunID } from "./types.ts"
 
 export interface RegistryInit {
   /** Persist a run snapshot (Storage.saveRun — throw-safe). */
@@ -41,6 +41,8 @@ export class RegistryImpl implements Registry {
   private ownedActive = new Map<string, string>()
   /** Durable provenance — survives run completion. */
   private everOwned = new Set<string>()
+  /** sessionID -> { runID, agentID } — survives finalize (tool-count provenance). */
+  private sessionAgents = new Map<string, { runID: string; agentID: string }>()
   private agentCounters = new Map<string, number>()
   private throttles = new Map<string, ThrottleState>()
   private readonly persist: (record: RunRecord) => void
@@ -101,7 +103,7 @@ export class RegistryImpl implements Registry {
 
   activeRuns(): RunRecord[] {
     return [...this.runs.values()]
-      .filter((r) => r.status === "running" || r.status === "stopping")
+      .filter((r) => isActiveRunStatus(r.status))
       .sort((a, b) => b.startedAt - a.startedAt)
   }
 
@@ -183,7 +185,7 @@ export class RegistryImpl implements Registry {
     // Only active runs can own sessions — a finalized (or unknown) run must
     // never grant active-ownership rights (review fix: ownership leak).
     const run = this.runs.get(runID)
-    if (!run || (run.status !== "running" && run.status !== "stopping")) return
+    if (!run || !isActiveRunStatus(run.status)) return
     this.ownedActive.set(sessionID, runID)
     this.everOwned.add(sessionID)
   }
@@ -192,7 +194,7 @@ export class RegistryImpl implements Registry {
     const runID = this.ownedActive.get(sessionID)
     if (runID === undefined) return false
     const run = this.runs.get(runID)
-    return run !== undefined && (run.status === "running" || run.status === "stopping")
+    return run !== undefined && isActiveRunStatus(run.status)
   }
 
   wasEverOwned(sessionID: string): boolean {
@@ -203,7 +205,15 @@ export class RegistryImpl implements Registry {
     const runID = this.ownedActive.get(sessionID)
     if (runID === undefined) return undefined
     const run = this.runs.get(runID)
-    return run !== undefined && (run.status === "running" || run.status === "stopping") ? run : undefined
+    return run !== undefined && isActiveRunStatus(run.status) ? run : undefined
+  }
+
+  bindAgentSession(runID: string, agentID: string, sessionID: string): void {
+    this.sessionAgents.set(sessionID, { runID, agentID })
+  }
+
+  agentForSession(sessionID: string): { runID: string; agentID: string } | undefined {
+    return this.sessionAgents.get(sessionID)
   }
 
   // ------------------------------------------------------------------
@@ -211,8 +221,9 @@ export class RegistryImpl implements Registry {
   // ------------------------------------------------------------------
 
   /**
-   * Seed the registry from persisted records and flip any `running|stopping`
-   * run to `interrupted` with stopReason "server restart" (no auto-replay).
+   * Seed the registry from persisted records and flip any
+   * `running|stopping|paused` run to `interrupted` with stopReason
+   * "server restart" (no auto-replay).
    * Returns the number of flipped runs (interface types it as void; the
    * concrete count is useful for callers/tests).
    */
@@ -233,7 +244,7 @@ export class RegistryImpl implements Registry {
         agents: Array.isArray(raw.agents) ? raw.agents.map((a) => ({ ...a })) : [],
       }
       let wasActive = false
-      if (record.status === "running" || record.status === "stopping") {
+      if (isActiveRunStatus(record.status)) {
         record.status = "interrupted"
         record.stopReason = "server restart"
         if (record.endedAt === undefined) record.endedAt = this.now()

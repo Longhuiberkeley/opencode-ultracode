@@ -182,8 +182,18 @@ export class AgentRunner {
     this.maybeReport()
 
     try {
+      const titlePhase = opts.phase ?? this.ambientPhase()
       const result = await this.driver.runAgent(
-        { prompt, agent: opts.agent, label: opts.label, phase: opts.phase, schema: opts.schema, defaultAgent: this.defaultAgent },
+        {
+          prompt,
+          agent: opts.agent,
+          label: opts.label,
+          phase: titlePhase,
+          schema: opts.schema,
+          defaultAgent: this.defaultAgent,
+          runID: this.runID,
+          ord: record.id,
+        },
         this.availableAgents,
         {
           signal: this.signal ?? NEVER_ABORTED.signal,
@@ -193,6 +203,11 @@ export class AgentRunner {
               sessionID,
               startedAt: Date.now(),
             })
+            try {
+              this.registry.bindAgentSession(this.runID, record.id, sessionID)
+            } catch {
+              // provenance must not break the call
+            }
           },
         },
       )
