@@ -16,9 +16,16 @@ import type { Skill } from "@opencode/plugin"
 import { promises as fsp } from "node:fs"
 import { homedir } from "node:os"
 import { fileURLToPath } from "node:url"
-import { commandArgs, helpText, matchesUltracodeKeyword, parseSubcommand } from "./command.ts"
+import {
+  TOOL_DESCRIPTION,
+  feedToolEvent,
+  handleUltracodeCommand,
+  matchesUltracodeKeyword,
+} from "./command.ts"
 import { loadOptions } from "./config.ts"
 import { RegistryImpl } from "./registry.ts"
+import { emptyToolEventState } from "./run-events.ts"
+import { EMPTY_CATALOG, SKILL_CONTENT, SKILL_DESCRIPTION, SKILL_NAME, buildSkillContent } from "./skill-content.ts"
 import { StorageImpl, normalizePath, resolveContainedPath } from "./storage.ts"
 import { validateToolInput } from "./tool-input.ts"
 import type {
@@ -26,12 +33,10 @@ import type {
   Json,
   KvLike,
   ParentContext,
-  RunRecord,
   SessionCtx,
   Supervisor,
   WorkflowMeta,
 } from "./types.ts"
-import { countAgents } from "./types.ts"
 
 /** Minimal shape of a plugin hook/transform registration (for cleanup). */
 interface RegistrationLike {
@@ -58,23 +63,6 @@ function describeError(err: unknown): string {
   } catch {
     return String(err)
   }
-}
-
-function fmtDuration(ms: number): string {
-  if (!Number.isFinite(ms) || ms < 0) return "n/a"
-  const s = Math.round(ms / 1000)
-  if (s < 60) return `${s}s`
-  const m = Math.floor(s / 60)
-  if (m < 60) return `${m}m ${s % 60}s`
-  const h = Math.floor(m / 60)
-  return `${h}h ${m % 60}m`
-}
-
-function fmtTokens(n: number | undefined): string {
-  if (n === undefined) return "-"
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`
-  return String(n)
 }
 
 /** Permission actions treated as "edits" (spike: exact names unverified — keep small + code-local). */
@@ -187,6 +175,7 @@ export default Plugin.define({
     // unregistered skill id into prompts (it can break admission). Never
     // inherited across plugin reloads.
     let skillInstalled = false
+    let catalogInjected = false
 
     // ---- capabilities (plain interfaces; everything stays node-testable) ----
     const projectRoot = normalizePath(String(ctx.location?.project?.directory ?? process.cwd()))
@@ -247,7 +236,11 @@ export default Plugin.define({
 
     const sessions: SessionCtx = {
       create: async (input) =>
-        (await ctx.session.create({ title: input.title, agent: input.agent })) as unknown as {
+        (await ctx.session.create({
+          title: input.title,
+          agent: input.agent,
+          ...(input.metadata ? { metadata: input.metadata as { readonly [k: string]: never } } : {}),
+        })) as unknown as {
           id: string
           agent?: string
         },
@@ -286,19 +279,60 @@ export default Plugin.define({
       .catch((err) => warn("failed to reconcile persisted runs", err))
 
     // ---- agent availability (fresh per invocation; failures fail the run) ----
-    async function listAgentIDs(): Promise<{ ok: true; ids: string[] } | { ok: false; error: string }> {
+    async function listAgents(): Promise<
+      | { ok: true; agents: Array<{ id: string; description?: string }> }
+      | { ok: false; error: string }
+    > {
       try {
         const result = (await ctx.agent.list()) as unknown
-        const ids = unwrapList(result)
-          .map((a) =>
-            a && typeof a === "object" && typeof (a as { id?: unknown }).id === "string"
-              ? (a as { id: string }).id
-              : "",
-          )
-          .filter((id) => id !== "")
-        return { ok: true, ids }
+        const agents: Array<{ id: string; description?: string }> = []
+        for (const a of unwrapList(result)) {
+          if (!a || typeof a !== "object") continue
+          const id = (a as { id?: unknown }).id
+          if (typeof id !== "string" || id === "") continue
+          const description = (a as { description?: unknown }).description
+          const name = (a as { name?: unknown }).name
+          const desc =
+            typeof description === "string"
+              ? description
+              : typeof name === "string" && name !== id
+                ? name
+                : undefined
+          agents.push(desc ? { id, description: desc } : { id })
+        }
+        return { ok: true, agents }
       } catch (err) {
         return { ok: false, error: describeError(err) }
+      }
+    }
+
+    /** D1: first non-empty agent.list() rebuilds the in-memory skill (never the shipped file). */
+    async function maybeInjectCatalog(agents: Array<{ id: string; description?: string }>): Promise<void> {
+      if (catalogInjected || !skillInstalled || agents.length === 0) return
+      const prior = skillInstalled
+      try {
+        await storage.refreshWorkflows()
+        const workflows = storage.listWorkflows().map((w) => ({
+          name: w.manifest.name,
+          description: w.manifest.description,
+          phases: w.manifest.phases,
+          trusted: storage.workflowTrustState(w.manifest.name) === "trusted",
+        }))
+        const content = buildSkillContent({ agents, workflows })
+        await ctx.skill.transform((editor) => {
+          try {
+            editor.update("ultracode", (skill) => {
+              skill.content = content
+            })
+          } catch (err) {
+            warn("skill editor.update failed during catalog injection", err)
+            throw err
+          }
+        })
+        catalogInjected = true
+      } catch (err) {
+        skillInstalled = prior
+        warn("live catalog injection failed — skill left at prior content", err)
       }
     }
 
@@ -357,14 +391,7 @@ export default Plugin.define({
           editor.add({
             name: "run",
             options: { namespace: "ultracode" },
-            description:
-              "Run an ultracode workflow (invoke this tool as ultracode_run) — a plain-JS async-function-body script that " +
-              "orchestrates multiple AI agents (agent(), parallel(), pipeline(), phase(), progress(), workflow(name), sleep()) " +
-              "and returns a small JSON value. Input is { script, meta?, args? } (inline) or { workflow: name, args? } " +
-              "(saved workflow — must be trusted first via /ultracode trust <name>). " +
-              "Use when a task outgrows one context window or needs fan-out / verification / repeatable orchestration. " +
-              "Blocks until every agent settles, then returns an envelope { runID, status, agents, tokens, result | preview }. " +
-              "Mention the standalone keyword 'ultracode' anywhere in your prompt to load the authoring skill.",
+            description: TOOL_DESCRIPTION,
             input: WORKFLOW_TOOL_INPUT_SCHEMA,
             execute: async (rawInput: unknown, tool) => {
               if (supervisor?.isOwnedSession(tool.sessionID)) {
@@ -383,13 +410,14 @@ export default Plugin.define({
 
                 // Agent availability: fresh fetch on EVERY invocation; a failed
                 // fetch fails the run (no silent stale reuse).
-                const agents = await listAgentIDs()
+                const agents = await listAgents()
                 if (!agents.ok) {
                   return {
                     content: `error: could not list available agents (${agents.error}) — refusing to start the run`,
                   }
                 }
-                const availableAgents = agents.ids
+                const availableAgents = agents.agents.map((a) => a.id)
+                await maybeInjectCatalog(agents.agents)
 
                 let script: string
                 let meta: WorkflowMeta | undefined
@@ -479,244 +507,23 @@ export default Plugin.define({
     }
 
     // ---- /ultracode command (no /workflow aliases — avoid OpenCode name collisions) ----
-    function summarizeRun(run: RunRecord): string {
-      const counts = countAgents(run)
-      const bits = [
-        `\`${run.id}\``,
-        run.name ?? run.workflowName ?? "(unnamed)",
-        `[${run.status}]`,
-        `agents ${counts.succeeded + counts.failed + counts.interrupted}/${counts.total}`,
-      ]
-      const tokens = run.totalTokens
-      if (tokens) bits.push(`~${fmtTokens(tokens.input + tokens.output + tokens.reasoning)} tok`)
-      if (run.error) bits.push(`error: ${run.error.slice(0, 80)}`)
-      return `- ${bits.join(" · ")}`
-    }
-
-    async function showRun(run: RunRecord): Promise<string> {
-      const lines: string[] = []
-      lines.push(`## Run \`${run.id}\`${run.name ? ` — ${run.name}` : ""}`)
-      lines.push("")
-      lines.push(`- status: **${run.status}**`)
-      if (run.workflowName) lines.push(`- workflow: ${run.workflowName}`)
-      lines.push(`- duration: ${fmtDuration((run.endedAt ?? Date.now()) - run.startedAt)}`)
-      if (run.error) lines.push(`- error: ${run.error}`)
-      if (run.stopReason) lines.push(`- stop reason: ${run.stopReason}`)
-      if (run.totalTokens) {
-        const t = run.totalTokens
-        lines.push(
-          `- tokens: in ${fmtTokens(t.input)} · out ${fmtTokens(t.output)} · reasoning ${fmtTokens(t.reasoning)} · cache read ${fmtTokens(t.cache.read)}`,
-        )
-      }
-      if (run.scriptPath) lines.push(`- script artifact: ${run.scriptPath}`)
-      if (run.resultTruncated && run.resultArtifactKey) {
-        lines.push(`- result truncated — full result: /ultracode result \`${run.id}\` (artifact key \`${run.resultArtifactKey}\`)`)
-      }
-      lines.push("")
-      lines.push("### Agents")
-      lines.push("")
-      if (run.agents.length === 0) {
-        lines.push("(no agents were started)")
-      } else {
-        lines.push("| id | label / phase | agent | model | status | tokens in/out | session |")
-        lines.push("| --- | --- | --- | --- | --- | --- | --- |")
-        for (const a of run.agents) {
-          const label = [a.label, a.phase].filter(Boolean).join(" · ") || "-"
-          const agent = a.effectiveAgent ?? a.requestedAgent ?? "-"
-          const model = a.effectiveModel ? `${a.effectiveModel.providerID}/${a.effectiveModel.id}` : "-"
-          const tokens = a.tokens ? `${fmtTokens(a.tokens.input)}/${fmtTokens(a.tokens.output)}` : "-"
-          const error = a.error ? ` — ${a.error.slice(0, 60)}` : ""
-          lines.push(`| ${a.id} | ${label} | ${agent} | ${model} | ${a.status}${error} | ${tokens} | ${a.sessionID ?? "-"} |`)
-        }
-      }
-      // Pending permissions for children of an active run (best-effort).
-      if (run.status === "running" || run.status === "stopping") {
-        const pending: string[] = []
-        for (const a of run.agents) {
-          if (a.status !== "running" || !a.sessionID) continue
-          const text = await pendingPermissions(a.sessionID)
-          if (text) pending.push(`- \`${a.id}\` (\`${a.sessionID}\`): ${text}`)
-        }
-        if (pending.length > 0) {
-          lines.push("")
-          lines.push("**Waiting for permission**")
-          lines.push(...pending)
-        }
-      }
-      lines.push("")
-      lines.push("### Script")
-      lines.push("")
-      lines.push("```js")
-      lines.push(run.script)
-      lines.push("```")
-      return lines.join("\n")
-    }
-
     const commandHandler = async (invocation: { sessionID: string; prompt: { text?: string } }): Promise<void> => {
       try {
         if (disposed) return
-        const { sessionID } = invocation
-        const argsText = commandArgs(invocation.prompt?.text)
-        if (argsText === "") {
-          await runsReconciled
-          await storage.refreshWorkflows() // fresh from disk on every invocation
-          const active = supervisor?.activeRuns() ?? registry.activeRuns()
-          const finished = registry
-            .listRecent(50)
-            .filter((r) => r.status !== "running" && r.status !== "stopping")
-            .slice(0, 5)
-          const saved = storage.listWorkflows()
-          const parts: string[] = ["## Ultracode workflows", ""]
-          parts.push("**Active runs**")
-          parts.push(active.length ? active.map(summarizeRun).join("\n") : "(none)")
-          parts.push("")
-          parts.push("**Recent runs**")
-          parts.push(finished.length ? finished.map(summarizeRun).join("\n") : "(none)")
-          parts.push("")
-          parts.push("**Saved workflows**")
-          parts.push(
-            saved.length
-              ? saved
-                  .map((w) => {
-                    const state = storage.workflowTrustState(w.manifest.name)
-                    const stateText =
-                      state === "trusted" ? "trusted" : state === "untrusted" ? "untrusted (changed)" : "unknown"
-                    return `- \`${w.manifest.name}\` — ${w.manifest.description ?? "(no description)"} [${w.manifest.source} · ${stateText}]`
-                  })
-                  .join("\n")
-              : "(none — save one with `/ultracode save <runID> <name>`)",
-          )
-          parts.push("")
-          parts.push(`Workflow dirs: project \`${normalizePath(`${projectRoot}/.opencode/workflows`)}\` (wins) · personal \`${personalWorkflowDir}\``)
-          await say(sessionID, parts.join("\n"))
-          return
-        }
-
-        const { sub, rest } = parseSubcommand(argsText)
-
-        if (sub === "help") {
-          await say(sessionID, helpText())
-          return
-        }
-
-        if (sub === "stop") {
-          if (!rest) {
-            await say(sessionID, "Usage: /ultracode stop <runID>")
-            return
-          }
-          if (!supervisor) {
-            await say(sessionID, `error: ${supervisorError ?? "supervisor unavailable"}`)
-            return
-          }
-          const stopped = supervisor.stop(rest, "user requested (/ultracode stop)")
-          await say(
-            sessionID,
-            stopped ? `Stopping run \`${rest}\` — in-flight agents will be interrupted.` : `Run \`${rest}\` is unknown or already finished. See /ultracode for the list.`,
-          )
-          return
-        }
-
-        if (sub === "show") {
-          if (!rest) {
-            await say(sessionID, "Usage: /ultracode show <runID>")
-            return
-          }
-          await runsReconciled
-          const run = registry.get(rest)
-          if (!run) {
-            await say(sessionID, `Run \`${rest}\` not found. See /ultracode for known runs.`)
-            return
-          }
-          await say(sessionID, await showRun(run))
-          return
-        }
-
-        if (sub === "save") {
-          const saveMatch = /^(\S+)\s+(\S+)$/.exec(rest)
-          if (!saveMatch) {
-            await say(sessionID, "Usage: /ultracode save <runID> <name>\n(name: lowercase alphanumerics, `-`/`_`, max 64 chars)")
-            return
-          }
-          const runID = saveMatch[1]!
-          const name = saveMatch[2]!
-          const run = registry.get(runID)
-          if (!run) {
-            await say(sessionID, `Run \`${runID}\` not found. See /ultracode for known runs.`)
-            return
-          }
-          try {
-            // manifest.name is ALWAYS the lookup key; the run's display name
-            // only enriches the description.
-            const display = run.meta?.name ?? run.name
-            const saved = await storage.saveWorkflow(name, run.script, {
-              name,
-              description: display && display !== name ? `saved from run ${run.id} (${display})` : `saved from run ${run.id}`,
-              phases: run.meta?.phases,
-              requires: run.meta?.requires,
-              savedFromRunID: run.id,
-              source: "project",
-            })
-            await say(
-              sessionID,
-              `Saved workflow \`${saved.manifest.name}\` (${saved.manifest.source}) — approve it once with \`/ultracode trust ${saved.manifest.name}\`, then run it with { workflow: "${saved.manifest.name}" }`,
-            )
-          } catch (err) {
-            await say(sessionID, `error: could not save workflow — ${describeError(err)}`)
-          }
-          return
-        }
-
-        if (sub === "trust") {
-          if (!rest || /\s/.test(rest)) {
-            await say(sessionID, "Usage: /ultracode trust <name>")
-            return
-          }
-          try {
-            const trusted = await storage.trustWorkflow(rest)
-            if (!trusted) {
-              await say(sessionID, `Workflow \`${rest}\` not found on disk. See /ultracode for the list.`)
-              return
-            }
-            await say(
-              sessionID,
-              `Trusted workflow \`${rest}\` (current version, sha256 ${trusted.digest.slice(0, 12)}…) — it can now be run with { workflow: "${rest}" }.`,
-            )
-          } catch (err) {
-            await say(sessionID, `error: could not trust workflow — ${describeError(err)}`)
-          }
-          return
-        }
-
-        if (sub === "result") {
-          if (!rest) {
-            await say(sessionID, "Usage: /ultracode result <runID>")
-            return
-          }
-          await runsReconciled
-          const run = registry.get(rest)
-          if (!run) {
-            await say(sessionID, `Run \`${rest}\` not found. See /ultracode for known runs.`)
-            return
-          }
-          if (!run.resultArtifactKey) {
-            await say(
-              sessionID,
-              run.resultTruncated
-                ? `Run \`${rest}\` was truncated but no result artifact was recorded.`
-                : `Run \`${rest}\` was not truncated — its result is already in the tool output (see /ultracode show).`,
-            )
-            return
-          }
-          const result = await storage.loadResultArtifactFresh(run.resultArtifactKey)
-          if (result === undefined) {
-            await say(sessionID, `No stored result found for run \`${rest}\` (key \`${run.resultArtifactKey}\`).`)
-            return
-          }
-          await say(sessionID, `## Full result — \`${rest}\`\n\n\`\`\`json\n${JSON.stringify(result, null, 1)}\n\`\`\``)
-          return
-        }
-
-        await say(sessionID, `Unknown /ultracode argument: ${JSON.stringify(sub)}\n\n${helpText()}`)
+        await handleUltracodeCommand(invocation, {
+          registry,
+          supervisor,
+          supervisorError,
+          storage,
+          say,
+          projectRoot,
+          personalWorkflowDir,
+          pendingPermissions,
+          prepare: async () => {
+            await runsReconciled
+            await storage.refreshWorkflows()
+          },
+        })
       } catch (err) {
         warn("/ultracode command failed", err)
       }
@@ -727,7 +534,8 @@ export default Plugin.define({
         try {
           editor.add({
             name: "ultracode",
-            description: "Inspect and manage ultracode workflow runs (summary, show, stop, save, trust, result, help)",
+            description:
+              "Inspect and manage ultracode workflow runs (show, result, stop, pause, resume, rerun, save, trust, untrust, help)",
             execute: commandHandler,
           })
         } catch (err) {
@@ -773,10 +581,9 @@ export default Plugin.define({
 
     // ---- skill registration (Builder C content; static file in the plugin package) ----
     try {
-      const content = await import("./skill-content.ts")
       // The skill markdown ships inside the plugin package (skills/ultracode.md).
       // Derive the plugin dir from this module's URL; never write into the
-      // user's project.
+      // user's project. Catalog injection later updates in-memory content only.
       const skillPath = fileURLToPath(new URL("../skills/ultracode.md", import.meta.url))
       let filePresent = false
       try {
@@ -789,7 +596,7 @@ export default Plugin.define({
         // Read-only installs simply skip skill registration.
         try {
           await fs.mkdir(normalizePath(`${skillPath}/..`), true)
-          await fs.writeFile(skillPath, content.SKILL_CONTENT)
+          await fs.writeFile(skillPath, SKILL_CONTENT)
           filePresent = true
         } catch (err) {
           warn(`skill file ${skillPath} is missing and could not be created`, err)
@@ -798,18 +605,22 @@ export default Plugin.define({
       if (filePresent) {
         await ctx.skill.transform((editor) => {
           try {
-            skillInstalled = false // defensive: reset before any replay
             const existing = editor.get("ultracode") as { location?: string } | undefined
             if (existing && existing.location !== skillPath) {
               warn(`skill id "ultracode" is already registered at ${String(existing.location)} — not overriding it`)
               return
             }
+            if (existing) {
+              // Replay of this transform (late catalog inject / reload): keep ours.
+              skillInstalled = true
+              return
+            }
             editor.add({
               id: "ultracode",
-              name: content.SKILL_NAME,
-              description: content.SKILL_DESCRIPTION,
+              name: SKILL_NAME,
+              description: SKILL_DESCRIPTION,
               location: skillPath,
-              content: content.SKILL_CONTENT,
+              content: buildSkillContent(EMPTY_CATALOG),
             } as unknown as Skill.Info)
             skillInstalled = true
           } catch (err) {
@@ -821,6 +632,36 @@ export default Plugin.define({
       }
     } catch (err) {
       warn("skill registration failed — keyword skill attach will not resolve", err)
+    }
+
+    // ---- session.tool.* event stream → AgentRecord.toolCalls (D6/A2) ----
+    try {
+      const subscribe = (ctx.event as { subscribe?: (opts?: { signal?: AbortSignal }) => AsyncIterable<unknown> })
+        .subscribe
+      if (typeof subscribe !== "function") {
+        warn("event.subscribe unavailable — tool-call counts disabled")
+      } else {
+        const stream = subscribe({ signal: controller.signal })
+        void (async () => {
+          let state = emptyToolEventState()
+          try {
+            for await (const raw of stream) {
+              if (controller.signal.aborted) break
+              const ev = raw as { type?: string; created?: number; data?: { sessionID?: string; id?: string } }
+              if (typeof ev?.type !== "string") continue
+              state = feedToolEvent(
+                state,
+                { type: ev.type, created: ev.created, data: ev.data },
+                registry,
+              )
+            }
+          } catch (err) {
+            if (!controller.signal.aborted) warn("event subscription ended", err)
+          }
+        })()
+      }
+    } catch (err) {
+      warn("event subscribe failed — tool-call counts disabled", err)
     }
 
     // ---- permission hook (only when NOT delegating every ask to the user) ----

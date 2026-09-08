@@ -243,3 +243,55 @@ Before writing the script, answer two questions: what is the fan-out? who verifi
 answers exist, write the script: self-contained prompts, explicit phases, bounded loops, a schema
 for everything you merge on, and a small JSON return.
 `
+
+/** Live agent + saved-workflow catalog injected into the in-memory skill (D1). */
+export interface SkillCatalogAgent {
+  id: string
+  description?: string
+}
+
+export interface SkillCatalogWorkflow {
+  name: string
+  description?: string
+  phases?: string[]
+  trusted: boolean
+}
+
+export interface SkillCatalog {
+  agents: ReadonlyArray<SkillCatalogAgent>
+  workflows: ReadonlyArray<SkillCatalogWorkflow>
+}
+
+export const EMPTY_CATALOG: SkillCatalog = { agents: [], workflows: [] }
+
+/**
+ * Authoring skill markdown plus, when the catalog is non-empty, a live
+ * agents/workflows appendix. Empty catalog returns SKILL_CONTENT byte-identical
+ * so `skills/ultracode.md === SKILL_CONTENT` stays locked.
+ */
+export function buildSkillContent(catalog: SkillCatalog): string {
+  if (catalog.agents.length === 0 && catalog.workflows.length === 0) return SKILL_CONTENT
+  const lines: string[] = ["", "## Live catalogs in this install", "", "### Agents", ""]
+  if (catalog.agents.length === 0) {
+    lines.push("(none)")
+  } else {
+    for (const a of catalog.agents) {
+      lines.push(a.description ? `- \`${a.id}\` — ${a.description}` : `- \`${a.id}\``)
+    }
+  }
+  lines.push("", "### Saved workflows", "")
+  if (catalog.workflows.length === 0) {
+    lines.push("(none)")
+  } else {
+    for (const w of catalog.workflows) {
+      const bits: string[] = []
+      if (w.phases && w.phases.length > 0) bits.push(`phases: ${w.phases.join(", ")}`)
+      bits.push(`trusted: ${w.trusted ? "yes" : "no"}`)
+      const extra = bits.join("; ")
+      const desc = w.description ? ` — ${w.description}` : ""
+      lines.push(`- \`${w.name}\`${desc} (${extra})`)
+    }
+  }
+  lines.push("")
+  return SKILL_CONTENT + lines.join("\n")
+}

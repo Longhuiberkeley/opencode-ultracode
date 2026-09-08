@@ -5,7 +5,16 @@
  */
 import test from "node:test"
 import assert from "node:assert/strict"
-import { commandArgs, helpText, matchesUltracodeKeyword, parseSubcommand } from "../src/command.ts"
+import {
+  D2_VERBS,
+  TOOL_DESCRIPTION,
+  TOOL_DESCRIPTION_MAX_LINES,
+  commandArgs,
+  helpText,
+  matchesUltracodeKeyword,
+  parseSubcommand,
+  verbsListedInHelp,
+} from "../src/command.ts"
 
 test("keyword: start-of-prompt forms attach", () => {
   assert.equal(matchesUltracodeKeyword("ultracode: audit src/auth"), true)
@@ -55,4 +64,27 @@ test("helpText is management-only and points at the keyword", () => {
   assert.match(helpText(), /\/ultracode help/)
   assert.match(helpText(), /no leading slash/)
   assert.doesNotMatch(helpText(), /\/workflows?\b/)
+})
+
+test("helpText lists exactly the D2 verb set", () => {
+  const listed = verbsListedInHelp()
+  assert.deepEqual(new Set(listed), new Set(D2_VERBS))
+  assert.equal(listed.length, D2_VERBS.length, "each D2 verb listed once")
+})
+
+test("tool description names every primitive and stays within the line cap", () => {
+  const lines = TOOL_DESCRIPTION.split("\n")
+  assert.ok(
+    lines.length <= TOOL_DESCRIPTION_MAX_LINES,
+    `tool description is ${lines.length} lines (cap ${TOOL_DESCRIPTION_MAX_LINES})`,
+  )
+  for (const name of ["agent", "parallel", "pipeline", "phase", "progress", "workflow", "sleep", "console", "args", "meta"]) {
+    assert.match(TOOL_DESCRIPTION, new RegExp(`\\b${name}\\b`), `tool description must name ${name}`)
+  }
+  assert.ok(
+    TOOL_DESCRIPTION.includes(
+      "Full patterns + live catalogs load with the Ultracode skill (auto-attaches on the standalone keyword 'ultracode')",
+    ),
+  )
+  assert.match(TOOL_DESCRIPTION, /[Rr]oute by agent/)
 })

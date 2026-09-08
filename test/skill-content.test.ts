@@ -14,7 +14,13 @@ import { readFileSync } from "node:fs"
 import { fileURLToPath } from "node:url"
 import path from "node:path"
 
-import { SKILL_NAME, SKILL_DESCRIPTION, SKILL_CONTENT } from "../src/skill-content.ts"
+import {
+  EMPTY_CATALOG,
+  SKILL_NAME,
+  SKILL_DESCRIPTION,
+  SKILL_CONTENT,
+  buildSkillContent,
+} from "../src/skill-content.ts"
 
 const samplesDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "workflows", "samples")
 
@@ -81,6 +87,39 @@ test("static skill file skills/ultracode.md mirrors SKILL_CONTENT exactly", () =
   const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..")
   const file = readFileSync(path.join(repoRoot, "skills", "ultracode.md"), "utf8")
   assert.equal(file, SKILL_CONTENT, "skills/ultracode.md is the registered skill location — keep it in sync")
+})
+
+test("buildSkillContent empty catalog is byte-identical to SKILL_CONTENT", () => {
+  assert.equal(buildSkillContent(EMPTY_CATALOG), SKILL_CONTENT)
+  assert.equal(buildSkillContent({ agents: [], workflows: [] }), SKILL_CONTENT)
+})
+
+test("buildSkillContent appends live catalogs when non-empty", () => {
+  const text = buildSkillContent({
+    agents: [
+      { id: "general", description: "general-purpose subagent" },
+      { id: "explore" },
+    ],
+    workflows: [
+      {
+        name: "deep-research",
+        description: "multi-source research",
+        phases: ["research", "verify"],
+        trusted: true,
+      },
+      { name: "scratch", trusted: false },
+    ],
+  })
+  assert.ok(text.startsWith(SKILL_CONTENT))
+  assert.ok(text.includes("## Live catalogs in this install"))
+  assert.ok(text.includes("`general` — general-purpose subagent"))
+  assert.ok(text.includes("`explore`"))
+  assert.ok(text.includes("`deep-research` — multi-source research"))
+  assert.ok(text.includes("phases: research, verify"))
+  assert.ok(text.includes("trusted: yes"))
+  assert.ok(text.includes("`scratch`"))
+  assert.ok(text.includes("trusted: no"))
+  assert.notEqual(text, SKILL_CONTENT)
 })
 
 // ---------------------------------------------------------------------------

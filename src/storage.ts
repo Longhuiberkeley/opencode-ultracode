@@ -392,6 +392,29 @@ export class StorageImpl implements Storage {
     return { workflow: entry.workflow, digest }
   }
 
+  /**
+   * Delete the KV trust record for `name`. Unknown (not currently trusted)
+   * names throw, listing the workflows that are trusted.
+   */
+  async revokeTrust(name: string): Promise<void> {
+    requireValidWorkflowName(name)
+    const digest = this.trustDigests.get(name)
+    if (digest === undefined) {
+      const names = [...this.trustDigests.keys()].sort()
+      throw new StorageError(
+        `workflow "${name}" is not trusted.` +
+          (names.length > 0 ? ` Trusted workflows: ${names.join(", ")}.` : " No workflows are trusted."),
+      )
+    }
+    this.trustDigests.delete(name)
+    try {
+      if (this.kv.remove) await this.kv.remove(`${this.trustPrefix}/${name}`)
+    } catch (err) {
+      this.trustDigests.set(name, digest)
+      throw err
+    }
+  }
+
   async saveWorkflow(
     name: string,
     script: string,
