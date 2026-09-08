@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "name": "deep-research",
+  "description": "Fan out one researcher per angle, verify every claim with an independent verifier, overturn weak verdicts with a skeptic pass, then synthesize a cited report.",
+  "phases": ["research", "verify", "skeptic", "synthesize"],
+  "requires": ["general", "explore"],
+  "hash": "",
+  "source": "project",
+  "savedAt": 0
+}

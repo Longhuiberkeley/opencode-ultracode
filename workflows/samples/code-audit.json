@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "name": "code-audit",
+  "description": "One explorer per module extracts structured findings, then an adversarial reviewer re-examines each batch of ten and rejects weak or duplicated findings.",
+  "phases": ["scan", "review"],
+  "requires": ["general", "explore"],
+  "hash": "",
+  "source": "project",
+  "savedAt": 0
+}

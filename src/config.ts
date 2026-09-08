@@ -1,0 +1,93 @@
+/**
+ * Plugin option parsing/validation (Builder A).
+ *
+ * Rules (CONTRACTS.md): unknown keys ignored; bad values fall back to defaults
+ * and collect a human-readable warning. Never throws.
+ */
+import type { PermissionMode, UltracodeOptions } from "./types.ts"
+import { DEFAULT_OPTIONS } from "./types.ts"
+
+export interface LoadedOptions {
+  options: Required<UltracodeOptions>
+  warnings: string[]
+}
+
+interface NumRange {
+  min: number
+  max: number
+}
+
+/** Verified ranges — see CONTRACTS.md Builder A. */
+const RANGES: Record<"concurrency" | "maxAgents" | "timeoutMs" | "maxResultChars", NumRange> = {
+  concurrency: { min: 1, max: 64 },
+  maxAgents: { min: 1, max: 10_000 },
+  timeoutMs: { min: 10_000, max: 86_400_000 },
+  maxResultChars: { min: 1_000, max: 1_000_000 },
+}
+
+const PERMISSION_MODES: ReadonlySet<string> = new Set(["ask", "autoEditsWorkflow", "noEditTools"])
+
+function num(warnings: string[], raw: Record<string, unknown>, key: keyof typeof RANGES): number | undefined {
+  const range = RANGES[key]
+  const value = raw[key]
+  if (value === undefined) return undefined // use default, no warning
+  if (typeof value !== "number" || !Number.isFinite(value) || !Number.isInteger(value)) {
+    warnings.push(
+      `option "${key}" must be an integer number, got ${JSON.stringify(value) ?? String(value)} — using default ${DEFAULT_OPTIONS[key]}`,
+    )
+    return undefined
+  }
+  if (value < range.min || value > range.max) {
+    warnings.push(
+      `option "${key}" must be between ${range.min} and ${range.max}, got ${value} — using default ${DEFAULT_OPTIONS[key]}`,
+    )
+    return undefined
+  }
+  return value
+}
+
+/**
+ * Parse `ctx.options` into validated options. Always returns a fully-populated
+ * `Required<UltracodeOptions>` plus warnings for every value that was rejected.
+ */
+export function loadOptions(raw: unknown): LoadedOptions {
+  const warnings: string[] = []
+  const options: Required<UltracodeOptions> = { ...DEFAULT_OPTIONS }
+
+  if (raw === null || raw === undefined) return { options, warnings }
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    warnings.push(`options must be an object, got ${Array.isArray(raw) ? "array" : typeof raw} — using defaults`)
+    return { options, warnings }
+  }
+  const record = raw as Record<string, unknown>
+
+  for (const key of Object.keys(RANGES) as Array<keyof typeof RANGES>) {
+    const parsed = num(warnings, record, key)
+    if (parsed !== undefined) options[key] = parsed
+  }
+
+  const permissions = record["permissions"]
+  if (permissions !== undefined) {
+    if (typeof permissions === "string" && PERMISSION_MODES.has(permissions)) {
+      options.permissions = permissions as PermissionMode
+    } else {
+      warnings.push(
+        `option "permissions" must be one of ask | autoEditsWorkflow | noEditTools, got ${JSON.stringify(permissions) ?? String(permissions)} — using default "${DEFAULT_OPTIONS.permissions}"`,
+      )
+    }
+  }
+
+  const agent = record["agent"]
+  if (agent !== undefined) {
+    if (typeof agent === "string" && agent.trim() !== "") {
+      options.agent = agent.trim()
+    } else {
+      warnings.push(
+        `option "agent" must be a non-empty string, got ${JSON.stringify(agent) ?? String(agent)} — using default "${DEFAULT_OPTIONS.agent}"`,
+      )
+    }
+  }
+
+  // Unknown keys intentionally ignored (forward compatibility).
+  return { options, warnings }
+}

@@ -73,6 +73,11 @@ export interface InlineRunInput {
 export interface SavedRunInput {
   workflow: string
   args?: Json
+  /**
+   * Proceed despite a manifest/script hash mismatch (script changed on disk
+   * since it was saved). Added additively by Builder A per CONTRACTS.md.
+   */
+  confirm?: boolean
 }
 
 export type WorkflowToolInput = InlineRunInput | SavedRunInput
@@ -258,10 +263,26 @@ export interface BridgeEvent {
   data: Json
 }
 
+/** host -> worker: launch the script (additive; sent once, before anything else). */
+export interface BridgeInit {
+  type: "init"
+  script: string
+  args?: Json
+  meta?: WorkflowMeta
+}
+
+/** worker -> host: final script outcome (additive; settles the run). */
+export interface BridgeDone {
+  type: "done"
+  ok: boolean
+  value?: Json
+  error?: string
+}
+
 /** worker -> host */
-export type WorkerMessage = BridgeCall | BridgeEvent
+export type WorkerMessage = BridgeCall | BridgeEvent | BridgeDone
 /** host -> worker */
-export type HostMessage = BridgeResultOk | BridgeResultErr
+export type HostMessage = BridgeResultOk | BridgeResultErr | BridgeInit
 
 // ---------------------------------------------------------------------------
 // Saved workflows (storage domain)
@@ -366,6 +387,12 @@ export interface ParentContext {
   messageID?: string
   /** Throttled tool.progress reporter. Never throws. */
   report(status: string): void
+  /**
+   * Agent ids available in this location (from ctx.agent.list().data), when
+   * known. Used to fail fast on unknown agent() targets. Optional (additive):
+   * when absent, agent ids are not pre-validated.
+   */
+  availableAgents?: string[]
 }
 
 export interface RunOutcome {

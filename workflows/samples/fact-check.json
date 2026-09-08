@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "name": "fact-check",
+  "description": "Extract checkable claims from a draft, verify each claim against supplied sources, overturn weak verdicts with a skeptic pass, then compile a markdown table report.",
+  "phases": ["extract", "verify", "skeptic", "report"],
+  "requires": ["general"],
+  "hash": "",
+  "source": "project",
+  "savedAt": 0
+}

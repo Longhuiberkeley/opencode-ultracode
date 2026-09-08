@@ -5,13 +5,22 @@
  * Run tests: npm test  (node --experimental-strip-types --test test/)
  */
 import type {
+  AgentRecord,
   ContextMessage,
   FsLike,
   Json,
   KvLike,
+  Registry,
+  RunRecord,
+  RunStatus,
+  SavedWorkflow,
+  SavedWorkflowManifest,
   SessionCtx,
+  Storage,
   TokenUsage,
+  WorkflowMeta,
 } from "../src/types.ts"
+import { createHash } from "node:crypto"
 import { emptyTokens } from "../src/types.ts"
 
 // ---------------------------------------------------------------------------
@@ -283,4 +292,209 @@ export type FakeCtx = ReturnType<typeof makeFakeCtx>
 
 export function jsonOf(value: unknown): Json {
   return JSON.parse(JSON.stringify(value)) as Json
+}
+
+// ---------------------------------------------------------------------------
+// Fake registry (additive — Builder B; used by primitives/supervisor tests)
+// ---------------------------------------------------------------------------
+
+export class FakeRegistry implements Registry {
+  runs = new Map<string, RunRecord>()
+  owned = new Map<string, string>() // sessionID -> runID
+  everOwned = new Set<string>()
+  saveCalls: RunRecord[] = []
+  private runCounter = 0
+  private agentCounter = 0
+
+  create(init: {
+    parentSessionID: string
+    parentAgent?: string
+    script: string
+    meta?: WorkflowMeta
+    args?: Json
+    name?: string
+    workflowName?: string
+  }): RunRecord {
+    this.runCounter += 1
+    const run: RunRecord = {
+      id: `run_fake${this.runCounter}`,
+      parentSessionID: init.parentSessionID,
+      parentAgent: init.parentAgent,
+      name: init.name,
+      workflowName: init.workflowName,
+      status: "running",
+      script: init.script,
+      meta: init.meta,
+      args: init.args,
+      startedAt: Date.now(),
+      agents: [],
+    }
+    this.runs.set(run.id, run)
+    this.saveCalls.push(run)
+    return run
+  }
+
+  get(runID: string): RunRecord | undefined {
+    return this.runs.get(runID)
+  }
+
+  listRecent(limit: number): RunRecord[] {
+    return [...this.runs.values()]
+      .sort((a, b) => b.startedAt - a.startedAt)
+      .slice(0, limit)
+  }
+
+  activeRuns(): RunRecord[] {
+    return [...this.runs.values()].filter((r) => r.status === "running" || r.status === "stopping")
+  }
+
+  setStatus(runID: string, status: RunStatus, extra?: { error?: string; stopReason?: string }): boolean {
+    const run = this.runs.get(runID)
+    if (!run) return false
+    run.status = status
+    if (extra?.error !== undefined) run.error = extra.error
+    if (extra?.stopReason !== undefined) run.stopReason = extra.stopReason
+    this.saveCalls.push(run)
+    return true
+  }
+
+  addAgent(runID: string, init: Omit<AgentRecord, "id">): AgentRecord | undefined {
+    const run = this.runs.get(runID)
+    if (!run) return undefined
+    this.agentCounter += 1
+    const agent: AgentRecord = { ...init, id: `a${this.agentCounter}` }
+    run.agents.push(agent)
+    return agent
+  }
+
+  updateAgent(runID: string, agentID: string, patch: Partial<AgentRecord>): void {
+    const agent = this.getAgent(runID, agentID)
+    if (!agent) return
+    Object.assign(agent, patch)
+  }
+
+  getAgent(runID: string, agentID: string): AgentRecord | undefined {
+    return this.runs.get(runID)?.agents.find((a) => a.id === agentID)
+  }
+
+  finish(runID: string, outcome: {
+    status: RunStatus
+    result?: Json
+    resultTruncated?: boolean
+    resultArtifactKey?: string
+    error?: string
+    stopReason?: string
+  }): RunRecord | undefined {
+    const run = this.runs.get(runID)
+    if (!run) return undefined
+    run.status = outcome.status
+    if (outcome.result !== undefined) run.result = outcome.result
+    if (outcome.resultTruncated !== undefined) run.resultTruncated = outcome.resultTruncated
+    if (outcome.resultArtifactKey !== undefined) run.resultArtifactKey = outcome.resultArtifactKey
+    if (outcome.error !== undefined) run.error = outcome.error
+    if (outcome.stopReason !== undefined) run.stopReason = outcome.stopReason
+    run.endedAt = Date.now()
+    this.saveCalls.push(run)
+    return run
+  }
+
+  markOwned(runID: string, sessionID: string): void {
+    this.owned.set(sessionID, runID)
+    this.everOwned.add(sessionID)
+  }
+
+  isOwnedActive(sessionID: string): boolean {
+    const runID = this.owned.get(sessionID)
+    if (!runID) return false
+    const run = this.runs.get(runID)
+    return run !== undefined && (run.status === "running" || run.status === "stopping")
+  }
+
+  wasEverOwned(sessionID: string): boolean {
+    return this.everOwned.has(sessionID)
+  }
+
+  runForActiveSession(sessionID: string): RunRecord | undefined {
+    const runID = this.owned.get(sessionID)
+    if (!runID) return undefined
+    const run = this.runs.get(runID)
+    return run !== undefined && (run.status === "running" || run.status === "stopping") ? run : undefined
+  }
+
+  reconcileOrphans(): void {
+    for (const run of this.runs.values()) {
+      if (run.status === "running" || run.status === "stopping") {
+        run.status = "interrupted"
+        run.stopReason = "server restart"
+        run.endedAt = Date.now()
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Fake storage (additive — Builder B; used by primitives/supervisor tests)
+// ---------------------------------------------------------------------------
+
+export class FakeStorage implements Storage {
+  runSnapshots: RunRecord[] = []
+  scriptArtifacts = new Map<string, string>()
+  resultArtifacts = new Map<string, Json>()
+  workflows = new Map<string, SavedWorkflow>()
+  failWriteScriptArtifact = false
+
+  saveRun(record: RunRecord): void {
+    this.runSnapshots.push({ ...record, agents: record.agents.map((a) => ({ ...a })) })
+  }
+
+  loadRuns(): RunRecord[] {
+    return this.runSnapshots
+  }
+
+  async writeScriptArtifact(runID: string, script: string): Promise<string | undefined> {
+    if (this.failWriteScriptArtifact) throw new Error("fs unavailable")
+    const path = `/project/.opencode/workflows/runs/${runID}.js`
+    this.scriptArtifacts.set(path, script)
+    return path
+  }
+
+  saveResultArtifact(runID: string, result: Json): string {
+    const key = `results/${runID}`
+    this.resultArtifacts.set(key, result)
+    return key
+  }
+
+  loadResultArtifact(key: string): Json | undefined {
+    return this.resultArtifacts.get(key)
+  }
+
+  listWorkflows(): SavedWorkflow[] {
+    return [...this.workflows.values()]
+  }
+
+  loadWorkflow(name: string): SavedWorkflow | undefined {
+    return this.workflows.get(name)
+  }
+
+  async saveWorkflow(
+    name: string,
+    script: string,
+    manifest: Omit<SavedWorkflowManifest, "version" | "hash" | "savedAt" | "source"> & { source: "project" | "personal" },
+  ): Promise<SavedWorkflow> {
+    const saved: SavedWorkflow = {
+      manifest: {
+        version: 1,
+        name,
+        description: manifest.description,
+        phases: manifest.phases,
+        requires: manifest.requires,
+        hash: createHash("sha256").update(script).digest("hex"),
+        source: manifest.source,
+        savedAt: Date.now(),
+      },
+      script,
+    }
+    this.workflows.set(name, saved)
+    return saved
+  }
 }
