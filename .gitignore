@@ -1,0 +1,5 @@
+node_modules/
+spike/out/
+spike/scratch/.opencode/plugins/probe/node_modules/
+*.log
+.DS_Store
