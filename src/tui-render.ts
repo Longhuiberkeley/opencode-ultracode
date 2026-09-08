@@ -17,7 +17,7 @@ export const STATUS_DOT: Record<AgentStatus, string> = {
   succeeded: "✓",
   failed: "✗",
   pending: "○",
-  interrupted: "○",
+  interrupted: "■",
 }
 
 export type SessionView = {
@@ -65,7 +65,7 @@ export type SettlePrev = {
   fired: boolean
 }
 
-export type Page<T> = { window: T[]; label: string }
+export type Page<T> = { window: T[]; label: string; offset: number }
 
 /**
  * Strict gate: channel must be `beta`, version must parse as
@@ -238,13 +238,13 @@ export function agentRows(runView: RunView, phase?: string): string[][] {
 
 export function paginate<T>(rows: readonly T[], offset: number, height: number): Page<T> {
   const n = rows.length
-  if (n === 0) return { window: [], label: "0–0 of 0" }
+  if (n === 0) return { window: [], label: "0–0 of 0", offset: 0 }
   const h = Math.max(1, Math.floor(height))
   const maxOff = Math.max(0, n - h)
   const off = Math.min(Math.max(0, Math.floor(offset)), maxOff)
   const end = Math.min(n, off + h)
   const window = rows.slice(off, end) as T[]
-  return { window, label: `${off + 1}–${end} of ${n}` }
+  return { window, label: `${off + 1}–${end} of ${n}`, offset: off }
 }
 
 export function runFingerprint(run: RunView): string {
@@ -301,6 +301,59 @@ export function planSettleCheck(
     if (changed + quietMs <= nowTs) due.push(runID)
   }
   return due
+}
+
+export type SettleMaps = {
+  lastChange: Record<string, number>
+  fired: Record<string, number>
+  prev: Map<string, SettlePrev>
+}
+
+function fingerprintAgentCount(fp: string): number {
+  if (!fp) return 0
+  return fp.split("|").filter((p) => p.length > 0).length
+}
+
+/** Cancel a pending quiet-window when the run is no longer settled or a child appeared. */
+export function shouldClearSettleDeadline(run: RunView, prev: SettlePrev | undefined): boolean {
+  if (!run.settled) return true
+  if (!prev) return false
+  return run.agents.length > fingerprintAgentCount(prev.fingerprint)
+}
+
+/**
+ * Advance settle maps one tick. Returns runIDs that should toast (once-per-run).
+ * Caller must re-verify settled (e.g. via inspectModel) before toasting; this
+ * function already skips due IDs that are not settled at fire time.
+ */
+export function applySettleTick(runs: readonly RunView[], maps: SettleMaps, nowTs: number, quietMs: number): string[] {
+  for (const run of runs) {
+    const prev = maps.prev.get(run.runID)
+    if (shouldClearSettleDeadline(run, prev)) {
+      delete maps.lastChange[run.runID]
+    }
+    const next = nextSettlePrev(prev, run, nowTs)
+    maps.prev.set(run.runID, next)
+    if (run.settled && maps.lastChange[run.runID] === undefined && !Object.prototype.hasOwnProperty.call(maps.fired, run.runID)) {
+      maps.lastChange[run.runID] = next.lastChangeAt
+    }
+  }
+  const due = planSettleCheck(maps.fired, maps.lastChange, nowTs, quietMs)
+  const toast: string[] = []
+  for (const runID of due) {
+    const run = runs.find((r) => r.runID === runID)
+    if (!run?.settled) {
+      delete maps.lastChange[runID]
+      continue
+    }
+    if (Object.prototype.hasOwnProperty.call(maps.fired, runID)) continue
+    toast.push(runID)
+    maps.fired[runID] = nowTs
+    delete maps.lastChange[runID]
+    const p = maps.prev.get(runID)
+    if (p) maps.prev.set(runID, { ...p, fired: true })
+  }
+  return toast
 }
 
 export type RunAckKind = "paused" | "resumed" | "stopped" | "saved" | "error"
@@ -365,6 +418,34 @@ export function detailsFromMessages(messages: ReadonlyArray<MessageLike>): {
   return { model, toolCalls }
 }
 
+export type DetailCacheEntry = {
+  toolCalls: number
+  model: { providerID: string; id: string } | null
+  tentative: boolean
+}
+
+export type CacheEvent = { type?: string; sessionID?: string }
+
+/** Tentative when we have no model and zero tool calls (empty / not-yet-fetched). */
+export function detailsCacheEntry(details: { model?: { providerID: string; id: string }; toolCalls: number }): DetailCacheEntry {
+  const model = details.model ?? null
+  const toolCalls = details.toolCalls
+  return { toolCalls, model, tentative: toolCalls === 0 && model === null }
+}
+
+/**
+ * Session/message events drop tentative cache rows for that session.
+ * Non-tentative entries stay. Unknown / unrelated events keep the entry.
+ */
+export function cacheDecision(entry: DetailCacheEntry | undefined, evt: CacheEvent): "keep" | "delete" | "skip" {
+  if (!entry) return "skip"
+  if (!entry.tentative) return "keep"
+  const t = evt.type ?? ""
+  const sessionHit = typeof evt.sessionID === "string" && evt.sessionID.length > 0
+  if (sessionHit && (t.startsWith("session.") || t.includes("message"))) return "delete"
+  return "keep"
+}
+
 /** Run whose parsed parent matches, else most recently started. */
 export function defaultRunIndex(runs: readonly RunView[], parentSessionID?: string): number {
   if (runs.length === 0) return 0
@@ -389,6 +470,55 @@ export type InspectSel = {
   parentSessionID?: string
 }
 
+/** Per-run inspector selection (map values). */
+export type InspectSelection = {
+  parentSessionID?: string
+  runID?: string
+  phase: string
+  offset: number
+  selected: number
+}
+
+export function selectionMapKey(parentSessionID: string | undefined, runID: string | undefined): string {
+  return `${parentSessionID ?? ""}\0${runID ?? ""}`
+}
+
+/**
+ * Opening the inspector from parent P defaults to P's run (parsed parent
+ * segment) and resets to that default whenever the open-parent changes.
+ * Same parent keeps the previous per-run entry when that run still exists.
+ */
+export function selectForOpen(
+  prev: InspectSelection | undefined,
+  runs: readonly RunView[],
+  openParentID: string | undefined,
+): InspectSelection {
+  const idx = defaultRunIndex(runs, openParentID)
+  const runID = runs.length === 0 ? undefined : runs[idx]?.runID
+  if (prev && prev.parentSessionID === openParentID) {
+    const still = prev.runID !== undefined && runs.some((r) => r.runID === prev.runID)
+    if (still) return { ...prev, parentSessionID: openParentID }
+  }
+  return {
+    parentSessionID: openParentID,
+    runID,
+    phase: "all",
+    offset: 0,
+    selected: 0,
+  }
+}
+
+export function inspectSelFromSelection(sel: InspectSelection, runs: readonly RunView[]): InspectSel {
+  const hit = sel.runID ? runs.findIndex((r) => r.runID === sel.runID) : -1
+  return {
+    runIndex: hit >= 0 ? hit : undefined,
+    phase: sel.phase,
+    offset: sel.offset,
+    selected: sel.selected,
+    parentSessionID: sel.parentSessionID,
+  }
+}
+
 export type InspectModel = {
   runs: RunView[]
   runIndex: number
@@ -397,12 +527,21 @@ export type InspectModel = {
   phases: string[]
   selectedPhase: string
   left: string[]
+  /** Full cell rows for the selected phase (not the window). */
   rows: string[][]
+  window: string[][]
+  sessionIDs: string[]
   selected: number
+  rowInWindow: number
   offset: number
   pageLabel: string
   runningCount: number
   selectedSessionID: string | undefined
+}
+
+/** Visible-row session id: `rows`/`sessionIDs` index = offset + rowInWindow. */
+export function selectedSessionID(model: InspectModel): string | undefined {
+  return model.sessionIDs[model.offset + model.rowInWindow]
 }
 
 /**
@@ -426,7 +565,10 @@ export function inspectModel(sessions: SessionView[], sel: InspectSel, nowTs: nu
       selectedPhase: "all",
       left: ["Phases", "  (none)"],
       rows: [],
+      window: [],
+      sessionIDs: [],
       selected: 0,
+      rowInWindow: 0,
       offset: 0,
       pageLabel: "0–0 of 0",
       runningCount,
@@ -439,9 +581,10 @@ export function inspectModel(sessions: SessionView[], sel: InspectSel, nowTs: nu
   const selectedPhase = phases.includes(wantPhase) ? wantPhase : "all"
   const agents = agentsForPhase(run, selectedPhase)
   const rows = agentRows(run, selectedPhase)
+  const sessionIDs = agents.map((a) => a.sessionID)
   const selected = rows.length === 0 ? 0 : Math.min(Math.max(0, Math.floor(sel.selected)), rows.length - 1)
   const page = paginate(rows, sel.offset, 10)
-  const more = page.window.length > 0 && sel.offset + page.window.length < rows.length
+  const more = page.window.length > 0 && page.offset + page.window.length < rows.length
   const pageLabel = more ? `${page.label} ↓` : page.label
   const elapsed = compactElapsed(Math.max(0, nowTs - run.startedAt))
   const header = `${shortRunID(run.runID)} · run ${runIndex + 1}/${n} · ${run.counts.done}/${run.counts.total} agents · ${elapsed}`
@@ -455,8 +598,9 @@ export function inspectModel(sessions: SessionView[], sel: InspectSel, nowTs: nu
     left.push(`${mark} ${name} ${done}/${inPhase.length}`)
   }
 
-  const windowOffset = Math.min(Math.max(0, Math.floor(sel.offset)), Math.max(0, rows.length - 1))
-  return {
+  const rowInWindow =
+    page.window.length === 0 ? 0 : Math.min(Math.max(0, selected - page.offset), page.window.length - 1)
+  const model: InspectModel = {
     runs,
     runIndex,
     run,
@@ -464,13 +608,18 @@ export function inspectModel(sessions: SessionView[], sel: InspectSel, nowTs: nu
     phases,
     selectedPhase,
     left,
-    rows: page.window,
+    rows,
+    window: page.window,
+    sessionIDs,
     selected,
-    offset: windowOffset,
+    rowInWindow,
+    offset: page.offset,
     pageLabel,
     runningCount,
-    selectedSessionID: agents[selected]?.sessionID,
+    selectedSessionID: undefined,
   }
+  model.selectedSessionID = selectedSessionID(model)
+  return model
 }
 
 export function formatCounts(counts: RunView["counts"]): string {
@@ -560,7 +709,7 @@ export function twoColumn(runView: RunView, opts: TwoColumnOpts): TwoColumnView 
     phaseName === undefined ? runView.agents : runView.agents.filter((a) => a.phase === phaseName)
   const title = `${phaseName ?? "agents"} · ${inPhase.length} agents`
   const page = paginate(rows, opts.offset, opts.height)
-  const more = page.window.length > 0 && opts.offset + page.window.length < rows.length
+  const more = page.window.length > 0 && page.offset + page.window.length < rows.length
   const pageLabel = more ? `${page.label} ↓` : page.label
   const right: string[][] = [[title], ...page.window]
 

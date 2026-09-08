@@ -8,7 +8,10 @@ import type { AgentRecord, TokenUsage } from "../src/types.ts"
 import {
   STATUS_DOT,
   agentRows,
+  applySettleTick,
+  cacheDecision,
   defaultRunIndex,
+  detailsCacheEntry,
   detailsFromMessages,
   footerHints,
   formatCounts,
@@ -23,10 +26,13 @@ import {
   planSettleCheck,
   runFingerprint,
   runningRunCount,
+  selectForOpen,
+  selectedSessionID,
   settleCandidate,
   shouldEnableTui,
   shortRunID,
   twoColumn,
+  type InspectSelection,
   type RunView,
   type SessionView,
   type SettlePrev,
@@ -212,14 +218,39 @@ test("phaseColumns + agentRows D11 parity (status dot replaces status cell)", ()
 
 test("paginate", () => {
   const rows = ["a", "b", "c", "d", "e"]
-  assert.deepEqual(paginate(rows, 0, 2), { window: ["a", "b"], label: "1–2 of 5" })
-  assert.deepEqual(paginate(rows, 2, 2), { window: ["c", "d"], label: "3–4 of 5" })
-  assert.deepEqual(paginate(rows, 4, 2), { window: ["d", "e"], label: "4–5 of 5" })
-  assert.deepEqual(paginate(rows, -3, 2), { window: ["a", "b"], label: "1–2 of 5" })
-  assert.deepEqual(paginate(rows, 99, 2), { window: ["d", "e"], label: "4–5 of 5" })
-  assert.deepEqual(paginate(rows, 0, 10), { window: rows, label: "1–5 of 5" })
-  assert.deepEqual(paginate([], 0, 5), { window: [], label: "0–0 of 0" })
-  assert.deepEqual(paginate(rows, 0, 0), { window: ["a"], label: "1–1 of 5" })
+  assert.deepEqual(paginate(rows, 0, 2), { window: ["a", "b"], label: "1–2 of 5", offset: 0 })
+  assert.deepEqual(paginate(rows, 2, 2), { window: ["c", "d"], label: "3–4 of 5", offset: 2 })
+  assert.deepEqual(paginate(rows, 4, 2), { window: ["d", "e"], label: "4–5 of 5", offset: 3 })
+  assert.deepEqual(paginate(rows, -3, 2), { window: ["a", "b"], label: "1–2 of 5", offset: 0 })
+  assert.deepEqual(paginate(rows, 99, 2), { window: ["d", "e"], label: "4–5 of 5", offset: 3 })
+  assert.deepEqual(paginate(rows, 0, 10), { window: rows, label: "1–5 of 5", offset: 0 })
+  assert.deepEqual(paginate([], 0, 5), { window: [], label: "0–0 of 0", offset: 0 })
+  assert.deepEqual(paginate(rows, 0, 0), { window: ["a"], label: "1–1 of 5", offset: 0 })
+})
+
+test("paginate: 12 rows, offset 11 → window starts at 2; selected index consistent both directions", () => {
+  const rows = Array.from({ length: 12 }, (_, i) => `r${i}`)
+  const page = paginate(rows, 11, 10)
+  assert.equal(page.offset, 2)
+  assert.deepEqual(page.window, rows.slice(2, 12))
+  assert.equal(page.window[0], rows[page.offset])
+  const sessions: SessionView[] = rows.map((title, i) => ({
+    id: `ses_${i}`,
+    title: `[uc:run_p a${i + 1} p:ses_p] ${title}`,
+    outcome: "succeeded",
+    time: { created: i },
+  }))
+  const model = inspectModel(sessions, { offset: 11, selected: 11, parentSessionID: "ses_p" }, 1000)
+  assert.equal(model.offset, 2)
+  assert.equal(model.rows.length, 12)
+  assert.equal(model.window.length, 10)
+  assert.equal(model.window[0], model.rows[model.offset])
+  assert.equal(model.selected, 11)
+  assert.equal(model.rowInWindow, 9)
+  assert.equal(model.offset + model.rowInWindow, model.selected)
+  assert.equal(selectedSessionID(model), "ses_11")
+  assert.equal(selectedSessionID(model), model.sessionIDs[model.offset + model.rowInWindow])
+  assert.equal(model.selectedSessionID, selectedSessionID(model))
 })
 
 test("settleCandidate: quiet window + once-per-run dedupe", () => {
@@ -530,5 +561,98 @@ test("detailsFromMessages: last assistant model + tool part count", () => {
   ])
   assert.deepEqual(got.model, { providerID: "anthropic", id: "sonnet" })
   assert.equal(got.toolCalls, 3)
+})
+
+test("detailsFromMessages + cacheDecision: tentative empty, delete on session event, keep populated", () => {
+  const empty = detailsFromMessages([])
+  assert.equal(empty.toolCalls, 0)
+  assert.equal(empty.model, undefined)
+  const tentative = detailsCacheEntry(empty)
+  assert.equal(tentative.tentative, true)
+  assert.equal(tentative.model, null)
+  assert.equal(cacheDecision(tentative, { type: "session.updated", sessionID: "ses_1" }), "delete")
+  assert.equal(cacheDecision(tentative, { type: "message.updated", sessionID: "ses_1" }), "delete")
+  assert.equal(cacheDecision(undefined, { type: "session.updated", sessionID: "ses_1" }), "skip")
+  const populated = detailsCacheEntry({ model: { providerID: "anthropic", id: "sonnet" }, toolCalls: 2 })
+  assert.equal(populated.tentative, false)
+  assert.equal(cacheDecision(populated, { type: "session.updated", sessionID: "ses_1" }), "keep")
+})
+
+test("applySettleTick: complete-all → new child before quietMs → no toast; complete-all → silence → toast once", () => {
+  const quietMs = 5000
+  const settledAgents = [
+    { sessionID: "s1", ord: "a1", status: "succeeded" as const, title: "t1" },
+    { sessionID: "s2", ord: "a2", status: "succeeded" as const, title: "t2" },
+  ]
+  const settled: RunView = {
+    runID: "run_x",
+    agents: settledAgents,
+    phases: [],
+    counts: { total: 2, done: 2, failed: 0 },
+    startedAt: 0,
+    settled: true,
+  }
+  const maps = { lastChange: {} as Record<string, number>, fired: {} as Record<string, number>, prev: new Map<string, SettlePrev>() }
+
+  assert.deepEqual(applySettleTick([settled], maps, 1000, quietMs), [])
+  assert.equal(maps.lastChange.run_x, 1000)
+
+  const withChild: RunView = {
+    ...settled,
+    settled: false,
+    counts: { total: 3, done: 2, failed: 0 },
+    agents: [...settledAgents, { sessionID: "s3", ord: "a3", status: "running", title: "t3" }],
+  }
+  assert.deepEqual(applySettleTick([withChild], maps, 2000, quietMs), [])
+  assert.equal(maps.lastChange.run_x, undefined)
+  assert.deepEqual(applySettleTick([withChild], maps, 99_000, quietMs), [])
+  assert.equal(maps.fired.run_x, undefined)
+
+  const maps2 = { lastChange: {} as Record<string, number>, fired: {} as Record<string, number>, prev: new Map<string, SettlePrev>() }
+  assert.deepEqual(applySettleTick([settled], maps2, 1000, quietMs), [])
+  assert.deepEqual(applySettleTick([settled], maps2, 5999, quietMs), [])
+  assert.deepEqual(applySettleTick([settled], maps2, 6000, quietMs), ["run_x"])
+  assert.equal(maps2.fired.run_x, 6000)
+  assert.deepEqual(applySettleTick([settled], maps2, 99_000, quietMs), [])
+})
+
+test("selectForOpen: parent default, reset on open-parent change, keep same parent", () => {
+  const runs: RunView[] = [
+    {
+      runID: "run_a",
+      parent: "ses_p",
+      agents: [{ sessionID: "s1", status: "running", title: "t" }],
+      phases: [],
+      counts: { total: 1, done: 0, failed: 0 },
+      startedAt: 10,
+      settled: false,
+    },
+    {
+      runID: "run_b",
+      parent: "ses_q",
+      agents: [{ sessionID: "s2", status: "running", title: "t" }],
+      phases: [],
+      counts: { total: 1, done: 0, failed: 0 },
+      startedAt: 50,
+      settled: false,
+    },
+  ]
+  const fromP = selectForOpen(undefined, runs, "ses_p")
+  assert.equal(fromP.runID, "run_a")
+  assert.equal(fromP.parentSessionID, "ses_p")
+  assert.equal(fromP.phase, "all")
+  assert.equal(fromP.offset, 0)
+  assert.equal(fromP.selected, 0)
+
+  const moved: InspectSelection = { ...fromP, phase: "research", offset: 3, selected: 2 }
+  const sameParent = selectForOpen(moved, runs, "ses_p")
+  assert.deepEqual(sameParent, { ...moved, parentSessionID: "ses_p" })
+
+  const otherParent = selectForOpen(moved, runs, "ses_q")
+  assert.equal(otherParent.runID, "run_b")
+  assert.equal(otherParent.parentSessionID, "ses_q")
+  assert.equal(otherParent.phase, "all")
+  assert.equal(otherParent.offset, 0)
+  assert.equal(otherParent.selected, 0)
 })
 

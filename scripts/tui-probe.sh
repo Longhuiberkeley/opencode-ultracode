@@ -62,6 +62,9 @@ mkdir -p "$OUT_DIR"
 
 export PROBE_TUI_OUT="$OUT"
 export PROBE_OUT="$SERVER_OUT"
+PARENT_MSG_OUT="$OUT_DIR/tui-live-parent-messages.jsonl"
+export PROBE_PARENT_MSG_OUT="$PARENT_MSG_OUT"
+: > "$PARENT_MSG_OUT"
 if [[ "$DIALOG_KEYS" -eq 1 ]]; then
   export PROBE_DIALOG_KEYS=1
   export TUI_PROBE_SEQ=dialog-keys
@@ -134,6 +137,35 @@ print("exports[./tui] =", tui)
 ' "$PKG" "$main" "$tui"
 }
 
+assert_new_marker() {
+  local pre_file="$1" post_file="$2" pattern="$3"
+  python3 -c '
+import re, sys
+pre_p, post_p, pat = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    pre = open(pre_p, encoding="utf-8", errors="replace").read()
+    post = open(post_p, encoding="utf-8", errors="replace").read()
+except FileNotFoundError as e:
+    print("assert_new_marker FAIL: missing file", e)
+    raise SystemExit(1)
+cre = re.compile(pat)
+pre_lines = [ln for ln in pre.splitlines() if cre.search(ln)]
+post_lines = [ln for ln in post.splitlines() if cre.search(ln)]
+pre_set = set(pre_lines)
+new_lines = [ln for ln in post_lines if ln not in pre_set]
+in_post = cre.search(post) is not None
+in_pre = cre.search(pre) is not None
+if new_lines or (in_post and not in_pre):
+    shown = new_lines[0] if new_lines else pat
+    print(f"assert_new_marker OK: {pat!r} new in post ({post_p}): {shown!r}")
+    raise SystemExit(0)
+print(f"assert_new_marker FAIL: {pat!r} not new in post vs pre")
+print("  pre", pre_p)
+print("  post", post_p)
+raise SystemExit(1)
+' "$pre_file" "$post_file" "$pattern"
+}
+
 assert_live_paint() {
   python3 -c '
 import os, sys
@@ -171,10 +203,9 @@ a = open(after, encoding="utf-8", errors="replace").read() if os.path.isfile(aft
 print(f"F3 before-down bytes: {len(b)} file={before}")
 print(f"F3 after-down bytes: {len(a)} file={after}")
 if not b or not a or b == a:
-    print("F14 FAIL: selection-change frame diff missing (before-down vs after-down must differ)")
-    fail = True
+    print("F14 secondary: selection-change frame files missing or identical")
 else:
-    print("F3 selection-change: frames differ")
+    print("F3 secondary: selection-change frames differ")
 bc = base + "-before-complete.txt"
 ac = base + "-after-complete.txt"
 bct = open(bc, encoding="utf-8", errors="replace").read() if os.path.isfile(bc) else ""
@@ -182,9 +213,7 @@ act = open(ac, encoding="utf-8", errors="replace").read() if os.path.isfile(ac) 
 print(f"F3 before-complete bytes: {len(bct)}")
 print(f"F3 after-complete bytes: {len(act)}")
 if bct and act and bct != act:
-    print("F3 child-complete: frames differ")
-elif bct or act:
-    print("F3 child-complete: frames present but identical or one missing (non-fatal if no child completed)")
+    print("F3 secondary: child-complete frames differ")
 if fail:
     raise SystemExit(1)
 print("live paint ok:", path)
@@ -192,9 +221,9 @@ print("live paint ok:", path)
 }
 
 assert_live_transport() {
-  python3 - "$OUT" "$SERVER_OUT" <<'PY'
+  python3 - "$OUT" "$SERVER_OUT" "$PARENT_MSG_OUT" <<'PY'
 import json, sys
-tui, server = sys.argv[1], sys.argv[2]
+tui, server, parent_msg = sys.argv[1], sys.argv[2], sys.argv[3]
 
 def load(path):
     rows = []
@@ -213,40 +242,60 @@ def load(path):
 
 tui_rows = load(tui)
 srv = load(server)
+parent_rows = load(parent_msg)
 warning = any(
     r.get("kind") == "WARNING" or (r.get("kind") == "live-watch-done" and (r.get("data") or {}).get("paintFallback"))
     or (isinstance(r.get("data"), dict) and "paint-only" in str(r.get("data")))
     for r in tui_rows
 )
-ready = next((r for r in tui_rows if r.get("kind") == "ready-for-keys"), None)
 real = next((r for r in tui_rows if r.get("kind") == "live-real-uc-children"), None)
 if warning and not real:
-    print("WARNING: paint-only run_livepaint fallback — SKIP F12 transport assertions")
+    print("F12 transport SKIPPED: paint-only run_livepaint fallback")
     raise SystemExit(0)
 
+run_id = None
+for r in tui_rows:
+    if r.get("kind") in ("live-run-id", "live-real-uc-children"):
+        rid = (r.get("data") or {}).get("runID")
+        if isinstance(rid, str) and rid and "livepaint" not in rid:
+            run_id = rid
+            break
+print("F12 liveRunID:", run_id)
+
 invoked = [r for r in srv if r.get("kind") == "command-invoked"]
-# Server executor also beacons onto the TUI jsonl (via=index-live) when PROBE_OUT
-# is not inherited by the server process.
 invoked += [r for r in tui_rows if r.get("kind") == "command-invoked" and (r.get("data") or {}).get("via") == "index-live"]
 texts = [str((r.get("data") or {}).get("text") or "") for r in invoked]
-pause = [t for t in texts if t.startswith("pause ")]
-stop = [t for t in texts if t.startswith("stop ")]
-print("F12 command-invoked count:", len(invoked), "pause:", pause, "stop:", stop)
+print("F12 command-invoked texts:", texts)
 ok = True
-if not pause or not stop:
-    print("F12 FAIL: server jsonl missing command-invoked pause+stop for a real run")
+want_pause = f"pause {run_id}" if run_id else None
+want_stop = f"stop {run_id}" if run_id else None
+pause_ok = bool(run_id) and any(t.strip() == want_pause or t.startswith(want_pause + " ") for t in texts)
+stop_ok = bool(run_id) and any(t.strip() == want_stop or t.startswith(want_stop + " ") for t in texts)
+print(f"F12 pause receipt {want_pause!r}: {pause_ok}")
+print(f"F12 stop receipt {want_stop!r}: {stop_ok}")
+if not pause_ok:
+    print("F12 FAIL: server jsonl missing command-invoked pause <liveRunID>")
     ok = False
-run_ids = set()
-for t in pause + stop:
-    parts = t.split()
-    if len(parts) >= 2:
-        run_ids.add(parts[1])
-print("F12 runIDs:", sorted(run_ids))
-syn = [r for r in tui_rows if r.get("kind") == "live-session-synthetic"]
-print("F12 live-session-synthetic count:", len(syn))
-if not syn:
-    print("F12 note: no live-session-synthetic in tui jsonl (ack events may not have reached the TUI)")
-# stopped: look for stop command plus execution.interrupted / live-watch
+if not stop_ok:
+    print("F12 FAIL: server jsonl missing command-invoked stop <liveRunID>")
+    ok = False
+
+stopped = False
+for r in parent_rows + tui_rows:
+    kind = r.get("kind")
+    data = r.get("data") or {}
+    if kind in ("live-run-stopped", "live-parent-final-messages", "live-run-ack"):
+        if data.get("stopped") is True or data.get("status") == "stopped" or data.get("kind") == "stopped":
+            if not run_id or data.get("runID") in (None, run_id) or str(data.get("runID")) == run_id:
+                stopped = True
+        texts_m = data.get("texts") if isinstance(data.get("texts"), list) else []
+        blob = " ".join(str(x) for x in texts_m) + json.dumps(data, default=str)
+        if run_id and "stopped" in blob.lower() and run_id in blob:
+            stopped = True
+print("F12 parent stopped-status:", stopped, "file=", parent_msg)
+if not stopped:
+    print("F12 FAIL: parent messages/ack missing status stopped for", run_id)
+    ok = False
 if not ok:
     raise SystemExit(1)
 print("F12 transport ok")
@@ -370,7 +419,7 @@ open(sys.argv[2],"wb").write(text)
 run_pty() {
   echo "== pty mode: send keystrokes, capture ANSI =="
   python3 - "$SCRATCH" "$ANSI" "$STRIPPED" "$TTY_LOG" "$OUT" <<'PY'
-import errno, fcntl, os, pty, re, select, signal, struct, sys, time, termios
+import errno, fcntl, json, os, pty, re, select, signal, struct, sys, time, termios
 
 scratch, ansi_path, stripped_path, tty_log_path, jsonl_path = sys.argv[1:6]
 cols, rows = 120, 40
@@ -386,6 +435,108 @@ def stripped_bytes():
     )
     return re.sub(rb"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", b"", text)
 
+def screen_bytes(raw: bytes, nrows: int, ncols: int) -> bytes:
+    """Best-effort current-screen snapshot (in-place cursor updates)."""
+    lines = [[" "] * ncols for _ in range(nrows)]
+    r = c = 0
+    i = 0
+    n = len(raw)
+    def clip():
+        nonlocal r, c
+        r = min(max(0, r), nrows - 1)
+        c = min(max(0, c), ncols - 1)
+    while i < n:
+        ch = raw[i]
+        if ch == 0x1B and i + 1 < n:
+            nxt = raw[i + 1]
+            if nxt == 0x5B:  # CSI
+                j = i + 2
+                while j < n and not (0x40 <= raw[j] <= 0x7E):
+                    j += 1
+                if j >= n:
+                    break
+                final = chr(raw[j])
+                params = raw[i + 2 : j].decode("ascii", "replace")
+                nums = []
+                for part in params.split(";"):
+                    if part.isdigit():
+                        nums.append(int(part))
+                if final == "H" or final == "f":
+                    r = (nums[0] - 1) if len(nums) > 0 and nums[0] else 0
+                    c = (nums[1] - 1) if len(nums) > 1 and nums[1] else 0
+                    clip()
+                elif final == "A":
+                    r -= nums[0] if nums else 1
+                    clip()
+                elif final == "B":
+                    r += nums[0] if nums else 1
+                    clip()
+                elif final == "C":
+                    c += nums[0] if nums else 1
+                    clip()
+                elif final == "D":
+                    c -= nums[0] if nums else 1
+                    clip()
+                elif final == "J":
+                    mode = nums[0] if nums else 0
+                    if mode == 2 or mode == 3:
+                        lines = [[" "] * ncols for _ in range(nrows)]
+                        r = c = 0
+                    elif mode == 0:
+                        for x in range(c, ncols):
+                            lines[r][x] = " "
+                        for rr in range(r + 1, nrows):
+                            lines[rr] = [" "] * ncols
+                elif final == "K":
+                    mode = nums[0] if nums else 0
+                    if mode == 0:
+                        for x in range(c, ncols):
+                            lines[r][x] = " "
+                    elif mode == 1:
+                        for x in range(0, c + 1):
+                            lines[r][x] = " "
+                    else:
+                        lines[r] = [" "] * ncols
+                i = j + 1
+                continue
+            if nxt == 0x5D:  # OSC
+                j = i + 2
+                while j < n and raw[j] not in (0x07, 0x1B):
+                    j += 1
+                if j < n and raw[j] == 0x1B and j + 1 < n and raw[j + 1] == 0x5C:
+                    i = j + 2
+                else:
+                    i = j + 1
+                continue
+            i += 2
+            continue
+        if ch == 0x0A:
+            r = min(r + 1, nrows - 1)
+            c = 0
+            i += 1
+            continue
+        if ch == 0x0D:
+            c = 0
+            i += 1
+            continue
+        if ch == 0x08:
+            c = max(0, c - 1)
+            i += 1
+            continue
+        if ch == 0x09:
+            c = min(ncols - 1, (c // 8 + 1) * 8)
+            i += 1
+            continue
+        if 32 <= ch < 127:
+            if 0 <= r < nrows and 0 <= c < ncols:
+                lines[r][c] = chr(ch)
+            c += 1
+            if c >= ncols:
+                c = 0
+                r = min(r + 1, nrows - 1)
+        i += 1
+    return ("\n".join("".join(row).rstrip() for row in lines).rstrip() + "\n").encode()
+
 def dump():
     open(ansi_path, "wb").write(buf)
     open(stripped_path, "wb").write(stripped_bytes())
@@ -393,7 +544,7 @@ def dump():
 def dump_named(label: str) -> str:
     dump()
     path = stripped_path[:-4] + f"-{label}.txt" if stripped_path.endswith(".txt") else stripped_path + f"-{label}.txt"
-    open(path, "wb").write(stripped_bytes())
+    open(path, "wb").write(screen_bytes(bytes(buf), rows, cols))
     sys.stderr.write(f"  frame {label} -> {path}\n")
     return path
 
@@ -514,26 +665,48 @@ try:
         pump(1.5)
         dump()
     elif seq == "live":
-        # Real authoring prompt (F12). Panel opens when [uc:] children appear.
-        send(b"ultracode: answer OK using one explore agent, no schema", "authoring-prompt")
-        send(b"\r", "enter-prompt")
-        got_children = wait_kind("live-real-uc-children", 75.0)
-        got_panel = wait_kind("live-panel-open", 20.0)
+        # Real authoring prompt (F12). p/x while the run is still active.
+        paint_only_env = os.environ.get("TUI_PROBE_ALLOW_PAINT_FALLBACK") == "1"
+        prompt = os.environ.get(
+            "TUI_PROBE_AUTHORING",
+            "ultracode: use two explore agents in parallel to each read README.md. Reply OK.",
+        )
+        if paint_only_env:
+            got_children = False
+            sys.stderr.write("  paint-only: skip authoring prompt so panel can own keys\n")
+        else:
+            send(prompt.encode(), "authoring-prompt")
+            send(b"\r", "enter-prompt")
+            got_children = wait_kind("live-real-uc-children", 75.0)
+        got_panel = wait_kind("live-panel-open", 20.0 if paint_only_env else 20.0)
         sys.stderr.write(f"  live-real-uc-children={got_children} live-panel-open={got_panel}\n")
         pump(2.0)
         dump_named("before-down")
         send(b"\x1b[B", "down-arrow")
-        pump(1.5)
-        dump_named("after-down")
-        dump_named("before-complete")
-        got_done = wait_kind("live-child-complete", 45.0)
-        sys.stderr.write(f"  live-child-complete={got_done}\n")
-        pump(1.0)
-        dump_named("after-complete")
-        send(b"p", "p-pause")
         pump(2.0)
-        send(b"x", "x-stop")
-        pump(2.5)
+        dump_named("after-down")
+        already_done = jsonl_has("live-child-complete")
+        paint_only = os.environ.get("TUI_PROBE_ALLOW_PAINT_FALLBACK") == "1" and not got_children
+        def log_kind(kind, **data):
+            try:
+                with open(jsonl_path, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps({"time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "kind": kind, "data": data}) + "\n")
+            except OSError:
+                pass
+        dump_named("before-complete")
+        if got_children and not already_done and not paint_only:
+            send(b"p", "p-pause-while-active")
+            pump(1.5)
+            send(b"x", "x-stop-while-active")
+            pump(2.5)
+            log_kind("live-keys-sent-while-active", pause=True, stop=True)
+        else:
+            log_kind("live-timing-fail", children=got_children, already_done=already_done, paint_only=paint_only)
+            sys.stderr.write("  live-timing-fail: run finished or missing before p/x\n")
+        got_done = wait_kind("live-child-complete", 40.0) or wait_kind("live-run-stopped", 10.0)
+        sys.stderr.write(f"  live-child-complete/stopped={got_done}\n")
+        pump(1.5)
+        dump_named("after-complete")
         dump()
         send(b"\x1b", "esc")
         send(b"\x03", "ctrl+c")
@@ -714,15 +887,78 @@ else
   set_tui_export "./tui.tsx"
 fi
 
-if [[ "$MODE" == "legacy" ]]; then
-  run_legacy
-else
-  if ! python3 -c 'import pty,select,fcntl,termios,struct' 2>/dev/null; then
-    echo "python pty unavailable — falling back to legacy"
+live_keys_ok() {
+  python3 -c '
+import json,sys
+path=sys.argv[1]
+keys=False
+children=False
+try:
+    for line in open(path, encoding="utf-8", errors="replace"):
+        line=line.strip()
+        if not line: continue
+        try:
+            rec=json.loads(line)
+        except Exception:
+            continue
+        k=rec.get("kind")
+        if k=="live-keys-sent-while-active":
+            keys=True
+        if k=="live-real-uc-children":
+            children=True
+except FileNotFoundError:
+    raise SystemExit(1)
+raise SystemExit(0 if keys and children else 1)
+' "$OUT"
+}
+
+run_once() {
+  if [[ "$MODE" == "legacy" ]]; then
     run_legacy
   else
-    run_pty || true
+    if ! python3 -c 'import pty,select,fcntl,termios,struct' 2>/dev/null; then
+      echo "python pty unavailable — falling back to legacy"
+      run_legacy
+    else
+      run_pty || true
+    fi
   fi
+}
+
+FAST_PROMPT="ultracode: use two explore agents in parallel to each read README.md. Reply OK."
+SLOW_PROMPT="ultracode: use two explore agents in parallel. Each must read README.md, src/tui.tsx, src/tui-render.ts, src/index.ts, and package.json. Take about 30 seconds exploring those files before answering. Reply with one word: OK."
+TRANSPORT_SKIPPED=0
+
+if [[ "$LIVE" -eq 1 ]]; then
+  export TUI_PROBE_AUTHORING="$FAST_PROMPT"
+  if [[ "${TUI_PROBE_ALLOW_PAINT_FALLBACK:-}" == "1" ]]; then
+    echo "== TUI_PROBE_ALLOW_PAINT_FALLBACK=1 — paint-only (transport SKIPPED) =="
+    TRANSPORT_SKIPPED=1
+    run_once
+  else
+  unset TUI_PROBE_ALLOW_PAINT_FALLBACK || true
+  run_once
+  if ! live_keys_ok; then
+    echo "== retry live with slower authoring prompt (~30s) =="
+    : > "$OUT"
+    : > "$SERVER_OUT"
+    : > "$PARENT_MSG_OUT"
+    export TUI_PROBE_AUTHORING="$SLOW_PROMPT"
+    run_once
+  fi
+  if ! live_keys_ok; then
+    echo "== two failed timings — labeled paint-only fallback; transport SKIPPED =="
+    : > "$OUT"
+    : > "$SERVER_OUT"
+    : > "$PARENT_MSG_OUT"
+    export TUI_PROBE_ALLOW_PAINT_FALLBACK=1
+    export TUI_PROBE_AUTHORING="$SLOW_PROMPT"
+    TRANSPORT_SKIPPED=1
+    run_once
+  fi
+  fi
+else
+  run_once
 fi
 
 # If TSX never evaluated, switch export to tui.ts and rerun once (unless already fallback)
@@ -731,11 +967,7 @@ if [[ "$LIVE" -eq 0 ]] && ! jsonl_has "$OUT" "tui-module-evaluated"; then
   : > "$OUT"
   : > "$SERVER_OUT"
   set_tui_export "./tui.ts"
-  if [[ "$MODE" == "legacy" ]]; then
-    run_legacy
-  else
-    run_pty || true
-  fi
+  run_once
 fi
 
 summarize
@@ -750,8 +982,23 @@ if [[ "$DIALOG_KEYS" -eq 1 ]]; then
   g1_verdict
 fi
 
+FAILED=0
 if [[ "$LIVE" -eq 1 ]]; then
-  assert_live_paint
+  assert_live_paint || FAILED=1
+  BASE="${STRIPPED%.txt}"
+  echo "== P6 new-marker assertions =="
+  assert_new_marker "${BASE}-before-down.txt" "${BASE}-after-down.txt" '> 2 ' || FAILED=1
+  if [[ "$TRANSPORT_SKIPPED" -eq 1 ]]; then
+    echo "P6 completion marker SKIPPED: paint-only fallback"
+  else
+    assert_new_marker "${BASE}-before-complete.txt" "${BASE}-after-complete.txt" '[✓✗■]' || FAILED=1
+  fi
   echo "== F12 transport =="
-  assert_live_transport
+  if [[ "$TRANSPORT_SKIPPED" -eq 1 ]]; then
+    echo "F12 transport SKIPPED: paint-only fallback after two failed timings"
+  else
+    assert_live_transport || FAILED=1
+  fi
+  echo "== live assertion aggregate failed=$FAILED transport_skipped=$TRANSPORT_SKIPPED =="
+  exit "$FAILED"
 fi

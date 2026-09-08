@@ -10,10 +10,15 @@
 import { appendFileSync, mkdirSync } from "node:fs"
 import { dirname } from "node:path"
 import real from "../../../../../src/tui.tsx"
+import { parseRunAck } from "../../../../../src/tui-render.ts"
 
 const OUT =
   process.env.PROBE_TUI_OUT ??
   "<repo>/spike/out/tui-probe.jsonl"
+const PARENT_MSG_OUT =
+  process.env.PROBE_PARENT_MSG_OUT ??
+  "<repo>/spike/out/tui-live-parent-messages.jsonl"
+const ALLOW_PAINT_FALLBACK = process.env.TUI_PROBE_ALLOW_PAINT_FALLBACK === "1"
 
 function logTo(path: string, kind: string, data: unknown = {}): void {
   try {
@@ -41,6 +46,7 @@ type AnyCtx = {
       create?: (input?: unknown) => Promise<{ id?: string }>
       command?: (input: unknown) => Promise<unknown>
     }
+    message?: { list?: (input: unknown) => Promise<unknown> }
   }
   data?: {
     on?: (type: string, handler: (ev: unknown) => void) => () => void
@@ -74,6 +80,34 @@ function ucTitles(context: AnyCtx): string[] {
 
 function isPaintFallback(titles: string[]): boolean {
   return titles.some((t) => t.includes("run_livepaint"))
+}
+
+function runIDFromTitles(titles: string[]): string | undefined {
+  for (const title of titles) {
+    if (title.includes("run_livepaint")) continue
+    const m = /\[uc:([^\s\]]+)/.exec(title)
+    if (m?.[1]) return m[1]
+  }
+  return undefined
+}
+
+function messageTexts(raw: unknown): string[] {
+  const rec = raw && typeof raw === "object" ? (raw as { data?: unknown }) : undefined
+  const list = Array.isArray(rec?.data) ? rec.data : Array.isArray(raw) ? raw : []
+  const texts: string[] = []
+  for (const item of list) {
+    if (!item || typeof item !== "object") continue
+    const msg = item as { content?: unknown; text?: unknown; parts?: unknown }
+    if (typeof msg.text === "string") texts.push(msg.text)
+    const content = Array.isArray(msg.content) ? msg.content : Array.isArray(msg.parts) ? msg.parts : []
+    for (const part of content) {
+      if (part && typeof part === "object") {
+        const text = (part as { text?: unknown; content?: unknown }).text ?? (part as { content?: unknown }).content
+        if (typeof text === "string") texts.push(text)
+      }
+    }
+  }
+  return texts
 }
 
 async function seedPaintFallback(context: AnyCtx, parentID: string | undefined): Promise<void> {
@@ -112,6 +146,32 @@ async function openInspect(context: AnyCtx): Promise<void> {
   }
 }
 
+async function dumpParentMessages(context: AnyCtx, parentID: string | undefined, runID: string | undefined): Promise<void> {
+  if (!parentID) return
+  let raw: unknown
+  try {
+    raw = await context.client?.message?.list?.({ sessionID: parentID })
+  } catch (err) {
+    log("live-parent-messages-error", String(err))
+    return
+  }
+  const texts = messageTexts(raw)
+  let stopped = false
+  for (const text of texts) {
+    const ack = parseRunAck(text)
+    if (ack?.kind === "stopped" && (!runID || !ack.runID || ack.runID === runID)) stopped = true
+    if (runID && /stopped/i.test(text) && text.includes(runID)) stopped = true
+    if (runID && /^Stopping run/.test(text) && text.includes(runID)) stopped = true
+  }
+  const payload = { sessionID: parentID, runID: runID ?? null, stopped, texts, raw: raw ?? null }
+  log("live-parent-final-messages", payload)
+  logTo(PARENT_MSG_OUT, "live-parent-final-messages", payload)
+  if (stopped && runID) {
+    log("live-run-stopped", { runID, sessionID: parentID })
+    logTo(PARENT_MSG_OUT, "live-run-stopped", { runID, sessionID: parentID, status: "stopped" })
+  }
+}
+
 async function watchForRun(context: AnyCtx, parentID: string | undefined): Promise<void> {
   const deadline = Date.now() + 90_000
   let opened = false
@@ -123,7 +183,9 @@ async function watchForRun(context: AnyCtx, parentID: string | undefined): Promi
     if (realTitles.length > 0) {
       if (!loggedReal) {
         loggedReal = true
-        log("live-real-uc-children", { titles: realTitles, parentID: parentID ?? null })
+        const runID = runIDFromTitles(realTitles)
+        log("live-real-uc-children", { titles: realTitles, parentID: parentID ?? null, runID: runID ?? null })
+        log("live-run-id", { runID: runID ?? null })
       }
       if (!opened) {
         opened = true
@@ -131,7 +193,7 @@ async function watchForRun(context: AnyCtx, parentID: string | undefined): Promi
       }
       return
     }
-    if (!fallback && Date.now() > deadline - 15_000) {
+    if (ALLOW_PAINT_FALLBACK && !fallback) {
       fallback = true
       await seedPaintFallback(context, parentID)
       await new Promise((r) => setTimeout(r, 800))
@@ -151,8 +213,18 @@ async function watchForRun(context: AnyCtx, parentID: string | undefined): Promi
       log("live-child-complete", { event: ev ?? null, titles: ucTitles(context) })
       void tick()
     })
+    context.data?.on?.("session.execution.interrupted", (ev: unknown) => {
+      log("live-child-complete", { event: ev ?? null, titles: ucTitles(context), interrupted: true })
+      void tick()
+    })
     context.data?.on?.("session.synthetic", (ev: unknown) => {
       log("live-session-synthetic", { event: ev ?? null })
+      const rec = ev && typeof ev === "object" ? (ev as { data?: { text?: string }; text?: string }) : undefined
+      const text = rec?.data?.text ?? rec?.text
+      if (typeof text === "string") {
+        const ack = parseRunAck(text)
+        if (ack) log("live-run-ack", ack)
+      }
     })
   } catch (err) {
     log("live-watch-error", String(err))
@@ -160,16 +232,25 @@ async function watchForRun(context: AnyCtx, parentID: string | undefined): Promi
 
   while (Date.now() < deadline) {
     await tick()
-    if (opened && ucTitles(context).length > 0) break
+    const titles = ucTitles(context)
+    if (opened && titles.length > 0) {
+      const runID = runIDFromTitles(titles)
+      await dumpParentMessages(context, parentID, runID)
+      // keep polling so stop acks after p/x are captured
+    }
     await new Promise((r) => setTimeout(r, 500))
+    if (opened && titles.length > 0 && Date.now() > deadline - 5_000) break
   }
 
   const titles = ucTitles(context)
   const paintOnly = isPaintFallback(titles) && realTitlesEmpty(titles)
+  const runID = runIDFromTitles(titles)
+  await dumpParentMessages(context, parentID, runID)
   log("live-watch-done", {
     sessionID: parentID ?? null,
     ucTitles: titles,
     paintFallback: paintOnly,
+    runID: runID ?? null,
     note: paintOnly
       ? "WARNING: paint-only run_livepaint fallback — skip transport assertions"
       : "real [uc:] children; transport session = parent",
