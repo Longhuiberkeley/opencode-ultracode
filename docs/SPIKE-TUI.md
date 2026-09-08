@@ -87,3 +87,31 @@ Server `/ultracode` + `ultracode_run` keep working with TUI gone.
 - [ ] Confirm whether exporting `./tui` from an **npm** server package auto-loads TUI (local sibling `tui.ts` did load with full TUI).
 - [ ] `keymap.shortcuts("session.tab.close")` — exact default chord.
 - [ ] Whether `slot({ append: "app_bottom" })` paints anything (API accepted it).
+
+## Addendum 2026-09-08 (phase 0-server, build 0.0.0-beta-19271, plugin pkg 0.0.0-beta-19289)
+
+Headless probe: `spike/scratch/.opencode/plugins/probe/index.ts`  
+Runner: `scripts/server-probe.sh` (`opencode2 run --standalone` + `opencode2 api --standalone`, same as live-test.sh)  
+Evidence: `spike/out/server-probe.jsonl`, `spike/out/server-probe-install-config.jsonl`, `spike/out/server-probe-install-autoload.jsonl`
+
+**Version pin:** repo `package.json` dependencies and devDependencies pin `@opencode/plugin` to `0.0.0-beta-19289` (was `"beta"`). The **binary build and plugin package build differ**: `opencode2 --version` = `0.0.0-beta-19271`, installed plugin pkg = `0.0.0-beta-19289`. Types/docs from the pkg may not match the running binary.
+
+| Item | Verdict | Evidence (jsonl `kind`) |
+| --- | --- | --- |
+| D12 create accepts `metadata` without throw | VERIFIED | `d12.session.create` succeeded (`id=ses_f7eaab6c2ffeU9SfOIfBCQpivy`); no `d12.session.create-error` |
+| D12 metadata readable via `ctx.session.get` | REFUTED | `d12.create-shape` / `d12.get-after-create-shape` / `session-record-shape`: `metadata: null`, key absent |
+| D12 metadata visible in session list | UNKNOWN | `d12.session.list-absent` — `ctx.session` has no `list` (`sessionKeys` in `setup`) |
+| Session record shape after child completes | VERIFIED | `session-record-shape` keys: `agent,cost,id,location,outcome,projectID,subpath,time,title,tokens`. `model` absent at session level (lives on assistant messages). `outcome=succeeded`, `tokens` populated, `title=probe-child-meta` |
+| D6 `session.tool.called` + stable part id | VERIFIED | `event` type `session.tool.called`: `data.sessionID` + `data.id` (e.g. `call_e2c856552c484427980f4fe4`) + `durable.{aggregateID,seq,version}` |
+| D6 status / idle / outcome events | REFUTED (idle/status) / VERIFIED (execution) | `event-type-counts`: no `session.idle` / `session.status`. Completion = `session.execution.succeeded` (`durable.seq`) + `session.get().outcome` |
+| D6 durability / replay | VERIFIED | tool events carry `durable.aggregateID` (=session id) + monotonic `seq` + `version` (called v1, success/failed v2). `session.tool.progress` has **no** `durable`. Dedupe on `data.id` per session is viable; replay risk is real (durable stream). |
+| D1 `ctx.skill.reload` + editor methods | VERIFIED | `setup.skillKeys=["list","reload","transform"]`; `skill-transform-callback` methods `add,get,list,remove,update` |
+| D1 late re-transform from executor (not setup) | VERIFIED | `d1.skill.late-transform` `updateThrew: null`; `d1.skill.list-after.probeContent` = updated text. **Replays other transforms:** `skill-transform-callback` `from=setup-registration` fired again on late `transform` and on `reload` (`n` 1→5). |
+| D10 install shape | VERIFIED (auto-load dir) | See below |
+
+**Install shape (D10):** scratch currently has all three: `.opencode/plugins/probe/index.ts` (dir), `.opencode/opencode.json` `plugins: ["./plugins/probe"]`, `.opencode/cli.json` `plugins: ["./plugins/probe"]`. On **this** binary, removing both config `plugins` entries **still loaded** the probe (`server-probe-install-autoload.jsonl` `kind=setup`). Config entry also loaded (`server-probe-install-config.jsonl` `kind=setup`). **Verified shape = auto-load of `.opencode/plugins/*/index.ts`.** (This differs from the 19151 finding in SPIKE-FINDINGS.md that dir auto-load did not work.) `/api/plugin` and `ctx.plugin.list` returned `data: []` even while setup ran — do not use plugin.list as a load detector.
+
+**Plan impact:**
+- **D12:** metadata stamp is not exposed on session records or `session.created` (`dataKeys` have title/agent, no metadata). TUI join must use the **title fallback** as the real contract, not a fallback. Widening `SessionCtx.create` with `metadata` stays type-correct but will not round-trip on this build.
+- **D6:** proceed with `src/run-events.ts` on `session.tool.called` / `success` / `failed`, dedupe `data.id`, ignore events older than `startedAt`. Do not wait for `session.idle`/`session.status`.
+- **D10:** `install.sh` can drop a re-export into `.opencode/plugins/<id>/`; `--write-config` is optional on this build, not required for load.
