@@ -1,9 +1,11 @@
 /** @jsxImportSource solid-js */
 /**
- * Live paint wiring: load the real TUI plugin (src/tui.tsx), then seed a
- * parent session plus `[uc:]` children and open the inspect panel so the
- * two-column inspector paints. Fake children are paint-proof only (no live
- * supervisor run).
+ * Live wiring: load the real TUI plugin (src/tui.tsx), navigate to a parent
+ * session, wait for REAL `[uc:]` children from an authoring prompt typed into
+ * the PTY, then open the inspect panel.
+ *
+ * Fake `run_livepaint` children are a paint-only fallback when no real run
+ * spawns — transport assertions must then be skipped.
  */
 import { appendFileSync, mkdirSync } from "node:fs"
 import { dirname } from "node:path"
@@ -12,9 +14,6 @@ import real from "../../../../../src/tui.tsx"
 const OUT =
   process.env.PROBE_TUI_OUT ??
   "<repo>/spike/out/tui-probe.jsonl"
-const SERVER_OUT =
-  process.env.PROBE_OUT ??
-  "<repo>/spike/out/tui-live-server.jsonl"
 
 function logTo(path: string, kind: string, data: unknown = {}): void {
   try {
@@ -44,6 +43,7 @@ type AnyCtx = {
     }
   }
   data?: {
+    on?: (type: string, handler: (ev: unknown) => void) => () => void
     session?: {
       sync?: (id: string) => Promise<void>
       list?: () => unknown[]
@@ -58,7 +58,129 @@ type PluginDef = {
 
 const realPlugin = real as unknown as PluginDef
 
-async function seed(context: AnyCtx): Promise<void> {
+function ucTitles(context: AnyCtx): string[] {
+  try {
+    const list = context.data?.session?.list?.() ?? []
+    const out: string[] = []
+    for (const item of list) {
+      const title = item && typeof item === "object" ? (item as { title?: string }).title : undefined
+      if (typeof title === "string" && title.includes("[uc:")) out.push(title)
+    }
+    return out
+  } catch {
+    return []
+  }
+}
+
+function isPaintFallback(titles: string[]): boolean {
+  return titles.some((t) => t.includes("run_livepaint"))
+}
+
+async function seedPaintFallback(context: AnyCtx, parentID: string | undefined): Promise<void> {
+  log("WARNING", {
+    message: "no real [uc:] run spawned — seeding run_livepaint paint-only fallback; SKIP transport assertions",
+  })
+  const titles = [
+    `[uc:run_livepaint a1 research${parentID ? ` p:${parentID}` : ""}] seeker`,
+    `[uc:run_livepaint a2 research${parentID ? ` p:${parentID}` : ""}] retry`,
+    `[uc:run_livepaint a3 extract${parentID ? ` p:${parentID}` : ""}] judge`,
+  ]
+  for (const title of titles) {
+    try {
+      const created = await context.client?.session?.create?.({ title })
+      const id = typeof created?.id === "string" ? created.id : undefined
+      log("live-session-create", { id: id ?? null, title, role: "child", fallback: true })
+      if (id) {
+        try {
+          await context.data?.session?.sync?.(id)
+        } catch (err) {
+          log("live-sync-error", String(err))
+        }
+      }
+    } catch (err) {
+      log("live-session-create-error", String(err))
+    }
+  }
+}
+
+async function openInspect(context: AnyCtx): Promise<void> {
+  try {
+    const ok = context.ui?.panel?.open?.("ultracode.inspect")
+    log("live-panel-open", { ok: ok ?? null })
+  } catch (err) {
+    log("live-panel-open-error", String(err))
+  }
+}
+
+async function watchForRun(context: AnyCtx, parentID: string | undefined): Promise<void> {
+  const deadline = Date.now() + 90_000
+  let opened = false
+  let fallback = false
+  let loggedReal = false
+  const tick = async (): Promise<void> => {
+    const titles = ucTitles(context)
+    const realTitles = titles.filter((t) => !t.includes("run_livepaint"))
+    if (realTitles.length > 0) {
+      if (!loggedReal) {
+        loggedReal = true
+        log("live-real-uc-children", { titles: realTitles, parentID: parentID ?? null })
+      }
+      if (!opened) {
+        opened = true
+        await openInspect(context)
+      }
+      return
+    }
+    if (!fallback && Date.now() > deadline - 15_000) {
+      fallback = true
+      await seedPaintFallback(context, parentID)
+      await new Promise((r) => setTimeout(r, 800))
+      await openInspect(context)
+      opened = true
+    }
+  }
+
+  try {
+    context.data?.on?.("session.created", () => {
+      void tick()
+    })
+    context.data?.on?.("session.execution.started", () => {
+      void tick()
+    })
+    context.data?.on?.("session.execution.succeeded", (ev: unknown) => {
+      log("live-child-complete", { event: ev ?? null, titles: ucTitles(context) })
+      void tick()
+    })
+    context.data?.on?.("session.synthetic", (ev: unknown) => {
+      log("live-session-synthetic", { event: ev ?? null })
+    })
+  } catch (err) {
+    log("live-watch-error", String(err))
+  }
+
+  while (Date.now() < deadline) {
+    await tick()
+    if (opened && ucTitles(context).length > 0) break
+    await new Promise((r) => setTimeout(r, 500))
+  }
+
+  const titles = ucTitles(context)
+  const paintOnly = isPaintFallback(titles) && realTitlesEmpty(titles)
+  log("live-watch-done", {
+    sessionID: parentID ?? null,
+    ucTitles: titles,
+    paintFallback: paintOnly,
+    note: paintOnly
+      ? "WARNING: paint-only run_livepaint fallback — skip transport assertions"
+      : "real [uc:] children; transport session = parent",
+  })
+}
+
+function realTitlesEmpty(titles: string[]): boolean {
+  return !titles.some((t) => t.includes("[uc:") && !t.includes("run_livepaint"))
+}
+
+async function boot(context: AnyCtx): Promise<void> {
   let parentID: string | undefined
   try {
     const parent = await context.client?.session?.create?.({ title: "uc-live-parent" })
@@ -75,37 +197,7 @@ async function seed(context: AnyCtx): Promise<void> {
       log("live-navigate-error", String(err))
     }
   }
-
-  const titles = [
-    "[uc:run_livepaint a1 research] seeker",
-    "[uc:run_livepaint a2 research] retry",
-    "[uc:run_livepaint a3 extract] judge",
-  ]
-  for (const title of titles) {
-    try {
-      const created = await context.client?.session?.create?.({ title })
-      const id = typeof created?.id === "string" ? created.id : undefined
-      log("live-session-create", { id: id ?? null, title, role: "child" })
-      if (id) {
-        try {
-          await context.data?.session?.sync?.(id)
-        } catch (err) {
-          log("live-sync-error", String(err))
-        }
-      }
-    } catch (err) {
-      log("live-session-create-error", String(err))
-    }
-  }
-
-  await new Promise((r) => setTimeout(r, 800))
-  try {
-    const ok = context.ui?.panel?.open?.("ultracode.inspect")
-    log("live-panel-open", { ok: ok ?? null })
-  } catch (err) {
-    log("live-panel-open-error", String(err))
-  }
-  await new Promise((r) => setTimeout(r, 1200))
+  await new Promise((r) => setTimeout(r, 600))
   log("ready-for-keys", {
     sessionID: parentID ?? null,
     listCount: (() => {
@@ -115,8 +207,9 @@ async function seed(context: AnyCtx): Promise<void> {
         return null
       }
     })(),
-    note: "fake [uc:] children for paint proof; transport session = parent",
+    note: "parent ready; type authoring prompt for a real run",
   })
+  await watchForRun(context, parentID)
 }
 
 const plugin: PluginDef = {
@@ -139,13 +232,6 @@ const plugin: PluginDef = {
       if (typeof orig === "function" && session) {
         session.command = async (input: unknown) => {
           log("client-session-command", { input })
-          const rec = input && typeof input === "object" ? (input as Record<string, unknown>) : {}
-          logTo(SERVER_OUT, "command-invoked", {
-            name: rec.command ?? "ultracode",
-            sessionID: rec.sessionID ?? null,
-            text: rec.text ?? null,
-            via: "tui-client-wrap",
-          })
           try {
             const result = await orig(input)
             log("client-session-command-done", { input, result: result ?? null })
@@ -160,7 +246,7 @@ const plugin: PluginDef = {
       log("client-command-wrap-error", String(err))
     }
     log("tui-setup-done", { out: OUT })
-    void seed(context).catch((err) => log("live-seed-error", String(err)))
+    void boot(context).catch((err) => log("live-seed-error", String(err)))
     return cleanup
   },
 }

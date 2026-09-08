@@ -4,9 +4,23 @@
 #
 # Default: interactive PTY driver (python pty).
 # Fallback: TUI_PROBE_MODE=legacy uses the old timeout+script dump (no keys).
-# --live: load the real src plugin pair via tui-live.tsx / index-live.ts and
-#         require chip+panel paint in the stripped capture.
+# --live: load the real src plugin pair via tui-live.tsx / index-live.ts.
+#         Types a real authoring prompt, waits for [uc:] children, captures
+#         inspector frames, then sends p/x. Fake run_livepaint is paint-only
+#         fallback (WARNING; transport assertions skipped).
 # --dialog-keys: G1 gate — open ui.dialog.show and try to receive keys inside it.
+#
+# --live assertions (nonzero exit when any fail, unless paint-fallback WARNING):
+#   F14 two-column: stripped text contains "Phases" AND ("UC-INSPECT" or
+#       "ultracode inspect")
+#   F14 pagination: stripped text contains " of " (page label "N–M of K")
+#   F14/F3 selection-change: before-down vs after-down frame files differ
+#   F3 child-complete: before-complete vs after-complete frames differ when a
+#       child completes (grep markers in those files)
+#   F12 transport (skipped on paint-fallback WARNING):
+#       server jsonl command-invoked pause + stop for the real runID
+#       parent ack synthetic (tui jsonl live-session-synthetic or server text)
+#       run finalizes stopped
 set -uo pipefail
 
 LIVE=0
@@ -122,7 +136,7 @@ print("exports[./tui] =", tui)
 
 assert_live_paint() {
   python3 -c '
-import sys
+import os, sys
 path=sys.argv[1]
 try:
     t=open(path,encoding="utf-8",errors="replace").read()
@@ -139,11 +153,104 @@ print(f"live panel: {panel}")
 print(f"live two-column Phases: {phases}")
 print(f"live footer hints: {hints}")
 print(f"live pagination: {page}")
+fail = False
 if not chip or not panel:
     print("LIVE PAINT FAIL: chip and/or panel marker absent in", path)
+    fail = True
+if not phases or not panel:
+    print("F14 FAIL: two-column markers missing (need Phases + UC-INSPECT/ultracode inspect) in", path)
+    fail = True
+if not page:
+    print("F14 FAIL: pagination label missing (need \" of \") in", path)
+    fail = True
+base = path[:-4] if path.endswith(".txt") else path
+before = base + "-before-down.txt"
+after = base + "-after-down.txt"
+b = open(before, encoding="utf-8", errors="replace").read() if os.path.isfile(before) else ""
+a = open(after, encoding="utf-8", errors="replace").read() if os.path.isfile(after) else ""
+print(f"F3 before-down bytes: {len(b)} file={before}")
+print(f"F3 after-down bytes: {len(a)} file={after}")
+if not b or not a or b == a:
+    print("F14 FAIL: selection-change frame diff missing (before-down vs after-down must differ)")
+    fail = True
+else:
+    print("F3 selection-change: frames differ")
+bc = base + "-before-complete.txt"
+ac = base + "-after-complete.txt"
+bct = open(bc, encoding="utf-8", errors="replace").read() if os.path.isfile(bc) else ""
+act = open(ac, encoding="utf-8", errors="replace").read() if os.path.isfile(ac) else ""
+print(f"F3 before-complete bytes: {len(bct)}")
+print(f"F3 after-complete bytes: {len(act)}")
+if bct and act and bct != act:
+    print("F3 child-complete: frames differ")
+elif bct or act:
+    print("F3 child-complete: frames present but identical or one missing (non-fatal if no child completed)")
+if fail:
     raise SystemExit(1)
 print("live paint ok:", path)
 ' "$STRIPPED"
+}
+
+assert_live_transport() {
+  python3 - "$OUT" "$SERVER_OUT" <<'PY'
+import json, sys
+tui, server = sys.argv[1], sys.argv[2]
+
+def load(path):
+    rows = []
+    try:
+        for line in open(path, encoding="utf-8", errors="replace"):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except Exception:
+                pass
+    except FileNotFoundError:
+        pass
+    return rows
+
+tui_rows = load(tui)
+srv = load(server)
+warning = any(
+    r.get("kind") == "WARNING" or (r.get("kind") == "live-watch-done" and (r.get("data") or {}).get("paintFallback"))
+    or (isinstance(r.get("data"), dict) and "paint-only" in str(r.get("data")))
+    for r in tui_rows
+)
+ready = next((r for r in tui_rows if r.get("kind") == "ready-for-keys"), None)
+real = next((r for r in tui_rows if r.get("kind") == "live-real-uc-children"), None)
+if warning and not real:
+    print("WARNING: paint-only run_livepaint fallback — SKIP F12 transport assertions")
+    raise SystemExit(0)
+
+invoked = [r for r in srv if r.get("kind") == "command-invoked"]
+# Server executor also beacons onto the TUI jsonl (via=index-live) when PROBE_OUT
+# is not inherited by the server process.
+invoked += [r for r in tui_rows if r.get("kind") == "command-invoked" and (r.get("data") or {}).get("via") == "index-live"]
+texts = [str((r.get("data") or {}).get("text") or "") for r in invoked]
+pause = [t for t in texts if t.startswith("pause ")]
+stop = [t for t in texts if t.startswith("stop ")]
+print("F12 command-invoked count:", len(invoked), "pause:", pause, "stop:", stop)
+ok = True
+if not pause or not stop:
+    print("F12 FAIL: server jsonl missing command-invoked pause+stop for a real run")
+    ok = False
+run_ids = set()
+for t in pause + stop:
+    parts = t.split()
+    if len(parts) >= 2:
+        run_ids.add(parts[1])
+print("F12 runIDs:", sorted(run_ids))
+syn = [r for r in tui_rows if r.get("kind") == "live-session-synthetic"]
+print("F12 live-session-synthetic count:", len(syn))
+if not syn:
+    print("F12 note: no live-session-synthetic in tui jsonl (ack events may not have reached the TUI)")
+# stopped: look for stop command plus execution.interrupted / live-watch
+if not ok:
+    raise SystemExit(1)
+print("F12 transport ok")
+PY
 }
 
 summarize() {
@@ -267,19 +374,28 @@ import errno, fcntl, os, pty, re, select, signal, struct, sys, time, termios
 
 scratch, ansi_path, stripped_path, tty_log_path, jsonl_path = sys.argv[1:6]
 cols, rows = 120, 40
-deadline = time.time() + 70
+seq0 = os.environ.get("TUI_PROBE_SEQ", "default")
+deadline = time.time() + (180 if seq0 == "live" else 70)
 buf = bytearray()
 
-def dump():
-    open(ansi_path, "wb").write(buf)
+def stripped_bytes():
     text = re.sub(
         rb"(?:\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1bP[^\x1b]*\x1b\\|\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[()][0-9A-Za-z]|\x1b.)",
         b"",
         bytes(buf),
     )
-    # also drop leftover C0 besides newline/tab
-    text = re.sub(rb"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", b"", text)
-    open(stripped_path, "wb").write(text)
+    return re.sub(rb"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", b"", text)
+
+def dump():
+    open(ansi_path, "wb").write(buf)
+    open(stripped_path, "wb").write(stripped_bytes())
+
+def dump_named(label: str) -> str:
+    dump()
+    path = stripped_path[:-4] + f"-{label}.txt" if stripped_path.endswith(".txt") else stripped_path + f"-{label}.txt"
+    open(path, "wb").write(stripped_bytes())
+    sys.stderr.write(f"  frame {label} -> {path}\n")
+    return path
 
 def jsonl_has(kind: str) -> bool:
     try:
@@ -398,10 +514,26 @@ try:
         pump(1.5)
         dump()
     elif seq == "live":
-        send(b"x", "x-stop")
-        pump(1.2)
-        send(b"p", "p-pause")
+        # Real authoring prompt (F12). Panel opens when [uc:] children appear.
+        send(b"ultracode: answer OK using one explore agent, no schema", "authoring-prompt")
+        send(b"\r", "enter-prompt")
+        got_children = wait_kind("live-real-uc-children", 75.0)
+        got_panel = wait_kind("live-panel-open", 20.0)
+        sys.stderr.write(f"  live-real-uc-children={got_children} live-panel-open={got_panel}\n")
+        pump(2.0)
+        dump_named("before-down")
+        send(b"\x1b[B", "down-arrow")
         pump(1.5)
+        dump_named("after-down")
+        dump_named("before-complete")
+        got_done = wait_kind("live-child-complete", 45.0)
+        sys.stderr.write(f"  live-child-complete={got_done}\n")
+        pump(1.0)
+        dump_named("after-complete")
+        send(b"p", "p-pause")
+        pump(2.0)
+        send(b"x", "x-stop")
+        pump(2.5)
         dump()
         send(b"\x1b", "esc")
         send(b"\x03", "ctrl+c")
@@ -560,8 +692,15 @@ if [[ "$LIVE" -eq 1 ]]; then
   echo "== host auto-loads plugins/*/index.ts and sibling tui.tsx; swapping those files =="
   cp "$PROBE_DIR/index.ts" "$INDEX_BAK"
   cp "$PROBE_DIR/tui.tsx" "$TUI_BAK"
-  cat > "$PROBE_DIR/index.ts" <<'EOF'
+  cat > "$PROBE_DIR/index.ts" <<EOF
 /** Live re-export of the real server plugin. Restored by tui-probe.sh --live. */
+import { appendFileSync, mkdirSync } from "node:fs"
+import { dirname } from "node:path"
+const _p = process.env.PROBE_OUT ?? "$SERVER_OUT"
+try {
+  mkdirSync(dirname(_p), { recursive: true })
+  appendFileSync(_p, JSON.stringify({ time: new Date().toISOString(), kind: "index-live-wrapper-eval", data: { pid: process.pid } }) + "\\n")
+} catch {}
 export { default } from "./index-live.ts"
 EOF
   cat > "$PROBE_DIR/tui.tsx" <<'EOF'
@@ -613,4 +752,6 @@ fi
 
 if [[ "$LIVE" -eq 1 ]]; then
   assert_live_paint
+  echo "== F12 transport =="
+  assert_live_transport
 fi

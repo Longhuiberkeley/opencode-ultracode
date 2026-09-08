@@ -281,9 +281,11 @@ when no host dialog is open. `ui.dialog.prompt` is used only for the save-name f
 | --- | --- | --- |
 | Header | yes | Short run id, agent counts, elapsed (`twoColumn` / `runHeaderCells`) |
 | Phases | yes | Left column; observed first-appearance order |
-| Agents | yes | Right column; D11 cells (status, label, phase, agent, model, …) |
-| Tokens | yes | Per-agent + run totals |
-| Tools | yes | `AgentRecord.toolCalls` (event reducer; context fallback) |
+| Agents | yes | Right column; D11 cells (status, label, phase, agent, model, …). Store `agent` is live; model/tools see below. |
+| Tokens | yes | Per-agent from the client store (A2) |
+| Model | partial | Live in `/ultracode show`. TUI: on-demand for the **selected** row via session messages; "-" on other rows until selected. |
+| Tools | partial | Live in `/ultracode show` (`AgentRecord.toolCalls` reducer). TUI: on-demand for the **selected** row (tool parts); "-" elsewhere. |
+| Pause | yes | Key `p` → pause/resume. TUI pause state is **intent-based** (updated only after `session.command` resolves; rejection → error toast, no toggle). `session.synthetic` ack events were **not** observed on the TUI bus during live p/x on beta-19271; `parseRunAck` is ready if they appear. |
 | Pagination | yes | Page height 10; `N of M` / ↓ when more rows |
 | Stop | yes | Key `x` → `/ultracode stop` |
 | Pause | yes | Key `p` → pause/resume |
