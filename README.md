@@ -75,18 +75,29 @@ cd /path/to/opencode-ultracode
 npm install
 ```
 
-Add the plugin by absolute path to your global config `~/.config/opencode/opencode.json`:
+**Local install that is verified on OpenCode v2 beta-19271:** drop a re-export into the
+project (or global) plugin auto-load directory. OpenCode loads `.opencode/plugins/*/index.ts`
+on first session activity (not on a bare `/api/plugin` query):
+
+```ts
+// <project>/.opencode/plugins/ultracode/index.ts
+export { default } from "/path/to/opencode-ultracode/src/index.ts"
+```
+
+Optionally also list it in `.opencode/opencode.json` (relative path from that file):
 
 ```json
 {
-  "plugins": [{ "package": "/path/to/opencode-ultracode" }]
+  "plugins": [
+    { "package": "./plugins/ultracode", "options": { "concurrency": 8 } }
+  ]
 }
 ```
 
-Spike note: local-path plugins need a resolvable `@opencode/plugin` dependency — the `npm install`
-above covers it. If the plugin silently fails to load, check the server logs for
-`disabled plugin after transform failure` (a throwing registration disables the whole plugin;
-every registration here is wrapped, but check logs first when in doubt).
+A bare absolute `"package": "/path/to/opencode-ultracode"` entry was **silently skipped** on
+beta-19271; prefer the auto-load re-export. `npm install` in the plugin repo is required so
+`@opencode/plugin` resolves. If load fails, check server logs for
+`failed to load plugin` / `disabled plugin after transform failure`.
 
 Recommended `.gitignore` entries for projects using the plugin:
 

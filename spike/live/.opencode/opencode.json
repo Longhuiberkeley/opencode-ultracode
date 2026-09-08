@@ -1,0 +1,6 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": [
+    { "package": "./plugins/ultracode", "options": { "concurrency": 2, "maxAgents": 4, "timeoutMs": 300000 } }
+  ]
+}

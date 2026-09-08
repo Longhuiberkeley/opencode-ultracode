@@ -23,8 +23,9 @@ api() { (cd "$LIVE_DIR" && opencode2 api --standalone "$@"); }
 
 case "${1:-}" in
   load)
-    echo "== plugin list =="
-    api get /api/plugin | python3 -c 'import json,sys; d=json.load(sys.stdin); print([p.get("id") for p in d.get("data",[])])'
+    echo "== plugin list (after activation) =="
+    (cd "$LIVE_DIR" && timeout 120 opencode2 api --standalone post /api/plugin/await-activation > /dev/null 2>&1; \
+      opencode2 api --standalone get /api/plugin | python3 -c 'import json,sys; d=json.load(sys.stdin); data=d.get("data",d) if isinstance(d,dict) else d; print([p.get("id") for p in (data or [])])')
     ;;
   run)
     echo "== headless ultracode run =="
