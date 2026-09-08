@@ -9,7 +9,15 @@
     "allowImportingTsExtensions": true,
     "verbatimModuleSyntax": true,
     "erasableSyntaxOnly": true,
-    "types": ["node"]
+    "types": ["node"],
+    "jsx": "preserve",
+    "jsxImportSource": "solid-js",
+    "baseUrl": ".",
+    "paths": {
+      "solid-js": ["src/tui-shims/solid-js.ts"],
+      "solid-js/jsx-runtime": ["src/tui-shims/jsx-runtime.ts"],
+      "solid-js/jsx-dev-runtime": ["src/tui-shims/jsx-runtime.ts"]
+    }
   },
-  "include": ["src/**/*.ts", "test/**/*.ts"]
+  "include": ["src/**/*.ts", "src/**/*.tsx", "src/**/*.d.ts", "test/**/*.ts"]
 }

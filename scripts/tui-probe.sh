@@ -4,18 +4,34 @@
 #
 # Default: interactive PTY driver (python pty).
 # Fallback: TUI_PROBE_MODE=legacy uses the old timeout+script dump (no keys).
+# --live: load the real src plugin pair via tui-live.tsx / index-live.ts and
+#         require chip+panel paint in the stripped capture.
 set -uo pipefail
+
+LIVE=0
+if [[ "${1:-}" == "--live" ]]; then
+  LIVE=1
+  shift
+fi
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SCRATCH="$REPO_ROOT/spike/scratch"
 OUT_DIR="$REPO_ROOT/spike/out"
-OUT="$OUT_DIR/tui-probe.jsonl"
-SERVER_OUT="$OUT_DIR/tui-probe-server.jsonl"
+PREFIX="tui-probe"
+if [[ "$LIVE" -eq 1 ]]; then
+  PREFIX="tui-live"
+fi
+OUT="$OUT_DIR/${PREFIX}.jsonl"
+SERVER_OUT="$OUT_DIR/${PREFIX}-server.jsonl"
 PKG="$SCRATCH/.opencode/plugins/probe/package.json"
+PKG_BAK="$OUT_DIR/${PREFIX}-package.json.bak"
+PROBE_DIR="$SCRATCH/.opencode/plugins/probe"
+INDEX_BAK="$OUT_DIR/${PREFIX}-index.ts.bak"
+TUI_BAK="$OUT_DIR/${PREFIX}-tui.tsx.bak"
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
-ANSI="$OUT_DIR/tui-probe-$TS.ansi"
-STRIPPED="$OUT_DIR/tui-probe-$TS.txt"
-TTY_LOG="$OUT_DIR/tui-probe-tty.txt"
+ANSI="$OUT_DIR/${PREFIX}-$TS.ansi"
+STRIPPED="$OUT_DIR/${PREFIX}-$TS.txt"
+TTY_LOG="$OUT_DIR/${PREFIX}-tty.txt"
 MODE="${TUI_PROBE_MODE:-pty}"
 
 mkdir -p "$OUT_DIR"
@@ -70,6 +86,43 @@ print("exports[./tui] =", t)
 ' "$PKG" "$target"
 }
 
+set_plugin_exports() {
+  local main="$1"
+  local tui="$2"
+  python3 -c '
+import json,sys
+p, main, tui = sys.argv[1], sys.argv[2], sys.argv[3]
+d=json.load(open(p))
+exp=d.setdefault("exports", {})
+exp["."]=main
+exp["./tui"]=tui
+json.dump(d, open(p,"w"), indent=2)
+open(p,"a").write("\n")
+print("exports[.] =", main)
+print("exports[./tui] =", tui)
+' "$PKG" "$main" "$tui"
+}
+
+assert_live_paint() {
+  python3 -c '
+import sys
+path=sys.argv[1]
+try:
+    t=open(path,encoding="utf-8",errors="replace").read()
+except FileNotFoundError:
+    print("LIVE PAINT FAIL: missing stripped capture", path)
+    raise SystemExit(1)
+chip = ("ultracode ·" in t) or ("ultracode" in t and "running" in t)
+panel = ("UC-INSPECT" in t) or ("ultracode inspect" in t) or ("ultracodeinspect" in t.replace(" ",""))
+print(f"live chip: {chip}")
+print(f"live panel: {panel}")
+if not chip or not panel:
+    print("LIVE PAINT FAIL: chip and/or panel marker absent in", path)
+    raise SystemExit(1)
+print("live paint ok:", path)
+' "$STRIPPED"
+}
+
 summarize() {
   echo "== log bytes: $(wc -c < "$OUT" | tr -d ' ') =="
   echo "== server bytes: $(wc -c < "$SERVER_OUT" | tr -d ' ') =="
@@ -114,13 +167,17 @@ print("\n".join(f"{k}: {v}" for k,v in sorted(c.items())) or "(none)")
     python3 -c '
 import sys
 p=sys.argv[1]
+live=sys.argv[2]=="1"
 try:
     t=open(p,encoding="utf-8",errors="replace").read()
 except FileNotFoundError:
     raise SystemExit
-for needle in ["UCPROBE-CHIP","UCPROBE-PANEL","UCPROBE-DIALOG","UCPROBE-HOME"]:
+needles=["UCPROBE-CHIP","UCPROBE-PANEL","UCPROBE-DIALOG","UCPROBE-HOME"]
+if live:
+    needles=["ultracode ·","ultracode inspect","UC-INSPECT","ultracode","running"]
+for needle in needles:
     print(f"stripped has {needle}: {needle in t}")
-' "$STRIPPED"
+' "$STRIPPED" "$LIVE"
   fi
 }
 
@@ -389,10 +446,41 @@ for line in out.splitlines():
 ' "$SCRATCH" 2>/dev/null || true
 }
 
-trap 'cleanup_strays' EXIT
+restore_pkg() {
+  if [[ -f "$PKG_BAK" ]]; then
+    cp "$PKG_BAK" "$PKG" 2>/dev/null || true
+  fi
+  if [[ -f "$INDEX_BAK" ]]; then
+    cp "$INDEX_BAK" "$PROBE_DIR/index.ts" 2>/dev/null || true
+  fi
+  if [[ -f "$TUI_BAK" ]]; then
+    cp "$TUI_BAK" "$PROBE_DIR/tui.tsx" 2>/dev/null || true
+  fi
+}
 
-# D13: try plain .tsx first
-set_tui_export "./tui.tsx"
+trap 'cleanup_strays; restore_pkg' EXIT
+
+cp "$PKG" "$PKG_BAK"
+
+if [[ "$LIVE" -eq 1 ]]; then
+  echo "== live mode: real src/index.ts + src/tui.tsx via probe re-exports =="
+  echo "== host auto-loads plugins/*/index.ts and sibling tui.tsx; swapping those files =="
+  cp "$PROBE_DIR/index.ts" "$INDEX_BAK"
+  cp "$PROBE_DIR/tui.tsx" "$TUI_BAK"
+  cat > "$PROBE_DIR/index.ts" <<'EOF'
+/** Live re-export of the real server plugin. Restored by tui-probe.sh --live. */
+export { default } from "./index-live.ts"
+EOF
+  cat > "$PROBE_DIR/tui.tsx" <<'EOF'
+/** @jsxImportSource solid-js */
+/** Live re-export of the real TUI plugin. Restored by tui-probe.sh --live. */
+export { default } from "./tui-live.tsx"
+EOF
+  set_plugin_exports "./index-live.ts" "./tui-live.tsx"
+else
+  # D13: try plain .tsx first
+  set_tui_export "./tui.tsx"
+fi
 
 if [[ "$MODE" == "legacy" ]]; then
   run_legacy
@@ -406,7 +494,7 @@ else
 fi
 
 # If TSX never evaluated, switch export to tui.ts and rerun once (unless already fallback)
-if ! jsonl_has "$OUT" "tui-module-evaluated"; then
+if [[ "$LIVE" -eq 0 ]] && ! jsonl_has "$OUT" "tui-module-evaluated"; then
   echo "== D13: tui.tsx did not evaluate; retrying with ./tui.ts fallback =="
   : > "$OUT"
   : > "$SERVER_OUT"
@@ -424,3 +512,7 @@ echo "jsonl: $OUT"
 echo "server jsonl: $SERVER_OUT"
 echo "ansi: $ANSI"
 echo "stripped: $STRIPPED"
+
+if [[ "$LIVE" -eq 1 ]]; then
+  assert_live_paint
+fi
