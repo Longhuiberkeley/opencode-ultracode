@@ -6,7 +6,7 @@
  * status dot.
  */
 import { parseChildTitle } from "./sessions.ts"
-import { agentCells } from "./run-format.ts"
+import { agentCells, compactElapsed } from "./run-format.ts"
 import type { AgentRecord, AgentStatus, TokenUsage } from "./types.ts"
 
 const VERSION_RE = /^v?0\.0\.0-beta-(\d+)$/
@@ -250,4 +250,100 @@ export function runningRunCount(runs: readonly RunView[]): number {
 
 export function formatCounts(counts: RunView["counts"]): string {
   return `${counts.done}/${counts.total}${counts.failed ? ` failed ${counts.failed}` : ""}`
+}
+
+export function shortRunID(runID: string): string {
+  if (runID.length <= 16) return runID
+  return runID.slice(0, 16)
+}
+
+export type TwoColumnOpts = {
+  width: number
+  selectedPhase: number
+  offset: number
+  height: number
+  now?: number
+}
+
+export type TwoColumnView = {
+  header: string[]
+  left: string[]
+  right: string[][]
+  footer: string[]
+  page: string
+}
+
+function clip(s: string, width: number): string {
+  if (width <= 0 || s.length <= width) return s
+  if (width === 1) return s.slice(0, 1)
+  return `${s.slice(0, width - 1)}…`
+}
+
+/**
+ * Footer hint line listing only the keys actually bound.
+ * Known chords collapse to the overlay legend (↑↓ select, x stop, …).
+ */
+export function footerHints(bound: string[]): string {
+  const set = new Set(bound.map((b) => b.trim().toLowerCase()))
+  const has = (...keys: string[]): boolean => keys.some((k) => set.has(k))
+  const parts: string[] = []
+  if (has("up", "down", "↑", "↓", "↑↓")) parts.push("↑↓ select")
+  if (has("x")) parts.push("x stop")
+  if (has("p")) parts.push("p pause")
+  if (has("s")) parts.push("s save")
+  const enter = has("return", "enter", "enter/→")
+  const right = has("right", "→", "enter/→")
+  if (enter && right) parts.push("enter/→ drill")
+  else if (enter) parts.push("enter drill")
+  else if (right) parts.push("→ drill")
+  if (has("esc")) parts.push("esc close")
+  const known = new Set(["up", "down", "↑", "↓", "↑↓", "x", "p", "s", "return", "enter", "right", "→", "enter/→", "esc"])
+  for (const raw of bound) {
+    const k = raw.trim()
+    if (k && !known.has(k.toLowerCase())) parts.push(k)
+  }
+  return parts.join("  ")
+}
+
+/**
+ * Two-column inspect view: left = numbered phases, right = D11 cells for the
+ * selected phase. Pagination label gains " ↓" when more rows sit below.
+ */
+export function twoColumn(runView: RunView, opts: TwoColumnOpts): TwoColumnView {
+  const now = opts.now ?? Date.now()
+  const elapsed = compactElapsed(Math.max(0, now - runView.startedAt))
+  const headerLine = `${shortRunID(runView.runID)} · ${runView.counts.done}/${runView.counts.total} agents · ${elapsed}`
+  const cols = phaseColumns(runView)
+  const phaseCount = cols.length
+  const selPh = phaseCount === 0 ? 0 : Math.min(Math.max(0, Math.floor(opts.selectedPhase)), phaseCount - 1)
+
+  const left: string[] = ["Phases"]
+  if (phaseCount === 0) {
+    left.push("  (none)")
+  } else {
+    for (let i = 0; i < cols.length; i++) {
+      const col = cols[i]!
+      const mark = i === selPh ? ">" : " "
+      left.push(`${mark} ${i + 1} ${col.phase} ${col.done}/${col.total}`)
+    }
+  }
+
+  const phaseName = phaseCount === 0 ? undefined : cols[selPh]!.phase
+  const rows = agentRows(runView, phaseName)
+  const inPhase =
+    phaseName === undefined ? runView.agents : runView.agents.filter((a) => a.phase === phaseName)
+  const title = `${phaseName ?? "agents"} · ${inPhase.length} agents`
+  const page = paginate(rows, opts.offset, opts.height)
+  const more = page.window.length > 0 && opts.offset + page.window.length < rows.length
+  const pageLabel = more ? `${page.label} ↓` : page.label
+  const right: string[][] = [[title], ...page.window]
+
+  const width = Math.max(0, Math.floor(opts.width))
+  return {
+    header: [clip(headerLine, width)],
+    left: left.map((line) => clip(line, width)),
+    right: right.map((cells) => cells.map((c) => clip(c, width))),
+    footer: [],
+    page: pageLabel,
+  }
 }

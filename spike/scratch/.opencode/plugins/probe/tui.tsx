@@ -484,6 +484,148 @@ function registerSlotsAndCommands(context: AnyCtx): void {
   dumpCommands(keymap as Record<string, unknown>, "after-layer-setup")
 }
 
+const DIALOG_KEYS = process.env.PROBE_DIALOG_KEYS === "1"
+
+function receipt(mechanism: string, key: string, extra: unknown = {}): void {
+  log("dialog-keys-receipt", { mechanism, key, dialogOpen, ...((extra && typeof extra === "object" ? extra : { extra }) as object) })
+}
+
+function KeysDialog() {
+  try {
+    const keymap = ctxRef?.keymap as { layer?: (input: () => unknown) => void } | undefined
+    keymap?.layer?.(() => ({
+      enabled: true,
+      priority: 200,
+      commands: [
+        {
+          id: "probe.dialogkeys.d",
+          title: "dialog-keys layer d",
+          bind: "d",
+          run: (_input?: string, event?: unknown) => {
+            receipt("layer", "d", { from: "component-dialog", event: shape(event, 1) })
+          },
+        },
+        {
+          id: "probe.dialogkeys.x",
+          title: "dialog-keys layer x",
+          bind: "x",
+          run: (_input?: string, event?: unknown) => {
+            receipt("layer", "x", { from: "component-dialog", event: shape(event, 1) })
+          },
+        },
+        {
+          id: "probe.dialogkeys.p",
+          title: "dialog-keys layer p",
+          bind: "p",
+          run: (_input?: string, event?: unknown) => {
+            receipt("layer", "p", { from: "component-dialog", event: shape(event, 1) })
+          },
+        },
+      ],
+    }))
+    log("dialog-keys-layer-ok", { from: "component-dialog", priority: 200, binds: ["d", "x", "p"] })
+  } catch (err) {
+    log("dialog-keys-layer-error", String(err))
+  }
+
+  const onKey = (mechanism: string) => (event?: unknown) => {
+    receipt(mechanism, "event", { event: shape(event, 1) })
+  }
+  const keyProps = {
+    onKey: onKey("onKey"),
+    onKeyDown: onKey("onKeyDown"),
+    onKeyPress: onKey("onKeyPress"),
+    onKeyUp: onKey("onKeyUp"),
+    focused: true,
+    focusable: true,
+  }
+  log("dialog-keys-onkey-props", { tried: Object.keys(keyProps) })
+  return (
+    <box {...keyProps} flexDirection="column">
+      <text {...keyProps}>G1-DIALOG-KEYS</text>
+    </box>
+  )
+}
+
+async function afterSetupDialogKeys(context: AnyCtx): Promise<void> {
+  const ui = context.ui as {
+    dialog?: {
+      show?: (...args: unknown[]) => void
+      set?: (opts: unknown) => void
+      clear?: () => void
+    }
+    router?: { navigate?: (d: unknown) => void }
+  }
+  const client = context.client as {
+    session?: { create?: (input?: unknown) => Promise<Record<string, unknown>> }
+  }
+  const keymap = context.keymap as Record<string, unknown>
+
+  log("dialog-keys-api", {
+    dialogKeys: keysOf(ui.dialog),
+    showType: typeof ui.dialog?.show,
+    setType: typeof ui.dialog?.set,
+    dialogOptionsTried: ["size", "centered", "onKey", "onKeyDown", "keys", "keymap", "handler"],
+  })
+
+  try {
+    const created = await client?.session?.create?.({ title: "probe-dialog-keys-parent" })
+    parentSessionID = typeof created?.id === "string" ? created.id : null
+    log("client-session-create", { id: parentSessionID })
+    if (parentSessionID) {
+      try {
+        ui.router?.navigate?.({ type: "session", sessionID: parentSessionID })
+        log("router-navigate", { sessionID: parentSessionID })
+      } catch (err) {
+        log("router-navigate-error", String(err))
+      }
+    }
+  } catch (err) {
+    log("client-session-create-error", String(err))
+  }
+
+  await new Promise((r) => setTimeout(r, 800))
+
+  try {
+    dialogOpen = true
+    ui.dialog?.show?.(
+      () => <KeysDialog />,
+      () => {
+        dialogOpen = false
+        log("dialog-onclose", { via: "callback" })
+      },
+    )
+    log("dialog-show-ok", { mode: "dialog-keys" })
+  } catch (err) {
+    log("dialog-show-error", String(err))
+  }
+
+  try {
+    ui.dialog?.set?.({ size: "large", centered: true })
+    log("dialog-set-ok", { size: "large", centered: true })
+  } catch (err) {
+    log("dialog-set-error", String(err))
+  }
+
+  for (const extra of [
+    { onKey: true },
+    { onKeyDown: true },
+    { keys: { d: true } },
+    { keymap: true },
+    { handler: true },
+  ]) {
+    try {
+      ui.dialog?.set?.(extra)
+      log("dialog-keys-option-set-ok", extra)
+    } catch (err) {
+      log("dialog-keys-option-set-error", { extra, error: String(err) })
+    }
+  }
+
+  dumpCommands(keymap, "dialog-keys-after-show")
+  log("ready-for-keys", { mode: "dialog-keys", parentSessionID, dialogOpen })
+}
+
 function openDialog(ui: {
   dialog?: {
     show?: (render: () => unknown, onClose?: () => void) => void
@@ -539,7 +681,13 @@ const plugin = define
           options: context.options ?? null,
           location: shape(context.location, 2),
           entry: "tui.tsx",
+          dialogKeys: DIALOG_KEYS,
         })
+        if (DIALOG_KEYS) {
+          log("tui-setup-done", { out: OUT, mode: "dialog-keys" })
+          void afterSetupDialogKeys(context).catch((err) => log("after-setup-error", String(err)))
+          return () => log("tui-dispose", {})
+        }
         subscribeData(context)
         registerSlotsAndCommands(context)
         log("tui-setup-done", { out: OUT })
@@ -552,6 +700,11 @@ const plugin = define
       setup(context: AnyCtx) {
         ctxRef = context
         log("tui-setup-without-define", { contextKeys: keysOf(context) })
+        if (DIALOG_KEYS) {
+          log("tui-setup-done", { out: OUT, mode: "dialog-keys" })
+          void afterSetupDialogKeys(context).catch((err) => log("after-setup-error", String(err)))
+          return () => log("tui-dispose", {})
+        }
         subscribeData(context)
         registerSlotsAndCommands(context)
         log("tui-setup-done", { out: OUT })

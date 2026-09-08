@@ -8,6 +8,7 @@ import type { AgentRecord, TokenUsage } from "../src/types.ts"
 import {
   STATUS_DOT,
   agentRows,
+  footerHints,
   formatCounts,
   groupRuns,
   nextSettlePrev,
@@ -18,6 +19,8 @@ import {
   runningRunCount,
   settleCandidate,
   shouldEnableTui,
+  shortRunID,
+  twoColumn,
   type RunView,
   type SessionView,
   type SettlePrev,
@@ -253,4 +256,82 @@ test("runFingerprint + formatCounts", () => {
   assert.equal(runFingerprint(run), "s1:succeeded|s2:failed")
   assert.equal(formatCounts(run.counts), "2/2 failed 1")
   assert.equal(formatCounts({ total: 3, done: 3, failed: 0 }), "3/3")
+})
+
+test("footerHints: only bound keys, collapsed chords", () => {
+  assert.equal(footerHints([]), "")
+  assert.equal(footerHints(["up", "down", "x", "p", "s", "return", "right", "esc"]), "↑↓ select  x stop  p pause  s save  enter/→ drill  esc close")
+  assert.equal(footerHints(["x", "esc"]), "x stop  esc close")
+  assert.equal(footerHints(["enter"]), "enter drill")
+  assert.equal(footerHints(["right"]), "→ drill")
+  assert.equal(footerHints(["p", "custom"]), "p pause  custom")
+})
+
+test("twoColumn: phases left, D11 right, pagination ↓, header", () => {
+  const run: RunView = {
+    runID: "run_abc123def456789",
+    phases: ["extract", "verify"],
+    startedAt: 1000,
+    settled: false,
+    counts: { total: 3, done: 1, failed: 1 },
+    agents: [
+      {
+        sessionID: "ses_1",
+        ord: "a3",
+        phase: "extract",
+        label: "seeker",
+        status: "running",
+        tokens: TOKENS_42_6K,
+        title: "[uc:run_abc123def456789 a3 extract] seeker",
+      },
+      {
+        sessionID: "ses_2",
+        ord: "a1",
+        phase: "verify",
+        label: undefined,
+        status: "pending",
+        title: "[uc:run_abc123def456789 a1 verify] a1",
+      },
+      {
+        sessionID: "ses_3",
+        ord: "a2",
+        phase: "verify",
+        label: "judge",
+        status: "failed",
+        title: "[uc:run_abc123def456789 a2 verify] judge",
+      },
+    ],
+  }
+
+  assert.equal(shortRunID(run.runID), "run_abc123def456")
+
+  const page0 = twoColumn(run, { width: 80, selectedPhase: 0, offset: 0, height: 10, now: 2500 })
+  assert.deepEqual(page0.header, ["run_abc123def456 · 1/3 agents · 1.5s"])
+  assert.deepEqual(page0.left, ["Phases", "> 1 extract 0/1", "  2 verify 1/2"])
+  assert.equal(page0.right[0]![0], "extract · 1 agents")
+  assert.deepEqual(page0.right[1], ["●", "a3 seeker", "extract", "-", "-", "42.6k", "-"])
+  assert.equal(page0.page, "1–1 of 1")
+  assert.deepEqual(page0.footer, [])
+
+  const page1 = twoColumn(run, { width: 80, selectedPhase: 1, offset: 0, height: 1, now: 2500 })
+  assert.deepEqual(page1.left, ["Phases", "  1 extract 0/1", "> 2 verify 1/2"])
+  assert.equal(page1.right[0]![0], "verify · 2 agents")
+  assert.equal(page1.right.length, 2) // title + 1 window row
+  assert.equal(page1.page, "1–1 of 2 ↓")
+
+  const page1b = twoColumn(run, { width: 80, selectedPhase: 1, offset: 1, height: 1, now: 2500 })
+  assert.equal(page1b.page, "2–2 of 2")
+  assert.deepEqual(page1b.right[1], ["✗", "a2 judge", "verify", "-", "-", "-", "-"])
+
+  const emptyPhases: RunView = {
+    runID: "ab12cd34",
+    phases: [],
+    startedAt: 0,
+    settled: true,
+    counts: { total: 1, done: 1, failed: 0 },
+    agents: [{ sessionID: "s1", status: "succeeded", title: "[uc:ab12cd34] seeker" }],
+  }
+  const none = twoColumn(emptyPhases, { width: 40, selectedPhase: 9, offset: 0, height: 5, now: 0 })
+  assert.deepEqual(none.left, ["Phases", "  (none)"])
+  assert.equal(none.right[0]![0], "agents · 1 agents")
 })

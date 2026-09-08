@@ -6,13 +6,18 @@
 # Fallback: TUI_PROBE_MODE=legacy uses the old timeout+script dump (no keys).
 # --live: load the real src plugin pair via tui-live.tsx / index-live.ts and
 #         require chip+panel paint in the stripped capture.
+# --dialog-keys: G1 gate — open ui.dialog.show and try to receive keys inside it.
 set -uo pipefail
 
 LIVE=0
-if [[ "${1:-}" == "--live" ]]; then
-  LIVE=1
-  shift
-fi
+DIALOG_KEYS=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --live) LIVE=1; shift ;;
+    --dialog-keys) DIALOG_KEYS=1; shift ;;
+    *) break ;;
+  esac
+done
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SCRATCH="$REPO_ROOT/spike/scratch"
@@ -20,6 +25,8 @@ OUT_DIR="$REPO_ROOT/spike/out"
 PREFIX="tui-probe"
 if [[ "$LIVE" -eq 1 ]]; then
   PREFIX="tui-live"
+elif [[ "$DIALOG_KEYS" -eq 1 ]]; then
+  PREFIX="tui-dialog-keys"
 fi
 OUT="$OUT_DIR/${PREFIX}.jsonl"
 SERVER_OUT="$OUT_DIR/${PREFIX}-server.jsonl"
@@ -41,6 +48,16 @@ mkdir -p "$OUT_DIR"
 
 export PROBE_TUI_OUT="$OUT"
 export PROBE_OUT="$SERVER_OUT"
+if [[ "$DIALOG_KEYS" -eq 1 ]]; then
+  export PROBE_DIALOG_KEYS=1
+  export TUI_PROBE_SEQ=dialog-keys
+else
+  unset PROBE_DIALOG_KEYS || true
+  export TUI_PROBE_SEQ="${TUI_PROBE_SEQ:-default}"
+fi
+if [[ "$LIVE" -eq 1 ]]; then
+  export TUI_PROBE_SEQ=live
+fi
 
 echo "== tui probe (opencode2 $(opencode2 --version 2>/dev/null || echo '?')) =="
 echo "scratch: $SCRATCH"
@@ -114,8 +131,14 @@ except FileNotFoundError:
     raise SystemExit(1)
 chip = ("ultracode ·" in t) or ("ultracode" in t and "running" in t)
 panel = ("UC-INSPECT" in t) or ("ultracode inspect" in t) or ("ultracodeinspect" in t.replace(" ",""))
+phases = "Phases" in t
+hints = ("x stop" in t) or ("p pause" in t) or ("select" in t and "pause" in t)
+page = (" of " in t) or ("1–" in t) or ("1-" in t)
 print(f"live chip: {chip}")
 print(f"live panel: {panel}")
+print(f"live two-column Phases: {phases}")
+print(f"live footer hints: {hints}")
+print(f"live pagination: {page}")
 if not chip or not panel:
     print("LIVE PAINT FAIL: chip and/or panel marker absent in", path)
     raise SystemExit(1)
@@ -174,11 +197,49 @@ except FileNotFoundError:
     raise SystemExit
 needles=["UCPROBE-CHIP","UCPROBE-PANEL","UCPROBE-DIALOG","UCPROBE-HOME"]
 if live:
-    needles=["ultracode ·","ultracode inspect","UC-INSPECT","ultracode","running"]
+    needles=["ultracode ·","ultracode inspect","UC-INSPECT","ultracode","running","Phases"]
+if sys.argv[3]=="1":
+    needles=["G1-DIALOG-KEYS","G1LEAK"]
 for needle in needles:
     print(f"stripped has {needle}: {needle in t}")
-' "$STRIPPED" "$LIVE"
+' "$STRIPPED" "$LIVE" "$DIALOG_KEYS"
   fi
+}
+
+g1_verdict() {
+  python3 - "$OUT" "$STRIPPED" <<'PY'
+import json, sys
+path, stripped = sys.argv[1], sys.argv[2]
+receipts = []
+try:
+    for line in open(path, encoding="utf-8", errors="replace"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        if rec.get("kind") == "dialog-keys-receipt":
+            receipts.append(rec.get("data") or {})
+except FileNotFoundError:
+    pass
+text = ""
+try:
+    text = open(stripped, encoding="utf-8", errors="replace").read()
+except FileNotFoundError:
+    pass
+mechs = sorted({str(r.get("mechanism")) for r in receipts})
+leaked = "G1LEAK" in text
+print("G1 receipts:", len(receipts), "mechanisms=" + ",".join(mechs))
+print("G1 leak G1LEAK in stripped:", leaked)
+go = len(receipts) > 0 and not leaked
+print("G1 verdict:", "GO" if go else "NO-GO")
+if go:
+    print("G1 mechanism:", ",".join(mechs))
+else:
+    print("G1 mechanism: none (layer inside dialog, onKey/onKeyDown, dialog.set extras)")
+PY
 }
 
 run_legacy() {
@@ -308,6 +369,9 @@ try:
             pump(0.2)
         return jsonl_has(kind)
 
+    seq = os.environ.get("TUI_PROBE_SEQ", "default")
+    sys.stderr.write(f"  seq={seq}\n")
+
     # boot
     pump(2.0)
     booted = wait_kind("tui-setup-done", 12.0)
@@ -317,64 +381,93 @@ try:
     pump(1.5)
     dump()
 
-    # auto-show dialog is up: send z while dialog open (layer should NOT see it)
-    send(b"z", "z-while-dialog")
-    send(b"z", "z-while-dialog-2")
-    send(b"\x0b", "ctrl+k-while-dialog")
-    pump(0.5)
-    dump()
+    if seq == "dialog-keys":
+        # G1: keys while dialog.show content is mounted
+        send(b"d", "d-layer-inside-dialog")
+        send(b"x", "x-layer-inside-dialog")
+        send(b"p", "p-layer-inside-dialog")
+        send(b"G1LEAK", "g1leak-prompt-canary")
+        pump(0.8)
+        dump()
+        send(b"\x1b", "esc-close-dialog")
+        pump(1.0)
+        dump()
+        send(b"\x03", "ctrl+c")
+        pump(1.0)
+        send(b"\x03", "ctrl+c-2")
+        pump(1.5)
+        dump()
+    elif seq == "live":
+        send(b"x", "x-stop")
+        pump(1.2)
+        send(b"p", "p-pause")
+        pump(1.5)
+        dump()
+        send(b"\x1b", "esc")
+        send(b"\x03", "ctrl+c")
+        pump(1.0)
+        send(b"\x03", "ctrl+c-2")
+        pump(1.5)
+        dump()
+    else:
+        # auto-show dialog is up: send z while dialog open (layer should NOT see it)
+        send(b"z", "z-while-dialog")
+        send(b"z", "z-while-dialog-2")
+        send(b"\x0b", "ctrl+k-while-dialog")
+        pump(0.5)
+        dump()
 
-    # esc closes dialog / fires onClose
-    send(b"\x1b", "esc-close-dialog")
-    pump(0.8)
-    dump()
+        # esc closes dialog / fires onClose
+        send(b"\x1b", "esc-close-dialog")
+        pump(0.8)
+        dump()
 
-    # keystroke-driven panel (ultracode.inspect bind ctrl+g)
-    send(b"\x07", "ctrl+g")
-    pump(1.2)
-    dump()
+        # keystroke-driven panel (ultracode.inspect bind ctrl+g)
+        send(b"\x07", "ctrl+g")
+        pump(1.2)
+        dump()
 
-    # keystroke-driven dialog (probe.dialog bind ctrl+f)
-    send(b"\x06", "ctrl+f")
-    pump(1.2)
-    dump()
+        # keystroke-driven dialog (probe.dialog bind ctrl+f)
+        send(b"\x06", "ctrl+f")
+        pump(1.2)
+        dump()
 
-    send(b"z", "z-while-dialog-2nd")
-    pump(0.4)
-    send(b"\x1b", "esc-close-dialog-2")
-    pump(0.8)
-    dump()
+        send(b"z", "z-while-dialog-2nd")
+        pump(0.4)
+        send(b"\x1b", "esc-close-dialog-2")
+        pump(0.8)
+        dump()
 
-    # z after dialog close — layer should capture; must not leak into prompt
-    send(b"zzz", "zzz-after-esc")
-    pump(0.6)
-    dump()
+        # z after dialog close — layer should capture; must not leak into prompt
+        send(b"zzz", "zzz-after-esc")
+        pump(0.6)
+        dump()
 
-    # command palette (ctrl+p) searches title
-    send(b"\x10", "ctrl+p")
-    pump(0.6)
-    send(b"inspect", "type inspect")
-    pump(0.5)
-    send(b"\r", "enter")
-    pump(1.0)
-    dump()
+        # command palette (ctrl+p) searches title
+        send(b"\x10", "ctrl+p")
+        pump(0.6)
+        send(b"inspect", "type inspect")
+        pump(0.5)
+        send(b"\r", "enter")
+        pump(1.0)
+        dump()
 
-    # slash fallback
-    send(b"\x1b", "esc-2")
-    pump(0.3)
-    send(b"/ucprobe", "slash ucprobe")
-    pump(0.4)
-    send(b"\r", "enter-slash")
-    pump(1.0)
-    dump()
+        # slash fallback
+        send(b"\x1b", "esc-2")
+        pump(0.3)
+        send(b"/ucprobe", "slash ucprobe")
+        pump(0.4)
+        send(b"\r", "enter-slash")
+        pump(1.0)
+        dump()
 
-    # quit
-    send(b"\x1b", "esc-quit")
-    send(b"\x03", "ctrl+c")
-    pump(1.0)
-    send(b"\x03", "ctrl+c-2")
-    pump(1.5)
-    dump()
+        # quit
+        send(b"\x1b", "esc-quit")
+        send(b"\x03", "ctrl+c")
+        pump(1.0)
+        send(b"\x03", "ctrl+c-2")
+        pump(1.5)
+        dump()
 finally:
     dump()
     try:
@@ -512,6 +605,11 @@ echo "jsonl: $OUT"
 echo "server jsonl: $SERVER_OUT"
 echo "ansi: $ANSI"
 echo "stripped: $STRIPPED"
+
+if [[ "$DIALOG_KEYS" -eq 1 ]]; then
+  echo "== G1 dialog-keys =="
+  g1_verdict
+fi
 
 if [[ "$LIVE" -eq 1 ]]; then
   assert_live_paint

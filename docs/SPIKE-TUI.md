@@ -188,3 +188,22 @@ Full child: `title="probe-tui-child"`, `outcome="succeeded"`, `tokens={input,out
 No `session.idle` / `session.status` on the **client** bus either (matches phase 0-server). Completion signal = `session.execution.succeeded` + `data.session.get/list().outcome`.
 
 **Plan impact:** D13 gate passed — Phase 2 TUI v1 may use `.tsx` + `jsxImportSource: "solid-js"` without adding `solid-js` to the plugin runtime (host provides JSX). D12 metadata is also missing from the **client** store; join on title. D4 transport shape confirmed. Overlay keys (Phase 3) must register `keymap.layer` inside the dialog component; do not expect chip-layer keys to fire while `dialog.show` is up.
+
+## Addendum 2026-09-08 (phase 3 G1 — dialog key capture, build 0.0.0-beta-19271)
+
+Runner: `scripts/tui-probe.sh --dialog-keys` (`PROBE_DIALOG_KEYS=1`, probe `tui.tsx` `KeysDialog`).  
+Evidence: `spike/out/tui-dialog-keys.jsonl`, `spike/out/tui-dialog-keys-20260908T151921Z.ansi` + `.txt`.
+
+Tried, in order, while `ui.dialog.show` was open (`G1-DIALOG-KEYS` painted):
+
+| Mechanism | Result | Evidence |
+| --- | --- | --- |
+| (a) `keymap.layer` from a component **mounted inside** the dialog render (`priority` 200, binds `d`/`x`/`p`) | **REFUTED** | `dialog-keys-layer-ok` then zero `dialog-keys-receipt`. `keymap-probeish` label `dialog-keys-after-show` does **not** list `probe.dialogkeys.*` (host dialog owns the keymap — same as A4). |
+| (b) `onKey` / `onKeyDown` / `onKeyPress` / `onKeyUp` props on `<box>` / `<text>` | **REFUTED** | `dialog-keys-onkey-props` tried those names; zero receipts. Not in `@opencode/plugin` 19289 Dialog / JSX typings. |
+| (c) dialog options carrying key handlers (`dialog.set({ onKey, onKeyDown, keys, keymap, handler })`) | **REFUTED** | `dialog-keys-option-set-ok` ×5 (no throw) but options are presentation-only per d.ts (`size`, `centered`); no receipts. `ui.dialog` keys: `alert,clear,confirm,prompt,select,set,show`. |
+
+`G1LEAK` canary was **absent** from stripped text (host dialog swallowed keystrokes) but **no plugin mechanism received them**. ESC still fired `dialog-onclose`.
+
+### G1 verdict: **NO-GO**
+
+No mechanism receives keys inside `dialog.show` without (or even with) leaking to the prompt. Phase 3 overlay is **panel-hosted**: two-column inspect stays in `session.panel` (component `keymap.layer` verified in Phase 2). `ui.dialog.prompt` is used only for the save-name flow.
