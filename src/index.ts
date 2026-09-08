@@ -21,6 +21,7 @@ import {
   feedToolEvent,
   handleUltracodeCommand,
   matchesUltracodeKeyword,
+  prepareRunLaunch,
 } from "./command.ts"
 import { loadOptions } from "./config.ts"
 import { RegistryImpl } from "./registry.ts"
@@ -408,17 +409,6 @@ export default Plugin.define({
                 }
                 const input = parsed.input
 
-                // Agent availability: fresh fetch on EVERY invocation; a failed
-                // fetch fails the run (no silent stale reuse).
-                const agents = await listAgents()
-                if (!agents.ok) {
-                  return {
-                    content: `error: could not list available agents (${agents.error}) — refusing to start the run`,
-                  }
-                }
-                const availableAgents = agents.agents.map((a) => a.id)
-                await maybeInjectCatalog(agents.agents)
-
                 let script: string
                 let meta: WorkflowMeta | undefined
                 let name: string | undefined
@@ -463,33 +453,20 @@ export default Plugin.define({
                   args = input.args
                 }
 
-                // Preflight required agents (fail fast, list what's available).
-                const requires = meta?.requires ?? []
-                const missingRequires = [...new Set(requires)].filter((id) => !availableAgents.includes(id))
-                if (missingRequires.length > 0) {
-                  return {
-                    content:
-                      `error: workflow requires agent(s) not available: ${missingRequires.join(", ")}. ` +
-                      `Available agents: ${availableAgents.join(", ") || "(none — create agents or check your install)"}`,
-                  }
-                }
-
-                // Validate the configured default agent for this run.
-                if (!availableAgents.includes(options.agent)) {
-                  return {
-                    content:
-                      `error: default agent "${options.agent}" is not available in this location. ` +
-                      `Available agents: ${availableAgents.join(", ") || "(none — create agents or check your install)"}. ` +
-                      `Set the "agent" plugin option to an available agent id.`,
-                  }
-                }
+                const prep = await prepareRunLaunch({
+                  listAgents,
+                  defaultAgent: options.agent,
+                  requires: meta?.requires,
+                })
+                if (!prep.ok) return { content: prep.error }
+                await maybeInjectCatalog(prep.agents)
 
                 const parent: ParentContext = {
                   sessionID: tool.sessionID,
                   agent: tool.agent,
                   messageID: tool.messageID,
                   report: makeReporter(tool.progress as (update: Record<string, unknown>) => Promise<void>),
-                  availableAgents,
+                  availableAgents: prep.availableAgents,
                 }
                 const outcome = await supervisor.start({ script, meta, args, name, workflowName }, parent)
                 return { content: JSON.stringify(outcome.envelope, null, 1) }
@@ -523,6 +500,8 @@ export default Plugin.define({
             await runsReconciled
             await storage.refreshWorkflows()
           },
+          listAgents,
+          defaultAgent: options.agent,
         })
       } catch (err) {
         warn("/ultracode command failed", err)

@@ -67,31 +67,41 @@ test("runAgent: title falls back label -> phase -> 'agent'", async () => {
 test("runAgent: titles carry the [uc:<runID> <ord> <phase>] prefix", async () => {
   const a = makeDriver([{ text: "x" }])
   await a.driver.runAgent(
-    input({ label: "seeker", runID: "run_ab12cd34efgh", ord: "a1" }),
+    input({ label: "seeker", runID: "run_ab12cd34efgh", ord: "a1", parentSessionID: "ses_parent" }),
     ["general"],
     hooks(),
   )
-  assert.equal([...a.fake.sessions.values()][0].title, "[uc:run_ab12cd34efgh a1] seeker")
+  assert.equal([...a.fake.sessions.values()][0].title, "[uc:run_ab12cd34efgh a1 p:ses_parent] seeker")
 
   const b = makeDriver([{ text: "x" }])
   await b.driver.runAgent(
-    input({ phase: "extract", runID: "run_ab12cd34efgh", ord: "a1" }),
+    input({ phase: "extract", runID: "run_ab12cd34efgh", ord: "a1", parentSessionID: "ses_parent" }),
     ["general"],
     hooks(),
   )
-  assert.equal([...b.fake.sessions.values()][0].title, "[uc:run_ab12cd34efgh a1 extract] extract")
+  assert.equal([...b.fake.sessions.values()][0].title, "[uc:run_ab12cd34efgh a1 extract p:ses_parent] extract")
 
   const c = makeDriver([{ text: "x" }])
-  await c.driver.runAgent(input({ runID: "run_ab12cd34efgh", ord: "a1" }), ["general"], hooks())
-  assert.equal([...c.fake.sessions.values()][0].title, "[uc:run_ab12cd34efgh a1] agent")
+  await c.driver.runAgent(
+    input({ runID: "run_ab12cd34efgh", ord: "a1", parentSessionID: "ses_parent" }),
+    ["general"],
+    hooks(),
+  )
+  assert.equal([...c.fake.sessions.values()][0].title, "[uc:run_ab12cd34efgh a1 p:ses_parent] agent")
 
   const e = makeDriver([{ text: "x" }])
   await e.driver.runAgent(
-    input({ label: "seeker", phase: "extract", runID: "run_ab12cd34efgh", ord: "a2" }),
+    input({
+      label: "seeker",
+      phase: "extract",
+      runID: "run_ab12cd34efgh",
+      ord: "a2",
+      parentSessionID: "ses_parent",
+    }),
     ["general"],
     hooks(),
   )
-  assert.equal([...e.fake.sessions.values()][0].title, "[uc:run_ab12cd34efgh a2 extract] seeker")
+  assert.equal([...e.fake.sessions.values()][0].title, "[uc:run_ab12cd34efgh a2 extract p:ses_parent] seeker")
 
   // No runID (direct driver use): plain title.
   const d = makeDriver([{ text: "x" }])
@@ -100,30 +110,54 @@ test("runAgent: titles carry the [uc:<runID> <ord> <phase>] prefix", async () =>
 })
 
 test("buildChildTitle / parseChildTitle round-trip + legacy parse", () => {
-  const full = buildChildTitle({ runID: "run_abc123def456", ord: "a3", phase: "extract", label: "seeker" })
-  assert.equal(full, "[uc:run_abc123def456 a3 extract] seeker")
+  const full = buildChildTitle({
+    runID: "run_abc123def456",
+    ord: "a3",
+    phase: "extract",
+    label: "seeker",
+    parentSessionID: "ses_parent",
+  })
+  assert.equal(full, "[uc:run_abc123def456 a3 extract p:ses_parent] seeker")
   assert.deepEqual(parseChildTitle(full), {
     runID: "run_abc123def456",
     ord: "a3",
     phase: "extract",
     label: "seeker",
+    parent: "ses_parent",
   })
 
-  const noPhase = buildChildTitle({ runID: "run_abc123def456", ord: "a1", label: "probe" })
-  assert.equal(noPhase, "[uc:run_abc123def456 a1] probe")
+  const noPhase = buildChildTitle({
+    runID: "run_abc123def456",
+    ord: "a1",
+    label: "probe",
+    parentSessionID: "ses_parent",
+  })
+  assert.equal(noPhase, "[uc:run_abc123def456 a1 p:ses_parent] probe")
   assert.deepEqual(parseChildTitle(noPhase), {
     runID: "run_abc123def456",
     ord: "a1",
     phase: undefined,
     label: "probe",
+    parent: "ses_parent",
   })
 
-  // Legacy `[uc:<tag>] label` — runID=tag, ord/phase undefined.
+  const noParent = buildChildTitle({ runID: "run_abc123def456", ord: "a1", label: "probe" })
+  assert.equal(noParent, "[uc:run_abc123def456 a1] probe")
+  assert.deepEqual(parseChildTitle(noParent), {
+    runID: "run_abc123def456",
+    ord: "a1",
+    phase: undefined,
+    label: "probe",
+    parent: undefined,
+  })
+
+  // Legacy `[uc:<tag>] label` — runID=tag, ord/phase/parent undefined.
   assert.deepEqual(parseChildTitle("[uc:ab12cd34] seeker"), {
     runID: "ab12cd34",
     ord: undefined,
     phase: undefined,
     label: "seeker",
+    parent: undefined,
   })
   assert.equal(parseChildTitle("plain title"), undefined)
 })

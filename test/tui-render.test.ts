@@ -46,10 +46,10 @@ test("shouldEnableTui: strict beta + build >= minBuild", () => {
 test("groupRuns: joins by parseChildTitle.runID, ignores non-uc, orders by ord", () => {
   const sessions: SessionView[] = [
     { id: "ses_noise", title: "plain title", outcome: "succeeded" },
-    { id: "ses_a2", title: "[uc:run_abc a2 extract] judge", outcome: "failed", time: { created: 200 } },
-    { id: "ses_a1", title: "[uc:run_abc a1 research] seeker", outcome: undefined, time: { created: 100 }, tokens: TOKENS_42_6K },
-    { id: "ses_b", title: "[uc:run_other a1] other", outcome: "succeeded", time: 50 },
-    { id: "ses_a3", title: "[uc:run_abc a3 research] retry", outcome: "succeeded", time: { created: 150 } },
+    { id: "ses_a2", title: "[uc:run_abc a2 extract p:ses_parent] judge", outcome: "failed", time: { created: 200 } },
+    { id: "ses_a1", title: "[uc:run_abc a1 research p:ses_parent] seeker", outcome: undefined, time: { created: 100 }, tokens: TOKENS_42_6K },
+    { id: "ses_b", title: "[uc:run_other a1 p:ses_parent] other", outcome: "succeeded", time: 50 },
+    { id: "ses_a3", title: "[uc:run_abc a3 research p:ses_parent] retry", outcome: "succeeded", time: { created: 150 } },
   ]
   const runs = groupRuns(sessions)
   assert.equal(runs.length, 2)
@@ -120,7 +120,7 @@ test("phaseColumns + agentRows D11 parity (status dot replaces status cell)", ()
         label: "seeker",
         status: "running",
         tokens: TOKENS_42_6K,
-        title: "[uc:run_abc123def456 a3 extract] seeker",
+        title: "[uc:run_abc123def456 a3 extract p:ses_parent] seeker",
       },
       {
         sessionID: "ses_2",
@@ -128,7 +128,7 @@ test("phaseColumns + agentRows D11 parity (status dot replaces status cell)", ()
         phase: "verify",
         label: undefined,
         status: "pending",
-        title: "[uc:run_abc123def456 a1 verify] a1",
+        title: "[uc:run_abc123def456 a1 verify p:ses_parent] a1",
       },
       {
         sessionID: "ses_3",
@@ -136,7 +136,7 @@ test("phaseColumns + agentRows D11 parity (status dot replaces status cell)", ()
         phase: "verify",
         label: "judge",
         status: "failed",
-        title: "[uc:run_abc123def456 a2 verify] judge",
+        title: "[uc:run_abc123def456 a2 verify p:ses_parent] judge",
       },
     ],
   }
@@ -282,7 +282,7 @@ test("twoColumn: phases left, D11 right, pagination ↓, header", () => {
         label: "seeker",
         status: "running",
         tokens: TOKENS_42_6K,
-        title: "[uc:run_abc123def456789 a3 extract] seeker",
+        title: "[uc:run_abc123def456789 a3 extract p:ses_parent] seeker",
       },
       {
         sessionID: "ses_2",
@@ -290,7 +290,7 @@ test("twoColumn: phases left, D11 right, pagination ↓, header", () => {
         phase: "verify",
         label: undefined,
         status: "pending",
-        title: "[uc:run_abc123def456789 a1 verify] a1",
+        title: "[uc:run_abc123def456789 a1 verify p:ses_parent] a1",
       },
       {
         sessionID: "ses_3",
@@ -298,7 +298,7 @@ test("twoColumn: phases left, D11 right, pagination ↓, header", () => {
         phase: "verify",
         label: "judge",
         status: "failed",
-        title: "[uc:run_abc123def456789 a2 verify] judge",
+        title: "[uc:run_abc123def456789 a2 verify p:ses_parent] judge",
       },
     ],
   }

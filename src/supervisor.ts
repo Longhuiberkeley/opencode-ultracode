@@ -216,7 +216,10 @@ export class SupervisorImpl implements Supervisor {
       // registry ownership (ambient phase tracked via state) and late children.
       const runner = new AgentRunner({
         driver: {
-          runAgent: (agentInput, availableAgents, hooks) => {
+          runAgent: async (agentInput, availableAgents, hooks) => {
+            // Re-check pause AFTER the concurrency semaphore (queued waiters
+            // released while paused must not start until resume/abort).
+            await this.waitIfPaused(state)
             let created: string | undefined
             return this.driver
               .runAgent(
@@ -580,7 +583,7 @@ export class SupervisorImpl implements Supervisor {
     }
   }
 
-  /** New agent() calls wait here while paused; queued semaphore waiters are unaffected. */
+  /** New agent() calls wait here while paused; also re-checked after semaphore acquire. */
   private waitIfPaused(state: RunState): Promise<void> {
     if (state.controller.signal.aborted) {
       return Promise.reject(new Error("run stopping"))

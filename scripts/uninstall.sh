@@ -100,6 +100,8 @@ fi
 PLUGIN_DIR="$OPENCODE_DIR/plugins/ultracode"
 INDEX_FILE="$PLUGIN_DIR/index.ts"
 TUI_FILE="$PLUGIN_DIR/tui.tsx"
+CONFIG_JSON="$OPENCODE_DIR/opencode.json"
+PACKAGE_PATH="./plugins/ultracode"
 WF_DIR="$OPENCODE_DIR/workflows"
 RUNS_DIR="$WF_DIR/runs"
 SKILL_MIRROR="$WF_DIR/ultracode-skill.md"
@@ -129,6 +131,61 @@ if [[ -d "$PLUGIN_DIR" ]]; then
   fi
 fi
 
+if [[ -f "$CONFIG_JSON" ]]; then
+  command -v node >/dev/null 2>&1 || die "node is required to update $CONFIG_JSON"
+  OPENCODE_JSON="$CONFIG_JSON" PACKAGE_PATH="$PACKAGE_PATH" REPO="$REPO" node -e '
+const fs = require("fs")
+const path = process.env.OPENCODE_JSON
+const relative = process.env.PACKAGE_PATH
+const repo = process.env.REPO
+if (!path) {
+  console.error("error: missing OPENCODE_JSON")
+  process.exit(1)
+}
+function pkgOf(entry) {
+  if (typeof entry === "string") return entry
+  if (entry && typeof entry === "object" && typeof entry.package === "string") return entry.package
+  return null
+}
+function norm(p) {
+  return String(p).replace(/\/+$/, "")
+}
+const want = new Set([relative, repo].filter(Boolean).map(norm))
+const raw = fs.readFileSync(path, "utf8")
+if (raw.trim() === "") process.exit(0)
+let doc
+try {
+  doc = JSON.parse(raw)
+} catch (err) {
+  console.error("error: cannot parse " + path + ": " + (err && err.message ? err.message : err))
+  process.exit(1)
+}
+if (doc === null || typeof doc !== "object" || Array.isArray(doc)) {
+  console.error("error: " + path + " root must be a JSON object")
+  process.exit(1)
+}
+if (!Object.prototype.hasOwnProperty.call(doc, "plugins") || doc.plugins == null) process.exit(0)
+if (!Array.isArray(doc.plugins)) {
+  console.error("error: plugins in " + path + " must be an array")
+  process.exit(1)
+}
+const next = []
+let removed = 0
+for (const entry of doc.plugins) {
+  const p = pkgOf(entry)
+  if (p != null && want.has(norm(p))) {
+    removed++
+    continue
+  }
+  next.push(entry)
+}
+if (removed === 0) process.exit(0)
+doc.plugins = next
+fs.writeFileSync(path, JSON.stringify(doc, null, 2) + "\n")
+console.log("removed " + removed + " plugins entry from " + path)
+'
+fi
+
 if [[ "$PURGE" -eq 1 ]]; then
   if [[ -e "$RUNS_DIR" ]]; then
     rm -rf "$RUNS_DIR"
@@ -150,36 +207,74 @@ EOF
 fi
 
 if [[ "$PURGE_WORKFLOWS" -eq 1 ]]; then
-  if [[ "$YES" -eq 0 ]]; then
-    if [[ ! -t 0 ]]; then
-      die "--purge-workflows requires confirmation; re-run with --yes"
-    fi
-    printf 'Delete saved workflow pairs (*.js / *.json) in %s? [y/N] ' "$WF_DIR"
-    read -r ans
-    case "$ans" in
-      y | Y | yes | YES) ;;
-      *)
-        echo "saved workflows left untouched"
-        PURGE_WORKFLOWS=0
-        ;;
-    esac
+  command -v node >/dev/null 2>&1 || die "node is required for --purge-workflows"
+  PAIR_LIST=""
+  if [[ -d "$WF_DIR" ]]; then
+    PAIR_LIST="$(WF_DIR="$WF_DIR" node -e '
+const fs = require("fs")
+const path = require("path")
+const dir = process.env.WF_DIR
+const NAME_RE = /^[a-z0-9][a-z0-9-_]{0,63}$/
+if (!dir || !fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) process.exit(0)
+let names
+try {
+  names = fs.readdirSync(dir)
+} catch {
+  process.exit(0)
+}
+const lines = []
+for (const file of names.sort()) {
+  if (!file.endsWith(".js")) continue
+  const name = file.slice(0, -3)
+  if (!NAME_RE.test(name)) continue
+  const js = path.join(dir, file)
+  const json = path.join(dir, name + ".json")
+  try {
+    if (!fs.statSync(js).isFile()) continue
+    if (!fs.existsSync(json) || !fs.statSync(json).isFile()) continue
+  } catch {
+    continue
+  }
+  let manifest
+  try {
+    manifest = JSON.parse(fs.readFileSync(json, "utf8"))
+  } catch {
+    continue
+  }
+  if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)) continue
+  if (typeof manifest.name !== "string" || manifest.name !== name) continue
+  lines.push(js)
+  lines.push(json)
+}
+if (lines.length) process.stdout.write(lines.join("\n") + "\n")
+')"
   fi
-  if [[ "$PURGE_WORKFLOWS" -eq 1 && -d "$WF_DIR" ]]; then
-    shopt -s nullglob
-    for js in "$WF_DIR"/*.js; do
-      base="${js%.js}"
-      rm -f "$js"
-      echo "removed $js"
-      if [[ -f "$base.json" ]]; then
-        rm -f "$base.json"
-        echo "removed $base.json"
+  if [[ -z "$PAIR_LIST" ]]; then
+    echo "no recognized saved-workflow pairs in $WF_DIR"
+  else
+    echo "recognized saved-workflow pairs to delete:"
+    printf '%s' "$PAIR_LIST"
+    if [[ "$YES" -eq 0 ]]; then
+      if [[ ! -t 0 ]]; then
+        die "--purge-workflows requires confirmation; re-run with --yes"
       fi
-    done
-    for json in "$WF_DIR"/*.json; do
-      rm -f "$json"
-      echo "removed $json"
-    done
-    shopt -u nullglob
+      printf 'Delete the pairs listed above in %s? [y/N] ' "$WF_DIR"
+      read -r ans
+      case "$ans" in
+        y | Y | yes | YES) ;;
+        *)
+          echo "saved workflows left untouched"
+          PURGE_WORKFLOWS=0
+          ;;
+      esac
+    fi
+    if [[ "$PURGE_WORKFLOWS" -eq 1 ]]; then
+      while IFS= read -r file; do
+        [[ -n "$file" ]] || continue
+        rm -f "$file"
+        echo "removed $file"
+      done <<< "$PAIR_LIST"
+    fi
   fi
 else
   echo "saved workflows left untouched (pass --purge-workflows to delete *.js/*.json pairs)"

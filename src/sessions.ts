@@ -52,11 +52,11 @@ export interface AgentRunInput {
   phase?: string
   schema?: Json
   defaultAgent: string
-  /** Full run id for child titles `[uc:<runID> <ord> <phase>] <label>`. */
+  /** Full run id for child titles `[uc:<runID> <ord> <phase> p:<parent>] <label>`. */
   runID?: string
   /** Agent ordinal within the run ("a1", "a2", ...). */
   ord?: string
-  /** Parent (invocation) session — stamped on create metadata only. */
+  /** Parent (invocation) session — title `p:` segment + create metadata. */
   parentSessionID?: string
   /** Saved-workflow name, when launched via {workflow: "name"}. */
   workflowName?: string
@@ -355,8 +355,9 @@ function errorMessage(err: unknown): string {
 
 /**
  * Child session title (A1 primary contract):
- *   `[uc:<fullRunID> <ord> <phase>] <label>`
- * Phase segment omitted when absent: `[uc:<runID> <ord>] <label>`.
+ *   `[uc:<fullRunID> <ord> <phase> p:<parentSessionID>] <label>`
+ * Phase segment omitted when absent: `[uc:<runID> <ord> p:<parent>] <label>`.
+ * `p:` is present whenever the parent session is known.
  * Direct driver use (no runID) is a plain label.
  */
 export function buildChildTitle(input: {
@@ -364,20 +365,22 @@ export function buildChildTitle(input: {
   phase?: string
   runID?: string
   ord?: string
+  parentSessionID?: string
 }): string {
   const label = input.label || input.phase || "agent"
   if (input.runID === undefined) return label
-  const inner = input.ord === undefined
-    ? input.runID
-    : input.phase
-      ? `${input.runID} ${input.ord} ${input.phase}`
-      : `${input.runID} ${input.ord}`
-  return `[uc:${inner}] ${label}`
+  const bits: string[] = [input.runID]
+  if (input.ord !== undefined) {
+    bits.push(input.ord)
+    if (input.phase) bits.push(input.phase)
+  }
+  if (input.parentSessionID) bits.push(`p:${input.parentSessionID}`)
+  return `[uc:${bits.join(" ")}] ${label}`
 }
 
 /**
  * Parse a child title. Tolerant of the legacy `[uc:<tag>] label` shape
- * (runID=tag, ord/phase undefined). Returns undefined when the title is
+ * (runID=tag, ord/phase/parent undefined). Returns undefined when the title is
  * not a `[uc:…]` child title.
  */
 export function parseChildTitle(title: string): {
@@ -385,6 +388,7 @@ export function parseChildTitle(title: string): {
   ord?: string
   phase?: string
   label?: string
+  parent?: string
 } | undefined {
   const m = /^\[uc:([^\]]+)\](?:\s+(.*))?$/.exec(title)
   if (!m) return undefined
@@ -392,13 +396,23 @@ export function parseChildTitle(title: string): {
   if (!inner) return undefined
   const label = m[2]
   const parts = inner.split(/\s+/).filter((p) => p.length > 0)
+  let parent: string | undefined
+  const last = parts[parts.length - 1]
+  if (last?.startsWith("p:")) {
+    const id = last.slice(2)
+    parent = id.length > 0 ? id : undefined
+    parts.pop()
+  }
+  if (parts.length === 0) {
+    return { runID: undefined, ord: undefined, phase: undefined, label, parent }
+  }
   if (parts.length === 1) {
-    return { runID: parts[0], ord: undefined, phase: undefined, label }
+    return { runID: parts[0], ord: undefined, phase: undefined, label, parent }
   }
   if (parts.length === 2) {
-    return { runID: parts[0], ord: parts[1], phase: undefined, label }
+    return { runID: parts[0], ord: parts[1], phase: undefined, label, parent }
   }
-  return { runID: parts[0], ord: parts[1], phase: parts.slice(2).join(" "), label }
+  return { runID: parts[0], ord: parts[1], phase: parts.slice(2).join(" "), label, parent }
 }
 
 /** D12 stamp — written on create, never read back (A1). */

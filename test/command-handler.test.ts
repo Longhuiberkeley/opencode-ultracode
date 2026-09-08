@@ -6,8 +6,10 @@ import test from "node:test"
 import assert from "node:assert/strict"
 import { createHash } from "node:crypto"
 import {
+  MIN_SUPPORTED_BUILD,
   NESTED_RUN_REFUSED,
   NO_ACTIVE_RUN,
+  PLUGIN_VERSION,
   SOURCE_STILL_ACTIVE,
   feedToolEvent,
   formatShowRun,
@@ -190,6 +192,8 @@ async function invoke(
     },
     projectRoot: "/project",
     personalWorkflowDir: "/home/u/.config/opencode/workflows",
+    listAgents: async () => ({ ok: true, agents: [{ id: "general" }, { id: "explore" }] }),
+    defaultAgent: "general",
   }
   await handleUltracodeCommand({ sessionID: opts.sessionID ?? "ses_parent", prompt: { text } }, deps)
   return { texts, registry, storage, supervisor }
@@ -338,6 +342,83 @@ test("rerun trust-gate refuses an edited workflow", async () => {
   assert.equal(supervisor.startCalls.length, 0)
 })
 
+test("rerun refuses after edit-.js-then-trust-B of a run whose script is A", async () => {
+  const scriptA = "return 1 // A"
+  const scriptB = "return 2 // B"
+  const registry = new FakeRegistry()
+  seed(
+    registry,
+    baseRun({
+      id: "run_a",
+      status: "succeeded",
+      script: scriptA,
+      workflowName: "flow",
+    }),
+  )
+  const storage = new MemoryStorage()
+  storage.workflows.set("flow", {
+    manifest: {
+      version: 1,
+      name: "flow",
+      hash: digest(scriptB),
+      source: "project",
+      savedAt: 2,
+    },
+    script: scriptB,
+  })
+  storage.trust.set("flow", digest(scriptB))
+  const { texts, supervisor } = await invoke("rerun run_a", { registry, storage })
+  assert.match(texts[0]!, /has changed since this run/)
+  assert.match(texts[0]!, /\/ultracode trust flow/)
+  assert.equal(supervisor.startCalls.length, 0)
+})
+
+test("rerun allows a trusted-unchanged workflow even with empty manifest hash", async () => {
+  const script = "return 1"
+  const registry = new FakeRegistry()
+  seed(
+    registry,
+    baseRun({
+      id: "run_wf",
+      status: "succeeded",
+      script,
+      workflowName: "flow",
+    }),
+  )
+  const storage = new MemoryStorage()
+  storage.workflows.set("flow", {
+    manifest: {
+      version: 1,
+      name: "flow",
+      hash: "",
+      source: "project",
+      savedAt: 1,
+    },
+    script,
+  })
+  storage.trust.set("flow", digest(script))
+  const { texts, supervisor } = await invoke("rerun run_wf", { registry, storage })
+  assert.match(texts[0]!, /^rerun started: \S+ \(from run_wf\)$/)
+  assert.equal(supervisor.startCalls.length, 1)
+})
+
+test("rerun with meta.requires listing a missing agent fails fast and spawns nothing", async () => {
+  const registry = new FakeRegistry()
+  seed(
+    registry,
+    baseRun({
+      id: "run_req",
+      status: "succeeded",
+      script: "return 1",
+      meta: { requires: ["reviewer"] },
+    }),
+  )
+  const { texts, supervisor } = await invoke("rerun run_req", { registry })
+  assert.match(texts[0]!, /requires agent\(s\) not available: reviewer/)
+  assert.match(texts[0]!, /Available agents: general, explore/)
+  assert.equal(supervisor.startCalls.length, 0)
+})
+
 test("rerun nested-run rejection (R15) while non-starting verbs stay allowed", async () => {
   const registry = new FakeRegistry()
   const child = seed(registry, baseRun({ id: "run_child", status: "running" }))
@@ -382,7 +463,7 @@ test("show golden table uses agentCells + sessionID and runHeaderCells", () => {
   assert.match(text, /status: \*\*running\*\*/)
 })
 
-test("dashboard lists paused runs as active, not recent, and is version-free", async () => {
+test("dashboard lists paused runs as active, not recent, and shows plugin version + min build", async () => {
   const registry = new FakeRegistry()
   seed(registry, baseRun({ id: "run_p", name: "paused-one", status: "paused", startedAt: 5 }))
   seed(registry, baseRun({ id: "run_d", name: "done-one", status: "succeeded", startedAt: 4 }))
@@ -396,7 +477,8 @@ test("dashboard lists paused runs as active, not recent, and is version-free", a
   assert.doesNotMatch(active, /run_d/)
   assert.match(recent, /run_d/)
   assert.doesNotMatch(recent, /run_p/)
-  assert.doesNotMatch(body, /\bversion\b/i)
+  assert.ok(body.includes(PLUGIN_VERSION), body)
+  assert.ok(body.includes(String(MIN_SUPPORTED_BUILD)), body)
 })
 
 test("event→toolCalls wiring: mapped sessions count, unmapped ignored, older-than-startedAt ignored, deduped", () => {

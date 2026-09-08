@@ -289,6 +289,51 @@ export interface CommandSupervisor {
   activeRuns(): RunRecord[]
 }
 
+export type ListedAgent = { id: string; description?: string }
+
+export type AgentListResult =
+  | { ok: true; agents: ListedAgent[] }
+  | { ok: false; error: string }
+
+/**
+ * Shared launch preflight for the tool executor and `/ultracode rerun`:
+ * fetch available agents, require the configured default, validate meta.requires.
+ */
+export async function prepareRunLaunch(input: {
+  listAgents: () => Promise<AgentListResult>
+  defaultAgent: string
+  requires?: readonly string[]
+}): Promise<{ ok: true; availableAgents: string[]; agents: ListedAgent[] } | { ok: false; error: string }> {
+  const listed = await input.listAgents()
+  if (!listed.ok) {
+    return {
+      ok: false,
+      error: `error: could not list available agents (${listed.error}) — refusing to start the run`,
+    }
+  }
+  const availableAgents = listed.agents.map((a) => a.id)
+  const requires = input.requires ?? []
+  const missingRequires = [...new Set(requires)].filter((id) => !availableAgents.includes(id))
+  if (missingRequires.length > 0) {
+    return {
+      ok: false,
+      error:
+        `error: workflow requires agent(s) not available: ${missingRequires.join(", ")}. ` +
+        `Available agents: ${availableAgents.join(", ") || "(none — create agents or check your install)"}`,
+    }
+  }
+  if (!availableAgents.includes(input.defaultAgent)) {
+    return {
+      ok: false,
+      error:
+        `error: default agent "${input.defaultAgent}" is not available in this location. ` +
+        `Available agents: ${availableAgents.join(", ") || "(none — create agents or check your install)"}. ` +
+        `Set the "agent" plugin option to an available agent id.`,
+    }
+  }
+  return { ok: true, availableAgents, agents: listed.agents }
+}
+
 export interface CommandDeps {
   registry: Registry
   supervisor?: CommandSupervisor
@@ -299,6 +344,8 @@ export interface CommandDeps {
   personalWorkflowDir: string
   pendingPermissions?: (sessionID: string) => Promise<string | undefined>
   prepare?: () => Promise<void>
+  listAgents: () => Promise<AgentListResult>
+  defaultAgent: string
 }
 
 export interface CommandInvocation {
@@ -604,10 +651,10 @@ async function rerunRun(deps: CommandDeps, sessionID: string, rest: string): Pro
       )
       return
     }
-    if (sha256(source.script) !== saved.manifest.hash) {
+    if (sha256(source.script) !== sha256(saved.script)) {
       await deps.say(
         sessionID,
-        `cannot rerun: workflow "${source.workflowName}" has changed since this run (script digest ≠ manifest hash). Re-trust the current version with /ultracode trust ${source.workflowName}.`,
+        `cannot rerun: workflow "${source.workflowName}" has changed since this run (script digest ≠ current trusted script). Re-trust the current version with /ultracode trust ${source.workflowName}.`,
       )
       return
     }
@@ -628,6 +675,16 @@ async function rerunRun(deps: CommandDeps, sessionID: string, rest: string): Pro
     return
   }
 
+  const prep = await prepareRunLaunch({
+    listAgents: deps.listAgents,
+    defaultAgent: deps.defaultAgent,
+    requires: source.meta?.requires,
+  })
+  if (!prep.ok) {
+    await deps.say(sessionID, prep.error)
+    return
+  }
+
   let launched: { runID: string; done: Promise<RunOutcome> }
   try {
     launched = deps.supervisor.startDetached(
@@ -638,7 +695,7 @@ async function rerunRun(deps: CommandDeps, sessionID: string, rest: string): Pro
         name: source.name,
         workflowName: source.workflowName,
       },
-      { sessionID, report: () => {} },
+      { sessionID, report: () => {}, availableAgents: prep.availableAgents },
     )
   } catch (err) {
     await deps.say(sessionID, `error: could not rerun — ${describeError(err)}`)

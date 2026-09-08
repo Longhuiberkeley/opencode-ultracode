@@ -174,6 +174,86 @@ test("install/uninstall quote a project dir that contains spaces", { skip }, () 
   }
 })
 
+test("install --write-config then uninstall removes the plugins entry and keeps unrelated keys", { skip }, () => {
+  const root = mkdtempSync(join(tmpdir(), "uc-roundtrip-"))
+  const project = join(root, "proj")
+  mkdirSync(project)
+  try {
+    mkdirSync(join(project, ".opencode"), { recursive: true })
+    const configPath = join(project, ".opencode/opencode.json")
+    writeFileSync(
+      configPath,
+      JSON.stringify(
+        {
+          model: "keep-me",
+          plugins: [{ package: "other-plugin" }],
+          theme: "dark",
+        },
+        null,
+        2,
+      ) + "\n",
+    )
+    const inst = run(INSTALL, ["--project", project, "--repo", REPO, "--write-config"])
+    assert.equal(inst.status, 0, inst.stderr || inst.stdout)
+    const afterInstall = JSON.parse(readFileSync(configPath, "utf8")) as {
+      model?: string
+      theme?: string
+      plugins?: unknown[]
+    }
+    assert.equal(afterInstall.model, "keep-me")
+    assert.equal(afterInstall.theme, "dark")
+    assert.ok(Array.isArray(afterInstall.plugins))
+    assert.equal(afterInstall.plugins!.length, 2)
+
+    const un = run(UNINSTALL, ["--project", project, "--repo", REPO])
+    assert.equal(un.status, 0, un.stderr || un.stdout)
+    const after = JSON.parse(readFileSync(configPath, "utf8")) as {
+      model?: string
+      theme?: string
+      plugins?: unknown[]
+    }
+    assert.equal(after.model, "keep-me")
+    assert.equal(after.theme, "dark")
+    assert.deepEqual(after.plugins, [{ package: "other-plugin" }])
+    const keys = Object.keys(after)
+    assert.deepEqual(keys, ["model", "plugins", "theme"])
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test("uninstall --purge-workflows deletes only recognized pairs and leaves stray files", { skip }, () => {
+  const root = mkdtempSync(join(tmpdir(), "uc-purge-wf-"))
+  const project = join(root, "proj")
+  mkdirSync(project)
+  try {
+    const inst = run(INSTALL, ["--project", project, "--repo", REPO])
+    assert.equal(inst.status, 0, inst.stderr || inst.stdout)
+    const wf = join(project, ".opencode/workflows")
+    mkdirSync(wf, { recursive: true })
+    writeFileSync(join(wf, "demo.js"), "return 1\n")
+    writeFileSync(join(wf, "demo.json"), JSON.stringify({ name: "demo", version: 1 }, null, 2) + "\n")
+    writeFileSync(join(wf, "stray.js"), "return 99\n")
+    writeFileSync(join(wf, "notes.json"), "{}\n")
+    writeFileSync(join(wf, "mismatch.js"), "return 0\n")
+    writeFileSync(join(wf, "mismatch.json"), JSON.stringify({ name: "other" }, null, 2) + "\n")
+
+    const un = run(UNINSTALL, ["--project", project, "--repo", REPO, "--purge-workflows", "--yes"])
+    assert.equal(un.status, 0, un.stderr || un.stdout)
+    assert.match(un.stdout, /recognized saved-workflow pairs to delete:/)
+    assert.match(un.stdout, /demo\.js/)
+    assert.match(un.stdout, /demo\.json/)
+    assert.equal(existsSync(join(wf, "demo.js")), false)
+    assert.equal(existsSync(join(wf, "demo.json")), false)
+    assert.equal(existsSync(join(wf, "stray.js")), true)
+    assert.equal(existsSync(join(wf, "notes.json")), true)
+    assert.equal(existsSync(join(wf, "mismatch.js")), true)
+    assert.equal(existsSync(join(wf, "mismatch.json")), true)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test("uninstall --purge removes matching skill mirror and runs/, leaves foreign files", { skip }, () => {
   const root = mkdtempSync(join(tmpdir(), "uc-purge-"))
   const project = join(root, "proj")

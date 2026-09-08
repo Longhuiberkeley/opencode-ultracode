@@ -354,7 +354,7 @@ test("supervisor: child session titles carry the [uc:<runID> <ord>] prefix", asy
   assert.ok(sessionID)
   const title = ctx.sessions.sessions.get(sessionID)?.title
   // FakeRegistry ids are run_fake<N>; no explicit/ambient phase → phase segment omitted.
-  assert.match(title ?? "", /^\[uc:run_fake\d+ a1\] probe$/)
+  assert.match(title ?? "", /^\[uc:run_fake\d+ a1 p:ses_parent\] probe$/)
   assert.deepEqual(ctx.registry.agentForSession(sessionID), { runID: outcome.run.id, agentID: "a1" })
 })
 
@@ -422,6 +422,18 @@ test("supervisor: queued semaphore waiter stays queued while paused, runs on res
   ctx.sessions.push({ text: "one" })
   ctx.sessions.push({ text: "two" })
   ctx.sessions.hangWait = true
+  let creates = 0
+  let prompts = 0
+  const origCreate = ctx.sessions.create.bind(ctx.sessions)
+  const origPrompt = ctx.sessions.prompt.bind(ctx.sessions)
+  ctx.sessions.create = async (input) => {
+    creates++
+    return origCreate(input)
+  }
+  ctx.sessions.prompt = async (input) => {
+    prompts++
+    return origPrompt(input)
+  }
   const { runID, done } = ctx.supervisor.startDetached(
     {
       script: `
@@ -433,19 +445,29 @@ test("supervisor: queued semaphore waiter stays queued while paused, runs on res
     ctx.parent,
   )
   await waitFor(() => ctx.sessions.sessions.size === 1, "first child in-flight")
+  const createsAfterFirst = creates
+  const promptsAfterFirst = prompts
+  assert.equal(createsAfterFirst, 1)
+  assert.equal(promptsAfterFirst, 1)
   assert.equal(ctx.supervisor.pause(runID), true)
-  await tick(80)
-  assert.equal(ctx.sessions.sessions.size, 1, "queued waiter did not start a session")
-  assert.equal(ctx.supervisor.resume(runID), true)
-  await tick(80)
-  assert.equal(ctx.sessions.sessions.size, 1, "queued waiter still waiting for the slot")
   ctx.sessions.hangWait = false
   ctx.sessions.releaseHangs()
+  await waitFor(
+    () => ctx.registry.get(runID)?.agents.some((a) => a.status === "succeeded") === true,
+    "first child finished during pause",
+  )
+  await tick(80)
+  assert.equal(creates, createsAfterFirst, "second never created during pause")
+  assert.equal(prompts, promptsAfterFirst, "second never prompted during pause")
+  assert.equal(ctx.sessions.sessions.size, 1, "queued waiter did not start a session")
+  assert.equal(ctx.supervisor.resume(runID), true)
   const outcome = await done
   assert.equal(outcome.envelope.status, "succeeded")
   const result = outcome.envelope.result as { a?: string; b?: string }
   assert.equal(result.a, "one")
   assert.equal(result.b, "two")
+  assert.equal(creates, 2)
+  assert.equal(prompts, 2)
 })
 
 test("supervisor: stop during pause finalizes stopped with no cleanup-pending marker", async () => {
