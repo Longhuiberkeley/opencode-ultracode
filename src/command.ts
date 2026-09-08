@@ -67,6 +67,11 @@ export const SOURCE_STILL_ACTIVE = "source run is still active — stop it first
 export const NESTED_RUN_REFUSED =
   "cannot start a run from inside an active workflow session — use /ultracode from the parent"
 
+/** Plugin package version shown on the bare /ultracode dashboard. */
+export const PLUGIN_VERSION = "0.1.0"
+/** Oldest OpenCode binary build the inspect TUI is gated on (A7 / D7). */
+export const MIN_SUPPORTED_BUILD = 19271
+
 export function helpText(): string {
   return [
     "Usage: /ultracode — inspect and manage workflow runs",
@@ -456,7 +461,10 @@ async function renderDashboard(deps: CommandDeps, sessionID: string): Promise<vo
   const active = activeList(deps)
   const finished = deps.registry.listRecent(50).filter((r) => !isActiveRunStatus(r.status)).slice(0, 5)
   const saved = deps.storage.listWorkflows()
-  const parts: string[] = ["## Ultracode workflows", ""]
+  const parts: string[] = [
+    `## Ultracode workflows · plugin ${PLUGIN_VERSION} · min OpenCode beta-${MIN_SUPPORTED_BUILD}`,
+    "",
+  ]
   parts.push("**Active runs**")
   parts.push(active.length ? active.map(summarizeRun).join("\n") : "(none)")
   parts.push("")

@@ -51,3 +51,55 @@ Run after Builders A/B/C merge. Unit tests must be green first: `npm test`, `npx
 - [ ] Events include `tui-import-ok`, `tui-setup`, `slot-append-ok` for `prompt.footer.status` and `session.panel`
 - [ ] Compare dump to `docs/SPIKE-TUI.md` if OpenCode version ≠ beta-19271
 
+## 10. TUI checklist (v1 inspect + G1)
+
+Verified binary: **opencode2 0.0.0-beta-19271** (plugin pkg pin 0.0.0-beta-19289). Captures are
+gitignored under `spike/out/`.
+
+### Live capture (chip + panel-hosted two-column)
+
+Procedure:
+
+1. `npm install` in the plugin repo (so `@opencode/plugin` resolves).
+2. From repo root: `scripts/tui-probe.sh --live`
+3. Probe swaps `spike/scratch/.opencode/plugins/probe/{index.ts,tui.tsx}` to re-export the real
+   `src/` pair, drives a PTY (`opencode2 --standalone`), sends keystrokes, writes:
+   - `spike/out/tui-live.jsonl`
+   - `spike/out/tui-live-server.jsonl`
+   - `spike/out/tui-live-<timestamp>.ansi` + `.txt` (ANSI stripped)
+4. Script runs `assert_live_paint` on the stripped `.txt` (exit 1 if chip/panel markers absent).
+
+Grep list (stripped live capture):
+
+```bash
+grep -F 'ultracode ·' spike/out/tui-live-*.txt
+grep -F 'UC-INSPECT' spike/out/tui-live-*.txt
+grep -F 'ultracode inspect' spike/out/tui-live-*.txt
+grep -F 'Phases' spike/out/tui-live-*.txt
+grep -F 'x stop' spike/out/tui-live-*.txt
+grep -F 'p pause' spike/out/tui-live-*.txt
+```
+
+- [ ] chip needle `ultracode ·` (or `ultracode` + `running`) present
+- [ ] panel marker `UC-INSPECT` / `ultracode inspect` present
+- [ ] two-column `Phases` present when a run is grouped
+- [ ] footer `x stop` / `p pause` present when the panel has keys
+- [ ] fail-soft: no `disabled plugin after transform failure` in server jsonl
+
+### G1 dialog-keys procedure (expect NO-GO on this binary)
+
+1. `scripts/tui-probe.sh --dialog-keys` (`PROBE_DIALOG_KEYS=1`)
+2. Evidence: `spike/out/tui-dialog-keys.jsonl`, `spike/out/tui-dialog-keys-<timestamp>.ansi` + `.txt`
+3. Probe opens `ui.dialog.show` (`G1-DIALOG-KEYS` painted) and tries, in order:
+   - `keymap.layer` from a component mounted **inside** the dialog render
+   - `onKey` / `onKeyDown` / `onKeyPress` / `onKeyUp` props
+   - `dialog.set` extras (`onKey`, `keys`, `keymap`, `handler`)
+4. Verdict (script `g1_verdict`): GO only if jsonl has `dialog-keys-receipt` **and** stripped
+   text has no `G1LEAK`. On beta-19271 this is **NO-GO** — host dialog owns the keymap;
+   production inspect stays panel-hosted.
+
+- [ ] stripped dump contains `G1-DIALOG-KEYS`
+- [ ] zero `dialog-keys-receipt` in jsonl
+- [ ] `G1LEAK` absent (host swallowed keys; plugin still received none)
+- [ ] ESC still closes (`dialog-onclose`)
+

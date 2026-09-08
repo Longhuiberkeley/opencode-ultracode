@@ -69,22 +69,45 @@ multi-agent recipe, the model writes the orchestration on the fly and a runtime 
 
 ## Install
 
+**Precondition:** `npm install` in this repo so `node_modules/@opencode/plugin` resolves.
+The installer refuses to run until that is true (`run npm install in <repo>`).
+
 ```bash
 git clone <this-repo> /path/to/opencode-ultracode
 cd /path/to/opencode-ultracode
 npm install
+scripts/install.sh --project /path/to/your-project
+# or: scripts/install.sh --global
 ```
 
-**Local install that is verified on OpenCode v2 beta-19271:** drop a re-export into the
-project (or global) plugin auto-load directory. OpenCode loads `.opencode/plugins/*/index.ts`
-on first session activity (not on a bare `/api/plugin` query):
+`scripts/install.sh` writes a re-export into the auto-load dir (verified on OpenCode v2
+beta-19271: `.opencode/plugins/*/index.ts` is enough; `--write-config` is optional):
+
+| Flag | Effect |
+| --- | --- |
+| `--project DIR` | Install into `DIR/.opencode/` (default: cwd) |
+| `--global` | Install into `~/.config/opencode/` |
+| `--tui` | Also write sibling `tui.tsx` (inspect UI **opt-in**; host auto-loads it next to `index.ts`) |
+| `--write-config` | Merge a `plugins` entry into the target `opencode.json` only if no entry with the same package path exists |
+| `--repo PATH` | Plugin repo root (default: parent of the script) |
+
+Reruns are idempotent (same files, never duplicate config). No network.
+
+**TUI opt-in:** omit `--tui` for server-only (`ultracode_run` + `/ultracode`). Add `--tui` when
+you want the chip + inspect panel. Remove `tui.tsx` or run `scripts/uninstall.sh` to drop it;
+the server half keeps working.
+
+**Manual re-export (fallback if you do not want the script):**
 
 ```ts
 // <project>/.opencode/plugins/ultracode/index.ts
 export { default } from "/path/to/opencode-ultracode/src/index.ts"
+// optional sibling, only if you want inspect UI:
+// <project>/.opencode/plugins/ultracode/tui.tsx
+export { default } from "/path/to/opencode-ultracode/src/tui.tsx"
 ```
 
-Optionally also list it in `.opencode/opencode.json` (relative path from that file):
+Optionally list it in `.opencode/opencode.json` (relative path from that file):
 
 ```json
 {
@@ -95,9 +118,26 @@ Optionally also list it in `.opencode/opencode.json` (relative path from that fi
 ```
 
 A bare absolute `"package": "/path/to/opencode-ultracode"` entry was **silently skipped** on
-beta-19271; prefer the auto-load re-export. `npm install` in the plugin repo is required so
-`@opencode/plugin` resolves. If load fails, check server logs for
+beta-19271; prefer the auto-load re-export. If load fails, check server logs for
 `failed to load plugin` / `disabled plugin after transform failure`.
+
+### Uninstall
+
+```bash
+scripts/uninstall.sh --project /path/to/your-project
+# scripts/uninstall.sh --global
+# scripts/uninstall.sh --project DIR --purge              # runs/ + matching skill mirror
+# scripts/uninstall.sh --project DIR --purge-workflows --yes
+```
+
+Removes `plugins/ultracode/index.ts` and `tui.tsx` **only** when they still re-export this
+repo; never touches other plugins. `--purge` deletes `<target>/.opencode/workflows/runs/`
+and `ultracode-skill.md` only if that file is still byte-equal to `skills/ultracode.md`.
+`--purge-workflows` deletes saved `*.js`/`*.json` pairs after confirmation (`--yes` skips
+the prompt). Without that flag, saved workflows are left in place.
+
+**Data / KV:** run, result, and trust keys in OpenCode project KV are harmless residue. No
+shell can compute project KV ids; they disappear with an OpenCode data reset.
 
 Recommended `.gitignore` entries for projects using the plugin:
 
@@ -191,15 +231,104 @@ The tool returns when the run finishes, with an envelope:
 `/ultracode` is **management only**. To *author* a run, send a normal message containing the
 keyword `ultracode` (no leading slash).
 
-| Command | Effect |
+**Implicit targets:** `show` / `result` / `pause` / `resume` omit runID → the single active
+run (0 → "no active run", many → list IDs). `stop` requires an explicit runID unless exactly
+one run is active. `rerun` omit → most recent **final** run (refuses an active source).
+
+TUI keys (panel-hosted inspect; same verbs via `client.session.command`) fire only while the
+inspect panel is focused — they are not dialog-hosted.
+
+| Command | Effect | TUI key |
+| --- | --- | --- |
+| `/ultracode` | Dashboard: plugin/min-build line, active (including paused), recent, saved workflows. | palette `ultracode.inspect` opens the panel |
+| `/ultracode show [runID]` | Full run report (D11 cells + sessionID): status, agents, tokens, tools, script. | — (server parity floor) |
+| `/ultracode result [runID]` | Print the **full** result of a run whose envelope came back truncated. | — |
+| `/ultracode stop [runID]` | Graceful stop: no new agent calls, children interrupted, worker terminated after a grace period. | `x` |
+| `/ultracode pause [runID]` | Close admission of new `agent()` calls; in-flight finish; watchdog suspended. | `p` (toggles pause) |
+| `/ultracode resume [runID]` | Reopen admission on a paused run. | `p` (toggles resume) |
+| `/ultracode rerun [runID] [argsJSON]` | Start a new run from a finished run's script (trust/digest checks if it was a named workflow). | — |
+| `/ultracode save <runID> <name>` | Save a run's script as a named workflow (`.js` + `.json` manifest). | `s` (name via `dialog.prompt`) |
+| `/ultracode trust <name>` | One-time approval for a saved workflow (content digest). | — |
+| `/ultracode untrust <name>` | Revoke trust for a saved workflow. | — |
+| `/ultracode help` | Print this command list and the authoring hint. | — |
+| (select / drill) | Move the inspect highlight; open the selected child session tab. | `↑` `↓` select · `enter` / `→` drill |
+
+## Inspect UI
+
+Opt-in TUI (`scripts/install.sh --tui` / sibling `tui.tsx`). Fail-soft: every slot, keymap,
+dialog, and toast call is try/caught; a missing host API never takes down the CLI. Version
+gate: channel `beta` and binary `0.0.0-beta-NNNNN` with **NNNNN ≥ 19271** (`shouldEnableTui`).
+Older or unknown builds skip TUI registration; `/ultracode show` remains the server-only
+parity floor.
+
+| Piece | Where | What |
+| --- | --- | --- |
+| Chip | `prompt.footer.status` | `ultracode · N running` while any run is active |
+| Panel | `session.panel` contribution `ultracode.inspect` | Two-column inspector (phases \| agents), pagination, footer keys |
+| Palette | command `ultracode.inspect` | Opens the panel; stay on the parent session |
+| Overlay keys | `keymap.layer` **inside** the panel component | `↑↓` select, `x` stop, `p` pause/resume, `s` save, `enter`/`→` drill |
+| Toast | `ui.toast.show` | Completion (envelope / quiet-window heuristic) and post-save trust hint |
+
+**Why the two-column inspector is panel-hosted, not `ui.dialog.show`:** G1 on beta-19271 —
+the host dialog owns the keymap. `keymap.layer` from a component mounted inside `dialog.show`
+does not receive keys; `onKey*` props and `dialog.set` extras are presentation-only. Overlay
+keys therefore live on `session.panel` (priority 90), which is the verified working layer
+when no host dialog is open. `ui.dialog.prompt` is used only for the save-name flow.
+
+### Parity vs Claude Code inspector
+
+| Surface | Here | Notes |
+| --- | --- | --- |
+| Header | yes | Short run id, agent counts, elapsed (`twoColumn` / `runHeaderCells`) |
+| Phases | yes | Left column; observed first-appearance order |
+| Agents | yes | Right column; D11 cells (status, label, phase, agent, model, …) |
+| Tokens | yes | Per-agent + run totals |
+| Tools | yes | `AgentRecord.toolCalls` (event reducer; context fallback) |
+| Pagination | yes | Page height 10; `N of M` / ↓ when more rows |
+| Stop | yes | Key `x` → `/ultracode stop` |
+| Pause | yes | Key `p` → pause/resume |
+| Save | yes | Key `s` → `dialog.prompt` → `/ultracode save` |
+| Select | yes | `↑` `↓` |
+| Drill | yes | `enter` / `→` → `tabs.open` child when tabs enabled |
+| Dialog-hosted keys | **no** | Deliberate: host dialog steals the keymap (G1 NO-GO) |
+| Mid-tool freeze | **no** | Deliberate: in-flight tool calls finish; pause only closes admission |
+
+### Paint checklist
+
+Reproduce against the recorded binary:
+
+```bash
+scripts/tui-probe.sh --live
+```
+
+Captures land in `spike/out/tui-live-<timestamp>.txt` (plus `.ansi` / `tui-live.jsonl`).
+`assert_live_paint` in the probe greps the stripped text. Exact needles from the live
+captures / probe:
+
+```bash
+# chip
+grep -F 'ultracode ·' spike/out/tui-live-*.txt
+# panel marker (always painted, even with no runs)
+grep -F 'UC-INSPECT' spike/out/tui-live-*.txt
+grep -F 'ultracode inspect' spike/out/tui-live-*.txt
+# two-column + footer (present once a run is grouped)
+grep -F 'Phases' spike/out/tui-live-*.txt
+grep -F 'x stop' spike/out/tui-live-*.txt
+grep -F 'p pause' spike/out/tui-live-*.txt
+```
+
+G1 dialog-keys (expect **NO-GO** on beta-19271): `scripts/tui-probe.sh --dialog-keys` →
+`G1-DIALOG-KEYS` in the stripped dump, zero `dialog-keys-receipt` in jsonl, `G1LEAK` absent.
+
+### Versions
+
+| Piece | Pin |
 | --- | --- |
-| `/ultracode` | Summary: active runs, recent runs (status, agents, tokens), and saved workflows (with trust state). |
-| `/ultracode stop <runID>` | Graceful stop: no new agent calls, children interrupted, worker terminated after a grace period. |
-| `/ultracode show <runID>` | The script, the per-agent table (status, requested vs effective agent, model, tokens), and result/error. |
-| `/ultracode result <runID>` | Print the **full** result of a run whose envelope came back truncated. |
-| `/ultracode save <runID> <name>` | Save a run's script as a named workflow (writes `.js` + `.json` manifest into the project workflow dir). |
-| `/ultracode trust <name>` | One-time approval for a saved workflow: stores an approved digest of its current content. Editing the script later invalidates it until re-approved. |
-| `/ultracode help` | Print this command list and the authoring hint. |
+| OpenCode **binary** (verified) | `0.0.0-beta-19271` |
+| `@opencode/plugin` **package** (repo pin) | `0.0.0-beta-19289` |
+
+Builds differ; the TUI version gate keys off the **binary** build, not the plugin package.
+The `/ultracode` dashboard first line repeats plugin `0.1.0` and min OpenCode beta-19271.
 
 ## Cost control
 
@@ -279,9 +408,16 @@ list of available agents and guidance instead of spawning a broken run.
 
 ## Roadmap
 
-- **Worktree isolation** — give write agents separate git worktrees so they can run in parallel safely.
+- **Dialog-key overlay** — blocked on the host: `ui.dialog.show` owns the keymap (G1 NO-GO on
+  beta-19271). Inspect stays panel-hosted until a host API delivers keys inside a dialog
+  without leaking to the prompt.
 - **Resume** — checkpoint long runs and resume after interruption instead of replaying from zero.
+  (`/ultracode resume` today only reopens a *paused* in-process run.)
+- **Worktree isolation** — give write agents separate git worktrees so they can run in parallel safely.
 - **QuickJS sandbox** — replace omission-based isolation with a real capability sandbox for scripts.
+- **npm publish** — local installs load TUI via sibling `tui.tsx` auto-load (verified); the
+  remaining question is whether a published package `exports["./tui"]` auto-loads the same way.
+  That gate is moot for `scripts/install.sh` / dir auto-load.
 
 ## Development
 
