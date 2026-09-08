@@ -111,6 +111,11 @@ export class FakeFs implements FsLike {
     }
     return [...out].filter((x) => x !== ".keep")
   }
+
+  /** Fakes have no symlinks — realpath is normalize (additive, Builder A review fix). */
+  async realpath(path: string): Promise<string> {
+    return this.normalize(path)
+  }
 }
 
 // ---------------------------------------------------------------------------

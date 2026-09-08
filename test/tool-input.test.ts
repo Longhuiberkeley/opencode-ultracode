@@ -69,14 +69,15 @@ test("saved: minimal workflow-only input", () => {
   assert.deepEqual(input, { workflow: "deep-research" })
 })
 
-test("saved: workflow + args + confirm", () => {
-  const { input } = ok({ workflow: "code-audit", args: { modules: ["a", "b"] }, confirm: true })
-  assert.deepEqual(input, { workflow: "code-audit", args: { modules: ["a", "b"] }, confirm: true })
+test("saved: workflow + args", () => {
+  const { input } = ok({ workflow: "code-audit", args: { modules: ["a", "b"] } })
+  assert.deepEqual(input, { workflow: "code-audit", args: { modules: ["a", "b"] } })
 })
 
-test("saved: confirm false is preserved", () => {
-  const { input } = ok({ workflow: "x", confirm: false })
-  assert.deepEqual(input, { workflow: "x", confirm: false })
+test("saved: confirm field is rejected (trust gate replaced the old hash bypass)", () => {
+  bad({ workflow: "x", confirm: true }, /unexpected key "confirm"/)
+  bad({ workflow: "x", confirm: false }, /unexpected key "confirm"/)
+  bad({ workflow: "x", confirm: "yes" }, /unexpected key "confirm"/)
 })
 
 // ---------------------------------------------------------------------------
@@ -128,8 +129,8 @@ test("rejects bad name", () => {
 })
 
 test("rejects bad confirm", () => {
-  bad({ workflow: "x", confirm: "yes" }, /"confirm" must be a boolean/)
-  bad({ workflow: "x", confirm: 1 }, /"confirm" must be a boolean/)
+  bad({ workflow: "x", confirm: "yes" }, /unexpected key "confirm"/)
+  bad({ workflow: "x", confirm: 1 }, /unexpected key "confirm"/)
 })
 
 // ---------------------------------------------------------------------------

@@ -102,17 +102,12 @@ export function validateToolInput(raw: unknown): ToolInputResult {
 
   if (hasWorkflow) {
     // ---- saved-workflow shape ----
-    const extra = rejectExtras(raw, new Set(["workflow", "args", "confirm"]))
+    const extra = rejectExtras(raw, new Set(["workflow", "args"]))
     if (extra) return { ok: false, error: extra }
 
     const workflow = raw["workflow"]
     if (typeof workflow !== "string" || workflow.trim() === "") {
       return { ok: false, error: `"workflow" must be a non-empty string, got ${typeOf(workflow) === "string" ? "empty string" : typeOf(workflow)}` }
-    }
-
-    const confirm = raw["confirm"]
-    if (confirm !== undefined && typeof confirm !== "boolean") {
-      return { ok: false, error: `"confirm" must be a boolean, got ${typeOf(confirm)}` }
     }
 
     const args = validateArgs(raw["args"])
@@ -126,7 +121,6 @@ export function validateToolInput(raw: unknown): ToolInputResult {
 
     const input: SavedRunInput = { workflow }
     if (raw["args"] !== undefined) input.args = args.args
-    if (confirm !== undefined) input.confirm = confirm
     return { ok: true, input }
   }
 

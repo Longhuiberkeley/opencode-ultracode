@@ -1,5 +1,6 @@
 node_modules/
 spike/out/
 spike/scratch/.opencode/plugins/probe/node_modules/
+.opencode/workflows/runs/
 *.log
 .DS_Store

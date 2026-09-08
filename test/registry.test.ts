@@ -192,6 +192,29 @@ test("markOwned for an unknown run is a no-op", () => {
   assert.equal(registry.wasEverOwned("ses_x"), false)
 })
 
+test("markOwned after finish() does not grant active ownership (ownership leak fix)", () => {
+  const { registry } = makeRegistry()
+  const run = registry.create({ parentSessionID: "ses", script: "s" })
+  registry.finish(run.id, { status: "succeeded" })
+  registry.markOwned(run.id, "ses_late")
+  assert.equal(registry.isOwnedActive("ses_late"), false)
+  assert.equal(registry.runForActiveSession("ses_late"), undefined)
+  assert.equal(registry.wasEverOwned("ses_late"), false)
+})
+
+test("markOwned on a stopping run still works, but not after it finalizes", () => {
+  const { registry } = makeRegistry()
+  const run = registry.create({ parentSessionID: "ses", script: "s" })
+  registry.setStatus(run.id, "stopping")
+  registry.markOwned(run.id, "ses_mid")
+  assert.equal(registry.isOwnedActive("ses_mid"), true)
+  registry.setStatus(run.id, "stopped")
+  // Late re-marking of a finalized run must not resurrect ownership.
+  registry.markOwned(run.id, "ses_mid")
+  assert.equal(registry.isOwnedActive("ses_mid"), false)
+  assert.equal(registry.wasEverOwned("ses_mid"), true) // provenance survives
+})
+
 // ---------------------------------------------------------------------------
 // listRecent / activeRuns
 // ---------------------------------------------------------------------------

@@ -180,14 +180,19 @@ export class RegistryImpl implements Registry {
   // ------------------------------------------------------------------
 
   markOwned(runID: string, sessionID: string): void {
-    if (!this.runs.has(runID)) return
+    // Only active runs can own sessions — a finalized (or unknown) run must
+    // never grant active-ownership rights (review fix: ownership leak).
+    const run = this.runs.get(runID)
+    if (!run || (run.status !== "running" && run.status !== "stopping")) return
     this.ownedActive.set(sessionID, runID)
     this.everOwned.add(sessionID)
   }
 
   isOwnedActive(sessionID: string): boolean {
     const runID = this.ownedActive.get(sessionID)
-    return runID !== undefined && this.runs.has(runID)
+    if (runID === undefined) return false
+    const run = this.runs.get(runID)
+    return run !== undefined && (run.status === "running" || run.status === "stopping")
   }
 
   wasEverOwned(sessionID: string): boolean {
@@ -196,7 +201,9 @@ export class RegistryImpl implements Registry {
 
   runForActiveSession(sessionID: string): RunRecord | undefined {
     const runID = this.ownedActive.get(sessionID)
-    return runID === undefined ? undefined : this.runs.get(runID)
+    if (runID === undefined) return undefined
+    const run = this.runs.get(runID)
+    return run !== undefined && (run.status === "running" || run.status === "stopping") ? run : undefined
   }
 
   // ------------------------------------------------------------------

@@ -15,6 +15,7 @@ import { Plugin } from "@opencode/plugin"
 import type { Skill } from "@opencode/plugin"
 import { promises as fsp } from "node:fs"
 import { homedir } from "node:os"
+import { fileURLToPath } from "node:url"
 import { loadOptions } from "./config.ts"
 import { RegistryImpl } from "./registry.ts"
 import { StorageImpl, normalizePath } from "./storage.ts"
@@ -39,6 +40,10 @@ interface RegistrationLike {
 // ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
+
+/** Module-level skill state — the prompt hook must never push an
+ *  unregistered skill id into prompts (it can break admission). */
+let skillInstalled = false
 
 function warn(message: string, err?: unknown): void {
   try {
@@ -78,6 +83,16 @@ function fmtTokens(n: number | undefined): string {
 /** Permission actions treated as "edits" (spike: exact names unverified — keep small + code-local). */
 const EDIT_ACTIONS: ReadonlySet<string> = new Set(["edit", "write"])
 
+/** Unwrap a list response that is either a bare array or a { location, data } envelope. */
+function unwrapList(result: unknown): unknown[] {
+  if (Array.isArray(result)) return result
+  if (result && typeof result === "object") {
+    const data = (result as { data?: unknown }).data
+    if (Array.isArray(data)) return data
+  }
+  return []
+}
+
 /** JSON Schema for the workflow tool input union (inline script vs saved workflow). */
 const WORKFLOW_TOOL_INPUT_SCHEMA: Record<string, unknown> = {
   anyOf: [
@@ -91,7 +106,7 @@ const WORKFLOW_TOOL_INPUT_SCHEMA: Record<string, unknown> = {
           description:
             "Workflow source: a plain-JS async function body (no import/export). Injected globals: agent(prompt, opts?) -> {text, data?, tokens}, parallel(thunks), pipeline(items, ...stages), phase(name), progress(text), workflow(name, args), sleep(ms), console.log, args, meta. Return a small JSON value.",
         },
-        name: { type: "string", description: "Optional run name shown in /workflow summaries." },
+        name: { type: "string", description: "Optional run name shown in /ultracode summaries." },
         meta: {
           type: "object",
           additionalProperties: false,
@@ -114,12 +129,11 @@ const WORKFLOW_TOOL_INPUT_SCHEMA: Record<string, unknown> = {
       additionalProperties: false,
       required: ["workflow"],
       properties: {
-        workflow: { type: "string", description: "Saved workflow name (see /workflow for the list; project dir beats personal dir)." },
-        args: { description: "JSON value exposed to the script as `args` (max 64 KB serialized)." },
-        confirm: {
-          type: "boolean",
-          description: "Run despite a script/manifest hash mismatch (script changed on disk since it was saved).",
+        workflow: {
+          type: "string",
+          description: "Saved workflow name (see /ultracode for the list; project dir beats personal dir). Trusted via /ultracode trust <name>.",
         },
+        args: { description: "JSON value exposed to the script as `args` (max 64 KB serialized)." },
       },
     },
   ],
@@ -171,8 +185,11 @@ export default Plugin.define({
     const { options, warnings } = loadOptions(ctx.options)
     for (const w of warnings) warn(`config warning — ${w}`)
 
+    let disposed = false
+
     // ---- capabilities (plain interfaces; everything stays node-testable) ----
     const projectRoot = normalizePath(String(ctx.location?.project?.directory ?? process.cwd()))
+    const projectID = String(ctx.location?.project?.id ?? projectRoot)
     const personalWorkflowDir = normalizePath(
       `${process.env["HOME"] ?? homedir()}/.config/opencode/workflows`,
     )
@@ -215,6 +232,7 @@ export default Plugin.define({
           return []
         }
       },
+      realpath: async (path) => await fsp.realpath(path),
     }
 
     const sessions: SessionCtx = {
@@ -239,7 +257,7 @@ export default Plugin.define({
       },
     }
 
-    const storage = new StorageImpl({ kv, fs, projectRoot, personalWorkflowDir })
+    const storage = new StorageImpl({ kv, fs, projectRoot, personalWorkflowDir, projectID })
     const registry = new RegistryImpl({
       persist: (record) => storage.saveRun(record),
       loader: () => storage.loadRuns(),
@@ -248,7 +266,7 @@ export default Plugin.define({
     const controller = new AbortController()
     const registrations: RegistrationLike[] = []
 
-    // Async warm-ups (never block setup on session admission; kv/fs only).
+    // Async warm-up (never blocks setup on session admission; kv only).
     const runsReconciled = storage
       .loadRunsAsync()
       .then(() => {
@@ -256,40 +274,22 @@ export default Plugin.define({
         if (flipped > 0) warn(`marked ${flipped} orphaned run(s) as interrupted (server restart)`)
       })
       .catch((err) => warn("failed to reconcile persisted runs", err))
-    const workflowsReady = storage.refreshWorkflows().then(() => undefined, () => undefined)
 
-    // ---- agent availability (cached async fn; refreshed on every tool call) ----
-    let agentIds: string[] = []
-    let agentsInFlight: Promise<string[]> | undefined
-    function fetchAgentIDs(): Promise<string[]> {
-      if (agentsInFlight) return agentsInFlight
-      agentsInFlight = (async () => {
-        try {
-          const result = (await ctx.agent.list()) as unknown
-          let list: unknown[] = []
-          if (Array.isArray(result)) list = result
-          else if (result && typeof result === "object") {
-            const data = (result as { data?: unknown }).data // verified envelope
-            if (Array.isArray(data)) list = data
-          }
-          agentIds = list
-            .map((a) =>
-              a && typeof a === "object" && typeof (a as { id?: unknown }).id === "string"
-                ? (a as { id: string }).id
-                : "",
-            )
-            .filter((id) => id !== "")
-        } catch (err) {
-          if (controller.signal.aborted) return agentIds
-          if (agentIds.length === 0) warn("failed to list agents (preflight degraded)", err)
-        }
-        return agentIds
-      })()
-      const done = agentsInFlight
-      void done.then(() => {
-        agentsInFlight = undefined
-      })
-      return done
+    // ---- agent availability (fresh per invocation; failures fail the run) ----
+    async function listAgentIDs(): Promise<{ ok: true; ids: string[] } | { ok: false; error: string }> {
+      try {
+        const result = (await ctx.agent.list()) as unknown
+        const ids = unwrapList(result)
+          .map((a) =>
+            a && typeof a === "object" && typeof (a as { id?: unknown }).id === "string"
+              ? (a as { id: string }).id
+              : "",
+          )
+          .filter((id) => id !== "")
+        return { ok: true, ids }
+      } catch (err) {
+        return { ok: false, error: describeError(err) }
+      }
     }
 
     // ---- supervisor (Builder B module; guarded dynamic import) ----
@@ -314,25 +314,46 @@ export default Plugin.define({
       }
     }
 
-    // ---- workflow tool ----
+    /** Best-effort pending-permission summary for a child session. */
+    async function pendingPermissions(sessionID: string): Promise<string | undefined> {
+      try {
+        const result = (await ctx.permission.list({ sessionID })) as unknown
+        const items = unwrapList(result) as Array<{ action?: string; resources?: unknown; message?: string }>
+        if (items.length === 0) return undefined
+        return items
+          .map((p) => {
+            const resources = Array.isArray(p.resources) ? p.resources.join(", ") : "?"
+            return `${p.action ?? "?"} on ${resources}`
+          })
+          .join("; ")
+      } catch {
+        return undefined
+      }
+    }
+
+    // ---- ultracode_run tool (namespaced: unique vs future opencode/plugin tools) ----
     try {
       await ctx.tool.transform((editor) => {
         try {
+          editor.namespace({ name: "ultracode", description: "Dynamic workflow orchestration (ultracode)" })
           editor.add({
-            name: "workflow",
+            name: "run",
+            options: { namespace: "ultracode" },
             description:
-              "Run an ultracode workflow — a plain-JS async-function-body script that orchestrates multiple AI agents " +
-              "(agent(), parallel(), pipeline(), phase(), progress(), workflow(name), sleep()) and returns a small JSON value. " +
-              "Input is { script, meta?, args? } (inline) or { workflow: name, args?, confirm? } (saved workflow). " +
+              "Run an ultracode workflow (invoke this tool as ultracode_run) — a plain-JS async-function-body script that " +
+              "orchestrates multiple AI agents (agent(), parallel(), pipeline(), phase(), progress(), workflow(name), sleep()) " +
+              "and returns a small JSON value. Input is { script, meta?, args? } (inline) or { workflow: name, args? } " +
+              "(saved workflow — must be trusted first via /ultracode trust <name>). " +
               "Use when a task outgrows one context window or needs fan-out / verification / repeatable orchestration. " +
               "Blocks until every agent settles, then returns an envelope { runID, status, agents, tokens, result | preview }. " +
-              "Say 'ultracode' in the conversation to load the authoring skill.",
+              "Say 'ultracode' at the start of your prompt to load the authoring skill.",
             input: WORKFLOW_TOOL_INPUT_SCHEMA,
             execute: async (rawInput: unknown, tool) => {
               if (supervisor?.isOwnedSession(tool.sessionID)) {
                 return { content: "nested workflow runs are not allowed" }
               }
               try {
+                if (disposed) return { content: "error: the ultracode plugin is shutting down" }
                 if (!supervisor) {
                   return { content: `error: ${supervisorError ?? "workflow tool unavailable"}` }
                 }
@@ -342,6 +363,16 @@ export default Plugin.define({
                 }
                 const input = parsed.input
 
+                // Agent availability: fresh fetch on EVERY invocation; a failed
+                // fetch fails the run (no silent stale reuse).
+                const agents = await listAgentIDs()
+                if (!agents.ok) {
+                  return {
+                    content: `error: could not list available agents (${agents.error}) — refusing to start the run`,
+                  }
+                }
+                const availableAgents = agents.ids
+
                 let script: string
                 let meta: WorkflowMeta | undefined
                 let name: string | undefined
@@ -349,17 +380,14 @@ export default Plugin.define({
                 let args: Json | undefined
 
                 if ("workflow" in input) {
-                  await Promise.all([workflowsReady, runsReconciled])
-                  let saved
+                  // Fresh disk scan so edits made while the server runs are seen.
+                  await storage.refreshWorkflows()
+                  await runsReconciled
+                  let saved: ReturnType<StorageImpl["loadWorkflow"]>
                   try {
                     saved = storage.loadWorkflow(input.workflow)
                   } catch (err) {
-                    const message = describeError(err)
-                    if (input.confirm === true) {
-                      saved = storage.loadWorkflowTolerant(input.workflow)
-                    } else {
-                      return { content: `error: ${message}` }
-                    }
+                    return { content: `error: ${describeError(err)}` }
                   }
                   if (!saved) {
                     const available = storage
@@ -369,7 +397,7 @@ export default Plugin.define({
                     return {
                       content:
                         `error: workflow "${input.workflow}" not found.` +
-                        (available ? ` Saved workflows: ${available}.` : " No saved workflows exist yet — run one inline, then use /workflow save <runID> <name>."),
+                        (available ? ` Saved workflows: ${available}.` : " No saved workflows exist yet — run one inline, then use /ultracode save <runID> <name>."),
                     }
                   }
                   script = saved.script
@@ -391,15 +419,22 @@ export default Plugin.define({
 
                 // Preflight required agents (fail fast, list what's available).
                 const requires = meta?.requires ?? []
-                if (requires.length > 0) {
-                  const available = await fetchAgentIDs() // refresh on every tool call
-                  const missing = [...new Set(requires)].filter((id) => !available.includes(id))
-                  if (missing.length > 0) {
-                    return {
-                      content:
-                        `error: workflow requires agent(s) not available: ${missing.join(", ")}. ` +
-                        `Available agents: ${available.join(", ") || "(none — create agents or check your install)"}`,
-                    }
+                const missingRequires = [...new Set(requires)].filter((id) => !availableAgents.includes(id))
+                if (missingRequires.length > 0) {
+                  return {
+                    content:
+                      `error: workflow requires agent(s) not available: ${missingRequires.join(", ")}. ` +
+                      `Available agents: ${availableAgents.join(", ") || "(none — create agents or check your install)"}`,
+                  }
+                }
+
+                // Validate the configured default agent for this run.
+                if (!availableAgents.includes(options.agent)) {
+                  return {
+                    content:
+                      `error: default agent "${options.agent}" is not available in this location. ` +
+                      `Available agents: ${availableAgents.join(", ") || "(none — create agents or check your install)"}. ` +
+                      `Set the "agent" plugin option to an available agent id.`,
                   }
                 }
 
@@ -408,6 +443,7 @@ export default Plugin.define({
                   agent: tool.agent,
                   messageID: tool.messageID,
                   report: makeReporter(tool.progress as (update: Record<string, unknown>) => Promise<void>),
+                  availableAgents,
                 }
                 const outcome = await supervisor.start({ script, meta, args, name, workflowName }, parent)
                 return { content: JSON.stringify(outcome.envelope, null, 1) }
@@ -417,17 +453,17 @@ export default Plugin.define({
             },
           })
         } catch (err) {
-          warn("failed to register workflow tool", err)
+          warn("failed to register the ultracode_run tool", err)
         }
       })
     } catch (err) {
-      warn("tool transform failed — workflow tool not registered", err)
+      warn("tool transform failed — ultracode_run not registered", err)
     }
 
-    // ---- /workflow + /workflows commands ----
+    // ---- /ultracode command (+ /workflow, /workflows aliases when free) ----
     function commandArgs(promptText: string | undefined): string {
       const text = (promptText ?? "").trim()
-      const token = /^\/(?:workflows|workflow)\b/i.exec(text)
+      const token = /^\/(?:ultracode|workflows|workflow)\b/i.exec(text)
       return (token ? text.slice(token[0].length) : text).trim()
     }
 
@@ -445,7 +481,7 @@ export default Plugin.define({
       return `- ${bits.join(" · ")}`
     }
 
-    function showRun(run: RunRecord): string {
+    async function showRun(run: RunRecord): Promise<string> {
       const lines: string[] = []
       lines.push(`## Run \`${run.id}\`${run.name ? ` — ${run.name}` : ""}`)
       lines.push("")
@@ -461,21 +497,38 @@ export default Plugin.define({
         )
       }
       if (run.scriptPath) lines.push(`- script artifact: ${run.scriptPath}`)
+      if (run.resultTruncated && run.resultArtifactKey) {
+        lines.push(`- result truncated — full result: /ultracode result \`${run.id}\` (artifact key \`${run.resultArtifactKey}\`)`)
+      }
       lines.push("")
       lines.push("### Agents")
       lines.push("")
       if (run.agents.length === 0) {
         lines.push("(no agents were started)")
       } else {
-        lines.push("| id | label / phase | agent | model | status | tokens in/out |")
-        lines.push("| --- | --- | --- | --- | --- | --- |")
+        lines.push("| id | label / phase | agent | model | status | tokens in/out | session |")
+        lines.push("| --- | --- | --- | --- | --- | --- | --- |")
         for (const a of run.agents) {
           const label = [a.label, a.phase].filter(Boolean).join(" · ") || "-"
           const agent = a.effectiveAgent ?? a.requestedAgent ?? "-"
           const model = a.effectiveModel ? `${a.effectiveModel.providerID}/${a.effectiveModel.id}` : "-"
           const tokens = a.tokens ? `${fmtTokens(a.tokens.input)}/${fmtTokens(a.tokens.output)}` : "-"
           const error = a.error ? ` — ${a.error.slice(0, 60)}` : ""
-          lines.push(`| ${a.id} | ${label} | ${agent} | ${model} | ${a.status}${error} | ${tokens} |`)
+          lines.push(`| ${a.id} | ${label} | ${agent} | ${model} | ${a.status}${error} | ${tokens} | ${a.sessionID ?? "-"} |`)
+        }
+      }
+      // Pending permissions for children of an active run (best-effort).
+      if (run.status === "running" || run.status === "stopping") {
+        const pending: string[] = []
+        for (const a of run.agents) {
+          if (a.status !== "running" || !a.sessionID) continue
+          const text = await pendingPermissions(a.sessionID)
+          if (text) pending.push(`- \`${a.id}\` (\`${a.sessionID}\`): ${text}`)
+        }
+        if (pending.length > 0) {
+          lines.push("")
+          lines.push("**Waiting for permission**")
+          lines.push(...pending)
         }
       }
       lines.push("")
@@ -489,19 +542,24 @@ export default Plugin.define({
 
     function helpText(): string {
       return [
-        "Usage:",
-        "- `/workflow` — active + recent runs and saved workflows",
-        "- `/workflow show <runID>` — full run report (agents, tokens, script)",
-        "- `/workflow stop <runID>` — stop an active run",
-        "- `/workflow save <runID> <name>` — save a run's script as a reusable workflow",
+        "Usage (command: /ultracode; /workflow and /workflows work as aliases when not taken):",
+        "- `/ultracode` — active + recent runs and saved workflows",
+        "- `/ultracode show <runID>` — full run report (agents, sessions, tokens, script)",
+        "- `/ultracode stop <runID>` — stop an active run",
+        "- `/ultracode save <runID> <name>` — save a run's script as a reusable workflow",
+        "- `/ultracode trust <name>` — approve the current version of a saved workflow",
+        "- `/ultracode result <runID>` — print a truncated run's full result",
       ].join("\n")
     }
 
     const commandHandler = async (invocation: { sessionID: string; prompt: { text?: string } }): Promise<void> => {
       try {
+        if (disposed) return
         const { sessionID } = invocation
         const argsText = commandArgs(invocation.prompt?.text)
         if (argsText === "") {
+          await runsReconciled
+          await storage.refreshWorkflows() // fresh from disk on every invocation
           const active = supervisor?.activeRuns() ?? registry.activeRuns()
           const finished = registry
             .listRecent(50)
@@ -519,7 +577,7 @@ export default Plugin.define({
           parts.push(
             saved.length
               ? saved.map((w) => `- \`${w.manifest.name}\` — ${w.manifest.description ?? "(no description)"} [${w.manifest.source}]`).join("\n")
-              : "(none — save one with `/workflow save <runID> <name>`)",
+              : "(none — save one with `/ultracode save <runID> <name>`)",
           )
           parts.push("")
           parts.push(`Workflow dirs: project \`${normalizePath(`${projectRoot}/.opencode/workflows`)}\` (wins) · personal \`${personalWorkflowDir}\``)
@@ -533,53 +591,56 @@ export default Plugin.define({
 
         if (sub === "stop") {
           if (!rest) {
-            await say(sessionID, "Usage: /workflow stop <runID>")
+            await say(sessionID, "Usage: /ultracode stop <runID>")
             return
           }
           if (!supervisor) {
             await say(sessionID, `error: ${supervisorError ?? "supervisor unavailable"}`)
             return
           }
-          const stopped = supervisor.stop(rest, "user requested (/workflow stop)")
+          const stopped = supervisor.stop(rest, "user requested (/ultracode stop)")
           await say(
             sessionID,
-            stopped ? `Stopping run \`${rest}\` — in-flight agents will be interrupted.` : `Run \`${rest}\` is unknown or already finished. See /workflow for the list.`,
+            stopped ? `Stopping run \`${rest}\` — in-flight agents will be interrupted.` : `Run \`${rest}\` is unknown or already finished. See /ultracode for the list.`,
           )
           return
         }
 
         if (sub === "show") {
           if (!rest) {
-            await say(sessionID, "Usage: /workflow show <runID>")
+            await say(sessionID, "Usage: /ultracode show <runID>")
             return
           }
-          await Promise.all([runsReconciled])
+          await runsReconciled
           const run = registry.get(rest)
           if (!run) {
-            await say(sessionID, `Run \`${rest}\` not found. See /workflow for known runs.`)
+            await say(sessionID, `Run \`${rest}\` not found. See /ultracode for known runs.`)
             return
           }
-          await say(sessionID, showRun(run))
+          await say(sessionID, await showRun(run))
           return
         }
 
         if (sub === "save") {
           const saveMatch = /^(\S+)\s+(\S+)$/.exec(rest)
           if (!saveMatch) {
-            await say(sessionID, "Usage: /workflow save <runID> <name>\n(name: lowercase alphanumerics, `-`/`_`, max 64 chars)")
+            await say(sessionID, "Usage: /ultracode save <runID> <name>\n(name: lowercase alphanumerics, `-`/`_`, max 64 chars)")
             return
           }
           const runID = saveMatch[1]!
           const name = saveMatch[2]!
           const run = registry.get(runID)
           if (!run) {
-            await say(sessionID, `Run \`${runID}\` not found. See /workflow for known runs.`)
+            await say(sessionID, `Run \`${runID}\` not found. See /ultracode for known runs.`)
             return
           }
           try {
+            // manifest.name is ALWAYS the lookup key; the run's display name
+            // only enriches the description.
+            const display = run.meta?.name ?? run.name
             const saved = await storage.saveWorkflow(name, run.script, {
-              name: run.meta?.name ?? run.name ?? name,
-              description: run.meta?.description,
+              name,
+              description: display && display !== name ? `saved from run ${run.id} (${display})` : `saved from run ${run.id}`,
               phases: run.meta?.phases,
               requires: run.meta?.requires,
               savedFromRunID: run.id,
@@ -587,7 +648,7 @@ export default Plugin.define({
             })
             await say(
               sessionID,
-              `Saved workflow \`${saved.manifest.name}\` (${saved.manifest.source}) — run it with the workflow tool: { workflow: "${saved.manifest.name}" }`,
+              `Saved workflow \`${saved.manifest.name}\` (${saved.manifest.source}) — approve it once with \`/ultracode trust ${saved.manifest.name}\`, then run it with { workflow: "${saved.manifest.name}" }`,
             )
           } catch (err) {
             await say(sessionID, `error: could not save workflow — ${describeError(err)}`)
@@ -595,52 +656,131 @@ export default Plugin.define({
           return
         }
 
-        await say(sessionID, `Unknown /workflow argument: ${JSON.stringify(sub)}\n\n${helpText()}`)
+        if (sub === "trust") {
+          if (!rest || /\s/.test(rest)) {
+            await say(sessionID, "Usage: /ultracode trust <name>")
+            return
+          }
+          try {
+            const trusted = await storage.trustWorkflow(rest)
+            if (!trusted) {
+              await say(sessionID, `Workflow \`${rest}\` not found on disk. See /ultracode for the list.`)
+              return
+            }
+            await say(
+              sessionID,
+              `Trusted workflow \`${rest}\` (current version, sha256 ${trusted.manifest.hash.slice(0, 12)}…) — it can now be run with { workflow: "${rest}" }.`,
+            )
+          } catch (err) {
+            await say(sessionID, `error: could not trust workflow — ${describeError(err)}`)
+          }
+          return
+        }
+
+        if (sub === "result") {
+          if (!rest) {
+            await say(sessionID, "Usage: /ultracode result <runID>")
+            return
+          }
+          await runsReconciled
+          const run = registry.get(rest)
+          if (!run) {
+            await say(sessionID, `Run \`${rest}\` not found. See /ultracode for known runs.`)
+            return
+          }
+          if (!run.resultArtifactKey) {
+            await say(
+              sessionID,
+              run.resultTruncated
+                ? `Run \`${rest}\` was truncated but no result artifact was recorded.`
+                : `Run \`${rest}\` was not truncated — its result is already in the tool output (see /ultracode show).`,
+            )
+            return
+          }
+          const result = await storage.loadResultArtifactFresh(run.resultArtifactKey)
+          if (result === undefined) {
+            await say(sessionID, `No stored result found for run \`${rest}\` (key \`${run.resultArtifactKey}\`).`)
+            return
+          }
+          await say(sessionID, `## Full result — \`${rest}\`\n\n\`\`\`json\n${JSON.stringify(result, null, 1)}\n\`\`\``)
+          return
+        }
+
+        await say(sessionID, `Unknown /ultracode argument: ${JSON.stringify(sub)}\n\n${helpText()}`)
       } catch (err) {
-        warn("/workflow command failed", err)
+        warn("/ultracode command failed", err)
       }
     }
 
     try {
+      // Fetch existing commands BEFORE the transform: register /workflow and
+      // /workflows aliases only when the names are free (last-wins clobbering).
+      let aliasNames: ReadonlySet<string> = new Set(["workflow", "workflows"])
+      try {
+        const listed = unwrapList((await ctx.command.list()) as unknown) as Array<{ name?: unknown }>
+        aliasNames = new Set(
+          ["workflow", "workflows"].filter((name) => !listed.some((c) => c && typeof c === "object" && (c as { name?: unknown }).name === name)),
+        )
+      } catch (err) {
+        aliasNames = new Set()
+        warn("could not list existing commands — /workflow aliases skipped", err)
+      }
       await ctx.command.transform((editor) => {
         try {
           editor.add({
-            name: "workflow",
-            description: "Inspect and manage ultracode workflow runs (summary, show, stop, save)",
+            name: "ultracode",
+            description: "Inspect and manage ultracode workflow runs (summary, show, stop, save, trust, result)",
             execute: commandHandler,
           })
-          editor.add({
-            name: "workflows",
-            description: "Alias of /workflow",
-            execute: commandHandler,
-          })
+          if (aliasNames.has("workflow")) {
+            editor.add({
+              name: "workflow",
+              description: "Alias of /ultracode",
+              execute: commandHandler,
+            })
+          } else {
+            warn("skipping /workflow alias — a command with that name already exists")
+          }
+          if (aliasNames.has("workflows")) {
+            editor.add({
+              name: "workflows",
+              description: "Alias of /ultracode",
+              execute: commandHandler,
+            })
+          } else {
+            warn("skipping /workflows alias — a command with that name already exists")
+          }
         } catch (err) {
           warn("failed to register commands", err)
         }
       })
     } catch (err) {
-      warn("command transform failed — /workflow not registered", err)
+      warn("command transform failed — /ultracode not registered", err)
     }
 
-    // ---- prompt hook: attach the authoring skill on the "ultracode" keyword ----
+    // ---- prompt hook: attach the authoring skill on a leading "ultracode" keyword ----
     try {
       const reg = await ctx.session.hook("prompt", (event) => {
         try {
+          if (!skillInstalled) return // never push an unregistered skill id
           const ev = event as unknown as {
             sessionID?: string
             prompt?: { text?: string; skills?: Array<{ id: string }> }
           }
-          const text = ev.prompt?.text ?? ""
-          if (!/\bultracode\b/i.test(text)) return
+          // Start-of-prompt trigger only: "ultracode: do X" / "ultracode do X".
+          // Mid-sentence mentions and paths like opencode-ultracode do not fire.
+          if (!/^\s*ultracode(?=\s|:|$)/i.test(ev.prompt?.text ?? "")) return
+          // sessionID must be present; without it we cannot check ownership —
+          // don't mutate the prompt at all.
           const sessionID = ev.sessionID
+          if (typeof sessionID !== "string" || sessionID === "") return
           // Don't re-attach inside workflow-owned child sessions.
-          if (typeof sessionID === "string" && sessionID !== "") {
-            if (supervisor?.isOwnedSession(sessionID) || registry.isOwnedActive(sessionID)) return
-          }
-          if (!ev.prompt) return
-          ev.prompt.skills ??= []
-          if (!ev.prompt.skills.some((s) => s?.id === "ultracode")) {
-            ev.prompt.skills.push({ id: "ultracode" })
+          if (supervisor?.isOwnedSession(sessionID) || registry.isOwnedActive(sessionID)) return
+          const prompt = ev.prompt
+          if (!prompt || typeof prompt !== "object") return
+          prompt.skills ??= []
+          if (!prompt.skills.some((s) => s?.id === "ultracode")) {
+            prompt.skills.push({ id: "ultracode" })
           }
         } catch {
           // never throw from a hook
@@ -651,21 +791,38 @@ export default Plugin.define({
       warn("prompt hook registration failed — keyword skill attach disabled", err)
     }
 
-    // ---- skill registration (Builder C content; guarded) ----
+    // ---- skill registration (Builder C content; static file in the plugin package) ----
     try {
       const content = await import("./skill-content.ts")
-      const skillPath = storage.skillMarkdownPath()
-      let fileWritten = false
+      // The skill markdown ships inside the plugin package (skills/ultracode.md).
+      // Derive the plugin dir from this module's URL; never write into the
+      // user's project.
+      const skillPath = fileURLToPath(new URL("../skills/ultracode.md", import.meta.url))
+      let filePresent = false
       try {
-        await fs.mkdir(normalizePath(`${skillPath}/..`), true)
-        await fs.writeFile(skillPath, content.SKILL_CONTENT)
-        fileWritten = true
-      } catch (err) {
-        warn(`failed to write skill file ${skillPath}`, err)
+        filePresent = await fs.exists(skillPath)
+      } catch {
+        filePresent = false
       }
-      if (fileWritten) {
+      if (!filePresent) {
+        // Best effort: materialize it inside the PLUGIN dir (not the project).
+        // Read-only installs simply skip skill registration.
+        try {
+          await fs.mkdir(normalizePath(`${skillPath}/..`), true)
+          await fs.writeFile(skillPath, content.SKILL_CONTENT)
+          filePresent = true
+        } catch (err) {
+          warn(`skill file ${skillPath} is missing and could not be created`, err)
+        }
+      }
+      if (filePresent) {
         await ctx.skill.transform((editor) => {
           try {
+            const existing = editor.get("ultracode") as { location?: string } | undefined
+            if (existing && existing.location !== skillPath) {
+              warn(`skill id "ultracode" is already registered at ${String(existing.location)} — not overriding it`)
+              return
+            }
             editor.add({
               id: "ultracode",
               name: content.SKILL_NAME,
@@ -673,12 +830,13 @@ export default Plugin.define({
               location: skillPath,
               content: content.SKILL_CONTENT,
             } as unknown as Skill.Info)
+            skillInstalled = true
           } catch (err) {
             warn("skill editor.add failed", err)
           }
         })
       } else {
-        warn("skill not registered — its location file could not be written")
+        warn("skill not registered — its location file is unavailable")
       }
     } catch (err) {
       warn("skill registration failed — keyword skill attach will not resolve", err)
@@ -686,15 +844,40 @@ export default Plugin.define({
 
     // ---- permission hook (only when NOT delegating every ask to the user) ----
     if (options.permissions !== "ask") {
-      const projectRootNormalized = normalizePath(projectRoot)
-      const isInsideProject = (resource: string): boolean => {
-        let path = resource
-        if (path.startsWith("file://")) path = path.slice("file://".length)
-        const normalized = normalizePath(path)
-        return normalized === projectRootNormalized || normalized.startsWith(projectRootNormalized + "/")
+      const realpathProjectRoot = await (async () => {
+        try {
+          return normalizePath(await fs.realpath(projectRoot))
+        } catch {
+          return normalizePath(projectRoot)
+        }
+      })()
+      /** Parse a resource into an absolute path; undefined = unclassifiable (fail closed). */
+      const parseResourcePath = async (resource: string): Promise<string | undefined> => {
+        try {
+          let path: string
+          if (resource.startsWith("file:")) {
+            path = fileURLToPath(new URL(resource))
+          } else if (resource.startsWith("/")) {
+            path = resource
+          } else {
+            return undefined
+          }
+          try {
+            return normalizePath(await fs.realpath(path))
+          } catch {
+            return normalizePath(path) // not on disk (yet) — lexical check
+          }
+        } catch {
+          return undefined
+        }
+      }
+      const isInsideProject = async (resource: string): Promise<boolean> => {
+        const resolved = await parseResourcePath(resource)
+        if (resolved === undefined) return false
+        return resolved === realpathProjectRoot || resolved.startsWith(realpathProjectRoot + "/")
       }
       try {
-        const reg = await ctx.permission.hook("evaluate", (event) => {
+        const reg = await ctx.permission.hook("evaluate", async (event) => {
           try {
             const ev = event as unknown as {
               sessionID?: string
@@ -711,7 +894,8 @@ export default Plugin.define({
             if (options.permissions === "autoEditsWorkflow") {
               const resources = Array.isArray(ev.resources) ? ev.resources : []
               if (resources.length === 0) return
-              if (!resources.every((r) => typeof r === "string" && isInsideProject(r))) return
+              const inside = await Promise.all(resources.map((r) => (typeof r === "string" ? isInsideProject(r) : Promise.resolve(false))))
+              if (!inside.every(Boolean)) return // unclassifiable/escaped => no auto-allow
               ev.effect = "allow"
               return
             }
@@ -730,6 +914,7 @@ export default Plugin.define({
 
     // ---- cleanup ----
     return () => {
+      disposed = true
       controller.abort()
       for (const reg of registrations) {
         try {

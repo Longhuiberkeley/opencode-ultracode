@@ -73,11 +73,6 @@ export interface InlineRunInput {
 export interface SavedRunInput {
   workflow: string
   args?: Json
-  /**
-   * Proceed despite a manifest/script hash mismatch (script changed on disk
-   * since it was saved). Added additively by Builder A per CONTRACTS.md.
-   */
-  confirm?: boolean
 }
 
 export type WorkflowToolInput = InlineRunInput | SavedRunInput
@@ -181,6 +176,8 @@ export interface RunEnvelope {
   /** Present instead of `result` when truncated. */
   preview?: string
   truncated: boolean
+  /** Storage key of the full result artifact (present when truncated; additive — Builder B). */
+  resultArtifactKey?: string
   scriptPath?: string
   workflowName?: string
   error?: string
@@ -456,7 +453,7 @@ export interface KvLike {
   get(key: string): Promise<Json | undefined>
   set(key: string, value: Json): Promise<void>
   remove?(key: string): Promise<void>
-  scan?(options: { prefix: string; limit?: number }): Promise<{ entries: ReadonlyArray<{ key: string; value: Json }>; next?: string }>
+  scan?(options: { prefix: string; after?: string; limit?: number }): Promise<{ entries: ReadonlyArray<{ key: string; value: Json }>; next?: string }>
 }
 
 /** Filesystem subset used by storage. */
@@ -466,6 +463,8 @@ export interface FsLike {
   readFile(path: string): Promise<string>
   exists(path: string): Promise<boolean>
   readdir(path: string): Promise<string[]>
+  /** Resolve symlinks (node:fs realpath). Fakes: normalize(). */
+  realpath(path: string): Promise<string>
 }
 
 export function randomRunID(): string {
