@@ -84,7 +84,7 @@ export class RegistryImpl implements Registry {
       agents: [],
     }
     this.runs.set(id, record)
-    // First snapshot is durable immediately (crash visibility for /workflow).
+    // First snapshot is durable immediately (crash visibility for /ultracode).
     this.persistNow(id)
     return record
   }

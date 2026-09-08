@@ -326,7 +326,7 @@ export function buildEnvelope(run: RunRecord, maxChars: number): RunEnvelope {
     } else {
       envelope.preview = boundedPrettyStringify(run.result, maxChars)
       envelope.truncated = true
-      // Give consumers (e.g. `/workflow result`) a handle on the full artifact.
+      // Give consumers (e.g. `/ultracode result`) a handle on the full artifact.
       if (run.resultArtifactKey !== undefined) envelope.resultArtifactKey = run.resultArtifactKey
     }
   }

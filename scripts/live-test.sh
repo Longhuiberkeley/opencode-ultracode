@@ -35,10 +35,10 @@ case "${1:-}" in
     echo "exit: $? (see spike/out/live-run.txt)"
     ;;
   command)
-    echo "== /workflow via API on the most recent session =="
+    echo "== /ultracode via API on the most recent session =="
     SID=$(api get /api/session | python3 -c 'import json,sys; d=json.load(sys.stdin); items=d.get("data",[]); print(max(items,key=lambda s:s.get("time",{}).get("created",0))["id"] if items else "")')
     echo "session: $SID"
-    api post "/api/session/$SID/command" --data "{\"command\":\"workflow\"}"
+    api post "/api/session/$SID/command" --data "{\"command\":\"ultracode\"}"
     ;;
   stop|skill|nested|restart)
     echo "step '$1' — driven manually per docs/INTEGRATION-TEST.md"

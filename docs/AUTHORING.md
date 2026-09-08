@@ -22,9 +22,9 @@ the `Ultracode` skill; this document is the long form.
 ## The ultracode_run tool
 
 The model invokes the `ultracode_run` tool (it is received as a normal tool despite the
-namespaced registration name). The skill attaches automatically only when the prompt **starts
-with** `ultracode` (e.g. `ultracode: audit X`, `ultracode do X`); plain-language workflow requests
-reach the same tool by the model's own judgment.
+namespaced registration name). The skill auto-attaches when `ultracode` appears as a standalone
+keyword anywhere in the prompt (e.g. `ultracode: audit X`, `please ultracode this`);
+plain-language workflow requests reach the same tool by the model's own judgment.
 
 Two input shapes (a union — anything else is rejected, extra keys included):
 

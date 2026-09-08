@@ -20,9 +20,10 @@ re-enters your session. Child transcripts never touch your context.
 
 Invoke the \`ultracode_run\` tool with \`{ script, name?, meta?, args? }\` for an inline run, or
 \`{ workflow: "name", args? }\` to run a saved workflow. \`meta\` and \`args\` are injected into the
-script as globals. This skill attaches when a prompt starts with ultracode — for example
-\`ultracode: audit the auth module\` or \`ultracode do X and verify it\` — or when the user plainly
-asks for a workflow.
+script as globals. This skill auto-attaches when \`ultracode\` appears as a standalone keyword anywhere in the prompt
+— for example \`ultracode: audit the auth module\`, \`please ultracode this\`, or \`ultracode do X\`.
+Paths like \`opencode-ultracode\` do not match. Plain "use a workflow" does not auto-attach; the
+host may still select this skill from its description.
 
 ## Coexistence with other skills
 

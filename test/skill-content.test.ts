@@ -68,11 +68,13 @@ test("skill content teaches coexistence with domain skills", () => {
   assert.match(SKILL_CONTENT, /do NOT inherit/i, "children must not be assumed to inherit skills")
 })
 
-test("skill content names the ultracode_run tool and start-of-prompt trigger examples", () => {
+test("skill content names the ultracode_run tool and keyword trigger examples", () => {
   assert.ok(SKILL_CONTENT.includes("ultracode_run"), "tool is invoked as ultracode_run")
   assert.doesNotMatch(SKILL_CONTENT, /`workflow` tool/, "stale tool name")
-  assert.match(SKILL_CONTENT, /starts with ultracode/, "trigger is start-of-prompt only")
-  assert.ok(SKILL_CONTENT.includes("ultracode: audit the auth module"), "start-of-prompt example")
+  assert.match(SKILL_CONTENT, /standalone keyword/, "trigger is a standalone keyword anywhere")
+  assert.doesNotMatch(SKILL_CONTENT, /starts with ultracode/, "must not claim start-of-prompt only")
+  assert.ok(SKILL_CONTENT.includes("ultracode: audit the auth module"), "leading-keyword example")
+  assert.ok(SKILL_CONTENT.includes("please ultracode this"), "mid-prompt example")
 })
 
 test("static skill file skills/ultracode.md mirrors SKILL_CONTENT exactly", () => {

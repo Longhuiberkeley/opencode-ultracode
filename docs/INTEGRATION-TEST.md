@@ -19,14 +19,16 @@ Run after Builders A/B/C merge. Unit tests must be green first: `npm test`, `npx
 - [ ] `/api/session/{child}/get` shows outcome succeeded for children
 
 ## 3. Controls
-- [ ] `/workflow` (no args) via `POST /api/session/{id}/command` — synthetic summary lands in the session
-- [ ] `/workflow show <runID>` — script + agent table
-- [ ] Stop path: start a workflow with `sleep` long enough, then `/workflow stop <runID>`; verify status `stopped`, children interrupted, parent tool resolves with stopped envelope (this also answers the open "command while parent tool pending" question — record the outcome either way)
-- [ ] `/workflow save <runID> demo` then re-run via tool input `{workflow: "demo"}`; tamper the saved .js, verify hash-mismatch error, `confirm: true` path works
+- [ ] `/ultracode` (no args) via `POST /api/session/{id}/command` — synthetic summary lands in the session
+- [ ] `/ultracode show <runID>` — script + agent table
+- [ ] Stop path: start a workflow with `sleep` long enough, then `/ultracode stop <runID>`; verify status `stopped`, children interrupted, parent tool resolves with stopped envelope (this also answers the open "command while parent tool pending" question — record the outcome either way)
+- [ ] `/ultracode save <runID> demo` then `/ultracode trust demo`, re-run via tool input `{workflow: "demo"}`; tamper the saved .js, verify hash-mismatch refusal, re-trust after review
 
 ## 4. ultracode keyword + skill
-- [ ] Prompt containing "ultracode" in the scratch location attaches the skill (verify via session context message of type skill, or model behavior)
-- [ ] Prompt without keyword does not attach
+- [ ] Prompt starting with "ultracode:" attaches the skill (verify via session context message of type skill, or model behavior)
+- [ ] Mid-prompt "please ultracode this" attaches the skill
+- [ ] Prompt whose only hit is a path like `opencode-ultracode/docs` does not attach
+- [ ] Prompt without the keyword does not attach
 
 ## 5. Nested-run rejection
 - [ ] A workflow agent instructed to call the workflow tool gets the rejection error content (check child session messages)
@@ -37,9 +39,15 @@ Run after Builders A/B/C merge. Unit tests must be green first: `npm test`, `npx
 - [ ] autoEditsWorkflow: write inside project root allowed; write to `~/.config/opencode/agents/x.md` NOT auto-approved
 
 ## 7. Restart reconciliation
-- [ ] Kill the standalone server mid-run (SIGKILL), restart, assert the persisted run shows `interrupted` with stopReason "server restart" in `/workflow` output; no auto-replay
+- [ ] Kill the standalone server mid-run (SIGKILL), restart, assert the persisted run shows `interrupted` with stopReason "server restart" in `/ultracode` output; no auto-replay
 
 ## 8. Global install (user-approved)
 - [ ] Backup `~/.config/opencode/opencode.json`, add plugins entry with absolute path, `opencode2 service restart`, `/api/plugin` shows ultracode in the user's home location
 - [ ] Run one demo ultracode prompt in the user's real environment
 - [ ] Commit final state; tag v0.1.0
+
+## 9. TUI probe (inspect UI contract)
+- [ ] `scripts/tui-probe.sh` — full TUI (`opencode2 --standalone`, not `mini` / `run`) writes `spike/out/tui-probe.jsonl`
+- [ ] Events include `tui-import-ok`, `tui-setup`, `slot-append-ok` for `prompt.footer.status` and `session.panel`
+- [ ] Compare dump to `docs/SPIKE-TUI.md` if OpenCode version ≠ beta-19271
+

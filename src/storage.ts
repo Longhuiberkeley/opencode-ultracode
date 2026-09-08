@@ -11,7 +11,7 @@
  *    `<name>.js` + `<name>.json` (sha256 manifest via node:crypto).
  *
  * Trust model (review fix): a saved workflow loads only when the KV trust
- * record for its name matches the sha256 of the CURRENT script. `/workflow
+ * record for its name matches the sha256 of the CURRENT script. `/ultracode
  * trust <name>` approves. There is no hash bypass — sample workflows are
  * trusted the same honest way, once.
  *
@@ -258,7 +258,7 @@ export class StorageImpl implements Storage {
     return this.resultCache.get(key)
   }
 
-  /** Cache-first, KV-fallback read (used by `/workflow result`). */
+  /** Cache-first, KV-fallback read (used by `/ultracode result`). */
   async loadResultArtifactFresh(key: string): Promise<Json | undefined> {
     const cached = this.loadResultArtifact(key)
     if (cached !== undefined) return cached

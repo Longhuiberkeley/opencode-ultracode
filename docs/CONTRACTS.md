@@ -53,12 +53,15 @@ in your final report) is the single source of truth. Import shared types from `.
     to SavedRunInput validation in tool-input.ts); preflight `meta.requires` agents against
     `ctx.agent.list()` (fail fast listing available agents); then `supervisor.start(...)` and return
     `{ content: JSON.stringify(envelope, null, 1) }`.
-  - register commands via `ctx.command.transform`: `workflow` and alias `workflows`.
-    Parse `prompt.text` after the command token: no args => summary of active + recent runs +
-    saved workflows (deliver via `ctx.session.synthetic({ sessionID, text })`); `stop <runID>` =>
-    `supervisor.stop` + synthetic ack; `show <runID>` => script + agent table via synthetic;
-    `save <runID> <name>` => storage.saveWorkflow (default source "project") + synthetic ack.
-  - prompt hook: if `/\bultracode\b/i` matches `event.prompt.text` AND the session is not
+  - register commands via `ctx.command.transform`: **only** `ultracode` (no `/workflow` /
+    `/workflows` aliases — those names are left free to avoid colliding with a future OpenCode
+    command). Parse `prompt.text` after the `/ultracode` token: no args => summary of active +
+    recent runs + saved workflows (deliver via `ctx.session.synthetic({ sessionID, text })`);
+    `stop <runID>` => `supervisor.stop` + synthetic ack; `show <runID>` => script + agent table
+    via synthetic; `save <runID> <name>` => storage.saveWorkflow (default source "project") +
+    synthetic ack; `help` => usage text. Unknown args point at authoring-via-keyword (no slash).
+  - prompt hook: if `/(?:^|\s)ultracode(?=\s|:|$)/i` matches `event.prompt.text` (standalone
+    keyword anywhere; not path substrings like `opencode-ultracode`) AND the session is not
     registry-owned (defensive `event.sessionID` read) => `(event.prompt.skills ??= []).push({ id: "ultracode" })`.
   - skill transform (try/catch!): register skill id `ultracode` with content imported from
     `../skill-content.ts` (Builder C) and `location` pointing at `<projectRoot>/.opencode/workflows/ultracode-skill.md`
@@ -177,7 +180,7 @@ in your final report) is the single source of truth. Import shared types from `.
   Tests must pass with `npm test` (`node --experimental-strip-types --test test/`).
 - `README.md`: what it is (honest: trusted-code execution, worker = availability boundary NOT
   sandbox), install (git clone, npm install, add to global opencode.json plugins with absolute
-  path), options table, the `ultracode` keyword, `/workflow` command reference, cost control via
+  path), options table, the `ultracode` keyword, `/ultracode` command reference, cost control via
   `opencode2 subagent-config` pins (hot-reload applies to next spawned agent), saved workflows +
   sharing, security notes, FAQ (works on stock installs: general/explore; empty-agent fresh servers
   fail fast with guidance).

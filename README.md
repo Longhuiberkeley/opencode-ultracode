@@ -10,10 +10,10 @@ multi-agent recipe, the model writes the orchestration on the fly and a runtime 
 
 ## How it works
 
-1. Your prompt **starts with** the keyword `ultracode` (e.g. `ultracode: audit src/auth` or
-   `ultracode do X and verify it`). The `Ultracode` skill auto-attaches and teaches the model the
-   script API. Natural-language requests ("use a workflow to ...") work too — the model can always
-   choose to author one — but only the start-of-prompt keyword *auto-attaches* the skill.
+1. Your prompt contains the standalone keyword `ultracode` (e.g. `ultracode: audit src/auth`,
+   `please ultracode this`, or `ultracode do X and verify it`). The `Ultracode` skill auto-attaches
+   and teaches the model the script API. Natural-language requests ("use a workflow to ...") do
+   not auto-attach — the model can still choose to author one from the skill description.
 2. The model invokes the **`ultracode_run`** tool with `{ script, name?, meta?, args? }` for an
    inline run, or `{ workflow: "name", args? }` for a saved workflow.
 3. The runtime validates the script (plain JS async-function body — no module syntax), preflights
@@ -31,7 +31,7 @@ multi-agent recipe, the model writes the orchestration on the fly and a runtime 
 
 | Claude Code concept | Here |
 | --- | --- |
-| Keyword-triggered workflow skill | Start-of-prompt `ultracode` keyword attaches the `Ultracode` skill via a prompt hook |
+| Keyword-triggered workflow skill | Standalone `ultracode` keyword anywhere in the prompt attaches the `Ultracode` skill via a prompt hook |
 | Model-authored JS orchestration | The `ultracode_run` tool takes a script (async function body) |
 | Subagent execution | Every `agent()` call creates a real opencode session (spike-verified APIs) |
 | Structural verification patterns | Verifier + skeptic + judge patterns; see `docs/AUTHORING.md` |
@@ -140,15 +140,15 @@ back to defaults.
 
 ## Usage
 
-The skill auto-attaches when the prompt **starts with** `ultracode` followed by whitespace, a
-colon, or the end of the prompt. Before/after:
+The skill auto-attaches when `ultracode` appears as a **standalone** keyword anywhere in the
+prompt (whitespace-delimited, optionally followed by a colon). Before/after:
 
 | Prompt | Auto-attach? |
 | --- | --- |
 | `ultracode: audit src/auth and src/db for security issues` | yes |
 | `ultracode do a deep research pass on agent evals` | yes |
 | `ultracode` | yes (bare keyword) |
-| `please ultracode the audit` | **no** — mid-sentence mentions don't attach |
+| `please ultracode the audit` | yes — standalone keyword anywhere |
 | `look at opencode-ultracode/docs` | **no** — paths and names don't attach |
 | `use a workflow to fact-check this draft` | no auto-attach, but the model may still author one |
 
@@ -158,7 +158,7 @@ Examples that work:
 - `ultracode do an adversarial security audit of auth and db, reviewed in batches`
 - `ultracode: fact-check this blog draft against these three sources`
 - `run the deep-research workflow on agent evals, angles: technical, market, criticism` (plain
-  language — the model resolves it to a saved workflow)
+  language — the model resolves it to a saved workflow **after you copy and `/ultracode trust` the sample**)
 
 The model invokes the `ultracode_run` tool, e.g.:
 
@@ -183,10 +183,13 @@ The tool returns when the run finishes, with an envelope:
 }
 ```
 
-## Commands: `/ultracode` (canonical)
+## Commands: `/ultracode`
 
-`/workflow` and `/workflows` are aliases, registered only when those command names are free on
-your install.
+`/ultracode` is the only slash command this plugin registers. There are no `/workflow` or
+`/workflows` aliases — those names are left free so a future OpenCode release cannot collide.
+
+`/ultracode` is **management only**. To *author* a run, send a normal message containing the
+keyword `ultracode` (no leading slash).
 
 | Command | Effect |
 | --- | --- |
@@ -196,6 +199,7 @@ your install.
 | `/ultracode result <runID>` | Print the **full** result of a run whose envelope came back truncated. |
 | `/ultracode save <runID> <name>` | Save a run's script as a named workflow (writes `.js` + `.json` manifest into the project workflow dir). |
 | `/ultracode trust <name>` | One-time approval for a saved workflow: stores an approved digest of its current content. Editing the script later invalidates it until re-approved. |
+| `/ultracode help` | Print this command list and the authoring hint. |
 
 ## Cost control
 
@@ -262,7 +266,7 @@ list of available agents and guidance instead of spawning a broken run.
 | Symptom | What's going on / what to do |
 | --- | --- |
 | Plugin doesn't load, no `ultracode_run` tool | Check server logs for `disabled plugin after transform failure` — a throwing registration disables the plugin. Re-check config path and `npm install`. If the supervisor module failed to import, the tool is disabled with an explanatory message rather than half-working. |
-| Skill doesn't attach | The keyword must START the prompt (`ultracode: ...` / `ultracode do ...`). Mid-sentence mentions and paths like `opencode-ultracode` deliberately don't trigger. |
+| Skill doesn't attach | The keyword must be a standalone token (`ultracode: ...` / `please ultracode this`). Paths like `opencode-ultracode` and ids like `ultracode_run` deliberately don't trigger. |
 | Saved workflow refused: "not trusted" | Expected after first copy or after any edit. Review the script, then `/ultracode trust <name>`. Trust is content-bound; re-trust after every intentional edit. |
 | The model hangs on a prompt | Session-driving must never happen inside plugin `setup()` (admission deadlock — spike-verified). The plugin is built around that rule; if you still see a hang, capture logs and report. |
 | `/ultracode stop` seems ignored | Stop is graceful: in-flight agent calls get a grace period, children are interrupted, then the worker terminates. The envelope arrives when the run actually finalizes. |
@@ -270,7 +274,7 @@ list of available agents and guidance instead of spawning a broken run.
 | Result came back truncated | The script returned more than `maxResultChars`. The envelope carries a `preview` and a `resultArtifactKey`; print the full value with `/ultracode result <runID>`, raise the option, or return a summary instead of a dump. |
 | Run status `interrupted` after restart | Persisted `running`/`stopping` runs are marked `interrupted` on plugin load. There is no auto-replay; re-run the workflow. |
 | Nested `ultracode_run` tool call rejected | By design: sessions owned by a running workflow cannot start their own runs (no recursion). |
-| `/workflow` or `/workflows` does nothing | Those are best-effort aliases registered only when the names are free — another plugin may own them. Use the canonical `/ultracode`. |
+| `/ultracode can …` (or other prose) is "Unknown argument" | `/ultracode` is management only. To author a workflow, send a normal message such as `please ultracode …` without the leading slash. |
 | `npm test` fails with "Cannot find module .../test" | Node 22.13 quirk with `--test <dir>`. Run `node --experimental-strip-types --test` (auto-discovery) or pass the test file(s) directly. |
 
 ## Roadmap

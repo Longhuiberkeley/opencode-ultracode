@@ -118,8 +118,9 @@ it in ~2ms, main thread unaffected (verified, `spike/worker-test.mjs`). Worker i
 
 ## Known open items (verify during integration test)
 
-- Whether `/workflow stop` executes while the parent tool call is pending (supervisor is correct
+- Whether `/ultracode stop` executes while the parent tool call is pending (supervisor is correct
   either way; UX-only).
+- TUI inspect surface: see `docs/SPIKE-TUI.md` (beta-19271). `mini` / `run` do not load CLI plugins.
 - Exact permission action names for edits (code defensively: configurable allowlist).
 - Whether hook-pushed skills resolve (test live with the real plugin; fallback: append short
   instruction text to the prompt).

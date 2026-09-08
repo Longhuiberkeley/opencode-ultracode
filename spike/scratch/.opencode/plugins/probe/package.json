@@ -2,6 +2,10 @@
   "name": "probe-plugin",
   "version": "0.0.0",
   "type": "module",
+  "exports": {
+    ".": "./index.ts",
+    "./tui": "./tui.ts"
+  },
   "dependencies": {
     "@opencode/plugin": "^0.0.0-beta-19289"
   }

@@ -16,6 +16,7 @@ import type { Skill } from "@opencode/plugin"
 import { promises as fsp } from "node:fs"
 import { homedir } from "node:os"
 import { fileURLToPath } from "node:url"
+import { commandArgs, helpText, matchesUltracodeKeyword, parseSubcommand } from "./command.ts"
 import { loadOptions } from "./config.ts"
 import { RegistryImpl } from "./registry.ts"
 import { StorageImpl, normalizePath, resolveContainedPath } from "./storage.ts"
@@ -363,7 +364,7 @@ export default Plugin.define({
               "(saved workflow — must be trusted first via /ultracode trust <name>). " +
               "Use when a task outgrows one context window or needs fan-out / verification / repeatable orchestration. " +
               "Blocks until every agent settles, then returns an envelope { runID, status, agents, tokens, result | preview }. " +
-              "Say 'ultracode' at the start of your prompt to load the authoring skill.",
+              "Mention the standalone keyword 'ultracode' anywhere in your prompt to load the authoring skill.",
             input: WORKFLOW_TOOL_INPUT_SCHEMA,
             execute: async (rawInput: unknown, tool) => {
               if (supervisor?.isOwnedSession(tool.sessionID)) {
@@ -477,13 +478,7 @@ export default Plugin.define({
       warn("tool transform failed — ultracode_run not registered", err)
     }
 
-    // ---- /ultracode command (+ /workflow, /workflows aliases when free) ----
-    function commandArgs(promptText: string | undefined): string {
-      const text = (promptText ?? "").trim()
-      const token = /^\/(?:ultracode|workflows|workflow)\b/i.exec(text)
-      return (token ? text.slice(token[0].length) : text).trim()
-    }
-
+    // ---- /ultracode command (no /workflow aliases — avoid OpenCode name collisions) ----
     function summarizeRun(run: RunRecord): string {
       const counts = countAgents(run)
       const bits = [
@@ -557,18 +552,6 @@ export default Plugin.define({
       return lines.join("\n")
     }
 
-    function helpText(): string {
-      return [
-        "Usage (command: /ultracode; /workflow and /workflows work as aliases when not taken):",
-        "- `/ultracode` — active + recent runs and saved workflows",
-        "- `/ultracode show <runID>` — full run report (agents, sessions, tokens, script)",
-        "- `/ultracode stop <runID>` — stop an active run",
-        "- `/ultracode save <runID> <name>` — save a run's script as a reusable workflow",
-        "- `/ultracode trust <name>` — approve the current version of a saved workflow",
-        "- `/ultracode result <runID>` — print a truncated run's full result",
-      ].join("\n")
-    }
-
     const commandHandler = async (invocation: { sessionID: string; prompt: { text?: string } }): Promise<void> => {
       try {
         if (disposed) return
@@ -609,9 +592,12 @@ export default Plugin.define({
           return
         }
 
-        const spaceIdx = argsText.indexOf(" ")
-        const sub = (spaceIdx === -1 ? argsText : argsText.slice(0, spaceIdx)).toLowerCase()
-        const rest = spaceIdx === -1 ? "" : argsText.slice(spaceIdx + 1).trim()
+        const { sub, rest } = parseSubcommand(argsText)
+
+        if (sub === "help") {
+          await say(sessionID, helpText())
+          return
+        }
 
         if (sub === "stop") {
           if (!rest) {
@@ -737,43 +723,13 @@ export default Plugin.define({
     }
 
     try {
-      // Fetch existing commands BEFORE the transform: register /workflow and
-      // /workflows aliases only when the names are free (last-wins clobbering).
-      let aliasNames: ReadonlySet<string> = new Set(["workflow", "workflows"])
-      try {
-        const listed = unwrapList((await ctx.command.list()) as unknown) as Array<{ name?: unknown }>
-        aliasNames = new Set(
-          ["workflow", "workflows"].filter((name) => !listed.some((c) => c && typeof c === "object" && (c as { name?: unknown }).name === name)),
-        )
-      } catch (err) {
-        aliasNames = new Set()
-        warn("could not list existing commands — /workflow aliases skipped", err)
-      }
       await ctx.command.transform((editor) => {
         try {
           editor.add({
             name: "ultracode",
-            description: "Inspect and manage ultracode workflow runs (summary, show, stop, save, trust, result)",
+            description: "Inspect and manage ultracode workflow runs (summary, show, stop, save, trust, result, help)",
             execute: commandHandler,
           })
-          if (aliasNames.has("workflow")) {
-            editor.add({
-              name: "workflow",
-              description: "Alias of /ultracode",
-              execute: commandHandler,
-            })
-          } else {
-            warn("skipping /workflow alias — a command with that name already exists")
-          }
-          if (aliasNames.has("workflows")) {
-            editor.add({
-              name: "workflows",
-              description: "Alias of /ultracode",
-              execute: commandHandler,
-            })
-          } else {
-            warn("skipping /workflows alias — a command with that name already exists")
-          }
         } catch (err) {
           warn("failed to register commands", err)
         }
@@ -782,7 +738,7 @@ export default Plugin.define({
       warn("command transform failed — /ultracode not registered", err)
     }
 
-    // ---- prompt hook: attach the authoring skill on a leading "ultracode" keyword ----
+    // ---- prompt hook: attach the authoring skill on a standalone "ultracode" keyword ----
     try {
       const reg = await ctx.session.hook("prompt", (event) => {
         try {
@@ -791,9 +747,9 @@ export default Plugin.define({
             sessionID?: string
             prompt?: { text?: string; skills?: Array<{ id: string }> }
           }
-          // Start-of-prompt trigger only: "ultracode: do X" / "ultracode do X".
-          // Mid-sentence mentions and paths like opencode-ultracode do not fire.
-          if (!/^\s*ultracode(?=\s|:|$)/i.test(ev.prompt?.text ?? "")) return
+          // Standalone keyword anywhere: "ultracode: do X" / "please ultracode this".
+          // Paths like opencode-ultracode and ids like ultracode_run do not fire.
+          if (!matchesUltracodeKeyword(ev.prompt?.text ?? "")) return
           // sessionID must be present; without it we cannot check ownership —
           // don't mutate the prompt at all.
           const sessionID = ev.sessionID
