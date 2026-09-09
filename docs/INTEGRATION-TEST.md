@@ -60,8 +60,9 @@ FLAKY when a global ultracode plugin coexists with the scratch re-export (both r
 `ultracode_run`; execution ownership alternates) or when model latency exceeds the window. Then
 the runner prints `F12 transport SKIPPED: paint-only fallback` and exits 0 with
 `transport_skipped=1` — a skipped leg is reported, never silent. Receipts for a real run
-(`run_v3gmythjq6tr`, 2026-09-08) are in commit 4cbbde7's spike/out jsonl; re-capture in a clean
-environment (no global ultracode plugin) to re-prove the stopped-outcome assertion.
+(`run_v3gmythjq6tr`, 2026-09-08) were captured in local `spike/out/` jsonl (captures are
+local-only and never committed); re-capture in a clean environment (no global ultracode
+plugin) to re-prove the stopped-outcome assertion.
 
 ## 10. TUI checklist (v1 inspect + G1)
 

@@ -320,6 +320,16 @@ export function buildEnvelope(run: RunRecord, maxChars: number): RunEnvelope {
   if (run.stopReason !== undefined) envelope.stopReason = run.stopReason
   if (run.totalTokens !== undefined) envelope.tokens = run.totalTokens
 
+  // Distinct effective models: makes pin drift (children on an unexpected
+  // provider) visible in the tool result itself, without opening /ultracode.
+  const models = new Set<string>()
+  for (const agent of run.agents) {
+    if (agent.effectiveModel) {
+      models.add(`${agent.effectiveModel.providerID}/${agent.effectiveModel.id}`)
+    }
+  }
+  if (models.size > 0) envelope.models = [...models].sort()
+
   if (run.result !== undefined) {
     if (resultFits(run.result, maxChars)) {
       envelope.result = run.result

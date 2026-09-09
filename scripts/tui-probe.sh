@@ -88,6 +88,12 @@ echo "log:     $OUT"
 echo "server:  $SERVER_OUT"
 echo "ansi:    $ANSI"
 echo "mode:    $MODE"
+if [[ -n "${UC_LIVE_MODEL:-}" ]]; then
+  echo "model:   UC_LIVE_MODEL=$UC_LIVE_MODEL (pinned via --model; audit fails on drift)"
+else
+  echo "model:   WARNING: UC_LIVE_MODEL is unset — standalone scratch servers may not load"
+  echo "         global agent pins, so children can fall back to the location-default model."
+fi
 
 cd "$SCRATCH" || exit 1
 
@@ -605,11 +611,17 @@ PY
 
 run_legacy() {
   echo "== legacy mode: timeout+script, no keystrokes =="
+  MODEL_ARGS=()
+  if [[ -n "${UC_LIVE_MODEL:-}" ]]; then
+    MODEL_ARGS=(--model "$UC_LIVE_MODEL")
+  fi
   if command -v script >/dev/null 2>&1; then
     timeout 12 script -q /dev/null opencode2 --standalone --print-logs \
+      ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} \
       > "$TTY_LOG" 2>&1 || true
   else
     timeout 12 opencode2 --standalone --print-logs \
+      ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} \
       > "$TTY_LOG" 2>&1 || true
   fi
   cp "$TTY_LOG" "$ANSI" 2>/dev/null || true
@@ -686,7 +698,11 @@ if pid == 0:
         os.setsid()
     except Exception:
         pass
-    os.execvp("opencode2", ["opencode2", "--standalone", "--print-logs"])
+    _argv = ["opencode2", "--standalone", "--print-logs"]
+    _model = os.environ.get("UC_LIVE_MODEL", "")
+    if _model:
+        _argv += ["--model", _model]
+    os.execvp("opencode2", _argv)
 
 # parent
 try:
@@ -1098,6 +1114,35 @@ if [[ "$DIALOG_KEYS" -eq 1 ]]; then
   g1_verdict
 fi
 
+audit_live_model() {
+  python3 - "$SERVER_OUT" "${UC_LIVE_MODEL:-}" <<'PY'
+import re, sys
+
+path, want = sys.argv[1], sys.argv[2]
+models = set()
+try:
+    fh = open(path, encoding="utf-8", errors="replace")
+except FileNotFoundError:
+    print("model audit: no server jsonl — skipped")
+    sys.exit(0)
+with fh:
+    for line in fh:
+        for m in re.finditer(r'"model"\s*:\s*(?:\{[^}]*?"id"\s*:\s*"([^"]+)"|"([^"]+)")', line):
+            models.add(m.group(1) or m.group(2))
+if not models:
+    print("model audit: no model observations in the server jsonl — nothing to compare")
+    sys.exit(0)
+print("model audit: observed models:", ", ".join(sorted(models)))
+if not want:
+    sys.exit(0)
+if any(want in m or m == want for m in models):
+    print(f"model audit: ok — expected {want} was used")
+    sys.exit(0)
+print(f"model audit: FAIL — UC_LIVE_MODEL={want} but observed only {sorted(models)}")
+sys.exit(1)
+PY
+}
+
 FAILED=0
 if [[ "$LIVE" -eq 1 ]]; then
   assert_live_paint || FAILED=1
@@ -1114,6 +1159,12 @@ if [[ "$LIVE" -eq 1 ]]; then
     echo "F12 transport SKIPPED: paint-only fallback after two failed timings"
   else
     assert_live_transport || FAILED=1
+  fi
+  echo "== model audit =="
+  if [[ -n "${UC_LIVE_MODEL:-}" ]]; then
+    audit_live_model || FAILED=1
+  else
+    audit_live_model || true
   fi
   echo "== live assertion aggregate failed=$FAILED transport_skipped=$TRANSPORT_SKIPPED =="
   exit "$FAILED"

@@ -243,6 +243,30 @@ test("buildEnvelope: fields and counts", () => {
   assert.equal(env.preview, undefined)
 })
 
+test("buildEnvelope: distinct effective models surface, sorted and deduped", () => {
+  const agents: AgentRecord[] = [
+    {
+      id: "a1",
+      status: "succeeded",
+      effectiveModel: { providerID: "xai", id: "grok-4.6" },
+    },
+    {
+      id: "a2",
+      status: "succeeded",
+      effectiveModel: { providerID: "zai-coding-plan", id: "glm-5.3-flash" },
+    },
+    { id: "a3", status: "succeeded", effectiveModel: { providerID: "xai", id: "grok-4.6" } },
+    { id: "a4", status: "failed", error: "no model observed" },
+  ]
+  const env = buildEnvelope(fakeRun({ agents }), 1000)
+  assert.deepEqual(env.models, ["xai/grok-4.6", "zai-coding-plan/glm-5.3-flash"])
+})
+
+test("buildEnvelope: models omitted when no child recorded one", () => {
+  const env = buildEnvelope(fakeRun(), 1000)
+  assert.equal(env.models, undefined)
+})
+
 test("buildEnvelope: result fits at exactly maxChars", () => {
   const value: Json = { a: "12345" } // compact form is exactly 13 chars
   const env = buildEnvelope(fakeRun({ result: value }), 13)

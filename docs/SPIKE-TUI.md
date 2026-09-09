@@ -114,7 +114,7 @@ Evidence: `spike/out/server-probe.jsonl`, `spike/out/server-probe-install-config
 **Plan impact:**
 - **D12:** metadata stamp is not exposed on session records or `session.created` (`dataKeys` have title/agent, no metadata). TUI join must use the **title fallback** as the real contract, not a fallback. Widening `SessionCtx.create` with `metadata` stays type-correct but will not round-trip on this build.
 - **D6:** proceed with `src/run-events.ts` on `session.tool.called` / `success` / `failed`, dedupe `data.id`, ignore events older than `startedAt`. Do not wait for `session.idle`/`session.status`.
-- **D10:** `install.sh` can drop a re-export into `.opencode/plugins/<id>/`; `--write-config` is optional on this build, not required for load.
+- **D10:** `install.sh` can drop a plugin into `.opencode/plugins/<id>/`; `--write-config` is optional on this build, not required for load. Later finding (2026-09-09): the install must be a self-contained copy with RELATIVE entry re-exports — the TUI client rejects absolute-path imports, and absolute re-exports also break when the source checkout moves.
 
 ## Addendum 2026-09-08 (phase 0-tui, build 0.0.0-beta-19271, plugin pkg 0.0.0-beta-19289)
 

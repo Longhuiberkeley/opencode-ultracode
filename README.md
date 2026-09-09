@@ -69,8 +69,8 @@ multi-agent recipe, the model writes the orchestration on the fly and a runtime 
 
 ## Install
 
-**Precondition:** `npm install` in this repo so `node_modules/@opencode/plugin` resolves.
-The installer refuses to run until that is true (`run npm install in <repo>`).
+**Precondition:** `npm install` in this repo so the runtime dependency tree exists for the
+installer to copy. The installer refuses to run until that is true.
 
 ```bash
 git clone <this-repo> /path/to/opencode-ultracode
@@ -78,10 +78,14 @@ cd /path/to/opencode-ultracode
 npm install
 scripts/install.sh --project /path/to/your-project
 # or: scripts/install.sh --global
+# add --tui if you want the inspect UI (chip + panel + palette)
 ```
 
-`scripts/install.sh` writes a re-export into the auto-load dir (verified on OpenCode v2
-beta-19271: `.opencode/plugins/*/index.ts` is enough; `--write-config` is optional):
+`scripts/install.sh` writes a **self-contained copy** into the plugin dir (verified on OpenCode
+v2 beta-19271: `.opencode/plugins/*/index.ts` is enough; `--write-config` is optional). The
+installed tree — sources, skill, generated manifest, and the `@opencode/plugin` dependency tree
+— is **relocatable**: it contains no absolute paths and keeps working after the source checkout
+is moved or deleted:
 
 | Flag | Effect |
 | --- | --- |
@@ -89,22 +93,29 @@ beta-19271: `.opencode/plugins/*/index.ts` is enough; `--write-config` is option
 | `--global` | Install into `~/.config/opencode/` |
 | `--tui` | Also write sibling `tui.tsx` (inspect UI **opt-in**; host auto-loads it next to `index.ts`) |
 | `--write-config` | Merge a `plugins` entry into the target `opencode.json` only if no entry with the same package path exists |
+| `--no-deps` | Skip the `node_modules` copy (tests/dev only — the plugin then needs `@opencode/plugin` from elsewhere) |
 | `--repo PATH` | Plugin repo root (default: parent of the script) |
 
-Reruns are idempotent (same files, never duplicate config). No network.
+Reruns are idempotent (same files, never duplicate config). No network. An existing v1 install
+(absolute-path re-export shims) is migrated automatically to the new layout. Platform status:
+**macOS verified**; Linux expected but not exercised by this repo's CI; Windows untested.
 
 **TUI opt-in:** omit `--tui` for server-only (`ultracode_run` + `/ultracode`). Add `--tui` when
 you want the chip + inspect panel. Remove `tui.tsx` or run `scripts/uninstall.sh` to drop it;
 the server half keeps working.
 
-**Manual re-export (fallback if you do not want the script):**
+**Manual install (fallback if you do not want the script):** copy `src/`, `skills/`,
+`package.json`, and `node_modules/@opencode/plugin` (plus its transitive deps) into
+`<project>/.opencode/plugins/ultracode/`, then write these two entries — note the **relative**
+paths; the OpenCode TUI client rejects absolute-path imports (verified the hard way):
 
 ```ts
 // <project>/.opencode/plugins/ultracode/index.ts
-export { default } from "/path/to/opencode-ultracode/src/index.ts"
+export { default } from "./src/index.ts"
 // optional sibling, only if you want inspect UI:
 // <project>/.opencode/plugins/ultracode/tui.tsx
-export { default } from "/path/to/opencode-ultracode/src/tui.tsx"
+/** @jsxImportSource solid-js */
+export { default } from "./src/tui.tsx"
 ```
 
 Optionally list it in `.opencode/opencode.json` (relative path from that file):
@@ -118,7 +129,7 @@ Optionally list it in `.opencode/opencode.json` (relative path from that file):
 ```
 
 A bare absolute `"package": "/path/to/opencode-ultracode"` entry was **silently skipped** on
-beta-19271; prefer the auto-load re-export. If load fails, check server logs for
+beta-19271; prefer the auto-load plugin dir. If load fails, check server logs for
 `failed to load plugin` / `disabled plugin after transform failure`.
 
 ### Uninstall
@@ -130,11 +141,13 @@ scripts/uninstall.sh --project /path/to/your-project
 # scripts/uninstall.sh --project DIR --purge-workflows --yes
 ```
 
-Removes `plugins/ultracode/index.ts` and `tui.tsx` **only** when they still re-export this
-repo; never touches other plugins. `--purge` deletes `<target>/.opencode/workflows/runs/`
-and `ultracode-skill.md` only if that file is still byte-equal to `skills/ultracode.md`.
-`--purge-workflows` deletes saved `*.js`/`*.json` pairs after confirmation (`--yes` skips
-the prompt). Without that flag, saved workflows are left in place.
+Removes the ultracode install — every file this installer wrote (v2 copy tree or v1 shims),
+identified by an install marker / layout check, **without needing the source checkout**. It
+never touches other plugins or foreign files inside the plugin dir. `--purge` deletes
+`<target>/.opencode/workflows/runs/` and `ultracode-skill.md` only if that file is still
+byte-equal to `skills/ultracode.md`. `--purge-workflows` deletes saved `*.js`/`*.json` pairs
+after confirmation (`--yes` skips the prompt). Without that flag, saved workflows are left in
+place.
 
 **Data / KV:** run, result, and trust keys in OpenCode project KV are harmless residue. No
 shell can compute project KV ids; they disappear with an OpenCode data reset.
@@ -218,6 +231,7 @@ The tool returns when the run finishes, with an envelope:
   "durationMs": 214000,
   "agents": { "total": 8, "succeeded": 8, "failed": 0, "interrupted": 0 },
   "tokens": { "input": 412000, "output": 18200, "reasoning": 9400, "cache": { "read": 98000, "write": 0 } },
+  "models": ["xai/grok-4.6"],
   "result": { "report": "...", "stats": { "...": "..." } },
   "truncated": false
 }
@@ -303,9 +317,9 @@ Reproduce against the recorded binary:
 scripts/tui-probe.sh --live
 ```
 
-Captures land in `spike/out/tui-live-<timestamp>.txt` (plus `.ansi` / `tui-live.jsonl`).
-`assert_live_paint` in the probe greps the stripped text. Exact needles from the live
-captures / probe:
+Captures land in `spike/out/tui-live-<timestamp>.txt` (plus `.ansi` / `tui-live.jsonl`) —
+local-only, git-ignored; never committed. `assert_live_paint` in the probe greps the stripped
+text. Exact needles from the live captures / probe:
 
 ```bash
 # chip
@@ -330,16 +344,21 @@ G1 dialog-keys (expect **NO-GO** on beta-19271): `scripts/tui-probe.sh --dialog-
 | `@opencode/plugin` **package** (repo pin) | `0.0.0-beta-19289` |
 
 Builds differ; the TUI version gate keys off the **binary** build, not the plugin package.
-The `/ultracode` dashboard first line repeats plugin `0.1.0` and min OpenCode beta-19271.
+The `/ultracode` dashboard first line repeats the plugin version and min OpenCode beta-19271.
 
 ## Cost control
 
 Workflows multiply tokens. Controls, in order of leverage:
 
 1. **Route via subagents, not models.** Scripts reference *agent ids* (`general`, `explore`, your
-   own specialists) and never provider/model ids. Pin which model each agent runs with
-   `opencode2 subagent-config`. A typical shape: cheap agent for extraction/search fan-out
+   own specialists) and never provider/model ids. Pin which model each agent runs in your
+   OpenCode agent config. A typical shape: cheap agent for extraction/search fan-out
    (`explore`), strong agent for judgment/synthesis (`general` or your `reviewer`).
+   No model or provider id appears anywhere in this plugin; children run as **your** configured
+   agents. One caveat: standalone servers for scratch locations may not load global agent pins —
+   the child then falls back to that location's default model. Every run records the
+   `effectiveModel` each child actually used, so drift is visible, never silent
+   (`/ultracode show <runID>`).
 2. **Pins hot-reload.** Re-pinning an agent mid-run applies to the *next spawned agent* —
    already-running sessions keep their model. You can retune a long run without stopping it.
 3. **Watch the tokens.** Every envelope carries summed token usage; `/ultracode show <runID>`
@@ -417,9 +436,9 @@ list of available agents and guidance instead of spawning a broken run.
   (`/ultracode resume` today only reopens a *paused* in-process run.)
 - **Worktree isolation** — give write agents separate git worktrees so they can run in parallel safely.
 - **QuickJS sandbox** — replace omission-based isolation with a real capability sandbox for scripts.
-- **npm publish** — local installs load TUI via sibling `tui.tsx` auto-load (verified); the
-  remaining question is whether a published package `exports["./tui"]` auto-loads the same way.
-  That gate is moot for `scripts/install.sh` / dir auto-load.
+- **npm publish** — local installs are self-contained copies that auto-load `tui.tsx` next to
+  `index.ts` (verified); the remaining question is whether a published package
+  `exports["./tui"]` auto-loads the same way.
 
 ## Development
 
@@ -429,7 +448,15 @@ npm test              # node --experimental-strip-types --test test/
 npm run typecheck     # tsc --noEmit
 ```
 
-Layout: `src/` (plugin code), `skills/ultracode.md` (static mirror of the skill content — the
-registered skill location), `workflows/samples/` (sample workflow pairs), `docs/CONTRACTS.md`
-(module ownership), `docs/SPIKE-FINDINGS.md` (verified platform facts), `docs/AUTHORING.md` (the
-script authoring reference), `test/` (unit tests with fakes — no live server needed).
+CI runs the same three (plus `bash -n scripts/*.sh`) on every push — see
+`.github/workflows/ci.yml`. Layout: `src/` (plugin code), `skills/ultracode.md` (static mirror
+of the skill content — the registered skill location), `workflows/samples/` (sample workflow
+pairs), `spike/` (the development harness that verified the plugin APIs — see
+`spike/README.md`; opening opencode inside `spike/scratch` intentionally registers `/probe*`
+test commands), `docs/CONTRACTS.md` (module ownership), `docs/SPIKE-FINDINGS.md` (verified
+platform facts), `docs/AUTHORING.md` (the script authoring reference), `test/` (unit tests
+with fakes — no live server needed).
+
+## License
+
+[MIT](LICENSE) — see the LICENSE file.

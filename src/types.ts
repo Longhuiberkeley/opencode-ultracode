@@ -181,6 +181,8 @@ export interface RunEnvelope {
   durationMs: number
   agents: { total: number; succeeded: number; failed: number; interrupted: number }
   tokens?: TokenUsage
+  /** Distinct effective models ("providerID/id") children actually ran — empty omitted. */
+  models?: string[]
   /** Present when the result fit within maxResultChars. */
   result?: Json
   /** Present instead of `result` when truncated. */
