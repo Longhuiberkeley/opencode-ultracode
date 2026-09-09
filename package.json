@@ -6,12 +6,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/YOUR-GITHUB-HANDLE/opencode-ultracode.git"
+    "url": "git+https://github.com/Longhuiberkeley/opencode-ultracode.git"
   },
   "bugs": {
-    "url": "https://github.com/YOUR-GITHUB-HANDLE/opencode-ultracode/issues"
+    "url": "https://github.com/Longhuiberkeley/opencode-ultracode/issues"
   },
-  "homepage": "https://github.com/YOUR-GITHUB-HANDLE/opencode-ultracode#readme",
+  "homepage": "https://github.com/Longhuiberkeley/opencode-ultracode#readme",
   "main": "src/index.ts",
   "scripts": {
     "test": "node --experimental-strip-types --test \"test/*.test.ts\"",
