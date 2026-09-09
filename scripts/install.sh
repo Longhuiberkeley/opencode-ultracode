@@ -213,7 +213,7 @@ if [[ "$NO_DEPS" -eq 0 ]]; then
 fi
 
 # Generated package manifest (kept in sync with the repo version).
-VERSION="$VERSION" PLUGIN_DEP="$PLUGIN_DEP" node -e '
+VERSION="$VERSION" PLUGIN_DEP="$PLUGIN_DEP" REPO_JSON="$REPO/package.json" node -e '
 const fs = require("fs")
 const version = process.env.VERSION || "0.0.0"
 const deps = JSON.parse(process.env.PLUGIN_DEP || "{}")
@@ -230,6 +230,13 @@ const doc = {
   dependencies: deps,
   private: true,
 }
+// Carry attribution metadata when the source repo declares it.
+try {
+  const src = JSON.parse(fs.readFileSync(process.env.REPO_JSON, "utf8"))
+  for (const key of ["license", "repository", "bugs", "homepage"]) {
+    if (src[key] !== undefined) doc[key] = src[key]
+  }
+} catch {}
 fs.writeFileSync(process.argv[1], JSON.stringify(doc, null, 2) + "\n")
 ' "$PLUGIN_DIR/package.json"
 
