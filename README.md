@@ -255,7 +255,7 @@ inspect panel is focused — they are not dialog-hosted.
 
 | Command | Effect | TUI key |
 | --- | --- | --- |
-| `/ultracode` | Dashboard: plugin/min-build line, active (including paused), recent, saved workflows. | palette `ultracode.inspect` opens the panel |
+| `/ultracode` | Dashboard: plugin/min-build line, active (including paused), recent, saved workflows. | **Ctrl+G** or palette `ultracode.inspect` opens the panel |
 | `/ultracode show [runID]` | Full run report (D11 cells + sessionID): status, agents, tokens, tools, script. | — (server parity floor) |
 | `/ultracode result [runID]` | Print the **full** result of a run whose envelope came back truncated. | — |
 | `/ultracode stop [runID]` | Graceful stop: no new agent calls, children interrupted, worker terminated after a grace period. | `x` |
@@ -280,7 +280,7 @@ parity floor.
 | --- | --- | --- |
 | Chip | `prompt.footer.status` | `ultracode · N running` while any run is active |
 | Panel | `session.panel` contribution `ultracode.inspect` | Two-column inspector (phases \| agents), pagination, footer keys |
-| Palette | command `ultracode.inspect` | Opens the panel; stay on the parent session |
+| Palette | command `ultracode.inspect` (bind **Ctrl+G**) | Opens the panel; stay on the parent session |
 | Overlay keys | `keymap.layer` **inside** the panel component | `↑↓` select, `x` stop, `p` pause/resume, `s` save, `enter`/`→` drill |
 | Toast | `ui.toast.show` | Completion (envelope / quiet-window heuristic) and post-save trust hint |
 
@@ -295,7 +295,7 @@ when no host dialog is open. `ui.dialog.prompt` is used only for the save-name f
 | Surface | Here | Notes |
 | --- | --- | --- |
 | Header | yes | Short run id, agent counts, elapsed (`twoColumn` / `runHeaderCells`) |
-| Phases | yes | Left column; observed first-appearance order |
+| Phases | yes (flat filter list — select a phase to filter agents; not expandable containers) | Left column; observed first-appearance order |
 | Agents | yes | Right column; D11 cells (status, label, phase, agent, model, …). Store `agent` is live; model/tools see below. |
 | Tokens | yes | Per-agent from the client store (A2) |
 | Model | partial | Live in `/ultracode show`. TUI: on-demand for the **selected** row via session messages; "-" on other rows until selected. |

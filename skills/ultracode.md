@@ -7,7 +7,11 @@ re-enters your session. Child transcripts never touch your context.
 
 Invoke the `ultracode_run` tool with `{ script, name?, meta?, args? }` for an inline run, or
 `{ workflow: "name", args? }` to run a saved workflow. `meta` and `args` are injected into the
-script as globals. This skill auto-attaches when `ultracode` appears as a standalone keyword anywhere in the prompt
+script as globals.
+
+Never paste a workflow script into a generic JS/execute sandbox — `agent`, `parallel`, `pipeline`, `phase`, `progress`, `workflow`, `sleep`, `args`, and `meta` exist only inside `ultracode_run`; anywhere else they are undefined.
+
+This skill auto-attaches when `ultracode` appears as a standalone keyword anywhere in the prompt
 — for example `ultracode: audit the auth module`, `please ultracode this`, or `ultracode do X`.
 Paths like `opencode-ultracode` do not match. Plain "use a workflow" does not auto-attach; the
 host may still select this skill from its description.

@@ -463,7 +463,8 @@ export default Plugin.define({
                 title: "Ultracode inspect",
                 description: "Open the ultracode run inspect panel",
                 palette: true,
-                bind: false,
+                bind: "ctrl+g",
+                shortcuts: ["ctrl+g"],
                 run: () => {
                   openPanel()
                 },
