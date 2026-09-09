@@ -48,6 +48,8 @@ export class RunClosedError extends AgentCallError {
 export interface AgentRunInput {
   prompt: string
   agent?: string
+  /** Pinned model for the resolved agent (from user agent config); applied at create. */
+  model?: { providerID: string; id: string; variant?: string }
   label?: string
   phase?: string
   schema?: Json
@@ -111,10 +113,13 @@ export function createSessionDriver(sessions: SessionCtx, options: SessionDriver
     // 1. Resolve agent — fail fast with the available list.
     const agent = resolveAgent(input, availableAgents)
 
-    // 2. Create the child session; register the ID immediately.
+    // 2. Create the child session; register the ID immediately. A pinned
+    // model (from the user's agent config) rides along at create time —
+    // server-side session.create does not apply global agent pins itself.
     const created = await sessions.create({
       title: buildChildTitle(input),
       agent,
+      ...(input.model !== undefined ? { model: input.model } : {}),
       metadata: stampChildMetadata(input),
     })
     const sessionID = created.id

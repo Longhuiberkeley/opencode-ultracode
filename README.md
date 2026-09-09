@@ -353,13 +353,16 @@ Workflows multiply tokens. Controls, in order of leverage:
 
 1. **Route via subagents, not models.** Scripts reference *agent ids* (`general`, `explore`, your
    own specialists) and never provider/model ids. Pin which model each agent runs in your
-   OpenCode agent config. A typical shape: cheap agent for extraction/search fan-out
-   (`explore`), strong agent for judgment/synthesis (`general` or your `reviewer`).
+   OpenCode agent config (`~/.config/opencode/agents/<id>.md` or
+   `<project>/.opencode/agents/<id>.md`, project wins). A typical shape: cheap agent for
+   extraction/search fan-out (`explore`), strong agent for judgment/synthesis (`general` or
+   your `reviewer`).
    No model or provider id appears anywhere in this plugin; children run as **your** configured
-   agents. One caveat: standalone servers for scratch locations may not load global agent pins —
-   the child then falls back to that location's default model. Every run records the
-   `effectiveModel` each child actually used, so drift is visible, never silent
-   (`/ultracode show <runID>`).
+   agents **on your pinned models**: the plugin reads the same documented agent config the
+   client reads and applies the pin when creating each child session (OpenCode's server-side
+   `session.create` does not apply global pins itself — live-verified). Unpinned agents fall
+   back to the location default. Every run records the `effectiveModel` each child actually
+   used and the envelope lists the distinct `models`, so drift is visible, never silent.
 2. **Pins hot-reload.** Re-pinning an agent mid-run applies to the *next spawned agent* —
    already-running sessions keep their model. You can retune a long run without stopping it.
 3. **Watch the tokens.** Every envelope carries summed token usage; `/ultracode show <runID>`
@@ -421,7 +424,7 @@ list of available agents and guidance instead of spawning a broken run.
 | Saved workflow refused: "not trusted" | Expected after first copy or after any edit. Review the script, then `/ultracode trust <name>`. Trust is content-bound; re-trust after every intentional edit. |
 | The model hangs on a prompt | Session-driving must never happen inside plugin `setup()` (admission deadlock — spike-verified). The plugin is built around that rule; if you still see a hang, capture logs and report. |
 | `/ultracode stop` seems ignored | Stop is graceful: in-flight agent calls get a grace period, children are interrupted, then the worker terminates. The envelope arrives when the run actually finalizes. |
-| Child ran the "wrong" model (pin drift) | Agent pins may not load in standalone server contexts (spike-verified). Runs record `effectiveModel` per agent — check `/ultracode show`. Re-pin and it applies to the next spawned agent. |
+| Child ran the "wrong" model (pin drift) | Children apply the agent pin from `~/.config/opencode/agents/<id>.md` / project `.opencode/agents/<id>.md` (project wins) at session create; re-pinning applies to the **next** spawned child. Unpinned agents use the location default — which on some installs is a free-tier model. Runs record `effectiveModel` per agent and the envelope lists distinct `models`; check `/ultracode show` to confirm. |
 | Result came back truncated | The script returned more than `maxResultChars`. The envelope carries a `preview` and a `resultArtifactKey`; print the full value with `/ultracode result <runID>`, raise the option, or return a summary instead of a dump. |
 | Run status `interrupted` after restart | Persisted `running`/`stopping` runs are marked `interrupted` on plugin load. There is no auto-replay; re-run the workflow. |
 | Nested `ultracode_run` tool call rejected | By design: sessions owned by a running workflow cannot start their own runs (no recursion). |

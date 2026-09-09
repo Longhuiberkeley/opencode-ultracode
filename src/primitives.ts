@@ -107,6 +107,13 @@ export interface AgentRunnerOptions {
   maxAgents: number
   report: (status: string) => void
   ambientPhase: () => string | undefined
+  /**
+   * Resolves the pinned model for an agent id from the user's agent config
+   * (project beats global), in the object shape session.create expects.
+   * Applied at create so children run on the model the user pinned —
+   * server-side creates don't apply pins themselves.
+   */
+  pinForAgent?: (agentId: string) => Promise<{ providerID: string; id: string; variant?: string } | undefined>
   /** Run-wide abort signal: rejects queued semaphore waits + aborts in-flight sessions. */
   signal?: AbortSignal
   /** Clock injection for throttle tests. */
@@ -129,6 +136,9 @@ export class AgentRunner {
   private readonly maxAgents: number
   private readonly reportFn: (status: string) => void
   private readonly ambientPhase: () => string | undefined
+  private readonly pinForAgent:
+    | ((agentId: string) => Promise<{ providerID: string; id: string; variant?: string } | undefined>)
+    | undefined
   private readonly signal?: AbortSignal
   private readonly now: () => number
   private started = 0
@@ -144,6 +154,7 @@ export class AgentRunner {
     this.maxAgents = options.maxAgents
     this.reportFn = options.report
     this.ambientPhase = options.ambientPhase
+    this.pinForAgent = options.pinForAgent
     this.signal = options.signal
     this.now = options.now ?? Date.now
   }
@@ -183,10 +194,20 @@ export class AgentRunner {
 
     try {
       const titlePhase = opts.phase ?? this.ambientPhase()
+      const requestedAgent = opts.agent ?? this.defaultAgent
+      let model: { providerID: string; id: string; variant?: string } | undefined
+      if (this.pinForAgent) {
+        try {
+          model = await this.pinForAgent(requestedAgent)
+        } catch {
+          model = undefined // pin resolution must never break a run
+        }
+      }
       const result = await this.driver.runAgent(
         {
           prompt,
           agent: opts.agent,
+          ...(model !== undefined ? { model } : {}),
           label: opts.label,
           phase: titlePhase,
           schema: opts.schema,

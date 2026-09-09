@@ -457,6 +457,8 @@ export interface SessionCtx {
   create(input: {
     title?: string
     agent?: string
+    /** Pinned model applied at create time when known (SDK object shape). */
+    model?: { providerID: string; id: string; variant?: string }
     metadata?: Record<string, unknown>
   }): Promise<{ id: string; agent?: string }>
   get(input: { sessionID: string }): Promise<{

@@ -24,6 +24,7 @@ import {
   prepareRunLaunch,
 } from "./command.ts"
 import { loadOptions } from "./config.ts"
+import { lookupAgentPin, parseModelPin } from "./agent-pins.ts"
 import { RegistryImpl } from "./registry.ts"
 import { emptyToolEventState } from "./run-events.ts"
 import { EMPTY_CATALOG, SKILL_CONTENT, SKILL_DESCRIPTION, SKILL_NAME, buildSkillContent } from "./skill-content.ts"
@@ -240,6 +241,7 @@ export default Plugin.define({
         (await ctx.session.create({
           title: input.title,
           agent: input.agent,
+          ...(input.model !== undefined ? { model: input.model } : {}),
           ...(input.metadata ? { metadata: input.metadata as { readonly [k: string]: never } } : {}),
         })) as unknown as {
           id: string
@@ -350,6 +352,15 @@ export default Plugin.define({
         sessions,
         options,
         loadWorkflowFresh: (name: string) => storage.loadWorkflowFresh(name),
+        // Agent model pins: server-side session.create does not apply global
+        // agent pins (live-verified 2026-09-09 — children fell back to the
+        // free location default). Resolve the pin from the same documented
+        // config the client reads and apply it at create time. Per-call, so
+        // re-pinning applies to the next spawned child.
+        pinForAgent: async (agentId: string) => {
+          const pin = await lookupAgentPin(fs, projectRoot, process.env["HOME"] ?? homedir(), agentId)
+          return pin !== undefined ? parseModelPin(pin) : undefined
+        },
       })
     } catch (err) {
       supervisorError =

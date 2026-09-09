@@ -56,6 +56,12 @@ export interface SupervisorDeps {
    * present, else the cached Storage.loadWorkflow. Index wiring is A's/lead's.
    */
   loadWorkflowFresh?: WorkflowLoader
+  /**
+   * Resolves an agent's pinned model from the user's agent config (project
+   * beats global); applied at session.create so children honor agent pins.
+   * Index wiring; optional for tests.
+   */
+  pinForAgent?: (agentId: string) => Promise<{ providerID: string; id: string; variant?: string } | undefined>
 }
 
 interface PauseWaiter {
@@ -131,6 +137,9 @@ export class SupervisorImpl implements Supervisor {
   private readonly storage: Storage
   private readonly sessions: SessionCtx
   private readonly options: Required<UltracodeOptions>
+  private readonly pinForAgent:
+    | ((agentId: string) => Promise<{ providerID: string; id: string; variant?: string } | undefined>)
+    | undefined
   private readonly settleGraceMs: number
   private readonly stopKillMs: number
   private readonly driver: SessionDriver
@@ -143,6 +152,7 @@ export class SupervisorImpl implements Supervisor {
     this.storage = deps.storage
     this.sessions = deps.sessions
     this.options = deps.options
+    this.pinForAgent = deps.pinForAgent
     this.settleGraceMs = deps.settleGraceMs ?? SETTLE_GRACE_MS
     this.stopKillMs = deps.stopKillGraceMs ?? STOP_KILL_GRACE_MS
     // Driver construction performs no session calls — safe outside executors.
@@ -269,6 +279,7 @@ export class SupervisorImpl implements Supervisor {
         maxAgents: this.options.maxAgents,
         report: (status) => parent.report(status),
         ambientPhase: () => state.ambientPhase,
+        ...(this.pinForAgent ? { pinForAgent: this.pinForAgent } : {}),
         signal: state.controller.signal,
       })
 
