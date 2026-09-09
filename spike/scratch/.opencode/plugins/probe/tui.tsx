@@ -5,11 +5,13 @@
  * exports["./tui"] points here.
  */
 import { appendFileSync, mkdirSync } from "node:fs"
-import { dirname } from "node:path"
+import { dirname, join } from "node:path"
+import { fileURLToPath } from "node:url"
 
-const OUT =
-  process.env.PROBE_TUI_OUT ??
-  "<repo>/spike/out/tui-probe.jsonl"
+/** Repo root derived from this file (spike/scratch/.opencode/plugins/probe/). */
+const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "..", "..")
+
+const OUT = process.env.PROBE_TUI_OUT ?? join(REPO_ROOT, "spike", "out", "tui-probe.jsonl")
 
 function log(kind: string, data: unknown = {}): void {
   try {

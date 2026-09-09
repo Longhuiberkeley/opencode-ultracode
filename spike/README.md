@@ -35,4 +35,5 @@ UC_LIVE_MODEL='provider/model-id' scripts/tui-probe.sh --live
 - Without it, the harness prints a loud warning that the location-default model will be used
   and continues.
 
-No model id is committed anywhere in this repo.
+No live-harness model id is committed anywhere in this repo (model names appearing in docs or
+tests are illustrative examples only).

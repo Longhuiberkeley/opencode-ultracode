@@ -110,58 +110,65 @@ SKILL_MIRROR="$WF_DIR/ultracode-skill.md"
 SKILL_REPO="$REPO/skills/ultracode.md"
 
 # Our own entries in the plugin dir (v2 copy install + v1 shim install).
-OURS_ENTRIES=(index.ts tui.tsx .ultracode-install src skills node_modules package.json)
+OURS_ENTRIES=(index.ts tui.tsx .ultracode-install src skills node_modules package.json LICENSE)
 
 # Remove the plugin dir contents only when everything in it is ours:
 # a marker file (v2), or v1 shim re-export files, or our copied tree.
 # Foreign files are never deleted; an unrelated plugin dir is left untouched.
-if [[ -d "$PLUGIN_DIR" ]]; then
-  foreign=""
-  while IFS= read -r entry; do
-    [[ -n "$entry" ]] || continue
-    name="$(basename -- "$entry")"
-    keep=0
-    for ours in "${OURS_ENTRIES[@]}"; do
-      [[ "$name" == "$ours" ]] && keep=1 && break
-    done
-    if [[ "$keep" -eq 0 ]]; then
-      foreign="$name"
-      break
-    fi
-  done < <(find "$PLUGIN_DIR" -maxdepth 1 -mindepth 1 2>/dev/null || true)
-
-  looks_ours=0
-  if [[ -f "$MARKER_FILE" ]]; then
-    looks_ours=1
-  elif [[ -f "$INDEX_FILE" ]] && grep -F -q 'export { default } from' "$INDEX_FILE" 2>/dev/null; then
-    looks_ours=1
-  elif [[ -f "$PLUGIN_DIR/src/index.ts" ]]; then
-    looks_ours=1
-  fi
-
-  if [[ "$looks_ours" -eq 1 && -z "$foreign" ]]; then
-    for ours in "${OURS_ENTRIES[@]}"; do
-      rm -rf "${PLUGIN_DIR:?}/$ours"
-    done
-    echo "removed ultracode install entries in $PLUGIN_DIR"
-    if [[ -z "$(ls -A "$PLUGIN_DIR" 2>/dev/null || true)" ]]; then
-      rmdir "$PLUGIN_DIR"
-      echo "removed empty $PLUGIN_DIR"
-    fi
-    # Prune now-empty parents (rmdir fails safely on non-empty dirs).
-    if [[ -d "$OPENCODE_DIR/plugins" && -z "$(ls -A "$OPENCODE_DIR/plugins" 2>/dev/null || true)" ]]; then
-      rmdir "$OPENCODE_DIR/plugins" 2>/dev/null || true
-    fi
-    if [[ -d "$OPENCODE_DIR" && -z "$(ls -A "$OPENCODE_DIR" 2>/dev/null || true)" && ! -f "$CONFIG_JSON" ]]; then
-      rmdir "$OPENCODE_DIR" 2>/dev/null || true
-    fi
-  elif [[ "$looks_ours" -eq 1 && -n "$foreign" ]]; then
-    for ours in "${OURS_ENTRIES[@]}"; do
-      rm -rf "${PLUGIN_DIR:?}/$ours"
-    done
-    echo "removed ultracode install entries in $PLUGIN_DIR (left foreign file: $foreign)"
+if [[ -L "$PLUGIN_DIR" ]]; then
+  echo "leaving $PLUGIN_DIR (symlink — remove it manually)"
+elif [[ -d "$PLUGIN_DIR" ]]; then
+  # An empty dir (interrupted install) is always safe to remove.
+  if [[ -z "$(ls -A "$PLUGIN_DIR" 2>/dev/null || true)" ]]; then
+    rmdir "$PLUGIN_DIR" 2>/dev/null || true
   else
-    echo "leaving $PLUGIN_DIR (not recognized as an ultracode install)"
+    foreign=""
+    while IFS= read -r entry; do
+      [[ -n "$entry" ]] || continue
+      name="$(basename -- "$entry")"
+      keep=0
+      for ours in "${OURS_ENTRIES[@]}"; do
+        [[ "$name" == "$ours" ]] && keep=1 && break
+      done
+      if [[ "$keep" -eq 0 ]]; then
+        foreign="$name"
+        break
+      fi
+    done < <(find "$PLUGIN_DIR" -maxdepth 1 -mindepth 1 2>/dev/null || true)
+
+    looks_ours=0
+    if [[ -f "$MARKER_FILE" ]]; then
+      looks_ours=1
+    elif [[ -f "$INDEX_FILE" ]] && grep -F -q 'export { default } from' "$INDEX_FILE" 2>/dev/null; then
+      looks_ours=1
+    elif [[ -f "$PLUGIN_DIR/src/index.ts" ]]; then
+      looks_ours=1
+    fi
+
+    if [[ "$looks_ours" -eq 1 && -z "$foreign" ]]; then
+      for ours in "${OURS_ENTRIES[@]}"; do
+        rm -rf "${PLUGIN_DIR:?}/$ours"
+      done
+      echo "removed ultracode install entries in $PLUGIN_DIR"
+      if [[ -z "$(ls -A "$PLUGIN_DIR" 2>/dev/null || true)" ]]; then
+        rmdir "$PLUGIN_DIR"
+        echo "removed empty $PLUGIN_DIR"
+      fi
+      # Prune now-empty parents (rmdir fails safely on non-empty dirs).
+      if [[ -d "$OPENCODE_DIR/plugins" && -z "$(ls -A "$OPENCODE_DIR/plugins" 2>/dev/null || true)" ]]; then
+        rmdir "$OPENCODE_DIR/plugins" 2>/dev/null || true
+      fi
+      if [[ -d "$OPENCODE_DIR" && -z "$(ls -A "$OPENCODE_DIR" 2>/dev/null || true)" && ! -f "$CONFIG_JSON" ]]; then
+        rmdir "$OPENCODE_DIR" 2>/dev/null || true
+      fi
+    elif [[ "$looks_ours" -eq 1 && -n "$foreign" ]]; then
+      for ours in "${OURS_ENTRIES[@]}"; do
+        rm -rf "${PLUGIN_DIR:?}/$ours"
+      done
+      echo "removed ultracode install entries in $PLUGIN_DIR (left foreign file: $foreign)"
+    else
+      echo "leaving $PLUGIN_DIR (not recognized as an ultracode install)"
+    fi
   fi
 fi
 

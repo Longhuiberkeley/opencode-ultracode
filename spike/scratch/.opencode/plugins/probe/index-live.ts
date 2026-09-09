@@ -5,15 +5,15 @@
  * Wraps command.execute so x/p/s transport shows up as command-invoked jsonl.
  */
 import { appendFileSync, mkdirSync } from "node:fs"
-import { dirname } from "node:path"
+import { dirname, join } from "node:path"
+import { fileURLToPath } from "node:url"
 import real from "../../../../../src/index.ts"
 
-const OUT =
-  process.env.PROBE_OUT ??
-  "<repo>/spike/out/tui-live-server.jsonl"
-const TUI_OUT =
-  process.env.PROBE_TUI_OUT ??
-  "<repo>/spike/out/tui-live.jsonl"
+/** Repo root derived from this file (spike/scratch/.opencode/plugins/probe/). */
+const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "..", "..")
+
+const OUT = process.env.PROBE_OUT ?? join(REPO_ROOT, "spike", "out", "tui-live-server.jsonl")
+const TUI_OUT = process.env.PROBE_TUI_OUT ?? join(REPO_ROOT, "spike", "out", "tui-live.jsonl")
 
 function logTo(path: string, kind: string, data: unknown = {}): void {
   try {

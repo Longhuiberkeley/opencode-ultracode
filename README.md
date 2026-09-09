@@ -84,8 +84,8 @@ scripts/install.sh --project /path/to/your-project
 `scripts/install.sh` writes a **self-contained copy** into the plugin dir (verified on OpenCode
 v2 beta-19271: `.opencode/plugins/*/index.ts` is enough; `--write-config` is optional). The
 installed tree — sources, skill, generated manifest, and the `@opencode/plugin` dependency tree
-— is **relocatable**: it contains no absolute paths and keeps working after the source checkout
-is moved or deleted:
+— is **relocatable**: it contains no paths into your source checkout and keeps working after
+the source checkout is moved or deleted (assumes a plain `npm install` tree — no `npm link`):
 
 | Flag | Effect |
 | --- | --- |
@@ -98,7 +98,8 @@ is moved or deleted:
 
 Reruns are idempotent (same files, never duplicate config). No network. An existing v1 install
 (absolute-path re-export shims) is migrated automatically to the new layout. Platform status:
-**macOS verified**; Linux expected but not exercised by this repo's CI; Windows untested.
+**macOS verified** end-to-end (live TUI); Linux runs in CI (unit + installer tests); Windows
+untested.
 
 **TUI opt-in:** omit `--tui` for server-only (`ultracode_run` + `/ultracode`). Add `--tui` when
 you want the chip + inspect panel. Remove `tui.tsx` or run `scripts/uninstall.sh` to drop it;
@@ -177,7 +178,7 @@ back to defaults.
 {
   "plugins": [
     {
-      "package": "/path/to/opencode-ultracode",
+      "package": "./plugins/ultracode",
       "options": {
         "agent": "general",
         "concurrency": 8,

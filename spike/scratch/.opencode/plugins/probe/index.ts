@@ -2,14 +2,15 @@
 // Writes JSONL events to spike/out/probe-log.jsonl (PROBE_OUT overrides).
 import { Plugin } from "@opencode/plugin"
 import { appendFileSync, mkdirSync } from "node:fs"
-import { dirname } from "node:path"
+import { dirname, join } from "node:path"
+import { fileURLToPath } from "node:url"
 
-const OUT =
-  process.env.PROBE_OUT ??
-  "<repo>/spike/out/probe-log.jsonl"
+/** Repo root derived from this file (spike/scratch/.opencode/plugins/probe/). */
+const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "..", "..")
 
-const SKILL_LOCATION =
-  "<repo>/spike/scratch/.opencode/skills/probe-skill.md"
+const OUT = process.env.PROBE_OUT ?? join(REPO_ROOT, "spike", "out", "probe-log.jsonl")
+
+const SKILL_LOCATION = join(REPO_ROOT, "spike", "scratch", ".opencode", "skills", "probe-skill.md")
 
 const UC_META = { uc: { v: 1, run: "run_probe", ord: "a1" } }
 

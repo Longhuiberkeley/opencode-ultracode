@@ -89,7 +89,7 @@ echo "server:  $SERVER_OUT"
 echo "ansi:    $ANSI"
 echo "mode:    $MODE"
 if [[ -n "${UC_LIVE_MODEL:-}" ]]; then
-  echo "model:   UC_LIVE_MODEL=$UC_LIVE_MODEL (pinned via --model; audit fails on drift)"
+  echo "model:   UC_LIVE_MODEL=$UC_LIVE_MODEL (pinned via --model; audit fails on observed drift)"
 else
   echo "model:   WARNING: UC_LIVE_MODEL is unset — standalone scratch servers may not load"
   echo "         global agent pins, so children can fall back to the location-default model."
@@ -1115,31 +1115,45 @@ if [[ "$DIALOG_KEYS" -eq 1 ]]; then
 fi
 
 audit_live_model() {
-  python3 - "$SERVER_OUT" "${UC_LIVE_MODEL:-}" <<'PY'
+  # Best-effort drift audit: scans every capture the probe kept (server jsonl,
+  # probe jsonl, raw TTY log) for model objects. Prints what it found; fails
+  # ONLY when UC_LIVE_MODEL is set AND a full provider/id model was observed
+  # that does not match it. "No observations" never fails (paint dummies and
+  # truncated retries legitimately leave no model evidence).
+  python3 - "$SERVER_OUT" "$OUT" "$TTY_LOG" "${UC_LIVE_MODEL:-}" <<'PY'
 import re, sys
 
-path, want = sys.argv[1], sys.argv[2]
+paths, want = sys.argv[1:4], sys.argv[4]
+blob = ""
+for p in paths:
+    try:
+        with open(p, encoding="utf-8", errors="replace") as fh:
+            blob += fh.read() + "\n"
+    except OSError:
+        pass
+
 models = set()
-try:
-    fh = open(path, encoding="utf-8", errors="replace")
-except FileNotFoundError:
-    print("model audit: no server jsonl — skipped")
-    sys.exit(0)
-with fh:
-    for line in fh:
-        for m in re.finditer(r'"model"\s*:\s*(?:\{[^}]*?"id"\s*:\s*"([^"]+)"|"([^"]+)")', line):
-            models.add(m.group(1) or m.group(2))
+for m in re.finditer(r'"providerID"\s*:\s*"([^"]+)"[^}]*?"id"\s*:\s*"([^"]+)"', blob):
+    models.add(f"{m.group(1)}/{m.group(2)}")
+for m in re.finditer(r'"id"\s*:\s*"([^"/]+)"[^}]*?"providerID"\s*:\s*"([^"]+)"', blob):
+    models.add(f"{m.group(2)}/{m.group(1)}")
+
 if not models:
-    print("model audit: no model observations in the server jsonl — nothing to compare")
+    print("model audit: no model observations in the captures — nothing to compare")
     sys.exit(0)
 print("model audit: observed models:", ", ".join(sorted(models)))
 if not want:
+    print("model audit: UC_LIVE_MODEL unset — observations above are informational only")
     sys.exit(0)
-if any(want in m or m == want for m in models):
-    print(f"model audit: ok — expected {want} was used")
-    sys.exit(0)
-print(f"model audit: FAIL — UC_LIVE_MODEL={want} but observed only {sorted(models)}")
-sys.exit(1)
+expected = {m for m in models if m == want}
+unexpected = models - expected
+if unexpected and not expected:
+    print(f"model audit: FAIL — UC_LIVE_MODEL={want} never observed; saw only {sorted(models)}")
+    sys.exit(1)
+if unexpected:
+    print(f"model audit: FAIL — unexpected model(s) {sorted(unexpected)} (expected {want})")
+    sys.exit(1)
+print(f"model audit: ok — every observed model matches {want}")
 PY
 }
 

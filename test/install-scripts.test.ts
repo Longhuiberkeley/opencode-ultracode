@@ -16,6 +16,7 @@ import {
   realpathSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs"
 import { tmpdir } from "node:os"
@@ -217,6 +218,37 @@ test("install refuses to clobber a foreign plugin dir", { skip }, () => {
     assert.notEqual(inst.status, 0)
     assert.match(inst.stderr, /refusing to overwrite/)
     assert.equal(readFileSync(join(dir, "index.ts"), "utf8"), 'export default { id: "someone-elses" }\n')
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test("install recovers from an interrupted install (empty plugin dir)", { skip }, () => {
+  const root = mkdtempSync(join(tmpdir(), "uc-resume-"))
+  const project = join(root, "proj")
+  const dir = pluginDir(project)
+  mkdirSync(dir, { recursive: true }) // what a killed install leaves behind
+  try {
+    const inst = run(INSTALL, ["--project", project, "--repo", REPO, "--no-deps"])
+    assert.equal(inst.status, 0, inst.stderr || inst.stdout)
+    assert.equal(existsSync(join(dir, "src/index.ts")), true)
+    assert.equal(existsSync(join(dir, ".ultracode-install")), true)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test("install refuses a symlinked plugin dir", { skip }, () => {
+  const root = mkdtempSync(join(tmpdir(), "uc-symlink-"))
+  const project = join(root, "proj")
+  mkdirSync(join(project, ".opencode/plugins"), { recursive: true })
+  const realDir = join(root, "elsewhere")
+  mkdirSync(realDir)
+  try {
+    symlinkSync(realDir, pluginDir(project))
+    const inst = run(INSTALL, ["--project", project, "--repo", REPO, "--no-deps"])
+    assert.notEqual(inst.status, 0)
+    assert.match(inst.stderr, /symlink/)
   } finally {
     rmSync(root, { recursive: true, force: true })
   }

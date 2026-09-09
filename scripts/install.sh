@@ -136,14 +136,15 @@ MARKER="$PLUGIN_DIR/.ultracode-install"
 # ---------------------------------------------------------------------------
 
 # ours iff every top-level entry is one we write AND the dir looks like an
-# ultracode install (marker, re-export entry, or copied src tree). Survives
-# interrupted installs; refuses genuine foreign plugins at the same path.
+# ultracode install (marker, re-export entry, or copied src tree). An empty
+# dir (interrupted install) also counts — reruns must recover, not brick.
 is_ours() {
   [[ -d "$PLUGIN_DIR" ]] || return 1
   local foreign
   foreign="$(find "$PLUGIN_DIR" -maxdepth 1 -mindepth 1 \
     ! -name 'index.ts' ! -name 'tui.tsx' ! -name '.ultracode-install' \
     ! -name 'src' ! -name 'skills' ! -name 'node_modules' ! -name 'package.json' \
+    ! -name 'LICENSE' \
     -print -quit 2>/dev/null || true)"
   [[ -z "$foreign" ]] || return 1
   [[ -f "$MARKER" ]] && return 0
@@ -151,9 +152,14 @@ is_ours() {
   if [[ -f "$PLUGIN_DIR/index.ts" ]]; then
     grep -F -q 'export { default } from' "$PLUGIN_DIR/index.ts" 2>/dev/null && return 0
   fi
+  # Empty (or marker-less and file-less): interrupted install — recoverable.
+  [[ -z "$(ls -A "$PLUGIN_DIR" 2>/dev/null || true)" ]] && return 0
   return 1
 }
 
+if [[ -L "$PLUGIN_DIR" ]]; then
+  die "refusing to install through symlink $PLUGIN_DIR — remove the link first"
+fi
 if [[ -d "$PLUGIN_DIR" ]] && ! is_ours; then
   die "refusing to overwrite $PLUGIN_DIR — it contains files this installer did not write"
 fi
@@ -183,12 +189,17 @@ mkdir -p "$PLUGIN_DIR" || die "target dir is not writable: $TARGET"
 
 # Remove our own previous entries (foreign files are never touched).
 rm -rf "$PLUGIN_DIR/src" "$PLUGIN_DIR/skills" "$PLUGIN_DIR/node_modules"
-rm -f "$PLUGIN_DIR/index.ts" "$PLUGIN_DIR/tui.tsx" "$PLUGIN_DIR/package.json" "$PLUGIN_DIR/.ultracode-install"
+rm -f "$PLUGIN_DIR/index.ts" "$PLUGIN_DIR/tui.tsx" "$PLUGIN_DIR/package.json" \
+  "$PLUGIN_DIR/.ultracode-install" "$PLUGIN_DIR/LICENSE"
 
 # Sources + skill (src/index.ts resolves ../skills/ultracode.md via import.meta.url).
 cp -Rp "$REPO/src" "$PLUGIN_DIR/src"
 mkdir -p "$PLUGIN_DIR/skills"
 cp -p "$REPO/skills/ultracode.md" "$PLUGIN_DIR/skills/ultracode.md"
+# License travels with the copy (redistribution correctness).
+if [[ -f "$REPO/LICENSE" ]]; then
+  cp -p "$REPO/LICENSE" "$PLUGIN_DIR/LICENSE"
+fi
 
 # Runtime dependency tree (typescript is a devDependency — skip it).
 if [[ "$NO_DEPS" -eq 0 ]]; then

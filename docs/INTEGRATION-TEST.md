@@ -42,9 +42,9 @@ Run after Builders A/B/C merge. Unit tests must be green first: `npm test`, `npx
 - [ ] Kill the standalone server mid-run (SIGKILL), restart, assert the persisted run shows `interrupted` with stopReason "server restart" in `/ultracode` output; no auto-replay
 
 ## 8. Global install (user-approved)
-- [ ] Backup `~/.config/opencode/opencode.json`, add plugins entry with absolute path, `opencode2 service restart`, `/api/plugin` shows ultracode in the user's home location
+- [ ] Backup `~/.config/opencode/opencode.json`, `scripts/install.sh --global --tui --write-config`, `opencode2 service restart`, `/api/plugin` shows ultracode in the user's home location, TUI loads with no "Cannot find module" toast
 - [ ] Run one demo ultracode prompt in the user's real environment
-- [ ] Commit final state; tag v0.1.0
+- [ ] Commit final state; tag v0.2.0
 
 ## 9. TUI probe (inspect UI contract)
 - [ ] `scripts/tui-probe.sh` — full TUI (`opencode2 --standalone`, not `mini` / `run`) writes `spike/out/tui-probe.jsonl`

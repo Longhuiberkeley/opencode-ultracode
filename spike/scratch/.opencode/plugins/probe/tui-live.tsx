@@ -8,16 +8,17 @@
  * spawns — transport assertions must then be skipped.
  */
 import { appendFileSync, mkdirSync } from "node:fs"
-import { dirname } from "node:path"
+import { dirname, join } from "node:path"
+import { fileURLToPath } from "node:url"
 import real from "../../../../../src/tui.tsx"
 import { parseRunAck } from "../../../../../src/tui-render.ts"
 
-const OUT =
-  process.env.PROBE_TUI_OUT ??
-  "<repo>/spike/out/tui-probe.jsonl"
+/** Repo root derived from this file (spike/scratch/.opencode/plugins/probe/). */
+const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "..", "..")
+
+const OUT = process.env.PROBE_TUI_OUT ?? join(REPO_ROOT, "spike", "out", "tui-probe.jsonl")
 const PARENT_MSG_OUT =
-  process.env.PROBE_PARENT_MSG_OUT ??
-  "<repo>/spike/out/tui-live-parent-messages.jsonl"
+  process.env.PROBE_PARENT_MSG_OUT ?? join(REPO_ROOT, "spike", "out", "tui-live-parent-messages.jsonl")
 const ALLOW_PAINT_FALLBACK = process.env.TUI_PROBE_ALLOW_PAINT_FALLBACK === "1"
 
 function logTo(path: string, kind: string, data: unknown = {}): void {
