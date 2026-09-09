@@ -1,18 +1,33 @@
 #!/usr/bin/env bash
-# Install ultracode as an OpenCode plugin re-export (D10). No network.
+# Install ultracode as an OpenCode plugin (self-contained copy, v2). No network.
+#
+# Layout written into the target plugins dir:
+#   plugins/ultracode/index.ts            -> relative re-export of ./src/index.ts
+#   plugins/ultracode/tui.tsx  (--tui)    -> relative re-export of ./src/tui.tsx
+#   plugins/ultracode/src/…               -> copied plugin sources
+#   plugins/ultracode/skills/ultracode.md -> copied authoring skill
+#   plugins/ultracode/package.json        -> generated package manifest
+#   plugins/ultracode/node_modules/…      -> runtime deps (@opencode/plugin tree)
+#   plugins/ultracode/.ultracode-install  -> install marker (uninstall safety)
+#
+# The installed tree is relocatable: it contains NO absolute paths and keeps
+# working after the source checkout is moved or deleted. (v1 installs wrote
+# absolute-path re-export shims; the OpenCode TUI client refuses those.)
 set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: install.sh [--project DIR] [--global] [--tui] [--write-config] [--repo PATH]
+Usage: install.sh [--project DIR] [--global] [--tui] [--write-config] [--no-deps] [--repo PATH]
 
-Install the ultracode plugin by writing a re-export into the OpenCode auto-load
-directory. Idempotent: reruns rewrite the same files and never duplicate config.
+Install the ultracode plugin as a self-contained copy in the OpenCode plugin
+directory. Idempotent: reruns rebuild the same tree. No network required.
 
   --project DIR     Project root (default: current working directory)
   --global          Install into ~/.config/opencode (not DIR/.opencode)
   --tui             Also write sibling tui.tsx (inspect UI is opt-in)
   --write-config    Merge a plugins entry into opencode.json if missing
+  --no-deps         Skip the node_modules copy (tests/dev only — the plugin
+                    then requires @opencode/plugin resolution from elsewhere)
   --repo PATH       Plugin repo root (default: parent of this script)
 
 Preconditions: npm install has been run in the plugin repo; the target is writable.
@@ -28,6 +43,7 @@ PROJECT=""
 GLOBAL=0
 TUI=0
 WRITE_CONFIG=0
+NO_DEPS=0
 REPO_ARG=""
 
 while [[ $# -gt 0 ]]; do
@@ -53,8 +69,12 @@ while [[ $# -gt 0 ]]; do
       WRITE_CONFIG=1
       shift
       ;;
+    --no-deps)
+      NO_DEPS=1
+      shift
+      ;;
     --repo)
-      [[ $# -ge 2 ]] || die "--repo requires a path"
+      [[ $# -ge 2 ]] || die "--repo requires a directory"
       REPO_ARG="$2"
       shift 2
       ;;
@@ -76,11 +96,14 @@ else
   REPO="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd -P)"
 fi
 
-if [[ ! -e "$REPO/node_modules/@opencode/plugin" ]]; then
-  die "run npm install in $REPO"
-fi
 [[ -f "$REPO/src/index.ts" ]] || die "repo is missing src/index.ts: $REPO"
 [[ -f "$REPO/src/tui.tsx" ]] || die "repo is missing src/tui.tsx: $REPO"
+[[ -f "$REPO/skills/ultracode.md" ]] || die "repo is missing skills/ultracode.md: $REPO"
+[[ -f "$REPO/package.json" ]] || die "repo is missing package.json: $REPO"
+
+if [[ "$NO_DEPS" -eq 0 && ! -e "$REPO/node_modules/@opencode/plugin" ]]; then
+  die "run npm install in $REPO (or pass --no-deps to skip the dependency copy)"
+fi
 
 if [[ "$GLOBAL" -eq 1 ]]; then
   [[ -n "${HOME:-}" ]] || die "HOME is unset"
@@ -105,34 +128,112 @@ fi
 PLUGIN_DIR="$OPENCODE_DIR/plugins/ultracode"
 CONFIG_JSON="$OPENCODE_DIR/opencode.json"
 PACKAGE_PATH="./plugins/ultracode"
-INDEX_SRC="$REPO/src/index.ts"
-TUI_SRC="$REPO/src/tui.tsx"
+MARKER="$PLUGIN_DIR/.ultracode-install"
 
-ts_string() {
-  SRC_PATH="$1" node -e 'process.stdout.write(JSON.stringify(process.env.SRC_PATH ?? ""))'
+# ---------------------------------------------------------------------------
+# Ownership safety: only touch a plugin dir that is ours (marker file) or a
+# v1 shim install (2-line absolute-path re-export). Refuse on anything else.
+# ---------------------------------------------------------------------------
+
+# ours iff every top-level entry is one we write AND the dir looks like an
+# ultracode install (marker, re-export entry, or copied src tree). Survives
+# interrupted installs; refuses genuine foreign plugins at the same path.
+is_ours() {
+  [[ -d "$PLUGIN_DIR" ]] || return 1
+  local foreign
+  foreign="$(find "$PLUGIN_DIR" -maxdepth 1 -mindepth 1 \
+    ! -name 'index.ts' ! -name 'tui.tsx' ! -name '.ultracode-install' \
+    ! -name 'src' ! -name 'skills' ! -name 'node_modules' ! -name 'package.json' \
+    -print -quit 2>/dev/null || true)"
+  [[ -z "$foreign" ]] || return 1
+  [[ -f "$MARKER" ]] && return 0
+  [[ -f "$PLUGIN_DIR/src/index.ts" ]] && return 0
+  if [[ -f "$PLUGIN_DIR/index.ts" ]]; then
+    grep -F -q 'export { default } from' "$PLUGIN_DIR/index.ts" 2>/dev/null && return 0
+  fi
+  return 1
 }
 
-write_reexport() {
-  local dest="$1"
-  local src="$2"
-  local pragma="${3:-}"
-  mkdir -p "$(dirname -- "$dest")"
-  {
-    if [[ -n "$pragma" ]]; then
-      printf '%s\n' "$pragma"
-    fi
-    printf 'export { default } from %s\n' "$(ts_string "$src")"
-  } >"$dest"
-}
+if [[ -d "$PLUGIN_DIR" ]] && ! is_ours; then
+  die "refusing to overwrite $PLUGIN_DIR — it contains files this installer did not write"
+fi
+
+# ---------------------------------------------------------------------------
+# Build the tree (clean rebuild of our own entries; preserves foreign files)
+# ---------------------------------------------------------------------------
+
+VERSION="$(PLUGIN_JSON="$REPO/package.json" node -e '
+const fs = require("fs")
+try {
+  const doc = JSON.parse(fs.readFileSync(process.env.PLUGIN_JSON, "utf8"))
+  process.stdout.write(String(doc.version || "0.0.0"))
+} catch { process.stdout.write("0.0.0") }
+')"
+
+PLUGIN_DEP="$(PLUGIN_JSON="$REPO/package.json" node -e '
+const fs = require("fs")
+try {
+  const doc = JSON.parse(fs.readFileSync(process.env.PLUGIN_JSON, "utf8"))
+  const deps = doc.dependencies || {}
+  process.stdout.write(JSON.stringify({ "@opencode/plugin": deps["@opencode/plugin"] || "*" }))
+} catch { process.stdout.write(JSON.stringify({ "@opencode/plugin": "*" })) }
+')"
 
 mkdir -p "$PLUGIN_DIR" || die "target dir is not writable: $TARGET"
-write_reexport "$PLUGIN_DIR/index.ts" "$INDEX_SRC"
+
+# Remove our own previous entries (foreign files are never touched).
+rm -rf "$PLUGIN_DIR/src" "$PLUGIN_DIR/skills" "$PLUGIN_DIR/node_modules"
+rm -f "$PLUGIN_DIR/index.ts" "$PLUGIN_DIR/tui.tsx" "$PLUGIN_DIR/package.json" "$PLUGIN_DIR/.ultracode-install"
+
+# Sources + skill (src/index.ts resolves ../skills/ultracode.md via import.meta.url).
+cp -Rp "$REPO/src" "$PLUGIN_DIR/src"
+mkdir -p "$PLUGIN_DIR/skills"
+cp -p "$REPO/skills/ultracode.md" "$PLUGIN_DIR/skills/ultracode.md"
+
+# Runtime dependency tree (typescript is a devDependency — skip it).
+if [[ "$NO_DEPS" -eq 0 ]]; then
+  mkdir -p "$PLUGIN_DIR/node_modules"
+  for entry in "$REPO"/node_modules/*; do
+    name="$(basename -- "$entry")"
+    [[ "$name" == "typescript" ]] && continue
+    [[ "$name" == ".bin" || "$name" == ".package-lock.json" ]] && continue
+    cp -Rp "$entry" "$PLUGIN_DIR/node_modules/$name"
+  done
+fi
+
+# Generated package manifest (kept in sync with the repo version).
+VERSION="$VERSION" PLUGIN_DEP="$PLUGIN_DEP" node -e '
+const fs = require("fs")
+const version = process.env.VERSION || "0.0.0"
+const deps = JSON.parse(process.env.PLUGIN_DEP || "{}")
+const doc = {
+  name: "opencode-ultracode",
+  version,
+  description: "Claude Code-style dynamic workflows (ultracode) for OpenCode v2",
+  type: "module",
+  main: "src/index.ts",
+  exports: {
+    ".": "./src/index.ts",
+    "./tui": "./src/tui.tsx",
+  },
+  dependencies: deps,
+  private: true,
+}
+fs.writeFileSync(process.argv[1], JSON.stringify(doc, null, 2) + "\n")
+' "$PLUGIN_DIR/package.json"
+
+# Entry points: RELATIVE re-exports (the TUI client rejects absolute paths).
+printf '%s\n' 'export { default } from "./src/index.ts"' >"$PLUGIN_DIR/index.ts"
 echo "wrote $PLUGIN_DIR/index.ts"
 
 if [[ "$TUI" -eq 1 ]]; then
-  write_reexport "$PLUGIN_DIR/tui.tsx" "$TUI_SRC" "/** @jsxImportSource solid-js */"
+  printf '%s\n' '/** @jsxImportSource solid-js */' 'export { default } from "./src/tui.tsx"' >"$PLUGIN_DIR/tui.tsx"
   echo "wrote $PLUGIN_DIR/tui.tsx"
 fi
+
+# Install marker (uninstall removes the tree only when this is present).
+printf '%s\n' "{\"v\":2,\"version\":\"$VERSION\",\"tui\":$TUI}" >"$MARKER"
+echo "wrote $MARKER (self-contained copy, version $VERSION)"
 
 if [[ "$WRITE_CONFIG" -eq 1 ]]; then
   command -v node >/dev/null 2>&1 || die "node is required for --write-config"
@@ -222,4 +323,6 @@ Next steps:
 
 Plugin repo: $REPO
 Load path:   $PLUGIN_DIR
+Relocatable: yes — the installed tree has no absolute paths and no dependency
+             on the source checkout.
 EOF
