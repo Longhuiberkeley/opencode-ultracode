@@ -250,8 +250,9 @@ keyword `ultracode` (no leading slash).
 run (0 → "no active run", many → list IDs). `stop` requires an explicit runID unless exactly
 one run is active. `rerun` omit → most recent **final** run (refuses an active source).
 
-TUI keys (panel-hosted inspect; same verbs via `client.session.command`) fire only while the
-inspect panel is focused — they are not dialog-hosted.
+Panel action keys (panel-hosted inspect; same verbs via `client.session.command`) fire only
+while the inspect panel is focused — they are not dialog-hosted. The Ctrl+G panel opener is
+global (registered from the always-mounted chip component).
 
 | Command | Effect | TUI key |
 | --- | --- | --- |
@@ -274,7 +275,9 @@ Opt-in TUI (`scripts/install.sh --tui` / sibling `tui.tsx`). Fail-soft: every sl
 dialog, and toast call is try/caught; a missing host API never takes down the CLI. Version
 gate: channel `beta` and binary `0.0.0-beta-NNNNN` with **NNNNN ≥ 19271** (`shouldEnableTui`).
 Older or unknown builds skip TUI registration; `/ultracode show` remains the server-only
-parity floor.
+parity floor. The Ctrl+G opener is spike-verified on beta-19271; on builds where the host
+claims Ctrl+G for its own navigation, the palette entry is the fallback once palette listing
+surfaces bindless entries.
 
 | Piece | Where | What |
 | --- | --- | --- |
