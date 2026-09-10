@@ -104,7 +104,7 @@ test("fast-return admission: background true returns runID + running without awa
   assert.equal(body.status, "running")
   assert.equal(body.hint, BACKGROUND_RUN_HINT)
   assert.match(body.hint, /ctrl\+g/)
-  assert.match(body.hint, /not auto-woken/)
+  assert.match(body.hint, /settle notice lands in the parent session/)
 })
 
 test("fast-return admission: invalid script errors before return", async () => {

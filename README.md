@@ -295,9 +295,9 @@ or inline with a script it wrote itself (see `docs/AUTHORING.md` for the full sc
 By default the tool returns immediately after admission + script validation with
 `{ runID, status: "running", hint }` — the run continues detached and the conversation stays
 available; watch the inspect panel (`ctrl+g`) or poll status. When the run settles, the plugin
-appends a one-line settle notice to this session (status, agents, bounded result brief); whether
-that notice also *wakes* the agent is host-dependent — poll `/ultracode status [runID]`, the
-`ultracode_status` tool (`{ runID? }`), or the inspect panel when you need certainty. Pass
+appends a one-line settle notice to this session — status, agent counts, a bounded result
+brief, and the stop reason — and that notice **wakes the parent agent** (live-verified), so
+long runs resume the conversation on completion instead of requiring blind polling. Pass
 `background: false` when you want the full envelope in-call instead.
 
 The blocking envelope looks like:
@@ -392,8 +392,8 @@ Launch long work normally — runs are background by default, so you can keep ch
 without killing the workflow or restarting finished children, and
 `ultracode_control { action, runID? }` to stop / pause / resume runs it owns. Steering
 acknowledges admission, not that the child has already applied the adjustment. Background
-completion appends a one-line settle notice to the parent session; certainty still comes
-from status/inspector polling.
+completion appends a one-line settle notice to the parent session and wakes the parent
+agent (live-verified) — status, agents, result brief, and stop reason arrive in-conversation.
 
 **Authoritative status (RPC-gated):** the server registers an optional
 `ultracode` RPC (`runStatus`, `settings`) behind a capability check. `runStatus`
@@ -436,7 +436,7 @@ observation, and no session `time.updated` (else `created`) within 15 minutes
 1. Open the empty inspect panel (`no ultracode runs`). Press Escape. Panel closes. Focus returns to the prompt.
 2. Reopen. Press Ctrl+G. Panel toggles closed. Focus returns to the prompt.
 3. Repeat 1–2 with an active run (tree populated). Escape closes; Ctrl+G toggles closed; focus returns to the prompt.
-4. Start a run (background by default). Confirm the tool returns `runID` immediately; `/ultracode status` / `ultracode_status` show it running; chip/panel update; completion does not auto-wake the parent.
+4. Start a run (background by default). Confirm the tool returns `runID` immediately; `/ultracode status` / `ultracode_status` show it running; chip/panel update; on completion a one-line settle notice lands in this conversation and wakes the parent agent.
 5. Change a settings pane value (`+/-`). Confirm the live strip / `/ultracode settings` overlay updates and the **next** run uses it (current run unchanged).
 6. Settings pane shows cached overlay / per-run effective from already-received acks, or **unknown** when stale. Opening or cycling runs must **not** send a settings query. Press `r` on an active run to refresh once; `r` must no-op on settled/unknown runs.
 7. Tree pane header shows `run k of N` plus the run id; `[` / `]` cycle runs and restore per-run tree selection.

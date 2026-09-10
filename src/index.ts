@@ -149,7 +149,7 @@ const WORKFLOW_TOOL_INPUT_SCHEMA: Record<string, unknown> = {
         background: {
           type: "boolean",
           description:
-            "Default true: return immediately after admission with { runID, status: \"running\", hint }. Pass false to block until the envelope. The calling agent is not auto-woken on completion; poll ultracode_status.",
+            "Default true: return immediately after admission with { runID, status: \"running\", hint }. Pass false to block until the envelope. On completion a one-line settle notice lands in the parent session and wakes the calling agent; poll ultracode_status for detail.",
         },
       },
     },
@@ -166,7 +166,7 @@ const WORKFLOW_TOOL_INPUT_SCHEMA: Record<string, unknown> = {
         background: {
           type: "boolean",
           description:
-            "Default true: return immediately after admission with { runID, status: \"running\", hint }. Pass false to block until the envelope. The calling agent is not auto-woken on completion; poll ultracode_status.",
+            "Default true: return immediately after admission with { runID, status: \"running\", hint }. Pass false to block until the envelope. On completion a one-line settle notice lands in the parent session and wakes the calling agent; poll ultracode_status for detail.",
         },
       },
     },

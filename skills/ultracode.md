@@ -10,7 +10,8 @@ Invoke the `ultracode_run` tool with `{ script, name?, meta?, args?, background?
 script as globals. Runs are background by default: the tool returns immediately after admission
 so the parent chat stays available; pass `background: false` only when you need the envelope
 in-call. Progress and status are scoped to that run
-(`ultracode_status`, inspect, `/ultracode status`). The calling agent is not auto-woken on completion.
+(`ultracode_status`, inspect, `/ultracode status`). When the run settles, a one-line notice lands
+in the parent session and wakes the calling agent (status, agents, result brief, stop reason).
 
 For long interactive tasks, background is the default so the user can keep chatting.
 When the user changes requirements, use `ultracode_steer` with `{ runID, agentID?, text }`

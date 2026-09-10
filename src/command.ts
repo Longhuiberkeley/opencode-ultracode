@@ -143,7 +143,7 @@ export const TOOL_DESCRIPTION: string = [
   "Route by agent, never by model: pass opts.agent; the user's agent config picks the model. Never name provider/model ids.",
   "",
   "Caps: 8 concurrent agents (default), 200 agent() calls per run, 60 minutes wall clock, 512 KB max script, results truncated after 64 KB.",
-  "Default / background: runs are background by default — the tool returns immediately after admission with { runID, status: \"running\", hint } (inspect panel via ctrl+g, or /ultracode status / ultracode_status). The host cannot deliver a late tool result after execute returns — the calling agent is not auto-woken on completion.",
+  "Default / background: runs are background by default — the tool returns immediately after admission with { runID, status: \"running\", hint } (inspect panel via ctrl+g, or /ultracode status / ultracode_status). A late tool result cannot be delivered after execute returns; instead a settle notice lands in the parent session on completion and wakes the calling agent.",
   "background: false (opt-in) blocks until every agent settles, then returns { runID, status, agents, tokens, result | preview }.",
   "Orchestrator tools: ultracode_status { runID? } (per-child detail, elapsed, settled result preview), ultracode_control { action: stop|pause|resume, runID? } (owned runs only), ultracode_steer { runID, agentID?, text } (running child).",
   "",
@@ -183,7 +183,7 @@ function firstToken(rest: string): string {
 
 /** Hint on the background-run tool ack. Honest limitation: no late tool result. */
 export const BACKGROUND_RUN_HINT =
-  "Watch the inspect panel (ctrl+g) or poll /ultracode status [runID] / ultracode_status. The host cannot deliver a late tool result after execute returns — the calling agent is not auto-woken on completion."
+  "A settle notice lands in the parent session when the run finishes and wakes the calling agent (status, agents, result brief, stop reason). The tool result itself cannot arrive after execute returns; poll /ultracode status [runID] / ultracode_status or the panel (ctrl+g) for detail."
 
 export type RunStatusPayload = {
   runID: string

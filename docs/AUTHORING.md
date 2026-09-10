@@ -61,10 +61,10 @@ Two input shapes (a union — anything else is rejected, extra keys included):
   *before any session spawns*, with the list of agents that do exist.
 
 The tool call returns immediately after admission (`background` defaults to true) with
-`{ runID, status: "running", hint }`; the calling agent is **not** guaranteed to be woken on
-completion — the plugin appends a one-line settle notice to the parent session, and certainty
-comes from polling `/ultracode status` or `ultracode_status` (which carries a bounded result
-preview once settled), or opening the inspect panel. Runs cannot
+`{ runID, status: "running", hint }`. On completion the plugin appends a one-line settle
+notice to the parent session — status, agents, bounded result brief, stop reason — which
+**wakes the parent agent** (live-verified); `ultracode_status` remains the authoritative poll
+(carrying a bounded result preview once settled). Runs cannot
 nest: an `ultracode_run` call from a session owned by a
 running workflow is rejected. Pass `background: false` to block until the run finishes
 (success, failure, stop, or timeout) — never while agents are live.
