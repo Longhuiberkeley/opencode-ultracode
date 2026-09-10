@@ -8,6 +8,58 @@ pipelines, tournaments — expressed as code instead of a wall of manual delegat
 This mirrors Claude Code's dynamic-workflow capability: instead of the harness hard-coding every
 multi-agent recipe, the model writes the orchestration on the fly and a runtime makes it real.
 
+## Quickstart
+
+**Install** (global; `npm install` in the clone first — the installer copies the dependency tree):
+
+```bash
+git clone https://github.com/Longhuiberkeley/opencode-ultracode.git
+cd opencode-ultracode && npm install
+scripts/install.sh --global --tui      # --tui adds the inspector UI
+```
+
+Project-local instead: `scripts/install.sh --project /path/to/your-project --tui`. Keep **one**
+scope per project — a global plus project-local copy of the same plugin ID collides (`Duplicate
+plugin ID: ultracode` in `/plugins`). Details and flags: [Install](#install).
+
+**Trigger it:** put the standalone keyword `ultracode` in a normal message (no slash):
+
+- `ultracode: audit src/auth and src/db, verify findings before reporting`
+- `please ultracode this research task`
+- `ultracode do an adversarial review of the api layer`
+
+The skill attaches, the model writes a small orchestration script, and `ultracode_run` executes
+it — every `agent()` call is a real subagent session with its own context window.
+
+**Watch it run:** press **Ctrl+G** (or palette → `ultracode.inspect`):
+
+| Key | Action |
+| --- | --- |
+| `[` / `]` | previous / next run (pins selection) |
+| `.` | toggle follow-latest — new runs take focus automatically |
+| `↑` / `↓` | move the tree / scroll the detail pane |
+| `h` / `l` | switch panes: tree ↔ detail ↔ settings |
+| `enter` | open the selected child session as a tab (see what it is doing) |
+| `y` / `n` | review a pending child permission: allow once / reject |
+| `p` / `x` / `s` | pause/resume · stop · save the workflow |
+| `f` | full-screen presentation |
+| `esc` / Ctrl+G | close |
+
+**Configure:** `h`/`l` to the settings pane, `+`/`-` to edit concurrency, agent cap, timeout,
+permission mode, and result size — values apply to the **next** run. Equivalent commands:
+`/ultracode set <key> <value>`, or plugin `options` in `opencode.json` ([Options](#options)).
+
+**Long runs:** ask for `background: true` so you can keep chatting while the workflow runs;
+poll `/ultracode status` or the panel, and steer a running child with `ultracode_steer`.
+
+**Uninstall:**
+
+```bash
+scripts/uninstall.sh --global          # or --project /path/to/your-project
+```
+
+The rest of this README covers security, internals, and the full command surface.
+
 ## How it works
 
 1. Your prompt contains the standalone keyword `ultracode` (e.g. `ultracode: audit src/auth`,
@@ -80,7 +132,7 @@ renames with rollback, not a zero-gap atomic directory exchange.
 installer to copy. The installer refuses to run until that is true.
 
 ```bash
-git clone <this-repo> /path/to/opencode-ultracode
+git clone https://github.com/Longhuiberkeley/opencode-ultracode.git /path/to/opencode-ultracode
 cd /path/to/opencode-ultracode
 npm install
 scripts/install.sh --project /path/to/your-project
