@@ -383,6 +383,7 @@ observation, and no session `time.updated` (else `created`) within 15 minutes
 5. Change a settings pane value (`+/-`). Confirm the live strip / `/ultracode settings` overlay updates and the **next** run uses it (current run unchanged).
 6. Settings pane shows cached overlay / per-run effective from already-received acks, or **unknown** when stale. Opening or cycling runs must **not** send a settings query. Press `r` on an active run to refresh once; `r` must no-op on settled/unknown runs.
 7. Tree pane header shows `run k of N` plus the run id; `[` / `]` cycle runs and restore per-run tree selection.
+8. With an active run, move the tree cursor onto an agent row and press Enter — the child session opens as a tab (`tabs.open` adds it when tabs are enabled; the view navigates when they are not). Pressing Enter on a run or phase row is a no-op.
 
 **Why the two-column inspector is panel-hosted, not `ui.dialog.show`:** G1 on beta-19271 —
 the host dialog owns the keymap. `keymap.layer` from a component mounted inside `dialog.show`

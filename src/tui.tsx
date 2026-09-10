@@ -1130,8 +1130,10 @@ export default Plugin.define({
             const pending = permissionsForRun(model().run, blockedPerms())
             const row = firstBlockedSessionID(pending) ?? model().selectedSessionID
             if (!row) return
-            if (context.ui?.tabs?.enabled?.() && context.ui.tabs.focus) context.ui.tabs.focus(row)
-            else context.ui?.router?.navigate?.({ type: "session", sessionID: row })
+            // tabs.open adds the tab when not already open (focus only targets existing tabs,
+            // which silently no-ops for fresh child sessions); false falls back to navigation.
+            const opened = typeof context.ui?.tabs?.open === "function" ? context.ui.tabs.open(row) : false
+            if (!opened) context.ui?.router?.navigate?.({ type: "session", sessionID: row })
           } catch (err) {
             warn("tabs.open failed", err)
           }
