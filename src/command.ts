@@ -143,8 +143,8 @@ export const TOOL_DESCRIPTION: string = [
   "Route by agent, never by model: pass opts.agent; the user's agent config picks the model. Never name provider/model ids.",
   "",
   "Caps: 8 concurrent agents (default), 200 agent() calls per run, 60 minutes wall clock, 512 KB max script, results truncated after 64 KB.",
-  "Default / background: false blocks until every agent settles, then returns { runID, status, agents, tokens, result | preview }.",
-  "background: true returns immediately after admission with { runID, status: \"running\", hint } (inspect panel via ctrl+g, or /ultracode status / ultracode_status). The host cannot deliver a late tool result after execute returns — the calling agent is not auto-woken on completion.",
+  "Default / background: runs are background by default — the tool returns immediately after admission with { runID, status: \"running\", hint } (inspect panel via ctrl+g, or /ultracode status / ultracode_status). The host cannot deliver a late tool result after execute returns — the calling agent is not auto-woken on completion.",
+  "background: false (opt-in) blocks until every agent settles, then returns { runID, status, agents, tokens, result | preview }.",
   "",
   "Full patterns + live catalogs load with the Ultracode skill (auto-attaches on the standalone keyword 'ultracode').",
 ].join("\n")

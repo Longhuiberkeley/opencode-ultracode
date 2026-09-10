@@ -7,11 +7,12 @@ re-enters your session. Child transcripts never touch your context.
 
 Invoke the `ultracode_run` tool with `{ script, name?, meta?, args?, background? }` for an inline run, or
 `{ workflow: "name", args?, background? }` to run a saved workflow. `meta` and `args` are injected into the
-script as globals. `background: true` returns immediately after admission so the parent chat stays
-available; default `false` waits for the envelope. Progress and status are scoped to that run
+script as globals. Runs are background by default: the tool returns immediately after admission
+so the parent chat stays available; pass `background: false` only when you need the envelope
+in-call. Progress and status are scoped to that run
 (`ultracode_status`, inspect, `/ultracode status`). The calling agent is not auto-woken on completion.
 
-For long interactive tasks, prefer `background: true` so the user can keep chatting.
+For long interactive tasks, background is the default so the user can keep chatting.
 When the user changes requirements, use `ultracode_steer` with `{ runID, agentID?, text }`
 to deliver the adjustment to one running child without stopping the workflow. If several
 children are active, choose the relevant agentID from status; do not broadcast edits blindly.

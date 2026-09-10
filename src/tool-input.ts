@@ -99,6 +99,14 @@ function validateBackground(
   return { ok: true, background: value }
 }
 
+/**
+ * Runs are background by default (since 0.4.0): only an explicit `false`
+ * blocks the tool call until the envelope. Single testable flip point.
+ */
+export function resolveBackground(input: { background?: boolean }): boolean {
+  return input.background !== false
+}
+
 export function validateToolInput(raw: unknown): ToolInputResult {
   if (!isObj(raw)) {
     return { ok: false, error: `input must be an object, got ${typeOf(raw)}` }

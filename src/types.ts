@@ -84,7 +84,7 @@ export interface InlineRunInput {
   name?: string
   meta?: WorkflowMeta
   args?: Json
-  /** Default false: block until the envelope. true: return after admission. */
+  /** Default true: return after admission. Explicit false blocks until the envelope. */
   background?: boolean
 }
 
@@ -92,7 +92,7 @@ export interface InlineRunInput {
 export interface SavedRunInput {
   workflow: string
   args?: Json
-  /** Default false: block until the envelope. true: return after admission. */
+  /** Default true: return after admission. Explicit false blocks until the envelope. */
   background?: boolean
 }
 

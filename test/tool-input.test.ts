@@ -6,6 +6,7 @@ import assert from "node:assert/strict"
 import {
   MAX_ARGS_BYTES,
   MAX_SCRIPT_BYTES,
+  resolveBackground,
   validateStatusToolInput,
   validateToolInput,
 } from "../src/tool-input.ts"
@@ -92,6 +93,12 @@ test("saved: background true/false accepted; non-boolean rejected", () => {
   assert.deepEqual(ok({ workflow: "x", background: true }).input, { workflow: "x", background: true })
   assert.deepEqual(ok({ workflow: "x", background: false }).input, { workflow: "x", background: false })
   bad({ workflow: "x", background: "yes" }, /"background" must be a boolean/)
+})
+
+test("resolveBackground: omitted/true -> background run; only explicit false blocks", () => {
+  assert.equal(resolveBackground({}), true, "omitted defaults to background")
+  assert.equal(resolveBackground({ background: true }), true)
+  assert.equal(resolveBackground({ background: false }), false, "explicit false blocks for the envelope")
 })
 
 test("saved: confirm field is rejected (trust gate replaced the old hash bypass)", () => {

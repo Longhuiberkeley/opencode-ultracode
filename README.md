@@ -49,8 +49,9 @@ it — every `agent()` call is a real subagent session with its own context wind
 permission mode, and result size — values apply to the **next** run. Equivalent commands:
 `/ultracode set <key> <value>`, or plugin `options` in `opencode.json` ([Options](#options)).
 
-**Long runs:** ask for `background: true` so you can keep chatting while the workflow runs;
-poll `/ultracode status` or the panel, and steer a running child with `ultracode_steer`.
+**Long runs:** workflows run in the background by default — you can keep chatting while they
+run; poll `/ultracode status` or the panel, and steer a running child with `ultracode_steer`.
+Ask for `background: false` if you want the result envelope inside the call.
 
 **Uninstall:**
 
@@ -291,12 +292,13 @@ The model invokes the `ultracode_run` tool, e.g.:
 
 or inline with a script it wrote itself (see `docs/AUTHORING.md` for the full script API).
 
-By default the tool **blocks** until the run finishes and returns an envelope. Pass
-`background: true` to return immediately after admission + script validation with
-`{ runID, status: "running", hint }` — watch the inspect panel (`ctrl+g`) or poll status.
-The host cannot deliver a late tool result after `execute` has returned, so the calling
-agent is **not** auto-woken on completion. Use `/ultracode status [runID]`, the
-`ultracode_status` tool (`{ runID? }`), the inspect panel, or ping the agent.
+By default the tool returns immediately after admission + script validation with
+`{ runID, status: "running", hint }` — the run continues detached and the conversation stays
+available; watch the inspect panel (`ctrl+g`) or poll status. The host cannot deliver a late
+tool result after `execute` has returned, so the calling agent is **not** auto-woken on
+completion. Use `/ultracode status [runID]`, the `ultracode_status` tool (`{ runID? }`), the
+inspect panel, or ping the agent. Pass `background: false` when you want the full envelope
+in-call instead.
 
 The blocking envelope looks like:
 
@@ -384,7 +386,7 @@ wrap in the detail pane; `h/l` selects panes and up/down scrolls detail text. Pr
 `f` for the host's full-screen presentation when supported. Stop/pause actions are
 disabled for finished runs.
 
-Launch long work with `background: true` to keep chatting. The orchestrator can use
+Launch long work normally — runs are background by default, so you can keep chatting. The orchestrator can use
 `ultracode_steer { runID, agentID?, text }` to pass an adjustment to a running child
 without killing the workflow or restarting finished children. This acknowledges
 admission, not that the child has already applied the adjustment. Background completion
@@ -431,7 +433,7 @@ observation, and no session `time.updated` (else `created`) within 15 minutes
 1. Open the empty inspect panel (`no ultracode runs`). Press Escape. Panel closes. Focus returns to the prompt.
 2. Reopen. Press Ctrl+G. Panel toggles closed. Focus returns to the prompt.
 3. Repeat 1–2 with an active run (tree populated). Escape closes; Ctrl+G toggles closed; focus returns to the prompt.
-4. Start a `background: true` run. Confirm the tool returns `runID` immediately; `/ultracode status` / `ultracode_status` show it running; chip/panel update; completion does not auto-wake the parent.
+4. Start a run (background by default). Confirm the tool returns `runID` immediately; `/ultracode status` / `ultracode_status` show it running; chip/panel update; completion does not auto-wake the parent.
 5. Change a settings pane value (`+/-`). Confirm the live strip / `/ultracode settings` overlay updates and the **next** run uses it (current run unchanged).
 6. Settings pane shows cached overlay / per-run effective from already-received acks, or **unknown** when stale. Opening or cycling runs must **not** send a settings query. Press `r` on an active run to refresh once; `r` must no-op on settled/unknown runs.
 7. Tree pane header shows `run k of N` plus the run id; `[` / `]` cycle runs and restore per-run tree selection.

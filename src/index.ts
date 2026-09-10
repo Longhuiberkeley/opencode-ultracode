@@ -51,7 +51,7 @@ import { RegistryImpl } from "./registry.ts"
 import { emptyToolEventState } from "./run-events.ts"
 import { EMPTY_CATALOG, SKILL_CONTENT, SKILL_DESCRIPTION, SKILL_NAME, buildSkillContent } from "./skill-content.ts"
 import { StorageImpl, normalizePath, resolveContainedPath, sha256 } from "./storage.ts"
-import { validateStatusToolInput, validateToolInput } from "./tool-input.ts"
+import { resolveBackground, validateStatusToolInput, validateToolInput } from "./tool-input.ts"
 import type {
   FsLike,
   Json,
@@ -145,7 +145,7 @@ const WORKFLOW_TOOL_INPUT_SCHEMA: Record<string, unknown> = {
         background: {
           type: "boolean",
           description:
-            "If true, return immediately after admission with { runID, status: \"running\", hint }. Default false waits for the envelope. The calling agent is not auto-woken on completion.",
+            "Default true: return immediately after admission with { runID, status: \"running\", hint }. Pass false to block until the envelope. The calling agent is not auto-woken on completion; poll ultracode_status.",
         },
       },
     },
@@ -162,7 +162,7 @@ const WORKFLOW_TOOL_INPUT_SCHEMA: Record<string, unknown> = {
         background: {
           type: "boolean",
           description:
-            "If true, return immediately after admission with { runID, status: \"running\", hint }. Default false waits for the envelope. The calling agent is not auto-woken on completion.",
+            "Default true: return immediately after admission with { runID, status: \"running\", hint }. Pass false to block until the envelope. The calling agent is not auto-woken on completion; poll ultracode_status.",
         },
       },
     },
@@ -624,7 +624,7 @@ export default Plugin.define({
                   supervisor,
                   { script, meta, args, name, workflowName },
                   parent,
-                  input.background === true,
+                  resolveBackground(input),
                 )
               } catch (err) {
                 return { content: `error: workflow run failed — ${describeError(err)}` }
@@ -668,7 +668,7 @@ export default Plugin.define({
         editor.add({
           name: "steer",
           options: { namespace: "ultracode" },
-          description: "Send a user adjustment to a running workflow child without stopping the workflow. Only runs owned by this conversation. Specify agentID when several children are running. Does not restart completed children. Use background:true when launching to keep this conversation available.",
+          description: "Send a user adjustment to a running workflow child without stopping the workflow. Only runs owned by this conversation. Specify agentID when several children are running. Does not restart completed children. Runs are background by default, so this conversation stays available.",
           input: {
             type: "object", additionalProperties: false, required: ["runID", "text"],
             properties: { runID: { type: "string" }, agentID: { type: "string" }, text: { type: "string", minLength: 1, maxLength: 65536 } },

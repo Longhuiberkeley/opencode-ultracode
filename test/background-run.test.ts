@@ -126,7 +126,7 @@ test("fast-return admission: nested owned session errors before return", async (
   assert.equal(ctx.registry.runs.size, 1)
 })
 
-test("default blocking path unchanged: omit background / false waits for envelope", async () => {
+test("blocking path: explicit false waits for the envelope (background is the default at the tool-input layer)", async () => {
   const ctx = makeSupervisor()
   const omitted = await executeWorkflowLaunch(ctx.supervisor, { script: `return 7;` }, ctx.parent, false)
   const env = JSON.parse(omitted.content) as { status: string; result: unknown; runID: string; truncated: boolean }

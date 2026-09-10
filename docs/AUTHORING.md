@@ -60,11 +60,12 @@ Two input shapes (a union — anything else is rejected, extra keys included):
 - Agents listed in the manifest's `requires` are preflighted: a missing agent fails the call
   *before any session spawns*, with the list of agents that do exist.
 
-The tool call returns only when the run finishes (success, failure, stop, or timeout) — never
-while agents are live. Runs cannot nest: an `ultracode_run` call from a session owned by a
-running workflow is rejected. `background: true` returns `{ runID, status: "running", hint }`
-immediately after admission; the calling agent is **not** auto-woken on completion (poll
-`/ultracode status` or `ultracode_status`, or open the inspect panel).
+The tool call returns immediately after admission (`background` defaults to true) with
+`{ runID, status: "running", hint }`; the calling agent is **not** auto-woken on completion
+(poll `/ultracode status` or `ultracode_status`, or open the inspect panel). Runs cannot
+nest: an `ultracode_run` call from a session owned by a
+running workflow is rejected. Pass `background: false` to block until the run finishes
+(success, failure, stop, or timeout) — never while agents are live.
 
 ### Plan → Build (no prior run)
 
