@@ -18,9 +18,18 @@ worker. Every \`agent(...)\` call spawns a REAL subagent session with its own co
 own model. The script returns a small JSON value; only that value plus a compact run envelope
 re-enters your session. Child transcripts never touch your context.
 
-Invoke the \`ultracode_run\` tool with \`{ script, name?, meta?, args? }\` for an inline run, or
-\`{ workflow: "name", args? }\` to run a saved workflow. \`meta\` and \`args\` are injected into the
-script as globals.
+Invoke the \`ultracode_run\` tool with \`{ script, name?, meta?, args?, background? }\` for an inline run, or
+\`{ workflow: "name", args?, background? }\` to run a saved workflow. \`meta\` and \`args\` are injected into the
+script as globals. \`background: true\` returns immediately after admission so the parent chat stays
+available; default \`false\` waits for the envelope. Progress and status are scoped to that run
+(\`ultracode_status\`, inspect, \`/ultracode status\`). The calling agent is not auto-woken on completion.
+
+For long interactive tasks, prefer \`background: true\` so the user can keep chatting.
+When the user changes requirements, use \`ultracode_steer\` with \`{ runID, agentID?, text }\`
+to deliver the adjustment to one running child without stopping the workflow. If several
+children are active, choose the relevant agentID from status; do not broadcast edits blindly.
+Status includes active child IDs and permission waits. In Ctrl+G, review permissions with y or n;
+never treat a blocked child as completed work.
 
 Never paste a workflow script into a generic JS/execute sandbox — \`agent\`, \`parallel\`, \`pipeline\`, \`phase\`, \`progress\`, \`workflow\`, \`sleep\`, \`args\`, and \`meta\` exist only inside \`ultracode_run\`; anywhere else they are undefined.
 
@@ -54,6 +63,17 @@ Two rules keep the layers from fighting:
 
 Rule of thumb: a workflow earns its cost when you can name BOTH the fan-out AND the verifier.
 Name neither? Answer or delegate instead.
+
+## Plan → Build (named workflow, no prior run)
+
+Author in Plan mode; run by name from Build mode. Do not call \`ultracode_run\` inline from Plan.
+
+1. Write only \`<name>.js\` in the project workflows directory (async-function body, no module syntax).
+   Name: lowercase alphanumerics, \`-\`/\`_\`, max 64 chars.
+2. \`/ultracode save <name>\` (one-token file save). After a run, \`/ultracode save <runID> <name>\` still works.
+3. \`/ultracode trust <name>\` (digest-bound; editing the script invalidates trust until re-approved).
+4. Build: \`ultracode_run\` with \`{ workflow: "name", args? }\`. Do not mix native subagent fan-out
+   with a workflow in the same task.
 
 ## Script API (exact)
 
@@ -199,7 +219,8 @@ return { research: research.stats, audit: audit.stats }
 
 Saved workflows (samples included) run only after the user approves them once via
 \`/ultracode trust <name>\`; editing the script later invalidates that approval. An unapproved
-call fails fast with that instruction — relay it to the user instead of retrying.
+call fails fast with that instruction — relay it to the user instead of retrying. Plan-authored
+\`.js\` files use the same gate after \`/ultracode save <name>\`.
 
 ## Complete example
 

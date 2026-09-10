@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "name": "dev-loop",
+  "description": "Explore affected code, implement with tests and typecheck until green, independently verify, review for blockers, then a bounded fix/recheck loop (max 3 passes).",
+  "phases": ["explore", "implement", "verify", "review", "fix"],
+  "requires": ["general", "explore"],
+  "hash": "",
+  "source": "project",
+  "savedAt": 0
+}

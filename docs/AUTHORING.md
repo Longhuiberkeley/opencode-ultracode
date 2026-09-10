@@ -62,7 +62,20 @@ Two input shapes (a union — anything else is rejected, extra keys included):
 
 The tool call returns only when the run finishes (success, failure, stop, or timeout) — never
 while agents are live. Runs cannot nest: an `ultracode_run` call from a session owned by a
-running workflow is rejected.
+running workflow is rejected. `background: true` returns `{ runID, status: "running", hint }`
+immediately after admission; the calling agent is **not** auto-woken on completion (poll
+`/ultracode status` or `ultracode_status`, or open the inspect panel).
+
+### Plan → Build (no prior run)
+
+OpenCode plan/build is a host agent mode. Handoff is file + trust + named run:
+
+1. **Plan:** write only `<project>/.opencode/workflows/<name>.js` (async-function body). Do not call `ultracode_run` inline.
+2. `/ultracode save <name>` (one-token). After a run, `/ultracode save <runID> <name>` still works.
+3. `/ultracode trust <name>` (digest-bound; a changed script is refused until re-trusted).
+4. **Build:** `{ workflow: "name", args? }`. Do not mix native subagent fan-out with a workflow in the same task.
+
+The registered skill is `buildSkillContent` in `src/skill-content.ts`, not an on-disk markdown file.
 
 ## The script model
 
@@ -625,7 +638,7 @@ round) + merges + synthesizes should keep `items x stages + overhead` comfortabl
 
 ## Samples and manifests
 
-`workflows/samples/` ships three ready pairs (copy both files into
+`workflows/samples/` ships four ready pairs (copy both files into
 `<project>/.opencode/workflows/`, review them, then `/ultracode trust <name>` — samples go
 through the same one-time approval as any saved workflow):
 
@@ -634,10 +647,12 @@ through the same one-time approval as any saved workflow):
 | `deep-research` | `{ topic, angles? }` (default angles: technical, market, criticism) | research, verify, skeptic, synthesize | explore + general |
 | `code-audit` | `{ modules, focus? }` — returns reviewed `findings` plus reviewer-failed batches separately as `unverified` | scan, review | explore + general |
 | `fact-check` | `{ draft, sources }` | extract, verify, skeptic, report | general |
+| `dev-loop` | `{ task, repo?, scope?, fixPasses? }` (fixPasses max 3) | explore, implement, verify, review, fix | explore + general (reviewer via `args.reviewer`) |
 
 Manifest = `SavedWorkflowManifest` (v1): `version`, `name`, `description`, `phases`, `requires`,
 `hash` (sha256 of the script), `source` (`project` \| `personal`), `savedAt`, optional
-`savedFromRunID`. Create them with `/ultracode save <runID> <name>` — it computes the hash.
+`savedFromRunID` (omitted for one-token file saves). Create them with `/ultracode save <name>`
+from a `.js` file or `/ultracode save <runID> <name>` from a run — both compute the hash.
 
 Sample manifests ship with `"hash": ""` — the loader tolerates the **empty** hash specifically
 for these reviewed, in-repo samples. Trust, not the hash, is what gates execution: approval is

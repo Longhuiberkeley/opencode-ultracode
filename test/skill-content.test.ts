@@ -24,7 +24,7 @@ import {
 
 const samplesDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "workflows", "samples")
 
-const SAMPLE_NAMES = ["deep-research", "code-audit", "fact-check"] as const
+const SAMPLE_NAMES = ["deep-research", "code-audit", "fact-check", "dev-loop"] as const
 const STOCK_AGENTS = new Set(["general", "explore"])
 
 function readSample(name: string, ext: "js" | "json"): string {
@@ -66,6 +66,15 @@ test("skill content contains no provider or model ids", () => {
   const modelRef = SKILL_CONTENT.match(/[a-z-]+\/[a-z0-9.:-]+/)
   assert.equal(modelRef, null, `provider/model-looking ref in skill: ${modelRef?.[0]}`)
   assert.doesNotMatch(SKILL_CONTENT, /\b(opus|sonnet)\b|\b(gpt|claude)-/i, "model family name in skill")
+})
+
+test("skill content teaches Plan to Build named-workflow handoff", () => {
+  assert.match(SKILL_CONTENT, /Plan → Build/)
+  assert.match(SKILL_CONTENT, /\/ultracode save <name>/)
+  assert.match(SKILL_CONTENT, /\/ultracode trust <name>/)
+  assert.match(SKILL_CONTENT, /\{\s*workflow:\s*"name"/)
+  assert.match(SKILL_CONTENT, /Do not call `ultracode_run` inline from Plan/)
+  assert.doesNotMatch(SKILL_CONTENT, /ultracode-skill\.md/)
 })
 
 test("skill content teaches coexistence with domain skills", () => {
@@ -474,4 +483,89 @@ test("fact-check sample fails fast on missing draft or sources", async () => {
   const h = makeHarness(async () => ({ text: "" }))
   await assert.rejects(() => h.run(readSample("fact-check", "js"), { sources: ["s"] }), /args\.draft/)
   await assert.rejects(() => h.run(readSample("fact-check", "js"), { draft: "d" }), /args\.sources/)
+})
+
+test("dev-loop sample executes end to end (explore, implement, verify, review, bounded fix)", async () => {
+  let fixRechecks = 0
+  const h = makeHarness(async (_prompt, opts) => {
+    switch (String(opts.phase)) {
+      case "explore":
+        return {
+          text: "",
+          data: { findings: [{ file: "src/a.ts", note: "add guard", symbol: "fn" }] },
+        }
+      case "implement":
+        return { text: "", data: { ok: true, summary: "implemented" } }
+      case "verify":
+        return { text: "", data: { ok: true, checks: ["test", "typecheck"], issues: [] } }
+      case "review":
+        return {
+          text: "",
+          data: { blockers: [{ file: "src/a.ts", severity: "high", issue: "missing null check" }] },
+        }
+      case "fix":
+        if (String(opts.label).startsWith("recheck")) {
+          fixRechecks++
+          return { text: "", data: { blockers: [] } }
+        }
+        return { text: "fixed" }
+      default:
+        throw new Error(`unexpected phase ${String(opts.phase)}`)
+    }
+  })
+  const result = (await h.run(readSample("dev-loop", "js"), {
+    task: "add a null check",
+    repo: ".",
+    scope: "src/a.ts",
+    fixPasses: 3,
+  })) as { ok: boolean; blockers: unknown[]; stats: { findings: number; fixPasses: number } }
+  assert.equal(result.ok, true)
+  assert.deepEqual(result.blockers, [])
+  assert.equal(stat(result, "findings"), 1)
+  assert.equal(stat(result, "fixPasses"), 1)
+  assert.equal(fixRechecks, 1)
+  const phases = h.calls.map((c) => String(c.opts.phase))
+  assert.deepEqual(
+    [...new Set(phases)],
+    ["explore", "implement", "verify", "review", "fix"],
+  )
+  assert.equal(
+    h.calls.filter((c) => String(c.opts.phase) === "implement").length,
+    1,
+    "exactly one implement write agent",
+  )
+})
+
+test("dev-loop sample fails fast on missing task", async () => {
+  const h = makeHarness(async () => ({ text: "" }))
+  await assert.rejects(() => h.run(readSample("dev-loop", "js"), {}), /args\.task/)
+  assert.equal(h.calls.length, 0)
+})
+
+test("dev-loop sample fails closed when implementer does not confirm green", async () => {
+  const h = makeHarness(async (_prompt, opts) => {
+    switch (String(opts.phase)) {
+      case "explore":
+        return { text: "", data: { findings: [] } }
+      case "implement":
+        return { text: "", data: { ok: false, summary: "tests failed" } }
+      case "verify":
+        return { text: "", data: { ok: true, checks: [], issues: [] } }
+      case "review":
+        return { text: "", data: { blockers: [] } }
+      case "fix":
+        if (String(opts.label).startsWith("recheck")) return { text: "", data: { blockers: [] } }
+        return { text: "fixed" }
+      default:
+        throw new Error(`unexpected phase ${String(opts.phase)}`)
+    }
+  })
+  const result = (await h.run(readSample("dev-loop", "js"), { task: "x", repo: "." })) as {
+    ok: boolean
+    stats: { implementOk: boolean }
+  }
+  // implementer failed; the fix pass "cleared" it, so the re-verify gate must
+  // run — and its non-green result must fail the whole loop closed.
+  assert.equal(result.ok, false)
+  assert.equal(result.stats.implementOk, false)
 })
