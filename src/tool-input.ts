@@ -8,6 +8,7 @@
  * Discriminated on the presence of "workflow" vs "script". Rejects unknown
  * keys, wrong types and oversized inputs with precise messages.
  */
+import { CONTROL_ACTIONS, type ControlAction } from "./control.ts"
 import type { InlineRunInput, Json, SavedRunInput, WorkflowMeta, WorkflowToolInput } from "./types.ts"
 
 export type ToolInputResult =
@@ -222,4 +223,29 @@ export function validateStatusToolInput(
     }
   }
   return { ok: true, runID }
+}
+
+/** Input for the orchestrator `ultracode_control` tool. */
+export function validateControlToolInput(
+  raw: unknown,
+): { ok: true; action: ControlAction; runID?: string } | { ok: false; error: string } {
+  if (!isObj(raw)) return { ok: false, error: `input must be an object, got ${typeOf(raw)}` }
+  const extra = rejectExtras(raw, new Set(["action", "runID"]))
+  if (extra) return { ok: false, error: extra }
+  const action = raw["action"]
+  if (typeof action !== "string" || !CONTROL_ACTIONS.includes(action as ControlAction)) {
+    return {
+      ok: false,
+      error: `"action" must be one of ${CONTROL_ACTIONS.join(" | ")}, got ${typeof action === "string" ? `"${action}"` : typeOf(action)}`,
+    }
+  }
+  if (!has(raw, "runID")) return { ok: true, action: action as ControlAction }
+  const runID = raw["runID"]
+  if (typeof runID !== "string" || runID.trim() === "") {
+    return {
+      ok: false,
+      error: `"runID" must be a non-empty string, got ${typeOf(runID) === "string" ? "empty string" : typeOf(runID)}`,
+    }
+  }
+  return { ok: true, action: action as ControlAction, runID }
 }
