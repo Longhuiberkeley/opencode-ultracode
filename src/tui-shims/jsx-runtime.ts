@@ -11,7 +11,7 @@ export namespace JSX {
   }
   export interface IntrinsicElements {
     text: { children?: any }
-    box: { children?: any; flexDirection?: string; flexGrow?: number | string }
+    box: { children?: any; flexDirection?: string; flexGrow?: number | string; width?: number; flexShrink?: number }
   }
 }
 

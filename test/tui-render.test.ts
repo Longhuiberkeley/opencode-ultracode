@@ -3,6 +3,7 @@
  */
 import test from "node:test"
 import assert from "node:assert/strict"
+import { readFileSync } from "node:fs"
 import { agentCells } from "../src/run-format.ts"
 import type { AgentRecord, TokenUsage } from "../src/types.ts"
 import {
@@ -10,23 +11,41 @@ import {
   agentRows,
   applySettleTick,
   cacheDecision,
+  canRefreshRunSettings,
+  chipCounts,
+  compactRunAcks,
   cycleRunSelection,
   defaultRunIndex,
   detailsCacheEntry,
   detailsFromMessages,
+  filterSessionsForChip,
   footerHints,
+  formatChipText,
   formatCounts,
+  formatPermissionLines,
+  formatDetailLines,
+  formatTreeLines,
   groupRuns,
   inspectModel,
+  inspectPaneView,
   inspectPhaseList,
+  inspectSelFromSelection,
+  moveTree,
   nextSettlePrev,
   outcomeToStatus,
+  PAGE_HEIGHT,
   paginate,
+  parsePermissionList,
   parseRunAck,
+  pausedRunIDsFromAcks,
+  permissionsForRun,
+  runStripLines,
+  runsForParent,
   phaseColumns,
   planSettleCheck,
   runFingerprint,
   runningRunCount,
+  sessionToStatus,
   selectForOpen,
   selectedSessionID,
   selectionMapKey,
@@ -34,11 +53,23 @@ import {
   settleCandidate,
   shouldEnableTui,
   shortRunID,
+  clip,
+  clipPaneLines,
+  cycleInspectPane,
+  formatLiveStrip,
+  formatSettingsLines,
+  settingsPaneView,
+  splitPanelWidth,
+  toggleExpand,
+  toggleFollowPin,
+  treePaneTitle,
   twoColumn,
+  type InspectPane,
   type InspectSelection,
   type RunView,
   type SessionView,
   type SettlePrev,
+  type TreeSelection,
 } from "../src/tui-render.ts"
 
 const TOKENS_42_6K: TokenUsage = { input: 40_000, output: 2_600, reasoning: 0, cache: { read: 0, write: 0 } }
@@ -318,12 +349,25 @@ test("runFingerprint + formatCounts", () => {
 
 test("footerHints: only bound keys, collapsed chords", () => {
   assert.equal(footerHints([]), "")
-  assert.equal(footerHints(["up", "down", "x", "p", "s", "return", "right", "esc"]), "↑↓ select  x stop  p pause/resume  s save  enter/→ drill  esc close")
-  assert.equal(footerHints(["x", "esc"]), "x stop  esc close")
+  assert.equal(
+    footerHints(["up", "down", "x", "p", "s", "return", "right", "esc"]),
+    "↑↓ move  ←→ expand  enter drill  p pause/resume  x stop  s save  esc or ctrl+g close",
+  )
+  assert.equal(footerHints(["x", "esc"]), "x stop  esc or ctrl+g close")
   assert.equal(footerHints(["enter"]), "enter drill")
-  assert.equal(footerHints(["right"]), "→ drill")
+  assert.equal(footerHints(["right"]), "←→ expand")
   assert.equal(footerHints(["p", "custom"]), "p pause/resume  custom")
   assert.equal(footerHints(["[", "]"]), "[ ] run")
+  assert.equal(footerHints(["."]), ". follow/pin")
+  assert.equal(footerHints(["y", "n"]), "y/n perm")
+  assert.equal(
+    footerHints(["up", "down", "left", "right", "h", "l", "return", "[", "]", "p", "x", "s", "esc", "ctrl+g"]),
+    "↑↓ move  ←→ expand  h/l pane  enter drill  [ ] run  p pause/resume  x stop  s save  esc or ctrl+g close",
+  )
+  assert.equal(footerHints(["+", "-", "="]), "+/- edit")
+  assert.equal(footerHints(["r"]), "r refresh")
+  assert.equal(footerHints(["escape"]), "esc or ctrl+g close")
+  assert.doesNotMatch(footerHints(["esc", "escape", "ctrl+g"]), /\bescape\b/)
 })
 
 test("twoColumn: phases left, D11 right, pagination ↓, header", () => {
@@ -473,16 +517,17 @@ test("inspectModel: default run is parsed parent, else most recent started", () 
   const fromB = inspectModel(sessions, { offset: 0, selected: 0, parentSessionID: "ses_parentB" }, 1000)
   assert.equal(fromB.run?.runID, "run_b")
   assert.equal(fromB.run?.parent, "ses_parentB")
-  assert.match(fromB.header, /run 2\/3/)
+  assert.equal(fromB.runs.length, 1)
+  assert.match(fromB.header, /run 1\/1/)
   assert.equal(defaultRunIndex(fromB.runs, "ses_parentB"), fromB.runIndex)
 
   const fromUnknown = inspectModel(sessions, { offset: 0, selected: 0, parentSessionID: "ses_other" }, 1000)
-  assert.equal(fromUnknown.run?.runID, "run_c")
-  assert.match(fromUnknown.header, /run 3\/3/)
+  assert.equal(fromUnknown.run, undefined)
+  assert.equal(fromUnknown.runs.length, 0)
 
   const cycled = inspectModel(sessions, { runIndex: 0, offset: 0, selected: 0, parentSessionID: "ses_parentB" }, 1000)
-  assert.equal(cycled.run?.runID, "run_a")
-  assert.match(cycled.header, /run 1\/3/)
+  assert.equal(cycled.run?.runID, "run_b")
+  assert.match(cycled.header, /run 1\/1/)
 })
 
 test("inspectModel: unphased agents live under '-' and remain listed from all", () => {
@@ -555,7 +600,7 @@ test("cycleRunSelection: cycling into unseen shorter run initializes defaults", 
   }
   const intoShort = cycleRunSelection(selMap, runs, "run_long", 1, "ses_p")
   assert.equal(intoShort.runID, "run_short")
-  assert.deepEqual(intoShort.selection, { ...UNSEEN_RUN_SELECTION })
+  assert.deepEqual(intoShort.selection, { ...UNSEEN_RUN_SELECTION, pinned: true })
   assert.equal(intoShort.selection.selected, 0)
   assert.equal(intoShort.selection.rowInWindow, 0)
 
@@ -626,6 +671,81 @@ test("parseRunAck", () => {
   assert.equal(parseRunAck("error: supervisor unavailable")?.kind, "error")
   assert.equal(parseRunAck(""), undefined)
   assert.equal(parseRunAck("hello world"), undefined)
+  const settingsLine =
+    'ultracode-settings {"overlay":{"concurrency":4,"maxAgents":200,"timeoutMs":3600000,"permissions":"ask"},"runID":"run_abc123","effective":{"concurrency":4,"maxAgents":200,"timeoutMs":3600000,"permissions":"ask"}}'
+  const settingsAck = parseRunAck(settingsLine)
+  assert.equal(settingsAck?.kind, "settings")
+  assert.equal(settingsAck?.runID, "run_abc123")
+  assert.equal(settingsAck?.settings?.overlay.concurrency, 4)
+})
+
+test("settings pane: unhydrated values render as unknown", () => {
+  const lines = formatSettingsLines(undefined, 0, false)
+  assert.ok(lines.some((l) => l.includes("unknown")))
+  assert.ok(lines.some((l) => l.includes("concurrency") && l.includes("unknown")))
+  const live = formatLiveStrip(undefined, undefined, undefined, false)
+  assert.ok(live.some((l) => l.includes("unknown")))
+  const view = settingsPaneView(undefined, { byRun: {}, hydrated: false }, 0, 80)
+  assert.ok(view.settingsLines.some((l) => l.includes("unknown")))
+})
+
+test("canRefreshRunSettings: only active selected runs", () => {
+  const active: RunView = {
+    runID: "run_live",
+    agents: [],
+    phases: [],
+    counts: { total: 0, done: 0, failed: 0 },
+    startedAt: 0,
+    settled: false,
+  }
+  const settled: RunView = { ...active, runID: "run_done", settled: true }
+  assert.equal(canRefreshRunSettings(undefined), false)
+  assert.equal(canRefreshRunSettings(active), true)
+  assert.equal(canRefreshRunSettings(settled), false)
+})
+
+test("settings pane: stale per-run effective is unknown while overlay cache remains", () => {
+  const overlay = { concurrency: 4, maxAgents: 200, timeoutMs: 3_600_000, permissions: "ask" as const }
+  const run: RunView = {
+    runID: "run_other",
+    agents: [],
+    phases: [],
+    counts: { total: 0, done: 0, failed: 0 },
+    startedAt: 0,
+    settled: false,
+  }
+  const view = settingsPaneView(
+    run,
+    { overlay, byRun: { run_cached: overlay }, hydrated: true },
+    0,
+    80,
+  )
+  assert.ok(view.settingsLines.some((l) => l.includes("4 / 8")))
+  assert.ok(view.liveLines.some((l) => l.includes("unknown")))
+})
+
+test("settings pane: hydrated overlay and live snapshot", () => {
+  const overlay = { concurrency: 4, maxAgents: 200, timeoutMs: 3_600_000, permissions: "ask" as const }
+  const lines = formatSettingsLines(overlay, 0, true)
+  assert.ok(lines.some((l) => l.startsWith(">") && l.includes("concurrency") && l.includes("4 / 8")))
+  const run: RunView = {
+    runID: "run_abc",
+    agents: [],
+    phases: [],
+    counts: { total: 0, done: 0, failed: 0 },
+    startedAt: 0,
+    settled: false,
+  }
+  const live = formatLiveStrip(run, overlay, overlay, true)
+  assert.ok(live.some((l) => l.includes("conc 4/8")))
+})
+
+test("cycleInspectPane: tree → detail → settings", () => {
+  assert.equal(cycleInspectPane(undefined, 1), "detail")
+  assert.equal(cycleInspectPane("tree", 1), "detail")
+  assert.equal(cycleInspectPane("detail", 1), "settings")
+  assert.equal(cycleInspectPane("settings", 1), "tree")
+  assert.equal(cycleInspectPane("tree", -1), "settings")
 })
 
 test("detailsFromMessages: last assistant model + tool part count", () => {
@@ -729,7 +849,7 @@ test("selectForOpen: parent default, reset on open-parent change, keep same pare
 
   const moved: InspectSelection = { ...fromP, phase: "research", offset: 3, selected: 2 }
   const sameParent = selectForOpen(moved, runs, "ses_p")
-  assert.deepEqual(sameParent, { ...moved, parentSessionID: "ses_p" })
+  assert.deepEqual(sameParent, { ...moved, parentSessionID: "ses_p", pinned: false })
 
   const otherParent = selectForOpen(moved, runs, "ses_q")
   assert.equal(otherParent.runID, "run_b")
@@ -739,3 +859,775 @@ test("selectForOpen: parent default, reset on open-parent change, keep same pare
   assert.equal(otherParent.selected, 0)
 })
 
+const TREE_SESSIONS: SessionView[] = [
+  {
+    id: "ses_a1",
+    title: "[uc:run_abc a1 research p:ses_p] seeker",
+    outcome: undefined,
+    time: { created: 100 },
+    agent: "explore",
+    tokens: TOKENS_42_6K,
+    toolCalls: 3,
+  },
+  {
+    id: "ses_a3",
+    title: "[uc:run_abc a3 research p:ses_p] retry",
+    outcome: "succeeded",
+    time: { created: 150 },
+    agent: "explore",
+    toolCalls: 1,
+  },
+  {
+    id: "ses_a2",
+    title: "[uc:run_abc a2 extract p:ses_p] judge",
+    outcome: undefined,
+    time: { created: 110 },
+    agent: "general",
+  },
+]
+
+test("inspectModel tree: default expanded, cursor on first agent, skip synthetic all", () => {
+  const model = inspectModel(TREE_SESSIONS, { offset: 0, selected: 0, parentSessionID: "ses_p" }, 1000)
+  assert.equal(model.tree.some((r) => r.id === "all"), false)
+  assert.ok(model.tree.every((r) => r.kind !== "phase" || r.expanded !== false))
+  assert.deepEqual(
+    model.tree.filter((r) => r.kind === "phase").map((r) => r.id),
+    ["research", "extract"],
+  )
+  assert.equal(model.treeSel.cursor.kind, "agent")
+  assert.equal(model.treeSel.cursor.id, "ses_a1")
+  assert.equal(model.selectedSessionID, "ses_a1")
+  const lines = formatTreeLines(model.tree, model.treeSel.cursor)
+  assert.ok(lines.some((l) => l.startsWith("▾ research") || l.startsWith(" ▾ research") || l.includes("research")))
+  assert.ok(lines[0]!.includes("▾"))
+})
+
+test("inspectModel tree: cursor on phase ⇒ selectedSessionID undefined", () => {
+  const treeSel: TreeSelection = {
+    expanded: { research: true, extract: true },
+    cursor: { kind: "phase", id: "research" },
+    detailOffset: 0,
+  }
+  const model = inspectModel(
+    TREE_SESSIONS,
+    { offset: 0, selected: 0, parentSessionID: "ses_p", treeSel },
+    1000,
+  )
+  assert.equal(model.treeSel.cursor.kind, "phase")
+  assert.equal(model.treeSel.cursor.id, "research")
+  assert.equal(model.selectedSessionID, undefined)
+  assert.ok(model.detail[0] === "research")
+})
+
+test("W3C expand/collapse: right expands then first child; left collapses / parent", () => {
+  const collapsed: TreeSelection = {
+    expanded: { research: false, extract: true },
+    cursor: { kind: "phase", id: "research" },
+    detailOffset: 0,
+  }
+  const before = inspectModel(
+    TREE_SESSIONS,
+    { offset: 0, selected: 0, parentSessionID: "ses_p", treeSel: collapsed },
+    1000,
+  )
+  assert.equal(
+    before.tree.find((r) => r.kind === "phase" && r.id === "research")?.expanded,
+    false,
+  )
+  assert.equal(
+    before.tree.some((r) => r.kind === "agent" && r.phase === "research"),
+    false,
+  )
+
+  const expanded = toggleExpand(before.tree, before.treeSel, "right")
+  const afterExpand = inspectModel(
+    TREE_SESSIONS,
+    { offset: 0, selected: 0, parentSessionID: "ses_p", treeSel: expanded },
+    1000,
+  )
+  assert.equal(
+    afterExpand.tree.find((r) => r.kind === "phase" && r.id === "research")?.expanded,
+    true,
+  )
+  const intoChild = toggleExpand(afterExpand.tree, afterExpand.treeSel, "right")
+  assert.equal(intoChild.cursor.kind, "agent")
+  assert.equal(intoChild.cursor.id, "ses_a1")
+
+  const toParent = toggleExpand(afterExpand.tree, intoChild, "left")
+  assert.deepEqual(toParent.cursor, { kind: "phase", id: "research" })
+  const collapsedAgain = toggleExpand(afterExpand.tree, toParent, "left")
+  assert.equal(collapsedAgain.expanded.research, false)
+})
+
+test("tree selection: collapse while a child row is selected moves cursor to the parent phase", () => {
+  const treeSel: TreeSelection = {
+    expanded: { research: false, extract: true },
+    cursor: { kind: "agent", id: "ses_a1" },
+    detailOffset: 0,
+  }
+  const model = inspectModel(
+    TREE_SESSIONS,
+    { offset: 0, selected: 0, parentSessionID: "ses_p", treeSel },
+    1000,
+  )
+  assert.deepEqual(model.treeSel.cursor, { kind: "phase", id: "research" })
+  assert.equal(model.selectedSessionID, undefined)
+})
+
+test("tree selection: newly arriving agents do not steal the cursor", () => {
+  const sessions: SessionView[] = [
+    {
+      id: "ses_keep",
+      title: "[uc:run_n a2 research p:ses_p] keep",
+      outcome: undefined,
+      time: { created: 20 },
+    },
+  ]
+  const treeSel: TreeSelection = {
+    expanded: { research: true },
+    cursor: { kind: "agent", id: "ses_keep" },
+    detailOffset: 0,
+  }
+  const before = inspectModel(sessions, { offset: 0, selected: 0, parentSessionID: "ses_p", treeSel }, 10)
+  assert.equal(before.treeSel.cursor.id, "ses_keep")
+
+  sessions.unshift({
+    id: "ses_new",
+    title: "[uc:run_n a1 research p:ses_p] newcomer",
+    outcome: undefined,
+    time: { created: 1 },
+  })
+  const after = inspectModel(sessions, { offset: 0, selected: 0, parentSessionID: "ses_p", treeSel }, 10)
+  assert.equal(after.treeSel.cursor.kind, "agent")
+  assert.equal(after.treeSel.cursor.id, "ses_keep")
+  assert.equal(after.selectedSessionID, "ses_keep")
+  assert.ok(after.tree.some((r) => r.id === "ses_new"))
+})
+
+test("tree selection: run switching restores TreeSelection", () => {
+  const sessions: SessionView[] = [
+    { id: "ses_l0", title: "[uc:run_long a1 research p:ses_p] L0", outcome: "succeeded", time: { created: 0 } },
+    { id: "ses_l1", title: "[uc:run_long a2 research p:ses_p] L1", outcome: "succeeded", time: { created: 1 } },
+    { id: "ses_s0", title: "[uc:run_short a1 extract p:ses_p] S0", outcome: "succeeded", time: { created: 100 } },
+  ]
+  const runs = groupRuns(sessions)
+  const longTree: TreeSelection = {
+    expanded: { research: false },
+    cursor: { kind: "phase", id: "research" },
+    detailOffset: 0,
+  }
+  const selMap = {
+    [selectionMapKey("ses_p", "run_long")]: {
+      phase: "all",
+      offset: 0,
+      selected: 1,
+      runID: "run_long",
+      parentSessionID: "ses_p",
+      rowInWindow: 1,
+      treeSel: longTree,
+    },
+  }
+  const intoShort = cycleRunSelection(selMap, runs, "run_long", 1, "ses_p")
+  assert.equal(intoShort.runID, "run_short")
+  assert.equal(intoShort.selection.treeSel, undefined)
+
+  const back = cycleRunSelection(selMap, runs, "run_short", -1, "ses_p")
+  assert.equal(back.runID, "run_long")
+  assert.deepEqual(back.selection.treeSel, longTree)
+  const restored = inspectModel(
+    sessions,
+    inspectSelFromSelection(
+      { ...back.selection, runID: back.runID, parentSessionID: "ses_p", phase: back.selection.phase },
+      runs,
+    ),
+    1000,
+  )
+  assert.equal(restored.run?.runID, "run_long")
+  assert.deepEqual(restored.treeSel.cursor, { kind: "phase", id: "research" })
+  assert.equal(restored.tree.find((r) => r.id === "research")?.expanded, false)
+})
+
+test("tree pane title: run k of N plus short run id; cycling restores TreeSelection", () => {
+  const sessions: SessionView[] = [
+    { id: "ses_l0", title: "[uc:run_long a1 research p:ses_p] L0", outcome: "succeeded", time: { created: 0 } },
+    { id: "ses_l1", title: "[uc:run_long a2 research p:ses_p] L1", outcome: "succeeded", time: { created: 1 } },
+    { id: "ses_s0", title: "[uc:run_short a1 extract p:ses_p] S0", outcome: "succeeded", time: { created: 100 } },
+  ]
+  const runs = groupRuns(sessions)
+  const longTree: TreeSelection = {
+    expanded: { research: false },
+    cursor: { kind: "phase", id: "research" },
+    detailOffset: 0,
+  }
+  const first = inspectModel(sessions, { offset: 0, selected: 0, parentSessionID: "ses_p", runIndex: 0 }, 10)
+  assert.equal(treePaneTitle(first), `── tree  run 1 of 2  ${shortRunID("run_long")}`)
+  assert.equal(inspectPaneView(first, "tree", 80).treeTitle, treePaneTitle(first))
+
+  const selMap = {
+    [selectionMapKey("ses_p", "run_long")]: {
+      phase: "all",
+      offset: 0,
+      selected: 1,
+      runID: "run_long",
+      parentSessionID: "ses_p",
+      rowInWindow: 1,
+      treeSel: longTree,
+    },
+  }
+  const intoShort = cycleRunSelection(selMap, runs, "run_long", 1, "ses_p")
+  const shortModel = inspectModel(
+    sessions,
+    inspectSelFromSelection({ ...intoShort.selection, runID: intoShort.runID, parentSessionID: "ses_p", phase: intoShort.selection.phase }, runs),
+    10,
+  )
+  assert.equal(shortModel.run?.runID, "run_short")
+  assert.equal(treePaneTitle(shortModel), `── tree  run 2 of 2  ${shortRunID("run_short")}`)
+  assert.equal(intoShort.selection.treeSel, undefined)
+
+  const back = cycleRunSelection(selMap, runs, "run_short", -1, "ses_p")
+  const restored = inspectModel(
+    sessions,
+    inspectSelFromSelection({ ...back.selection, runID: back.runID, parentSessionID: "ses_p", phase: back.selection.phase }, runs),
+    10,
+  )
+  assert.equal(treePaneTitle(restored), `── tree  run 1 of 2  ${shortRunID("run_long")}`)
+  assert.deepEqual(restored.treeSel.cursor, { kind: "phase", id: "research" })
+  assert.equal(restored.tree.find((r) => r.id === "research")?.expanded, false)
+})
+
+test("tree selection: pagination beyond ten visible tree rows (PAGE_HEIGHT)", () => {
+  const sessions: SessionView[] = Array.from({ length: 12 }, (_, i) => ({
+    id: `ses_p${i}`,
+    title: `[uc:run_page a${i + 1} wave p:ses_p] r${i}`,
+    outcome: "succeeded",
+    time: { created: i },
+  }))
+  const start = inspectModel(sessions, { offset: 0, selected: 0, parentSessionID: "ses_p" }, 1000)
+  assert.ok(start.tree.length > PAGE_HEIGHT)
+  const startIdx = start.tree.findIndex((r) => r.kind === start.treeSel.cursor.kind && r.id === start.treeSel.cursor.id)
+  let treeSel = start.treeSel
+  for (let i = 0; i < 11; i++) treeSel = moveTree(start.tree, treeSel, 1)
+  const paged = inspectModel(sessions, { offset: 0, selected: 0, parentSessionID: "ses_p", treeSel }, 1000)
+  const cursorIdx = startIdx + 11
+  assert.equal(paged.treeSel.cursor.id, start.tree[cursorIdx]!.id)
+  assert.ok(paged.treeOffset > 0)
+  const window = paginate(paged.tree, paged.treeOffset, PAGE_HEIGHT)
+  assert.equal(window.window.length, PAGE_HEIGHT)
+  assert.equal(window.window[0], paged.tree[paged.treeOffset])
+  assert.ok(window.window.some((r) => r.id === paged.treeSel.cursor.id))
+  assert.ok(cursorIdx >= PAGE_HEIGHT)
+})
+
+test("tree/detail lines clip to pane width (long session and model ids)", () => {
+  const sessions: SessionView[] = [
+    {
+      id: "ses_very_long_session_identifier_that_must_clip",
+      title: "[uc:run_clip a1 research p:ses_p] seeker",
+      outcome: undefined,
+      time: { created: 1 },
+      agent: "explore",
+      model: { providerID: "openrouter", id: "a-very-long-model-identifier-value" },
+      toolCalls: 9,
+    },
+  ]
+  const model = inspectModel(sessions, { offset: 0, selected: 0, parentSessionID: "ses_p" }, 10)
+  const { tree, detail } = splitPanelWidth(40)
+  const treeLines = clipPaneLines(formatTreeLines(model.tree, model.treeSel.cursor), tree)
+  const detailLines = clipPaneLines(formatDetailLines(model.detail, "tree", 0), detail)
+  for (const line of treeLines) assert.ok(line.length <= tree)
+  for (const line of detailLines) assert.ok(line.length <= detail)
+  assert.ok(detailLines.some((l) => l.includes("…")))
+  assert.equal(clip("ses_very_long_session_identifier_that_must_clip", 10).endsWith("…"), true)
+})
+
+test("moveTree walks visible rows without stealing to a new agent", () => {
+  const model = inspectModel(TREE_SESSIONS, { offset: 0, selected: 0, parentSessionID: "ses_p" }, 1000)
+  const down = moveTree(model.tree, model.treeSel, 1)
+  assert.equal(down.cursor.kind, "agent")
+  assert.equal(down.cursor.id, "ses_a3")
+  const up = moveTree(model.tree, down, -1)
+  assert.equal(up.cursor.id, "ses_a1")
+})
+
+test("inspect pane paint: mounted accessors update (run, selection, collapse, details, resize)", () => {
+  const tuiSrc = readFileSync(new URL("../src/tui.tsx", import.meta.url), "utf8")
+  assert.match(tuiSrc, /createMemo\(\(\) =>\s*\n\s*inspectPaneView\(/)
+  assert.match(tuiSrc, /const treeLines = createMemo\(\(\) => paneView\(\)\.treeLines\)/)
+  assert.match(tuiSrc, /const detailLines = createMemo\(\(\) => paneView\(\)\.detailLines\)/)
+  assert.match(tuiSrc, /const treePageLabel = createMemo\(\(\) => paneView\(\)\.treePageLabel\)/)
+  assert.match(tuiSrc, /const treeTitle = createMemo\(\(\) => paneView\(\)\.treeTitle\)/)
+  assert.match(tuiSrc, /\{treeLines\(\)\.join\("\\n"\)\}/)
+  assert.match(tuiSrc, /\{detailLines\(\)\.join\("\\n"\)\}/)
+  assert.match(tuiSrc, /\{treePageLabel\(\)\}/)
+  assert.match(tuiSrc, /\{treeTitle\(\)\}/)
+
+  let sessions: SessionView[] = []
+  let pane: InspectPane | undefined
+  let width = 80
+  let treeSel: TreeSelection | undefined
+  const modelAcc = () =>
+    inspectModel(sessions, { offset: 0, selected: 0, parentSessionID: "ses_p", treeSel, pane }, 1000)
+
+  // Solid: component body runs once. Snapshots freeze; accessors stay live.
+  const snapped = inspectPaneView(modelAcc(), pane, width)
+  const paneView = () => inspectPaneView(modelAcc(), pane, width)
+  const treeLines = () => paneView().treeLines
+  const detailLines = () => paneView().detailLines
+  const treePageLabel = () => paneView().treePageLabel
+  const mounted = {
+    tree: () => treeLines().join("\n"),
+    detail: () => detailLines().join("\n"),
+    label: () => treePageLabel(),
+    pane: () => paneView().pane,
+    cols: () => paneView().cols,
+    hasRun: () => Boolean(modelAcc().run),
+  }
+
+  assert.equal(mounted.hasRun(), false)
+  assert.equal(mounted.tree(), "")
+  assert.equal(snapped.treeLines.join("\n"), "")
+
+  sessions = TREE_SESSIONS.map((s) => ({ ...s }))
+  assert.equal(mounted.hasRun(), true)
+  assert.ok(mounted.tree().includes("seeker"))
+  assert.ok(mounted.tree().split("\n").some((line) => line.startsWith(">") && line.includes("seeker")))
+  assert.equal(snapped.treeLines.join("\n"), "")
+
+  const afterRunTree = mounted.tree()
+  treeSel = moveTree(modelAcc().tree, modelAcc().treeSel, 1)
+  assert.notEqual(mounted.tree(), afterRunTree)
+  assert.ok(mounted.tree().split("\n").some((line) => line.startsWith(">") && line.includes("retry")))
+
+  const expandedTree = mounted.tree()
+  treeSel = toggleExpand(modelAcc().tree, modelAcc().treeSel, "left")
+  treeSel = toggleExpand(modelAcc().tree, treeSel, "left")
+  assert.notEqual(mounted.tree(), expandedTree)
+  assert.equal(mounted.tree().includes("seeker"), false)
+
+  pane = "detail"
+  assert.equal(mounted.pane(), "detail")
+  assert.equal(mounted.tree().split("\n").some((line) => line.startsWith(">")), false)
+  assert.ok(mounted.detail().startsWith(">"))
+
+  const beforeDetails = mounted.detail()
+  sessions = sessions.map((s) =>
+    s.id === "ses_a1" ? { ...s, model: { providerID: "openrouter", id: "loaded-model-id" }, toolCalls: 9 } : s,
+  )
+  treeSel = {
+    expanded: { research: true, extract: true },
+    cursor: { kind: "agent", id: "ses_a1" },
+    detailOffset: 0,
+  }
+  pane = "tree"
+  assert.ok(mounted.detail().includes("loaded-model-id"))
+  assert.notEqual(mounted.detail(), beforeDetails)
+
+  const wideCols = mounted.cols()
+  width = 20
+  const narrow = paneView()
+  assert.ok(narrow.cols.tree < wideCols.tree)
+  for (const line of narrow.treeLines) assert.ok(line.length <= narrow.cols.tree)
+  for (const line of narrow.detailLines) assert.ok(line.length <= narrow.cols.detail)
+
+  sessions = Array.from({ length: 12 }, (_, i) => ({
+    id: `ses_p${i}`,
+    title: `[uc:run_page a${i + 1} wave p:ses_p] r${i}`,
+    outcome: "succeeded" as const,
+    time: { created: i },
+  }))
+  treeSel = undefined
+  pane = "tree"
+  width = 80
+  assert.ok(modelAcc().tree.length > PAGE_HEIGHT)
+  assert.ok(mounted.label().includes("↓"))
+})
+
+test("sessionToStatus: idle with no execution is pending; terminal executions and outcomes win", () => {
+  assert.equal(sessionToStatus({ id: "a", title: "[uc:run_x a1] x" }), "running")
+  assert.equal(sessionToStatus({ id: "a", title: "[uc:run_x a1] x", hostStatus: "idle" }), "pending")
+  assert.equal(sessionToStatus({ id: "a", title: "[uc:run_x a1] x", lastExecution: "failed" }), "failed")
+  assert.equal(sessionToStatus({ id: "a", title: "[uc:run_x a1] x", lastExecution: "interrupted" }), "interrupted")
+  assert.equal(sessionToStatus({ id: "a", title: "[uc:run_x a1] x", lastExecution: "succeeded" }), "succeeded")
+  assert.equal(
+    sessionToStatus({ id: "a", title: "[uc:run_x a1] x", outcome: "succeeded", hostStatus: "idle" }),
+    "succeeded",
+  )
+})
+
+test("groupRuns: idle no-execution orphans are pending — never running, chip and counts hide them", () => {
+  const sessions: SessionView[] = [
+    { id: "ses_1", title: "[uc:run_orphan a1 p:ses_p] seeker", outcome: undefined, hostStatus: "idle", time: { created: 1 } },
+    { id: "ses_2", title: "[uc:run_orphan a2 p:ses_p] judge", lastExecution: "failed", time: { created: 2 } },
+  ]
+  const runs = groupRuns(sessions)
+  assert.equal(runs.length, 1)
+  assert.equal(runs[0]!.settled, false)
+  assert.equal(runs[0]!.agents[0]!.status, "pending")
+  assert.equal(runs[0]!.agents[1]!.status, "failed")
+  assert.equal(runningRunCount(runs), 0)
+  assert.equal(inspectModel(sessions, { offset: 0, selected: 0 }, 10).runningCount, 0)
+  assert.deepEqual(chipCounts(runs), { running: 0, paused: 0, failed: 0, agents: 0 })
+})
+
+test("filterSessionsForChip: other project directories do not leak", () => {
+  const sessions: SessionView[] = [
+    { id: "here", title: "[uc:run_a a1] x", locationDirectory: "/proj/a", projectID: "p-a" },
+    { id: "there", title: "[uc:run_b a1] y", locationDirectory: "/proj/b", projectID: "p-b" },
+    { id: "bare", title: "[uc:run_c a1] z" },
+  ]
+  const scoped = filterSessionsForChip(sessions, { directory: "/proj/a" })
+  assert.deepEqual(
+    scoped.map((s) => s.id),
+    ["here"],
+  )
+  assert.equal(filterSessionsForChip(sessions, undefined).length, 0)
+})
+
+test("session scoping fails closed when project scope cannot be determined", () => {
+  const sessions: SessionView[] = [
+    { id: "here", title: "[uc:run_a a1] x", locationDirectory: "/proj/a", projectID: "p-a" },
+    { id: "bare", title: "[uc:run_c a1] z" },
+  ]
+  assert.deepEqual(filterSessionsForChip(sessions, undefined), [])
+  assert.deepEqual(filterSessionsForChip(sessions, {}), [])
+  assert.equal(filterSessionsForChip(sessions, { directory: "/proj/a" }).map((s) => s.id).join(), "here")
+})
+
+test("inspectModel uses the same project-scoped filter as the chip", () => {
+  const sessions: SessionView[] = [
+    { id: "here", title: "[uc:run_a a1 p:ses_p] x", locationDirectory: "/proj/a", projectID: "p-a", time: { created: 1 } },
+    { id: "there", title: "[uc:run_b a1 p:ses_q] y", locationDirectory: "/proj/b", projectID: "p-b", time: { created: 2 } },
+  ]
+  const scope = { directory: "/proj/a", projectID: "p-a" }
+  const scoped = filterSessionsForChip(sessions, scope)
+  const model = inspectModel(scoped, { offset: 0, selected: 0 }, 10)
+  const chipRuns = groupRuns(scoped)
+  assert.deepEqual(
+    model.runs.map((r) => r.runID),
+    chipRuns.map((r) => r.runID),
+  )
+  assert.deepEqual(
+    model.runs.map((r) => r.runID),
+    ["run_a"],
+  )
+  assert.equal(inspectModel(sessions, { offset: 0, selected: 0 }, 10).runs.length, 2)
+})
+
+test("formatChipText: hide when idle; running/paused/failed only when real", () => {
+  assert.equal(formatChipText({ running: 0, paused: 0, failed: 2 }), "")
+  assert.equal(formatChipText({ running: 2, paused: 0, failed: 0 }), "ultracode · 2 runs")
+  assert.equal(formatChipText({ running: 0, paused: 1, failed: 0 }), "ultracode · 1 paused")
+  assert.equal(formatChipText({ running: 1, paused: 1, failed: 2 }), "ultracode · 1 run · 1 paused · 2 failed")
+  assert.equal(
+    formatChipText({ running: 1, paused: 0, failed: 0, agents: 3, blocked: 2 }),
+    "ultracode · 1 run · 3 agents · 2 awaiting permission",
+  )
+  const runs: RunView[] = [
+    {
+      runID: "run_live",
+      agents: [{ sessionID: "s1", status: "running", title: "t" }],
+      phases: [],
+      counts: { total: 1, done: 0, failed: 1 },
+      startedAt: 0,
+      settled: false,
+    },
+    {
+      runID: "run_pause",
+      agents: [{ sessionID: "s2", status: "running", title: "t" }],
+      phases: [],
+      counts: { total: 1, done: 0, failed: 0 },
+      startedAt: 0,
+      settled: false,
+    },
+    {
+      runID: "run_done",
+      agents: [{ sessionID: "s3", status: "succeeded", title: "t" }],
+      phases: [],
+      counts: { total: 1, done: 1, failed: 0 },
+      startedAt: 0,
+      settled: true,
+    },
+  ]
+  assert.deepEqual(chipCounts(runs, new Set(["run_pause"])), { running: 1, paused: 1, failed: 1, agents: 2 })
+  const withRunPaused = runs.map((r) => (r.runID === "run_pause" ? { ...r, paused: true } : r))
+  assert.deepEqual(chipCounts(withRunPaused), { running: 1, paused: 1, failed: 1, agents: 2 })
+})
+
+test("compactRunAcks keeps last pause/resume/stop ack per runID", () => {
+  const acks = [
+    parseRunAck("Paused run `run_a`")!,
+    parseRunAck("Paused run `run_b`")!,
+    parseRunAck("Resumed run `run_a`")!,
+    parseRunAck("Stopping run `run_b`")!,
+    parseRunAck("Paused run `run_a`")!,
+  ]
+  const compact = compactRunAcks(acks)
+  assert.equal(compact.length, 2)
+  assert.equal(compact.find((a) => a.runID === "run_a")?.kind, "paused")
+  assert.equal(compact.find((a) => a.runID === "run_b")?.kind, "stopped")
+  const ids = pausedRunIDsFromAcks(compact)
+  assert.equal(ids.has("run_a"), true)
+  assert.equal(ids.has("run_b"), false)
+  assert.deepEqual(ids, pausedRunIDsFromAcks(acks))
+})
+
+test("paused chip shows only while the run still has unsettled work; ended-while-paused drops off", () => {
+  const settled: RunView[] = [
+    {
+      runID: "run_pause",
+      agents: [{ sessionID: "s1", status: "succeeded", title: "t" }],
+      phases: [],
+      counts: { total: 1, done: 1, failed: 0 },
+      startedAt: 0,
+      settled: true,
+    },
+  ]
+  // All children final + paused ack: the run ended while paused (nothing will
+  // ever clear the ack) — it must NOT become an eternal "1 paused".
+  assert.deepEqual(chipCounts(settled, new Set(["run_pause"])), { running: 0, paused: 0, failed: 0, agents: 0 })
+  const withFlag = settled.map((r) => ({ ...r, paused: true }))
+  assert.deepEqual(chipCounts(withFlag), { running: 0, paused: 0, failed: 0, agents: 0 })
+
+  // Work still in flight (pending child or running child): paused is real.
+  const inFlight = settled.map((r): RunView => ({
+    ...r,
+    settled: false,
+    agents: [{ sessionID: "s1", status: "pending", title: "t" }],
+  }))
+  assert.deepEqual(chipCounts(inFlight, new Set(["run_pause"])), { running: 0, paused: 1, failed: 0, agents: 0 })
+  const runningChild = settled.map((r): RunView => ({
+    ...r,
+    settled: false,
+    agents: [{ sessionID: "s1", status: "running", title: "t" }],
+  }))
+  assert.deepEqual(chipCounts(runningChild, new Set(["run_pause"])), { running: 0, paused: 1, failed: 0, agents: 1 })
+  assert.equal(formatChipText(chipCounts(inFlight, new Set(["run_pause"]))), "ultracode · 1 paused")
+})
+
+test("chipCounts: pending-only runs are invisible; running+pending counts as running", () => {
+  const pendingOnly: RunView[] = [
+    {
+      runID: "run_q",
+      agents: [
+        { sessionID: "s1", status: "pending", title: "t" },
+        { sessionID: "s2", status: "pending", title: "t" },
+      ],
+      phases: [],
+      counts: { total: 2, done: 0, failed: 0 },
+      startedAt: 0,
+      settled: false,
+    },
+  ]
+  assert.deepEqual(chipCounts(pendingOnly), { running: 0, paused: 0, failed: 0, agents: 0 })
+  assert.equal(formatChipText(chipCounts(pendingOnly)), "")
+
+  const mixed: RunView[] = [
+    {
+      runID: "run_m",
+      agents: [
+        { sessionID: "s1", status: "running", title: "t" },
+        { sessionID: "s2", status: "pending", title: "t" },
+      ],
+      phases: [],
+      counts: { total: 2, done: 0, failed: 1 },
+      startedAt: 0,
+      settled: false,
+    },
+  ]
+  assert.deepEqual(chipCounts(mixed), { running: 1, paused: 0, failed: 1, agents: 1 })
+  assert.equal(runningRunCount(mixed), 1)
+  assert.equal(runningRunCount(pendingOnly), 0)
+})
+
+test("paused chip counts derive from run or ack state", () => {
+  const acks = [
+    parseRunAck("Paused run `run_a`")!,
+    parseRunAck("Resumed run `run_a`")!,
+    parseRunAck("Paused run `run_b`")!,
+    parseRunAck("Stopping run `run_b`")!,
+    parseRunAck("Paused run `run_c`")!,
+  ]
+  const ids = pausedRunIDsFromAcks(acks)
+  assert.equal(ids.has("run_a"), false)
+  assert.equal(ids.has("run_b"), false)
+  assert.equal(ids.has("run_c"), true)
+  const runs: RunView[] = [
+    {
+      runID: "run_c",
+      agents: [{ sessionID: "s1", status: "running", title: "t" }],
+      phases: [],
+      counts: { total: 1, done: 0, failed: 0 },
+      startedAt: 0,
+      settled: false,
+    },
+    {
+      runID: "run_d",
+      agents: [{ sessionID: "s2", status: "running", title: "t" }],
+      phases: [],
+      counts: { total: 1, done: 0, failed: 0 },
+      startedAt: 0,
+      settled: false,
+      paused: true,
+    },
+  ]
+  assert.deepEqual(chipCounts(runs, ids), { running: 0, paused: 2, failed: 0, agents: 2 })
+})
+
+test("formatTreeLines: connectors and selected mark", () => {
+  const model = inspectModel(TREE_SESSIONS, { offset: 0, selected: 0, parentSessionID: "ses_p" }, 1000)
+  const lines = formatTreeLines(model.tree, model.treeSel.cursor)
+  assert.ok(lines.some((l) => l.includes("├─") || l.includes("└─")))
+  assert.ok(lines.some((l) => l.startsWith(">") && l.includes("seeker")))
+  assert.ok(lines.some((l) => l.includes("▾") && l.includes("research")))
+})
+
+test("tui chip paints formatChipText and binds ctrl+g, not return", () => {
+  const tuiSrc = readFileSync(new URL("../src/tui.tsx", import.meta.url), "utf8")
+  assert.match(tuiSrc, /formatChipText\(counts\)/)
+  assert.match(tuiSrc, /filterSessionsForChip\(/)
+  assert.match(tuiSrc, /bind: "ctrl\+g"/)
+  assert.doesNotMatch(tuiSrc, /id: "ultracode\.inspect\.chip\.open"/)
+  const chipStart = tuiSrc.indexOf("function Chip(")
+  const panelStart = tuiSrc.indexOf("function Panel(")
+  assert.ok(chipStart >= 0 && panelStart > chipStart)
+  const chipSrc = tuiSrc.slice(chipStart, panelStart)
+  assert.doesNotMatch(chipSrc, /bind: "return"/)
+  assert.match(tuiSrc, /id: "ultracode\.inspect\.open"[\s\S]*?bind: "return"/)
+  assert.match(tuiSrc, /treeTitle\(\)/)
+  assert.match(tuiSrc, /PANE_TITLE_DETAIL/)
+  assert.doesNotMatch(tuiSrc, /lastSettingsQuery/)
+  assert.match(tuiSrc, /id: "ultracode\.inspect\.close\.escape"[\s\S]*?bind: "escape"/)
+  assert.match(tuiSrc, /id: "ultracode\.inspect\.settings\.refresh"[\s\S]*?bind: "r"/)
+  assert.match(tuiSrc, /canRefreshRunSettings/)
+  assert.match(tuiSrc, /scopedSessionSnapshot/)
+  assert.match(tuiSrc, /pausedRunIDsFromAcks/)
+  assert.match(tuiSrc, /compactRunAcks/)
+  assert.match(tuiSrc, /paused: true/)
+  assert.match(tuiSrc, /hydrated\.hydrated/)
+  assert.doesNotMatch(tuiSrc, /pane === "settings" \? "s" : "open"/)
+  assert.doesNotMatch(tuiSrc, /pauseIntent/)
+  assert.match(tuiSrc, /inspectModel\(snapshot/)
+  assert.match(tuiSrc, /filterSessionsForChip\(currentSessionSnapshot\(\)/)
+  assert.match(tuiSrc, /runStripLines\(/)
+  assert.match(tuiSrc, /toggleFollowPin\(/)
+  assert.match(tuiSrc, /client\?\.permission/)
+  assert.match(tuiSrc, /replyPermission\("once"\)/)
+  assert.match(tuiSrc, /replyPermission\("reject"\)/)
+  assert.doesNotMatch(tuiSrc, /reply:\s*"always"/)
+  assert.match(tuiSrc, /includeFinished:\s*true/)
+})
+
+test("runStripLines: visible picker marks follow-latest vs pinned", () => {
+  const runs: RunView[] = [
+    {
+      runID: "run_alpha",
+      name: "alpha",
+      parent: "ses_p",
+      agents: [{ sessionID: "s1", status: "running", title: "t" }],
+      phases: [],
+      counts: { total: 1, done: 0, failed: 0 },
+      startedAt: 2,
+      settled: false,
+    },
+    {
+      runID: "run_beta",
+      workflowName: "beta",
+      parent: "ses_p",
+      agents: [{ sessionID: "s2", status: "succeeded", title: "t" }],
+      phases: [],
+      counts: { total: 1, done: 1, failed: 0 },
+      startedAt: 1,
+      settled: true,
+    },
+  ]
+  const follow = runStripLines(runs, "run_alpha")
+  assert.match(follow[0]!, /follow-latest/)
+  assert.match(follow[0]!, /\[ \] switch/)
+  assert.ok(follow.some((l) => l.startsWith("* ") && l.includes("run_alpha")))
+  const pinned = runStripLines(runs, "run_beta", { pinned: true })
+  assert.match(pinned[0]!, /pinned/)
+  assert.ok(pinned.some((l) => l.startsWith("* ") && l.includes("run_beta")))
+})
+
+test("selectForOpen: pinned history sticks; unpinned follows latest after settle", () => {
+  const older: RunView = {
+    runID: "run_old",
+    parent: "ses_p",
+    agents: [{ sessionID: "s1", status: "succeeded", title: "t" }],
+    phases: [],
+    counts: { total: 1, done: 1, failed: 0 },
+    startedAt: 1,
+    settled: true,
+  }
+  const newer: RunView = {
+    runID: "run_new",
+    parent: "ses_p",
+    agents: [{ sessionID: "s2", status: "running", title: "t" }],
+    phases: [],
+    counts: { total: 1, done: 0, failed: 0 },
+    startedAt: 9,
+    settled: false,
+  }
+  const pinned = selectForOpen(
+    { parentSessionID: "ses_p", runID: "run_old", phase: "all", offset: 0, selected: 0, pinned: true },
+    [older, newer],
+    "ses_p",
+  )
+  assert.equal(pinned.runID, "run_old")
+  assert.equal(pinned.pinned, true)
+  const follow = selectForOpen(
+    { parentSessionID: "ses_p", runID: "run_old", phase: "all", offset: 0, selected: 0, pinned: false },
+    [older, newer],
+    "ses_p",
+  )
+  assert.equal(follow.runID, "run_new")
+  assert.equal(follow.pinned, false)
+  const toggled = toggleFollowPin(follow)
+  assert.equal(toggled.pinned, true)
+})
+
+test("inspectModel and runsForParent scope inventory to the open parent", () => {
+  const sessions: SessionView[] = [
+    { id: "here", title: "[uc:run_a a1 p:ses_p] x", time: { created: 1 } },
+    { id: "there", title: "[uc:run_b a1 p:ses_q] y", time: { created: 2 } },
+  ]
+  const model = inspectModel(sessions, { offset: 0, selected: 0, parentSessionID: "ses_p" }, 10)
+  assert.deepEqual(
+    model.runs.map((r) => r.runID),
+    ["run_a"],
+  )
+  const mixed: RunView[] = [
+    { runID: "run_a", parent: "ses_p", agents: [], phases: [], counts: { total: 0, done: 0, failed: 0 }, startedAt: 1, settled: true },
+    { runID: "run_b", parent: "ses_q", agents: [], phases: [], counts: { total: 0, done: 0, failed: 0 }, startedAt: 2, settled: true },
+  ]
+  assert.deepEqual(
+    runsForParent(mixed, "ses_p").map((r) => r.runID),
+    ["run_a"],
+  )
+})
+
+test("parsePermissionList and formatPermissionLines: blocked child, never always", () => {
+  const items = parsePermissionList({
+    data: [
+      { id: "perm_1", sessionID: "ses_child", action: "edit", resources: ["/proj/a.ts"], message: "write" },
+      { id: "skip", action: "edit" },
+    ],
+  })
+  assert.equal(items.length, 1)
+  assert.equal(items[0]!.id, "perm_1")
+  const run: RunView = {
+    runID: "run_a",
+    agents: [{ sessionID: "ses_child", status: "running", title: "t" }],
+    phases: [],
+    counts: { total: 1, done: 0, failed: 0 },
+    startedAt: 0,
+    settled: false,
+  }
+  const forRun = permissionsForRun(run, items)
+  assert.equal(forRun.length, 1)
+  const lines = formatPermissionLines(forRun)
+  assert.match(lines[0]!, /awaiting permission 1/)
+  assert.match(lines[0]!, /allow once/)
+  assert.match(lines[1]!, /ses_child/)
+  assert.doesNotMatch(lines.join("\n"), /always/)
+})

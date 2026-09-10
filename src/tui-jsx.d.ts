@@ -12,7 +12,7 @@ declare global {
     }
     interface IntrinsicElements {
       text: { children?: any }
-      box: { children?: any; flexDirection?: string; flexGrow?: number | string }
+      box: { children?: any; flexDirection?: string; flexGrow?: number | string; width?: number; flexShrink?: number }
     }
   }
 }
