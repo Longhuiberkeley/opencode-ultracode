@@ -8,6 +8,7 @@ import assert from "node:assert/strict"
 import { spawnSync } from "node:child_process"
 import { createHash } from "node:crypto"
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -173,6 +174,57 @@ test("full install (without --no-deps) ships the runtime dependency tree", { ski
     assert.equal(existsSync(join(dir, "node_modules/@opencode/plugin/package.json")), true)
     // typescript is a devDependency — never shipped.
     assert.equal(existsSync(join(dir, "node_modules/typescript")), false)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test("failed staged update preserves the complete live installation", { skip }, () => {
+  const root = mkdtempSync(join(tmpdir(), "uc-stage-failure-"))
+  const project = join(root, "proj")
+  mkdirSync(project)
+  try {
+    const first = run(INSTALL, ["--project", project, "--repo", REPO, "--no-deps", "--tui"])
+    assert.equal(first.status, 0, first.stderr)
+    const before = snapshot(project)
+    const bin = join(root, "bin")
+    mkdirSync(bin)
+    writeFileSync(join(bin, "cp"), "#!/bin/sh\nexit 42\n")
+    chmodSync(join(bin, "cp"), 0o755)
+    const failed = spawnSync(BASH!, [INSTALL, "--project", project, "--repo", REPO, "--no-deps"], {
+      encoding: "utf8",
+      env: { ...process.env, PATH: `${bin}:${process.env.PATH}` },
+    })
+    assert.notEqual(failed.status, 0)
+    assert.deepEqual(snapshot(project), before)
+    const recovered = run(INSTALL, ["--project", project, "--repo", REPO, "--no-deps", "--tui"])
+    assert.equal(recovered.status, 0, recovered.stderr)
+    assert.deepEqual(snapshot(project), before)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test("project installation identifies a conflicting global copy and honors TUI opt-in", { skip }, () => {
+  const root = mkdtempSync(join(tmpdir(), "uc-install-conflict-"))
+  const project = join(root, "proj")
+  const global = join(root, ".config/opencode/plugins/ultracode")
+  mkdirSync(project)
+  mkdirSync(global, { recursive: true })
+  writeFileSync(join(global, "index.ts"), 'export default { id: "ultracode" }\n')
+  try {
+    const result = spawnSync(BASH!, [INSTALL, "--project", project, "--repo", REPO, "--no-deps"], {
+      encoding: "utf8",
+      env: { ...process.env, HOME: root },
+    })
+    assert.equal(result.status, 0, result.stderr)
+    assert.match(result.stderr, /Duplicate plugin ID: ultracode/)
+    assert.ok(result.stderr.includes(global))
+    const pkg = JSON.parse(readFileSync(join(pluginDir(project), "package.json"), "utf8"))
+    assert.equal(pkg.exports["./tui"], undefined)
+    const withTui = run(INSTALL, ["--project", project, "--repo", REPO, "--no-deps", "--tui"])
+    assert.equal(withTui.status, 0, withTui.stderr)
+    assert.equal(JSON.parse(readFileSync(join(pluginDir(project), "package.json"), "utf8")).exports["./tui"], "./src/tui.tsx")
   } finally {
     rmSync(root, { recursive: true, force: true })
   }

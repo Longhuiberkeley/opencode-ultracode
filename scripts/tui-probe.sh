@@ -14,8 +14,8 @@
 # --dialog-keys: G1 gate — open ui.dialog.show and try to receive keys inside it.
 #
 # --live assertions (nonzero exit when any fail, unless paint-fallback WARNING):
-#   F14 two-column: stripped text contains "Phases" AND ("UC-INSPECT" or
-#       "ultracode inspect")
+#   F14 two-pane: stripped text contains ("h/l pane" or "←→ expand" or "esc close" or "esc or ctrl+g close")
+#       AND ("UC-INSPECT" or "ultracode inspect")
 #   F14 pagination: stripped text contains " of " (page label "N–M of K")
 #   F14/F3 selection-change: before-down vs after-down frame files differ
 #   F3 child-complete: before-complete vs after-complete frames differ when a
@@ -364,20 +364,20 @@ except FileNotFoundError:
     raise SystemExit(1)
 chip = ("ultracode ·" in t) or ("ultracode" in t and "running" in t)
 panel = ("UC-INSPECT" in t) or ("ultracode inspect" in t) or ("ultracodeinspect" in t.replace(" ",""))
-phases = "Phases" in t
+two_pane = ("h/l pane" in t) or ("←→ expand" in t) or ("esc close" in t) or ("esc or ctrl+g close" in t)
 hints = ("x stop" in t) or ("p pause" in t) or ("select" in t and "pause" in t)
 page = (" of " in t) or ("1–" in t) or ("1-" in t)
 print(f"live chip: {chip}")
 print(f"live panel: {panel}")
-print(f"live two-column Phases: {phases}")
+print(f"live two-pane footer: {two_pane}")
 print(f"live footer hints: {hints}")
 print(f"live pagination: {page}")
 fail = False
 if not chip or not panel:
     print("LIVE PAINT FAIL: chip and/or panel marker absent in", path)
     fail = True
-if not phases or not panel:
-    print("F14 FAIL: two-column markers missing (need Phases + UC-INSPECT/ultracode inspect) in", path)
+if not two_pane or not panel:
+    print("F14 FAIL: two-pane markers missing (need h/l pane or ←→ expand or esc close + UC-INSPECT/ultracode inspect) in", path)
     fail = True
 if not page:
     print("F14 FAIL: pagination label missing (need \" of \") in", path)
@@ -564,7 +564,7 @@ except FileNotFoundError:
     raise SystemExit
 needles=["UCPROBE-CHIP","UCPROBE-PANEL","UCPROBE-DIALOG","UCPROBE-HOME"]
 if live:
-    needles=["ultracode ·","ultracode inspect","UC-INSPECT","ultracode","running","Phases"]
+    needles=["ultracode ·","ultracode inspect","UC-INSPECT","ultracode","running","h/l pane","esc close","esc or ctrl+g close"]
 if sys.argv[3]=="1":
     needles=["G1-DIALOG-KEYS","G1LEAK"]
 for needle in needles:
@@ -1162,7 +1162,9 @@ if [[ "$LIVE" -eq 1 ]]; then
   assert_live_paint || FAILED=1
   BASE="${STRIPPED%.txt}"
   echo "== P6 new-marker assertions =="
-  assert_new_marker "${BASE}-before-down.txt" "${BASE}-after-down.txt" '> 2 ' || FAILED=1
+  # CHUNK 1 tree cursor: selected agent is ">└─● a2 retry" (any STATUS_DOT / ├─|└─), not "> 2 ".
+  # formatTreeLines: `${mark}${branch}${dot} ${label}` — connector sits between '>' and the dot.
+  assert_new_marker "${BASE}-before-down.txt" "${BASE}-after-down.txt" '>[├└]─[●✓✗○■] a2 ' || FAILED=1
   if [[ "$TRANSPORT_SKIPPED" -eq 1 ]]; then
     echo "P6 completion marker SKIPPED: paint-only fallback"
   else

@@ -165,7 +165,8 @@ if [[ -d "$PLUGIN_DIR" ]] && ! is_ours; then
 fi
 
 # ---------------------------------------------------------------------------
-# Build the tree (clean rebuild of our own entries; preserves foreign files)
+# Build outside plugin discovery. The live copy remains complete while copying.
+# Publishing uses two same-filesystem renames, NOT an atomic directory exchange.
 # ---------------------------------------------------------------------------
 
 VERSION="$(PLUGIN_JSON="$REPO/package.json" node -e '
@@ -185,12 +186,22 @@ try {
 } catch { process.stdout.write(JSON.stringify({ "@opencode/plugin": "*" })) }
 ')"
 
-mkdir -p "$PLUGIN_DIR" || die "target dir is not writable: $TARGET"
-
-# Remove our own previous entries (foreign files are never touched).
-rm -rf "$PLUGIN_DIR/src" "$PLUGIN_DIR/skills" "$PLUGIN_DIR/node_modules"
-rm -f "$PLUGIN_DIR/index.ts" "$PLUGIN_DIR/tui.tsx" "$PLUGIN_DIR/package.json" \
-  "$PLUGIN_DIR/.ultracode-install" "$PLUGIN_DIR/LICENSE"
+mkdir -p "$OPENCODE_DIR/plugins" || die "target dir is not writable: $TARGET"
+LIVE_PLUGIN_DIR="$PLUGIN_DIR"
+STAGE="$(mktemp -d "$OPENCODE_DIR/.ultracode-stage.XXXXXX")"
+BACKUP="$STAGE.previous"
+cleanup() {
+  # A failed second rename restores the previous complete installation.
+  if [[ -d "$BACKUP" && ! -e "$LIVE_PLUGIN_DIR" ]]; then
+    mv "$BACKUP" "$LIVE_PLUGIN_DIR" || echo "previous install preserved at $BACKUP" >&2
+  fi
+  [[ ! -d "$STAGE" ]] || rm -rf "$STAGE"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+PLUGIN_DIR="$STAGE"
+MARKER="$PLUGIN_DIR/.ultracode-install"
 
 # Sources + skill (src/index.ts resolves ../skills/ultracode.md via import.meta.url).
 cp -Rp "$REPO/src" "$PLUGIN_DIR/src"
@@ -213,7 +224,7 @@ if [[ "$NO_DEPS" -eq 0 ]]; then
 fi
 
 # Generated package manifest (kept in sync with the repo version).
-VERSION="$VERSION" PLUGIN_DEP="$PLUGIN_DEP" REPO_JSON="$REPO/package.json" node -e '
+VERSION="$VERSION" PLUGIN_DEP="$PLUGIN_DEP" REPO_JSON="$REPO/package.json" TUI="$TUI" node -e '
 const fs = require("fs")
 const version = process.env.VERSION || "0.0.0"
 const deps = JSON.parse(process.env.PLUGIN_DEP || "{}")
@@ -225,7 +236,7 @@ const doc = {
   main: "src/index.ts",
   exports: {
     ".": "./src/index.ts",
-    "./tui": "./src/tui.tsx",
+    ...(process.env.TUI === "1" ? { "./tui": "./src/tui.tsx" } : {}),
   },
   dependencies: deps,
   private: true,
@@ -252,6 +263,26 @@ fi
 # Install marker (uninstall removes the tree only when this is present).
 printf '%s\n' "{\"v\":2,\"version\":\"$VERSION\",\"tui\":$TUI}" >"$MARKER"
 echo "wrote $MARKER (self-contained copy, version $VERSION)"
+
+# Never expose the staged tree until its entrypoints and dependencies are ready.
+[[ -f "$PLUGIN_DIR/src/index.ts" && -f "$PLUGIN_DIR/index.ts" ]] || die "incomplete staged installation"
+if [[ -d "$LIVE_PLUGIN_DIR" ]]; then
+  mv "$LIVE_PLUGIN_DIR" "$BACKUP"
+fi
+mv "$STAGE" "$LIVE_PLUGIN_DIR" || die "could not publish installation; restoring previous copy"
+[[ ! -d "$BACKUP" ]] || rm -rf "$BACKUP"
+PLUGIN_DIR="$LIVE_PLUGIN_DIR"
+MARKER="$PLUGIN_DIR/.ultracode-install"
+
+# Global and local auto-discovery are additive, not an override mechanism.
+OTHER_PLUGIN="${HOME:-}/.config/opencode/plugins/ultracode"
+if [[ "$GLOBAL" -eq 1 ]]; then
+  OTHER_PLUGIN="$PWD/.opencode/plugins/ultracode"
+fi
+if [[ "$OTHER_PLUGIN" != "$PLUGIN_DIR" && -f "$OTHER_PLUGIN/index.ts" ]]; then
+  echo "note: another installation exists at $OTHER_PLUGIN" >&2
+  echo "Loading both in one project causes Duplicate plugin ID: ultracode. Keep one installation; move backups outside plugins/." >&2
+fi
 
 if [[ "$WRITE_CONFIG" -eq 1 ]]; then
   command -v node >/dev/null 2>&1 || die "node is required for --write-config"
