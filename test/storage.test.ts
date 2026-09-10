@@ -7,6 +7,7 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
 import { createHash } from "node:crypto"
+import { readFileSync } from "node:fs"
 import { StorageImpl, WORKFLOW_NAME_RE, normalizePath, resolveContainedPath } from "../src/storage.ts"
 import type { FsLike, Json, KvLike, RunRecord } from "../src/types.ts"
 import { FakeFs, FakeKv } from "./fakes.ts"
@@ -614,4 +615,97 @@ test("WORKFLOW_NAME_RE accepts and rejects the right names", () => {
   for (const bad of ["", "-x", "_x", "A", "a b", "a/b", "x".repeat(65), "a.b"]) {
     assert.equal(WORKFLOW_NAME_RE.test(bad), false, bad)
   }
+})
+
+test("settings overlay KV is project-scoped at settings/<pid>", async () => {
+  const { storage, kv } = makeStorage()
+  storage.saveSettingsOverlay({ concurrency: 3, permissions: "noEditTools" })
+  const key = `settings/${PID_KEY}`
+  const stored = await kv.get(key)
+  assert.ok(stored && typeof stored === "object")
+  const rec = stored as { concurrency?: number; permissions?: string }
+  assert.equal(rec.concurrency, 3)
+  assert.equal(rec.permissions, "noEditTools")
+  assert.equal(storage.loadSettingsOverlay()?.concurrency, 3)
+  const other = makeStorage({ projectID: "other-proj" })
+  assert.equal(other.storage.loadSettingsOverlay(), undefined)
+  const loaded = await storage.loadSettingsOverlayAsync()
+  assert.equal(loaded?.concurrency, 3)
+  assert.equal(loaded?.permissions, "noEditTools")
+})
+
+test("saveWorkflowFromFile: omitted savedFromRunID; hash matches file bytes", async () => {
+  const { storage, fs } = makeStorage()
+  seedAnchors(fs)
+  const script = "return 41 + 1"
+  await fs.writeFile(`${PROJECT_WF}/handoff.js`, script)
+  const saved = await storage.saveWorkflowFromFile("handoff")
+  assert.equal(saved.script, script)
+  assert.equal(saved.manifest.hash, createHash("sha256").update(script).digest("hex"))
+  assert.equal(saved.manifest.source, "project")
+  assert.equal(saved.manifest.savedFromRunID, undefined)
+  assert.equal("savedFromRunID" in saved.manifest, false)
+  const onDisk = JSON.parse(await fs.readFile(`${PROJECT_WF}/handoff.json`)) as Record<string, unknown>
+  assert.equal("savedFromRunID" in onDisk, false)
+  assert.equal(onDisk["hash"], saved.manifest.hash)
+})
+
+test("saveWorkflowFromFile invalid names fail closed without writing", async () => {
+  const { storage, fs } = makeStorage()
+  seedAnchors(fs)
+  for (const bad of ["UPPER", "-lead", "../evil", "", "has space"]) {
+    await assert.rejects(() => storage.saveWorkflowFromFile(bad), /invalid workflow name/)
+  }
+  assert.equal(await fs.exists(`${PROJECT_WF}/UPPER.js`), false)
+})
+
+test("saveWorkflowFromFile missing js errors before write", async () => {
+  const { storage, fs } = makeStorage()
+  seedAnchors(fs)
+  await assert.rejects(() => storage.saveWorkflowFromFile("nope"), /not found/)
+  assert.equal(await fs.exists(`${PROJECT_WF}/nope.json`), false)
+})
+
+test("saveWorkflowFromFile reads resolved.path not the lexical scriptPath", async () => {
+  const { storage, fs } = makeStorage()
+  seedAnchors(fs)
+  await writePair(fs, PROJECT_WF, "real", "x")
+  await fs.writeFile(`${PROJECT}/inside.js`, "return 9")
+  fs.symlinks.set(`${PROJECT_WF}/handoff.js`, `${PROJECT}/inside.js`)
+  const saved = await storage.saveWorkflowFromFile("handoff")
+  assert.equal(saved.script, "return 9")
+})
+
+test("saveWorkflowFromFile and saveWorkflow use resolved.path for read/write", () => {
+  const src = readFileSync(new URL("../src/storage.ts", import.meta.url), "utf8")
+  assert.match(src, /readFile\(resolved\.path\)/)
+  assert.match(src, /writeFile\(resolvedScript\.path/)
+  assert.match(src, /writeFile\(resolvedManifest\.path/)
+})
+
+test("saveWorkflowFromFile symlink escapes fail closed on source read", async () => {
+  const { storage, fs } = makeStorage()
+  seedAnchors(fs)
+  await writePair(fs, PROJECT_WF, "real", "x")
+  fs.symlinks.set(`${PROJECT_WF}/evil.js`, "/outside/target.js")
+  await fs.writeFile("/outside/target.js", "return 1")
+  await assert.rejects(() => storage.saveWorkflowFromFile("evil"), /refusing to read workflow "evil"/)
+  assert.equal(await fs.exists(`${PROJECT_WF}/evil.json`), false)
+  assert.equal(await fs.readFile("/outside/target.js"), "return 1")
+})
+
+test("saveWorkflowFromFile changed-script trust rejection until re-trust", async () => {
+  const { storage, fs } = makeStorage()
+  seedAnchors(fs)
+  await storage.saveWorkflow("gamma", "return 1", { name: "gamma", source: "project" })
+  await storage.trustWorkflow("gamma")
+  assert.equal(storage.workflowTrustState("gamma"), "trusted")
+  await fs.writeFile(`${PROJECT_WF}/gamma.js`, "return 2 // changed")
+  await storage.saveWorkflowFromFile("gamma")
+  await storage.refreshWorkflows()
+  assert.equal(storage.workflowTrustState("gamma"), "untrusted")
+  assert.throws(() => storage.loadWorkflow("gamma"), /is not trusted \(new or changed since approval\)/)
+  const trusted = await storage.trustWorkflow("gamma")
+  assert.equal(trusted?.digest, createHash("sha256").update("return 2 // changed").digest("hex"))
+  assert.equal(storage.loadWorkflow("gamma")?.script, "return 2 // changed")
 })

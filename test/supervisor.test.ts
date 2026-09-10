@@ -5,9 +5,11 @@
 import test from "node:test"
 import assert from "node:assert/strict"
 import { SupervisorImpl } from "../src/supervisor.ts"
-import type { Json, ParentContext, SessionCtx, UltracodeOptions } from "../src/types.ts"
+import { RegistryImpl } from "../src/registry.ts"
+import type { Json, ParentContext, RunRecord, SessionCtx, UltracodeOptions } from "../src/types.ts"
 import { DEFAULT_OPTIONS } from "../src/types.ts"
 import { FakeRegistry, FakeSessionCtx, FakeStorage } from "./fakes.ts"
+import { capturedFromRecord, remainingTimeoutMs } from "../src/settings.ts"
 
 const tick = (ms = 10): Promise<void> => new Promise((r) => setTimeout(r, ms))
 
@@ -507,4 +509,100 @@ test("supervisor: watchdog suspends while paused then settles after resume", asy
   const outcome = await done
   assert.equal(outcome.envelope.status, "stopped")
   assert.equal(outcome.envelope.stopReason, "timeout")
+})
+
+test("supervisor: startDetached freezes effective options before artifact write", async () => {
+  const ctx = makeSupervisor({ concurrency: 4, timeoutMs: 5_000, permissions: "ask" })
+  const { runID, done } = ctx.supervisor.startDetached({ script: `return 1;` }, ctx.parent)
+  const snap = ctx.registry.get(runID)?.effective
+  assert.ok(snap)
+  assert.equal(snap.concurrency, 4)
+  assert.equal(snap.timeoutMs, 5_000)
+  assert.equal(snap.permissions, "ask")
+  ctx.supervisor.updateDefaults({ ...DEFAULT_OPTIONS, timeoutMs: 5_000, concurrency: 1, permissions: "noEditTools" })
+  assert.equal(ctx.registry.get(runID)?.effective?.timeoutMs, 5_000)
+  assert.equal(ctx.registry.get(runID)?.effective?.permissions, "ask")
+  const outcome = await done
+  assert.equal(outcome.envelope.status, "succeeded")
+  const second = ctx.supervisor.startDetached({ script: `return 1;` }, ctx.parent)
+  assert.equal(ctx.registry.get(second.runID)?.effective?.concurrency, 1)
+  assert.equal(ctx.registry.get(second.runID)?.effective?.permissions, "noEditTools")
+  const secondOut = await second.done
+  assert.equal(secondOut.envelope.status, "succeeded")
+})
+
+test("supervisor: mutating defaults after startDetached does not rewrite remaining timeout", async () => {
+  const ctx = makeSupervisor({ timeoutMs: 5_000 })
+  const { runID, done } = ctx.supervisor.startDetached({ script: `await sleep(60000); return 1;` }, ctx.parent)
+  await waitFor(() => ctx.registry.activeRuns().length > 0, "run creation")
+  ctx.supervisor.updateDefaults({ ...DEFAULT_OPTIONS, timeoutMs: 1 })
+  assert.equal(ctx.registry.get(runID)?.effective?.timeoutMs, 5_000)
+  assert.equal(ctx.supervisor.pause(runID), true)
+  assert.equal(ctx.supervisor.resume(runID), true)
+  ctx.supervisor.stop(runID, "user request")
+  const outcome = await done
+  assert.equal(outcome.envelope.status, "stopped")
+})
+
+test("resume remainingTimeoutMs is pinned to the frozen effective timeout", async () => {
+  const ctx = makeSupervisor({ timeoutMs: 5_000 })
+  const { runID, done } = ctx.supervisor.startDetached({ script: `await sleep(60000); return 1;` }, ctx.parent)
+  await waitFor(() => ctx.registry.activeRuns().length > 0, "run creation")
+  const frozen = ctx.registry.get(runID)?.effective?.timeoutMs
+  assert.equal(frozen, 5_000)
+  assert.equal(ctx.supervisor.pause(runID), true)
+  ctx.supervisor.updateDefaults({ ...DEFAULT_OPTIONS, timeoutMs: 1 })
+  await tick(40)
+  assert.equal(ctx.supervisor.resume(runID), true)
+  const left = ctx.supervisor.remainingTimeoutFor(runID)
+  assert.equal(typeof left, "number")
+  assert.ok(left! > 1_000, `remaining ${left} should still track frozen 5000ms`)
+  const sharedWouldBe = remainingTimeoutMs(1, Date.now() - 50, 0, false, undefined, Date.now())
+  assert.ok(sharedWouldBe < 1, "shared options=1ms would already have expired")
+  assert.ok(left! > sharedWouldBe)
+  ctx.supervisor.stop(runID, "user request")
+  const outcome = await done
+  assert.equal(outcome.envelope.status, "stopped")
+  assert.equal(outcome.envelope.stopReason, "user request")
+})
+
+test("startDetached persists effective snapshot so a settings query after reload sees it", async () => {
+  const persisted: RunRecord[] = []
+  const registry = new RegistryImpl({
+    persist: (r) =>
+      persisted.push({
+        ...r,
+        agents: r.agents.map((a) => ({ ...a })),
+        effective: r.effective ? { ...r.effective } : undefined,
+      }),
+    throttleMs: 0,
+    now: () => 1_000,
+  })
+  const storage = new FakeStorage()
+  const sessions = new FakeSessionCtx()
+  const supervisor = new SupervisorImpl({
+    registry,
+    storage,
+    sessions,
+    options: { ...DEFAULT_OPTIONS, concurrency: 4, timeoutMs: 5_000, permissions: "ask" },
+  })
+  const parent: ParentContext = { sessionID: "ses_parent", agent: "build", report: () => {} }
+  const { runID, done } = supervisor.startDetached({ script: `return 1;` }, parent)
+  const withEffective = persisted.filter((p) => p.id === runID && p.effective)
+  assert.ok(withEffective.length >= 1, "effective must be persisted after assignment, not only the create snapshot")
+  assert.equal(withEffective[withEffective.length - 1]!.effective?.concurrency, 4)
+  assert.equal(withEffective[withEffective.length - 1]!.effective?.permissions, "ask")
+
+  const reloaded = new RegistryImpl({
+    persist: () => {},
+    loader: () => persisted.filter((p) => p.id === runID).slice(-1),
+    throttleMs: 0,
+  })
+  reloaded.reconcileOrphans()
+  const loaded = reloaded.get(runID)
+  assert.equal(capturedFromRecord(loaded)?.concurrency, 4)
+  assert.equal(capturedFromRecord(loaded)?.permissions, "ask")
+  const outcome = await done
+  assert.equal(outcome.envelope.status, "succeeded")
+  await supervisor.dispose()
 })

@@ -15,6 +15,7 @@ import {
   formatShowRun,
   handleUltracodeCommand,
   multipleActiveMessage,
+  resolveRunStatus,
   type CommandDeps,
   type CommandStorage,
   type CommandSupervisor,
@@ -22,6 +23,8 @@ import {
 import { emptyToolEventState, toolCallsFor } from "../src/run-events.ts"
 import { agentCells, runHeaderCells } from "../src/run-format.ts"
 import type { AgentRecord, Json, ParentContext, RunOutcome, RunRecord, SavedWorkflow } from "../src/types.ts"
+import { DEFAULT_OPTIONS } from "../src/types.ts"
+import { applyOverlay, overlayFromPanel, panelSettingsFrom, parseSettingsAckPayload } from "../src/settings.ts"
 import { FakeRegistry } from "./fakes.ts"
 
 function digest(script: string): string {
@@ -83,12 +86,18 @@ class MemoryStorage implements CommandStorage {
         hash: digest(script),
         source: manifest.source,
         savedAt: Date.now(),
-        savedFromRunID: manifest.savedFromRunID,
+        ...(manifest.savedFromRunID ? { savedFromRunID: manifest.savedFromRunID } : {}),
       },
       script,
     }
     this.workflows.set(name, saved)
     return saved
+  }
+  fileScripts = new Map<string, string>()
+  async saveWorkflowFromFile(name: string): Promise<SavedWorkflow> {
+    const script = this.fileScripts.get(name)
+    if (!script) throw new Error(`workflow "${name}" not found`)
+    return this.saveWorkflow(name, script, { name, source: "project" })
   }
   async trustWorkflow(name: string): Promise<{ workflow: SavedWorkflow; digest: string } | undefined> {
     const w = this.workflows.get(name)
@@ -199,7 +208,7 @@ async function invoke(
   return { texts, registry, storage, supervisor }
 }
 
-const RUN_SCOPED = ["show", "result", "pause", "resume", "stop"] as const
+const RUN_SCOPED = ["show", "status", "result", "pause", "resume", "stop"] as const
 
 for (const verb of RUN_SCOPED) {
   test(`implicit target: ${verb} × 0 active`, async () => {
@@ -216,6 +225,7 @@ for (const verb of RUN_SCOPED) {
     assert.doesNotMatch(texts[0]!, new RegExp(NO_ACTIVE_RUN.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")))
     assert.doesNotMatch(texts[0]!, /multiple active runs/)
     if (verb === "show") assert.match(texts[0]!, /run_only/)
+    if (verb === "status") assert.match(texts[0]!, /run_only/)
     if (verb === "pause") assert.match(texts[0]!, /Paused run `run_only`/)
     if (verb === "resume") assert.match(texts[0]!, /Resumed run `run_only`/)
     if (verb === "stop") assert.match(texts[0]!, /Stopping run `run_only`/)
@@ -229,6 +239,60 @@ for (const verb of RUN_SCOPED) {
     assert.equal(texts[0], multipleActiveMessage(["run_a", "run_b"]))
   })
 }
+
+test("status unknown id uses the not-found line", async () => {
+  const { texts } = await invoke("status run_missing")
+  assert.match(texts[0]!, /Run `run_missing` not found/)
+})
+
+test("status transitions: running → paused → running → interrupted via /ultracode status and ultracode_status", async () => {
+  const registry = new FakeRegistry()
+  const run = seed(
+    registry,
+    baseRun({
+      id: "run_bg",
+      status: "running",
+      startedAt: 1_000,
+      agents: [
+        { id: "a1", status: "succeeded" },
+        { id: "a2", status: "running" },
+      ],
+    }),
+  )
+  const now = 2_500
+  const cmd = await invoke("status run_bg", { registry })
+  assert.match(cmd.texts[0]!, /^run_bg · running · agents 1\/2 · /)
+
+  assert.equal(registry.setStatus("run_bg", "paused"), true)
+  const pausedCmd = await invoke("status run_bg", { registry })
+  assert.match(pausedCmd.texts[0]!, /^run_bg · paused · agents 1\/2 · /)
+  const pausedTool = resolveRunStatus(registry, "run_bg", registry.activeRuns())
+  assert.equal(pausedTool.ok, true)
+  if (pausedTool.ok) {
+    assert.deepEqual(pausedTool.payload, {
+      runID: "run_bg",
+      status: "paused",
+      agents: { done: 1, total: 2, failed: 0 },
+      startedAt: 1_000,
+    })
+  }
+
+  assert.equal(registry.setStatus("run_bg", "running"), true)
+  const resumedTool = resolveRunStatus(registry, "run_bg", registry.activeRuns())
+  assert.equal(resumedTool.ok && resumedTool.payload.status, "running")
+
+  run.agents[1] = { id: "a2", status: "interrupted" }
+  run.endedAt = now
+  assert.equal(registry.setStatus("run_bg", "interrupted"), true)
+  const doneCmd = await invoke("status run_bg", { registry })
+  assert.match(doneCmd.texts[0]!, /^run_bg · interrupted · agents 2\/2 · /)
+  const doneTool = resolveRunStatus(registry, "run_bg", registry.activeRuns())
+  assert.equal(doneTool.ok, true)
+  if (doneTool.ok) {
+    assert.equal(doneTool.payload.status, "interrupted")
+    assert.deepEqual(doneTool.payload.agents, { done: 2, total: 2, failed: 0 })
+  }
+})
 
 test("pause-on-paused is refused with an explicit error", async () => {
   const registry = new FakeRegistry()
@@ -498,4 +562,134 @@ test("event→toolCalls wiring: mapped sessions count, unmapped ignored, older-t
   assert.equal(registry.getAgent(run.id, agent.id)?.toolCalls, 1)
   state = feedToolEvent(state, { type: "session.tool.failed", data: { sessionID: "ses_a", id: "c3" }, created: 2200 }, registry)
   assert.equal(registry.getAgent(run.id, agent.id)?.toolCalls, 2)
+})
+
+test("settings query ack includes overlay and captured run snapshot", async () => {
+  const registry = new FakeRegistry()
+  const run = seed(
+    registry,
+    baseRun({
+      id: "run_set",
+      effective: { concurrency: 4, maxAgents: 200, timeoutMs: 3_600_000, permissions: "ask" },
+    }),
+  )
+  const texts: string[] = []
+  const next = panelSettingsFrom({ ...DEFAULT_OPTIONS, concurrency: 3 })
+  const deps: CommandDeps = {
+    registry,
+    supervisor: new MemorySupervisor(registry),
+    storage: new MemoryStorage(),
+    say: async (_sid, t) => {
+      texts.push(t)
+    },
+    projectRoot: "/project",
+    personalWorkflowDir: "/home/u/.config/opencode/workflows",
+    listAgents: async () => ({ ok: true, agents: [{ id: "general" }] }),
+    defaultAgent: "general",
+    nextRunSettings: () => next,
+  }
+  await handleUltracodeCommand({ sessionID: "ses_parent", prompt: { text: "settings run_set" } }, deps)
+  const ack = parseSettingsAckPayload(texts[0]!)
+  assert.ok(ack)
+  assert.equal(ack.overlay.concurrency, 3)
+  assert.equal(ack.runID, run.id)
+  assert.equal(ack.effective?.concurrency, 4)
+})
+
+test("set persists overlay, refreshes defaults, and emits settings ack", async () => {
+  const registry = new FakeRegistry()
+  let holder = { ...DEFAULT_OPTIONS }
+  let persisted: ReturnType<typeof overlayFromPanel> | undefined
+  const texts: string[] = []
+  const deps: CommandDeps = {
+    registry,
+    supervisor: new MemorySupervisor(registry),
+    storage: new MemoryStorage(),
+    say: async (_sid, t) => {
+      texts.push(t)
+    },
+    projectRoot: "/project",
+    personalWorkflowDir: "/home/u/.config/opencode/workflows",
+    listAgents: async () => ({ ok: true, agents: [{ id: "general" }] }),
+    defaultAgent: "general",
+    nextRunSettings: () => panelSettingsFrom(holder),
+    persistAndRefreshSettings: async (overlay) => {
+      persisted = overlay
+      holder = applyOverlay(DEFAULT_OPTIONS, overlay)
+      return panelSettingsFrom(holder)
+    },
+  }
+  await handleUltracodeCommand({ sessionID: "ses_parent", prompt: { text: "set concurrency 4" } }, deps)
+  assert.equal(persisted?.concurrency, 4)
+  assert.equal(holder.concurrency, 4)
+  const ack = parseSettingsAckPayload(texts[0]!)
+  assert.equal(ack?.overlay.concurrency, 4)
+})
+
+test("set missing value emits usage; unknown keys still ack", async () => {
+  let holder = { ...DEFAULT_OPTIONS }
+  const texts: string[] = []
+  const deps: CommandDeps = {
+    registry: new FakeRegistry(),
+    supervisor: new MemorySupervisor(new FakeRegistry()),
+    storage: new MemoryStorage(),
+    say: async (_sid, t) => {
+      texts.push(t)
+    },
+    projectRoot: "/project",
+    personalWorkflowDir: "/home/u/.config/opencode/workflows",
+    listAgents: async () => ({ ok: true, agents: [{ id: "general" }] }),
+    defaultAgent: "general",
+    nextRunSettings: () => panelSettingsFrom(holder),
+    persistAndRefreshSettings: async (overlay) => {
+      holder = applyOverlay(DEFAULT_OPTIONS, overlay)
+      return panelSettingsFrom(holder)
+    },
+  }
+  await handleUltracodeCommand({ sessionID: "ses_parent", prompt: { text: "set concurrency" } }, deps)
+  assert.match(texts[0]!, /Usage: \/ultracode set <key> <value>/)
+  texts.length = 0
+  await handleUltracodeCommand({ sessionID: "ses_parent", prompt: { text: "set sizeGuideline 1" } }, deps)
+  assert.equal(parseSettingsAckPayload(texts[0]!)?.overlay.concurrency, DEFAULT_OPTIONS.concurrency)
+})
+
+test("two-token save sets savedFromRunID", async () => {
+  const registry = new FakeRegistry()
+  seed(registry, baseRun({ id: "run_src", script: "return 99", name: "from-run" }))
+  const { texts, storage } = await invoke("save run_src from-run", { registry })
+  assert.match(texts[0]!, /Saved workflow `from-run`/)
+  const saved = storage.workflows.get("from-run")
+  assert.equal(saved?.manifest.savedFromRunID, "run_src")
+  assert.equal(saved?.script, "return 99")
+})
+
+test("one-token save of a known run id routes to two-token usage", async () => {
+  const registry = new FakeRegistry()
+  seed(registry, baseRun({ id: "run_src", script: "return 1" }))
+  const { texts, storage } = await invoke("save run_src", { registry })
+  assert.match(texts[0]!, /Usage: \/ultracode save/)
+  assert.match(texts[0]!, /\/ultracode save <runID> <name>/)
+  assert.equal(storage.workflows.size, 0)
+})
+
+test("one-token save without runID omits savedFromRunID", async () => {
+  const storage = new MemoryStorage()
+  storage.fileScripts.set("plan-flow", "return 7")
+  const { texts } = await invoke("save plan-flow", { storage })
+  assert.match(texts[0]!, /Saved workflow `plan-flow`/)
+  const saved = storage.workflows.get("plan-flow")
+  assert.equal(saved?.script, "return 7")
+  assert.equal(saved?.manifest.savedFromRunID, undefined)
+  assert.equal("savedFromRunID" in (saved?.manifest ?? {}), false)
+})
+
+test("one-token save invalid names fail closed", async () => {
+  const { texts } = await invoke("save UPPER")
+  assert.match(texts[0]!, /error: could not save workflow/)
+})
+
+test("dashboard empty saved-workflows mentions one-token and two-token save", async () => {
+  const { texts } = await invoke("")
+  assert.match(texts[0]!, /\/ultracode save <name>/)
+  assert.match(texts[0]!, /\/ultracode save <runID> <name>/)
 })

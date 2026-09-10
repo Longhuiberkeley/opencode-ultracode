@@ -2,7 +2,7 @@
  * Slash-command parsing, /ultracode verb surface, tool-description contract,
  * and session.tool.* → toolCalls wiring. Plugin-free so unit tests cover it.
  */
-import { agentCells, compactCount, compactTokens, runHeaderCells } from "./run-format.ts"
+import { agentCells, compactCount, compactElapsed, compactTokens, runHeaderCells } from "./run-format.ts"
 import { reduceToolEvent, toolCallsFor, type ToolEvent, type ToolEventState } from "./run-events.ts"
 import { normalizePath, sha256 } from "./storage.ts"
 import type {
@@ -12,10 +12,21 @@ import type {
   RunEnvelope,
   RunOutcome,
   RunRecord,
+  RunStatus,
   SavedWorkflow,
   Supervisor,
+  UltracodeOptions,
+  WorkflowMeta,
 } from "./types.ts"
 import { countAgents, isActiveRunStatus } from "./types.ts"
+import {
+  applySetValue,
+  capturedFromRecord,
+  formatSettingsAck,
+  overlayFromPanel,
+  parseSetArgs,
+  type PanelSettings,
+} from "./settings.ts"
 
 /**
  * Standalone keyword anywhere in the prompt: whitespace-delimited, optionally
@@ -43,9 +54,10 @@ export function parseSubcommand(argsText: string): { sub: string; rest: string }
   return { sub: (m?.[1] ?? "").toLowerCase(), rest: (m?.[2] ?? "").trim() }
 }
 
-/** D2 verb set (11; bare dashboard is not a verb). */
+/** D2 verb set (13; bare dashboard is not a verb). */
 export const D2_VERBS = [
   "show",
+  "status",
   "result",
   "stop",
   "pause",
@@ -54,6 +66,9 @@ export const D2_VERBS = [
   "save",
   "trust",
   "untrust",
+  "set",
+  "settings",
+  "doctor",
   "help",
 ] as const
 
@@ -68,7 +83,7 @@ export const NESTED_RUN_REFUSED =
   "cannot start a run from inside an active workflow session — use /ultracode from the parent"
 
 /** Plugin package version shown on the bare /ultracode dashboard. */
-export const PLUGIN_VERSION = "0.2.0"
+export const PLUGIN_VERSION = "0.3.3"
 /** Oldest OpenCode binary build the inspect TUI is gated on (A7 / D7). */
 export const MIN_SUPPORTED_BUILD = 19271
 
@@ -77,14 +92,18 @@ export function helpText(): string {
     "Usage: /ultracode — inspect and manage workflow runs",
     "- `/ultracode` — dashboard (active including paused, recent, saved workflows)",
     "- `/ultracode show [runID]` — full run report (agents, sessions, tokens, script)",
+    "- `/ultracode status [runID]` — compact run state (runID, status, agents done/total, elapsed)",
     "- `/ultracode result [runID]` — print a truncated run's full result",
     "- `/ultracode stop [runID]` — stop an active run (explicit runID required when several are active)",
     "- `/ultracode pause [runID]` — pause an active run (close admission of new agent() calls)",
     "- `/ultracode resume [runID]` — resume a paused run",
     "- `/ultracode rerun [runID] [argsJSON]` — start a new run from a finished run's script",
-    "- `/ultracode save <runID> <name>` — save a run's script as a reusable workflow",
+    "- `/ultracode save` `<name>` (from a project `<name>.js` file) or `<runID> <name>` (from a run)",
     "- `/ultracode trust <name>` — approve the current version of a saved workflow",
     "- `/ultracode untrust <name>` — revoke trust for a saved workflow",
+    "- `/ultracode settings [runID]` — next-run defaults and a run's captured settings",
+    "- `/ultracode set <key> <value>` — persist overlay (concurrency, maxAgents, timeoutMs, permissions); applies next run",
+    "- `/ultracode doctor` — install/load diagnostics (marker, entries, rpc, live vs persisted runs, last KV error)",
     "- `/ultracode help` — this text",
     "",
     "To author a run, send a normal message containing the keyword `ultracode` (no leading slash), e.g. `please ultracode this` or `ultracode: audit src/auth`.",
@@ -106,7 +125,7 @@ export const TOOL_DESCRIPTION: string = [
   "WHEN: the task outgrows one context window, needs fan-out, needs structural verification, or should be a repeatable orchestration.",
   "NOT: one reply answers it, or a single subagent is enough.",
   "",
-  "Input: { script, name?, meta?, args? } (inline) or { workflow: name, args? } (saved; trust first via /ultracode trust <name>).",
+  "Input: { script, name?, meta?, args?, background? } (inline) or { workflow: name, args?, background? } (saved; trust first via /ultracode trust <name>).",
   "Script = plain-JS async function body (no import/export). Return a small JSON value.",
   "",
   "Injected globals:",
@@ -124,7 +143,8 @@ export const TOOL_DESCRIPTION: string = [
   "Route by agent, never by model: pass opts.agent; the user's agent config picks the model. Never name provider/model ids.",
   "",
   "Caps: 8 concurrent agents (default), 200 agent() calls per run, 60 minutes wall clock, 512 KB max script, results truncated after 64 KB.",
-  "Blocks until every agent settles, then returns { runID, status, agents, tokens, result | preview }.",
+  "Default / background: false blocks until every agent settles, then returns { runID, status, agents, tokens, result | preview }.",
+  "background: true returns immediately after admission with { runID, status: \"running\", hint } (inspect panel via ctrl+g, or /ultracode status / ultracode_status). The host cannot deliver a late tool result after execute returns — the calling agent is not auto-woken on completion.",
   "",
   "Full patterns + live catalogs load with the Ultracode skill (auto-attaches on the standalone keyword 'ultracode').",
 ].join("\n")
@@ -158,6 +178,71 @@ function firstToken(rest: string): string {
   const trimmed = rest.trim()
   if (!trimmed) return ""
   return trimmed.split(/\s+/, 1)[0] ?? ""
+}
+
+/** Hint on the background-run tool ack. Honest limitation: no late tool result. */
+export const BACKGROUND_RUN_HINT =
+  "Watch the inspect panel (ctrl+g) or poll /ultracode status [runID] / ultracode_status. The host cannot deliver a late tool result after execute returns — the calling agent is not auto-woken on completion."
+
+export type RunStatusPayload = {
+  runID: string
+  status: RunStatus
+  agents: { done: number; total: number; failed: number }
+  startedAt: number
+}
+
+export function runStatusPayload(run: RunRecord): RunStatusPayload {
+  const counts = countAgents(run)
+  return {
+    runID: run.id,
+    status: run.status,
+    agents: {
+      done: counts.succeeded + counts.failed + counts.interrupted,
+      total: counts.total,
+      failed: counts.failed,
+    },
+    startedAt: run.startedAt,
+  }
+}
+
+/** Compact human-facing `/ultracode status` line. */
+export function formatStatusRun(run: RunRecord, now = Date.now()): string {
+  const payload = runStatusPayload(run)
+  const elapsed = compactElapsed((run.endedAt ?? now) - run.startedAt)
+  return `${payload.runID} · ${payload.status} · agents ${payload.agents.done}/${payload.agents.total} · ${elapsed}`
+}
+
+export function resolveRunStatus(
+  registry: Pick<Registry, "get">,
+  restOrRunID: string,
+  active: readonly RunRecord[],
+): { ok: true; payload: RunStatusPayload } | { ok: false; error: string } {
+  const target = resolveActiveTarget(restOrRunID, active)
+  if (!target.ok) return target
+  const run = registry.get(target.runID)
+  if (!run) return { ok: false, error: `Run \`${target.runID}\` not found. See /ultracode for known runs.` }
+  return { ok: true, payload: runStatusPayload(run) }
+}
+
+/**
+ * Tool launch: default awaits supervisor.start (blocking envelope).
+ * `background: true` returns after startDetached admission (do not await done).
+ */
+export async function executeWorkflowLaunch(
+  supervisor: Pick<Supervisor, "start" | "startDetached">,
+  input: { script: string; meta?: WorkflowMeta; args?: Json; name?: string; workflowName?: string },
+  parent: ParentContext,
+  background: boolean,
+): Promise<{ content: string }> {
+  if (background) {
+    const { runID, done } = supervisor.startDetached(input, parent)
+    void done.catch((err: unknown) => {
+      console.error(`ultracode background run ${runID} failed: ${describeError(err)}`)
+    })
+    return { content: JSON.stringify({ runID, status: "running", hint: BACKGROUND_RUN_HINT }) }
+  }
+  const outcome = await supervisor.start(input, parent)
+  return { content: JSON.stringify(outcome.envelope, null, 1) }
 }
 
 // ---------------------------------------------------------------------------
@@ -271,6 +356,7 @@ export interface CommandStorage {
       source: "project" | "personal"
     },
   ): Promise<SavedWorkflow>
+  saveWorkflowFromFile(name: string): Promise<SavedWorkflow>
   trustWorkflow(name: string): Promise<{ workflow: SavedWorkflow; digest: string } | undefined>
   revokeTrust(name: string): Promise<void>
   workflowTrustState(name: string): "trusted" | "untrusted" | "unknown"
@@ -287,6 +373,7 @@ export interface CommandSupervisor {
     parent: ParentContext,
   ): { runID: string; done: Promise<RunOutcome> }
   activeRuns(): RunRecord[]
+  updateDefaults?(next: Required<UltracodeOptions>): void
 }
 
 export type ListedAgent = { id: string; description?: string }
@@ -346,6 +433,56 @@ export interface CommandDeps {
   prepare?: () => Promise<void>
   listAgents: () => Promise<AgentListResult>
   defaultAgent: string
+  /** Next-run defaults after overlay merge (required for set/settings). */
+  nextRunSettings?: () => PanelSettings
+  persistAndRefreshSettings?: (overlay: ReturnType<typeof overlayFromPanel>) => Promise<PanelSettings>
+  /** `/ultracode doctor` — plugin wiring diagnostics. */
+  doctor?: () => string | Promise<string>
+}
+
+export type DoctorReport = {
+  version: string
+  installDir?: string
+  projectRoot: string
+  projectID: string
+  marker?: { v?: number; version?: string; tui?: number }
+  entryFiles: { index: boolean; srcIndex: boolean; tui: boolean; srcTui: boolean }
+  rpc: boolean
+  supervisor: boolean
+  liveRuns: number
+  persistedRuns: number
+  kvErrorCount: number
+  lastKvError?: string
+  tuiGate?: { version: string; channel?: string; enabled: boolean }
+  duplicateWarning?: string
+}
+
+export function formatDoctorReport(report: DoctorReport): string {
+  const lines = [
+    `ultracode doctor ${report.version}`,
+    `- installDir: ${report.installDir ?? "(unknown)"}`,
+    `- projectRoot: ${report.projectRoot}`,
+    `- projectID: ${report.projectID}`,
+  ]
+  if (report.marker) {
+    lines.push(`- marker: v${report.marker.v ?? "?"} version=${report.marker.version ?? "?"} tui=${report.marker.tui ?? 0}`)
+  } else {
+    lines.push("- marker: (missing — this load may not be an installer tree)")
+  }
+  lines.push(
+    `- entries: index.ts=${report.entryFiles.index ? "yes" : "NO"} src/index.ts=${report.entryFiles.srcIndex ? "yes" : "NO"} tui.tsx=${report.entryFiles.tui ? "yes" : "no"} src/tui.tsx=${report.entryFiles.srcTui ? "yes" : "NO"}`,
+  )
+  lines.push(`- rpc: ${report.rpc ? "registered" : "unavailable"}`)
+  lines.push(`- supervisor: ${report.supervisor ? "loaded" : "unavailable"}`)
+  lines.push(`- runs: live=${report.liveRuns} persisted=${report.persistedRuns}`)
+  lines.push(`- kv errors: ${report.kvErrorCount}${report.lastKvError ? ` last=${report.lastKvError}` : ""}`)
+  if (report.tuiGate) {
+    lines.push(
+      `- tui gate: version=${report.tuiGate.version} channel=${report.tuiGate.channel ?? "(none)"} enabled=${report.tuiGate.enabled}`,
+    )
+  }
+  if (report.duplicateWarning) lines.push(`- warning: ${report.duplicateWarning}`)
+  return lines.join("\n")
 }
 
 export interface CommandInvocation {
@@ -431,6 +568,21 @@ export async function handleUltracodeCommand(invocation: CommandInvocation, deps
     return
   }
 
+  if (sub === "status") {
+    const target = resolveActiveTarget(rest, activeList(deps))
+    if (!target.ok) {
+      await deps.say(sessionID, target.error)
+      return
+    }
+    const run = deps.registry.get(target.runID)
+    if (!run) {
+      await deps.say(sessionID, `Run \`${target.runID}\` not found. See /ultracode for known runs.`)
+      return
+    }
+    await deps.say(sessionID, formatStatusRun(run))
+    return
+  }
+
   if (sub === "result") {
     const target = resolveActiveTarget(rest, activeList(deps))
     if (!target.ok) {
@@ -501,7 +653,73 @@ export async function handleUltracodeCommand(invocation: CommandInvocation, deps
     return
   }
 
+  if (sub === "settings") {
+    await renderSettings(deps, sessionID, rest)
+    return
+  }
+
+  if (sub === "set") {
+    await setSettings(deps, sessionID, rest)
+    return
+  }
+
+  if (sub === "doctor") {
+    if (!deps.doctor) {
+      await deps.say(sessionID, "error: doctor unavailable")
+      return
+    }
+    await deps.say(sessionID, await deps.doctor())
+    return
+  }
+
   await deps.say(sessionID, `Unknown /ultracode argument: ${JSON.stringify(sub)}\n\n${helpText()}`)
+}
+
+function settingsAckFor(deps: CommandDeps, rest: string, overlay: PanelSettings): string {
+  const explicit = firstToken(rest)
+  let runID: string | undefined
+  let effective: PanelSettings | undefined
+  if (explicit) {
+    runID = explicit
+    const run = deps.registry.get(explicit)
+    effective = capturedFromRecord(run)
+  } else {
+    const active = activeList(deps)
+    if (active.length === 1) {
+      runID = active[0]!.id
+      effective = capturedFromRecord(active[0])
+    }
+  }
+  return formatSettingsAck({ overlay, runID, effective })
+}
+
+async function renderSettings(deps: CommandDeps, sessionID: string, rest: string): Promise<void> {
+  const overlay = deps.nextRunSettings?.()
+  if (!overlay) {
+    await deps.say(sessionID, "error: settings unavailable")
+    return
+  }
+  await deps.say(sessionID, settingsAckFor(deps, rest, overlay))
+}
+
+async function setSettings(deps: CommandDeps, sessionID: string, rest: string): Promise<void> {
+  const parsed = parseSetArgs(rest)
+  if (!parsed) {
+    await deps.say(sessionID, "Usage: /ultracode set <key> <value>")
+    return
+  }
+  const current = deps.nextRunSettings?.()
+  if (!current || !deps.persistAndRefreshSettings) {
+    await deps.say(sessionID, "error: settings unavailable")
+    return
+  }
+  const next = applySetValue(current, parsed.key, parsed.value)
+  const overlay = next === "ignored" ? current : next
+  let applied = overlay
+  if (next !== "ignored") {
+    applied = await deps.persistAndRefreshSettings(overlayFromPanel(overlay))
+  }
+  await deps.say(sessionID, settingsAckFor(deps, "", applied))
 }
 
 async function renderDashboard(deps: CommandDeps, sessionID: string): Promise<void> {
@@ -529,7 +747,7 @@ async function renderDashboard(deps: CommandDeps, sessionID: string): Promise<vo
             return `- \`${w.manifest.name}\` — ${w.manifest.description ?? "(no description)"} [${w.manifest.source} · ${stateText}]`
           })
           .join("\n")
-      : "(none — save one with `/ultracode save <runID> <name>`)",
+      : "(none — save one with `/ultracode save <name>` or `/ultracode save <runID> <name>`)",
   )
   parts.push("")
   parts.push(
@@ -717,37 +935,56 @@ async function rerunRun(deps: CommandDeps, sessionID: string, rest: string): Pro
 
 async function saveRun(deps: CommandDeps, sessionID: string, rest: string): Promise<void> {
   const saveMatch = /^(\S+)\s+(\S+)$/.exec(rest)
-  if (!saveMatch) {
-    await deps.say(
-      sessionID,
-      "Usage: /ultracode save <runID> <name>\n(name: lowercase alphanumerics, `-`/`_`, max 64 chars)",
-    )
+  if (saveMatch) {
+    const runID = saveMatch[1]!
+    const name = saveMatch[2]!
+    const run = deps.registry.get(runID)
+    if (!run) {
+      await deps.say(sessionID, `Run \`${runID}\` not found. See /ultracode for known runs.`)
+      return
+    }
+    try {
+      const display = run.meta?.name ?? run.name
+      const saved = await deps.storage.saveWorkflow(name, run.script, {
+        name,
+        description: display && display !== name ? `saved from run ${run.id} (${display})` : `saved from run ${run.id}`,
+        phases: run.meta?.phases,
+        requires: run.meta?.requires,
+        savedFromRunID: run.id,
+        source: "project",
+      })
+      await saySavedWorkflow(deps, sessionID, saved.manifest.name, saved.manifest.source)
+    } catch (err) {
+      await deps.say(sessionID, `error: could not save workflow — ${describeError(err)}`)
+    }
     return
   }
-  const runID = saveMatch[1]!
-  const name = saveMatch[2]!
-  const run = deps.registry.get(runID)
-  if (!run) {
-    await deps.say(sessionID, `Run \`${runID}\` not found. See /ultracode for known runs.`)
+  const name = rest.trim()
+  if (name && !/\s/.test(name) && !deps.registry.get(name)) {
+    try {
+      const saved = await deps.storage.saveWorkflowFromFile(name)
+      await saySavedWorkflow(deps, sessionID, saved.manifest.name, saved.manifest.source)
+    } catch (err) {
+      await deps.say(sessionID, `error: could not save workflow — ${describeError(err)}`)
+    }
     return
   }
-  try {
-    const display = run.meta?.name ?? run.name
-    const saved = await deps.storage.saveWorkflow(name, run.script, {
-      name,
-      description: display && display !== name ? `saved from run ${run.id} (${display})` : `saved from run ${run.id}`,
-      phases: run.meta?.phases,
-      requires: run.meta?.requires,
-      savedFromRunID: run.id,
-      source: "project",
-    })
-    await deps.say(
-      sessionID,
-      `Saved workflow \`${saved.manifest.name}\` (${saved.manifest.source}) — approve it once with \`/ultracode trust ${saved.manifest.name}\`, then run it with { workflow: "${saved.manifest.name}" }`,
-    )
-  } catch (err) {
-    await deps.say(sessionID, `error: could not save workflow — ${describeError(err)}`)
-  }
+  await deps.say(
+    sessionID,
+    "Usage: /ultracode save <name>\n       /ultracode save <runID> <name>\n(name: lowercase alphanumerics, `-`/`_`, max 64 chars)",
+  )
+}
+
+async function saySavedWorkflow(
+  deps: CommandDeps,
+  sessionID: string,
+  name: string,
+  source: string,
+): Promise<void> {
+  await deps.say(
+    sessionID,
+    `Saved workflow \`${name}\` (${source}) — approve it once with \`/ultracode trust ${name}\`, then run it with { workflow: "${name}" }`,
+  )
 }
 
 async function trustWorkflow(deps: CommandDeps, sessionID: string, rest: string): Promise<void> {

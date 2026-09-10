@@ -21,9 +21,14 @@ export interface RegistryInit {
   throttleMs?: number
   /** Clock seam for deterministic tests. Default Date.now. */
   now?: () => number
+  /** Runtime identity stamped on persisted records and registered until dispose. */
+  bootID?: string
 }
 
 const FINAL_STATUSES: ReadonlySet<string> = new Set(["succeeded", "failed", "stopped", "interrupted"])
+// A timestamp is not proof of a live supervisor. Only a registered runtime owner
+// may keep a persisted active record alive across same-process location loads.
+const runtimeOwners = new Map<string, RegistryImpl>()
 
 function isFinal(status: RunStatus): boolean {
   return FINAL_STATUSES.has(status)
@@ -49,12 +54,15 @@ export class RegistryImpl implements Registry {
   private readonly loader?: () => RunRecord[]
   private readonly throttleMs: number
   private readonly now: () => number
+  private readonly bootID?: string
 
   constructor(init: RegistryInit) {
     this.persist = init.persist
     this.loader = init.loader
     this.throttleMs = init.throttleMs ?? 1000
     this.now = init.now ?? Date.now
+    this.bootID = init.bootID
+    if (this.bootID) runtimeOwners.set(this.bootID, this)
   }
 
   // ------------------------------------------------------------------
@@ -62,6 +70,8 @@ export class RegistryImpl implements Registry {
   // ------------------------------------------------------------------
 
   create(init: {
+    directory?: string
+    projectID?: string
     parentSessionID: string
     parentAgent?: string
     script: string
@@ -73,6 +83,8 @@ export class RegistryImpl implements Registry {
     let id = randomRunID()
     while (this.runs.has(id)) id = randomRunID()
     const record: RunRecord = {
+      ...(init.directory ? { directory: init.directory } : {}),
+      ...(init.projectID ? { projectID: init.projectID } : {}),
       id,
       parentSessionID: init.parentSessionID,
       parentAgent: init.parentAgent,
@@ -221,11 +233,11 @@ export class RegistryImpl implements Registry {
   // ------------------------------------------------------------------
 
   /**
-   * Seed the registry from persisted records and flip any
-   * `running|stopping|paused` run to `interrupted` with stopReason
-   * "server restart" (no auto-replay).
-   * Returns the number of flipped runs (interface types it as void; the
-   * concrete count is useful for callers/tests).
+   * Seed the registry from persisted records. Owner-less records (legacy) still
+   * flip `running|stopping|paused` → `interrupted` with stopReason
+   * "server restart". Records with a proven live owner in this process share
+   * that owner's record, so completion remains visible across location loads.
+   * Returns the number of flipped runs.
    */
   reconcileOrphans(): number {
     if (!this.loader) return 0
@@ -236,9 +248,17 @@ export class RegistryImpl implements Registry {
       return 0
     }
     let flipped = 0
+    const now = this.now()
     for (const raw of persisted) {
       if (typeof raw?.id !== "string" || typeof raw.status !== "string") continue
       if (this.runs.has(raw.id)) continue // live state wins (not reachable at startup)
+      const liveOwner = raw.owner?.bootID ? runtimeOwners.get(raw.owner.bootID) : undefined
+      const liveRecord = liveOwner && liveOwner !== this ? liveOwner.get(raw.id) : undefined
+      if (liveRecord) {
+        // Share the actual record, not a clone that will never receive completion.
+        this.runs.set(raw.id, liveRecord)
+        continue
+      }
       const record: RunRecord = {
         ...raw,
         agents: Array.isArray(raw.agents) ? raw.agents.map((a) => ({ ...a })) : [],
@@ -247,7 +267,7 @@ export class RegistryImpl implements Registry {
       if (isActiveRunStatus(record.status)) {
         record.status = "interrupted"
         record.stopReason = "server restart"
-        if (record.endedAt === undefined) record.endedAt = this.now()
+        if (record.endedAt === undefined) record.endedAt = now
         for (const agent of record.agents) {
           if (agent.status === "pending" || agent.status === "running") {
             agent.status = "interrupted"
@@ -271,7 +291,7 @@ export class RegistryImpl implements Registry {
   // ------------------------------------------------------------------
 
   /** Immediately persist the current record state for a run. */
-  private persistNow(runID: string): void {
+  persistNow(runID: string): void {
     let state = this.throttles.get(runID)
     if (!state) {
       state = { lastPersist: 0, dirty: false }
@@ -285,6 +305,9 @@ export class RegistryImpl implements Registry {
     state.dirty = false
     const record = this.runs.get(runID)
     if (record) {
+      if (this.bootID) {
+        record.owner = { bootID: this.bootID, updatedAt: this.now() }
+      }
       try {
         this.persist(record)
       } catch {
@@ -329,6 +352,7 @@ export class RegistryImpl implements Registry {
 
   /** Clear pending timers without flushing (plugin unload). */
   dispose(): void {
+    if (this.bootID && runtimeOwners.get(this.bootID) === this) runtimeOwners.delete(this.bootID)
     for (const state of this.throttles.values()) {
       if (state.timer) {
         clearTimeout(state.timer)

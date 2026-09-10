@@ -160,6 +160,38 @@ test("agent runner: maxAgents cap rejects with cap message", async () => {
   void registry
 })
 
+test("agent runner: ninth call stays queued at configured concurrency 8", async () => {
+  const { runner, calls } = makeRunner({ concurrency: 8 })
+  const promises = Array.from({ length: 9 }, (_, i) => runner.call(`p${i}`))
+  await tick()
+  assert.equal(calls.length, 8)
+  assert.equal(runner.inFlight, 8)
+  assert.equal(runner.queued, 1)
+  calls[0]!.resolve(okResult("ses_0"))
+  await promises[0]
+  await tick()
+  assert.equal(calls.length, 9)
+  assert.equal(runner.queued, 0)
+  for (let i = 1; i < 9; i++) calls[i]!.resolve(okResult(`ses_${i}`))
+  await Promise.all(promises)
+})
+
+test("agent runner: concurrency 64 clamps to semaphore 8 (ninth queued)", async () => {
+  const { runner, calls } = makeRunner({ concurrency: 64 })
+  const promises = Array.from({ length: 9 }, (_, i) => runner.call(`p${i}`))
+  await tick()
+  assert.equal(calls.length, 8)
+  assert.equal(runner.inFlight, 8)
+  assert.equal(runner.queued, 1)
+  calls[0]!.resolve(okResult("ses_0"))
+  await promises[0]
+  await tick()
+  assert.equal(calls.length, 9)
+  assert.equal(runner.queued, 0)
+  for (let i = 1; i < 9; i++) calls[i]!.resolve(okResult(`ses_${i}`))
+  await Promise.all(promises)
+})
+
 test("agent runner: concurrency limits in-flight, queue drains FIFO", async () => {
   const { runner, calls } = makeRunner({ concurrency: 1 })
   const p1 = runner.call("one")

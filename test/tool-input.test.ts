@@ -3,7 +3,12 @@
  */
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { MAX_ARGS_BYTES, MAX_SCRIPT_BYTES, validateToolInput } from "../src/tool-input.ts"
+import {
+  MAX_ARGS_BYTES,
+  MAX_SCRIPT_BYTES,
+  validateStatusToolInput,
+  validateToolInput,
+} from "../src/tool-input.ts"
 
 type ValidInput = Extract<ReturnType<typeof validateToolInput>, { ok: true }>
 
@@ -72,6 +77,21 @@ test("saved: minimal workflow-only input", () => {
 test("saved: workflow + args", () => {
   const { input } = ok({ workflow: "code-audit", args: { modules: ["a", "b"] } })
   assert.deepEqual(input, { workflow: "code-audit", args: { modules: ["a", "b"] } })
+})
+
+test("inline: background true/false accepted; non-boolean rejected", () => {
+  assert.deepEqual(ok({ script: "return 1", background: true }).input, { script: "return 1", background: true })
+  assert.deepEqual(ok({ script: "return 1", background: false }).input, { script: "return 1", background: false })
+  assert.deepEqual(ok({ script: "return 1" }).input, { script: "return 1" })
+  bad({ script: "return 1", background: "true" }, /"background" must be a boolean/)
+  bad({ script: "return 1", background: 1 }, /"background" must be a boolean/)
+  bad({ script: "return 1", background: null }, /"background" must be a boolean/)
+})
+
+test("saved: background true/false accepted; non-boolean rejected", () => {
+  assert.deepEqual(ok({ workflow: "x", background: true }).input, { workflow: "x", background: true })
+  assert.deepEqual(ok({ workflow: "x", background: false }).input, { workflow: "x", background: false })
+  bad({ workflow: "x", background: "yes" }, /"background" must be a boolean/)
 })
 
 test("saved: confirm field is rejected (trust gate replaced the old hash bypass)", () => {
@@ -188,4 +208,20 @@ test("args containing non-JSON values is rejected", () => {
 test("multi-byte characters count as bytes, not chars", () => {
   // "é" is 2 UTF-8 bytes — 300k chars => 600k bytes => over the 512 KB cap.
   bad({ script: "é".repeat(300_000) }, /"script" is too large/)
+})
+
+test("status tool input: omitted, runID, extras, wrong types", () => {
+  assert.deepEqual(validateStatusToolInput(undefined), { ok: true })
+  assert.deepEqual(validateStatusToolInput(null), { ok: true })
+  assert.deepEqual(validateStatusToolInput({}), { ok: true })
+  assert.deepEqual(validateStatusToolInput({ runID: "run_abc" }), { ok: true, runID: "run_abc" })
+  const extra = validateStatusToolInput({ runID: "run_abc", extra: 1 })
+  assert.equal(extra.ok, false)
+  if (!extra.ok) assert.match(extra.error, /unexpected key "extra"/)
+  const badType = validateStatusToolInput({ runID: 1 })
+  assert.equal(badType.ok, false)
+  if (!badType.ok) assert.match(badType.error, /"runID" must be a non-empty string/)
+  const empty = validateStatusToolInput({ runID: "" })
+  assert.equal(empty.ok, false)
+  if (!empty.ok) assert.match(empty.error, /empty string/)
 })

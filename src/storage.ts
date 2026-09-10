@@ -27,7 +27,8 @@
  * ancestor chain against the project root (symlink escape => fail closed).
  */
 import { createHash } from "node:crypto"
-import type { FsLike, Json, KvLike, RunRecord, SavedWorkflow, SavedWorkflowManifest, Storage } from "./types.ts"
+import type { FsLike, Json, KvLike, RunRecord, SavedWorkflow, SavedWorkflowManifest, SettingsOverlayLike, Storage } from "./types.ts"
+import { parseSettingsOverlay } from "./settings.ts"
 
 export interface StorageInit {
   kv: KvLike
@@ -176,13 +177,20 @@ export class StorageImpl implements Storage {
   private readonly kv: KvLike
   private readonly fs: FsLike
   private readonly projectRoot: string
+  private readonly projectID: string
   private readonly projectWorkflowDir: string
   private readonly personalWorkflowDir: string
   private readonly runsArtifactDir: string
   private readonly runsPrefix: string
   private readonly resultsPrefix: string
   private readonly trustPrefix: string
+  private readonly settingsKey: string
+  private settingsCache: SettingsOverlayLike | undefined
   private runsCache: RunRecord[] = []
+  private persistFailures = 0
+  private scanFailures = 0
+  private lastPersistError: string | undefined
+  private lastScanError: string | undefined
   private workflowCache = new Map<string, CachedWorkflow>()
   private resultCache = new Map<string, Json>()
   /** name -> approved sha256 digest of the script (KV-backed, cache-loaded). */
@@ -192,6 +200,7 @@ export class StorageImpl implements Storage {
     this.kv = init.kv
     this.fs = init.fs
     this.projectRoot = normalizePath(init.projectRoot)
+    this.projectID = init.projectID
     this.projectWorkflowDir = joinInside(this.projectRoot, ".opencode/workflows", "project workflow dir")
     this.personalWorkflowDir = normalizePath(init.personalWorkflowDir)
     this.runsArtifactDir = joinInside(this.projectWorkflowDir, "runs", "runs artifact dir")
@@ -199,19 +208,41 @@ export class StorageImpl implements Storage {
     this.runsPrefix = `runs/${pid}`
     this.resultsPrefix = `results/${pid}`
     this.trustPrefix = `trust/${pid}`
+    this.settingsKey = `settings/${pid}`
   }
 
   // ------------------------------------------------------------------
   // Run snapshots (KV, project-scoped)
   // ------------------------------------------------------------------
 
-  /** Persist a run snapshot. Fire-and-forget; throw-safe. */
+  /** Persist a run snapshot. Fire-and-forget; throw-safe. Failures are counted for /ultracode doctor. */
   saveRun(record: RunRecord): void {
     this.upsertRunsCache(record)
     try {
-      void this.kv.set(`${this.runsPrefix}/${record.id}`, toJson(record)).catch(() => {})
-    } catch {
-      // throw-safe by contract
+      void this.kv.set(`${this.runsPrefix}/${record.id}`, toJson(record)).catch((err) => {
+        this.notePersistError(err)
+      })
+    } catch (err) {
+      this.notePersistError(err)
+    }
+  }
+
+  kvDiagnostics(): {
+    projectRoot: string
+    projectID: string
+    persistedRunCount: number
+    kvErrorCount: number
+    lastKvError?: string
+    runsPrefix: string
+  } {
+    const lastKvError = this.lastPersistError ?? this.lastScanError
+    return {
+      projectRoot: this.projectRoot,
+      projectID: this.projectID,
+      persistedRunCount: this.runsCache.length,
+      kvErrorCount: this.persistFailures + this.scanFailures,
+      lastKvError,
+      runsPrefix: this.runsPrefix,
     }
   }
 
@@ -232,6 +263,30 @@ export class StorageImpl implements Storage {
   /** Snapshot of runs known to this process (after loadRunsAsync / saveRun). */
   loadRuns(): RunRecord[] {
     return [...this.runsCache]
+  }
+
+  loadSettingsOverlay(): SettingsOverlayLike | undefined {
+    return this.settingsCache
+  }
+
+  async loadSettingsOverlayAsync(): Promise<SettingsOverlayLike | undefined> {
+    try {
+      const raw = await this.kv.get(this.settingsKey)
+      const overlay = parseSettingsOverlay(raw)
+      this.settingsCache = overlay
+      return overlay
+    } catch {
+      return this.settingsCache
+    }
+  }
+
+  saveSettingsOverlay(overlay: SettingsOverlayLike): void {
+    this.settingsCache = { ...overlay }
+    try {
+      void this.kv.set(this.settingsKey, toJson(overlay)).catch(() => {})
+    } catch {
+      // throw-safe by contract
+    }
   }
 
   // ------------------------------------------------------------------
@@ -435,26 +490,52 @@ export class StorageImpl implements Storage {
       hash: sha256(script),
       source,
       savedAt: Date.now(),
-      savedFromRunID: manifest.savedFromRunID,
+    }
+    if (typeof manifest.savedFromRunID === "string" && manifest.savedFromRunID.length > 0) {
+      full.savedFromRunID = manifest.savedFromRunID
     }
     const scriptPath = joinInside(dir, `${name}.js`, "workflow script")
     const manifestPath = joinInside(dir, `${name}.json`, "workflow manifest")
     // Shared lstat-aware containment (symlink escapes and dangling links fail
     // closed). Trusted anchor: project root for project saves, the personal
-    // config dir's parent for personal saves.
+    // config dir's parent for personal saves. Write resolved.path (not the
+    // lexical target) so a symlink swapped after the check is not followed.
     const anchor = source === "project" ? this.projectRoot : dirnameNormalized(this.personalWorkflowDir)
-    for (const target of [scriptPath, manifestPath]) {
-      const resolved = await resolveContainedPath(this.fs, anchor, target)
-      if (!resolved.ok) {
-        throw new StorageError(`refusing to write workflow "${name}": ${resolved.error}`)
-      }
+    const resolvedScript = await resolveContainedPath(this.fs, anchor, scriptPath)
+    if (!resolvedScript.ok) {
+      throw new StorageError(`refusing to write workflow "${name}": ${resolvedScript.error}`)
+    }
+    const resolvedManifest = await resolveContainedPath(this.fs, anchor, manifestPath)
+    if (!resolvedManifest.ok) {
+      throw new StorageError(`refusing to write workflow "${name}": ${resolvedManifest.error}`)
     }
     await this.mkdir(dir)
-    await this.fs.writeFile(scriptPath, script)
-    await this.fs.writeFile(manifestPath, JSON.stringify(full, null, 2) + "\n")
+    await this.fs.writeFile(resolvedScript.path, script)
+    await this.fs.writeFile(resolvedManifest.path, JSON.stringify(full, null, 2) + "\n")
     const workflow: SavedWorkflow = { manifest: full, script }
     this.workflowCache.set(name, { workflow, nameMismatch: false })
     return workflow
+  }
+
+  /**
+   * Contained source read of `<project>/.opencode/workflows/<name>.js` before
+   * any write, then the existing write pair. Manifest omits `savedFromRunID`.
+   * Does not auto-trust; a changed hash leaves `workflowTrustState` untrusted.
+   */
+  async saveWorkflowFromFile(name: string): Promise<SavedWorkflow> {
+    requireValidWorkflowName(name)
+    const scriptPath = joinInside(this.projectWorkflowDir, `${name}.js`, "workflow script")
+    const resolved = await resolveContainedPath(this.fs, this.projectRoot, scriptPath)
+    if (!resolved.ok) {
+      throw new StorageError(`refusing to read workflow "${name}": ${resolved.error}`)
+    }
+    let script: string
+    try {
+      script = await this.fs.readFile(resolved.path)
+    } catch (err) {
+      throw new StorageError(`workflow "${name}" not found (${name}.js): ${errText(err)}`)
+    }
+    return this.saveWorkflow(name, script, { name, source: "project" })
   }
 
   // ------------------------------------------------------------------
@@ -470,7 +551,8 @@ export class StorageImpl implements Storage {
       let result: { entries: ReadonlyArray<{ key: string; value: Json }>; next?: string }
       try {
         result = await this.kv.scan({ prefix, after, limit: 1000 })
-      } catch {
+      } catch (err) {
+        this.noteScanError(err)
         break
       }
       for (const entry of result?.entries ?? []) out.push(entry)
@@ -489,6 +571,16 @@ export class StorageImpl implements Storage {
       if (typeof entry.value === "string") digests.set(name, entry.value)
     }
     this.trustDigests = digests
+  }
+
+  private notePersistError(err: unknown): void {
+    this.persistFailures++
+    this.lastPersistError = err instanceof Error ? err.message : String(err)
+  }
+
+  private noteScanError(err: unknown): void {
+    this.scanFailures++
+    this.lastScanError = err instanceof Error ? err.message : String(err)
   }
 
   private async mkdir(dir: string): Promise<void> {

@@ -5,6 +5,7 @@
  */
 import test from "node:test"
 import assert from "node:assert/strict"
+import { readFileSync } from "node:fs"
 import {
   D2_VERBS,
   TOOL_DESCRIPTION,
@@ -70,6 +71,18 @@ test("helpText lists exactly the D2 verb set", () => {
   const listed = verbsListedInHelp()
   assert.deepEqual(new Set(listed), new Set(D2_VERBS))
   assert.equal(listed.length, D2_VERBS.length, "each D2 verb listed once")
+})
+
+test("palette command description lists D2 verbs including set and settings", () => {
+  const src = readFileSync(new URL("../src/index.ts", import.meta.url), "utf8")
+  assert.match(src, /D2_VERBS\.join/)
+  assert.ok(D2_VERBS.includes("set"))
+  assert.ok(D2_VERBS.includes("settings"))
+  const description = `Inspect and manage ultracode workflow runs (${D2_VERBS.join(", ")})`
+  assert.match(description, /\bset\b/)
+  assert.match(description, /\bsettings\b/)
+  assert.match(helpText(), /\/ultracode set /)
+  assert.match(helpText(), /\/ultracode settings /)
 })
 
 test("tool description names every primitive and stays within the line cap", () => {

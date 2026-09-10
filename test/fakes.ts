@@ -16,6 +16,7 @@ import type {
   SavedWorkflow,
   SavedWorkflowManifest,
   SessionCtx,
+  SettingsOverlayLike,
   Storage,
   TokenUsage,
   WorkflowMeta,
@@ -493,6 +494,11 @@ export class FakeRegistry implements Registry {
       }
     }
   }
+
+  persistNow(runID: string): void {
+    const run = this.runs.get(runID)
+    if (run) this.saveCalls.push(run)
+  }
 }
 
 /** Tiny event-feed helper for run-events tests. */
@@ -568,5 +574,25 @@ export class FakeStorage implements Storage {
     }
     this.workflows.set(name, saved)
     return saved
+  }
+
+  async saveWorkflowFromFile(name: string): Promise<SavedWorkflow> {
+    const existing = this.workflows.get(name)
+    if (!existing) throw new Error(`workflow "${name}" not found`)
+    return this.saveWorkflow(name, existing.script, { name, source: "project" })
+  }
+
+  settingsOverlay: SettingsOverlayLike | undefined
+
+  loadSettingsOverlay(): SettingsOverlayLike | undefined {
+    return this.settingsOverlay
+  }
+
+  async loadSettingsOverlayAsync(): Promise<SettingsOverlayLike | undefined> {
+    return this.settingsOverlay
+  }
+
+  saveSettingsOverlay(overlay: SettingsOverlayLike): void {
+    this.settingsOverlay = { ...overlay }
   }
 }

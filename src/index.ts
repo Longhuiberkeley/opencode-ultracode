@@ -11,25 +11,47 @@
  *  - ctx.agent.list() returns { location, data } — unwrap .data
  *  - tool executor 2nd arg: { sessionID, agent, messageID, id, progress }
  */
-import { Plugin } from "@opencode/plugin"
+import { Plugin, Rpc } from "@opencode/plugin"
 import type { Skill } from "@opencode/plugin"
 import { promises as fsp } from "node:fs"
 import { homedir } from "node:os"
 import { fileURLToPath } from "node:url"
 import {
+  D2_VERBS,
+  PLUGIN_VERSION,
   TOOL_DESCRIPTION,
+  executeWorkflowLaunch,
   feedToolEvent,
+  formatDoctorReport,
   handleUltracodeCommand,
   matchesUltracodeKeyword,
   prepareRunLaunch,
+  resolveRunStatus,
 } from "./command.ts"
 import { loadOptions } from "./config.ts"
+import {
+  applyOverlay,
+  capturedFromRecord,
+  panelSettingsFrom,
+  evaluateOwnedPermission,
+  type SettingsOverlay,
+} from "./settings.ts"
+import { ULTRACODE_RPC } from "./rpc-definition.ts"
+import { steerRun } from "./steer.ts"
+import {
+  agentStatusKey,
+  collectRunStatus,
+  hasRpcRegister,
+  isFinalRunStatus,
+  runStateTransition,
+  settingsPayload,
+} from "./run-status.ts"
 import { lookupAgentPin, parseModelPin } from "./agent-pins.ts"
 import { RegistryImpl } from "./registry.ts"
 import { emptyToolEventState } from "./run-events.ts"
 import { EMPTY_CATALOG, SKILL_CONTENT, SKILL_DESCRIPTION, SKILL_NAME, buildSkillContent } from "./skill-content.ts"
-import { StorageImpl, normalizePath, resolveContainedPath } from "./storage.ts"
-import { validateToolInput } from "./tool-input.ts"
+import { StorageImpl, normalizePath, resolveContainedPath, sha256 } from "./storage.ts"
+import { validateStatusToolInput, validateToolInput } from "./tool-input.ts"
 import type {
   FsLike,
   Json,
@@ -49,6 +71,20 @@ interface RegistrationLike {
 // Small helpers
 // ---------------------------------------------------------------------------
 
+const loadedByProject = new Map<string, string[]>()
+
+function randomBootID(): string {
+  return `boot_${Math.random().toString(36).slice(2, 10)}${Date.now().toString(36)}`
+}
+
+function pluginInstallDir(): string {
+  try {
+    return fileURLToPath(new URL("..", import.meta.url))
+  } catch {
+    return "(unknown)"
+  }
+}
+
 function warn(message: string, err?: unknown): void {
   try {
     const detail = err === undefined ? "" : `: ${err instanceof Error ? err.message : String(err)}`
@@ -66,9 +102,6 @@ function describeError(err: unknown): string {
     return String(err)
   }
 }
-
-/** Permission actions treated as "edits" (spike: exact names unverified — keep small + code-local). */
-const EDIT_ACTIONS: ReadonlySet<string> = new Set(["edit", "write"])
 
 /** Unwrap a list response that is either a bare array or a { location, data } envelope. */
 function unwrapList(result: unknown): unknown[] {
@@ -109,6 +142,11 @@ const WORKFLOW_TOOL_INPUT_SCHEMA: Record<string, unknown> = {
           },
         },
         args: { description: "JSON value exposed to the script as `args` (max 64 KB serialized)." },
+        background: {
+          type: "boolean",
+          description:
+            "If true, return immediately after admission with { runID, status: \"running\", hint }. Default false waits for the envelope. The calling agent is not auto-woken on completion.",
+        },
       },
     },
     {
@@ -121,9 +159,25 @@ const WORKFLOW_TOOL_INPUT_SCHEMA: Record<string, unknown> = {
           description: "Saved workflow name (see /ultracode for the list; project dir beats personal dir). Trusted via /ultracode trust <name>.",
         },
         args: { description: "JSON value exposed to the script as `args` (max 64 KB serialized)." },
+        background: {
+          type: "boolean",
+          description:
+            "If true, return immediately after admission with { runID, status: \"running\", hint }. Default false waits for the envelope. The calling agent is not auto-woken on completion.",
+        },
       },
     },
   ],
+}
+
+const STATUS_TOOL_INPUT_SCHEMA: Record<string, unknown> = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    runID: {
+      type: "string",
+      description: "Run id to inspect. Omit to use the single active run; none or many active runs is an error listing ids.",
+    },
+  },
 }
 
 /** ~500ms-throttled, never-throwing wrapper over tool.progress({ status }). */
@@ -169,8 +223,9 @@ export default Plugin.define({
   id: "ultracode",
   async setup(ctx) {
     // ---- options ----
-    const { options, warnings } = loadOptions(ctx.options)
-    for (const w of warnings) warn(`config warning — ${w}`)
+    const loaded = loadOptions(ctx.options)
+    const baseOptions = loaded.options
+    for (const w of loaded.warnings) warn(`config warning — ${w}`)
 
     let disposed = false
     // Instance-local skill state: the prompt hook must never push an
@@ -182,8 +237,20 @@ export default Plugin.define({
     // ---- capabilities (plain interfaces; everything stays node-testable) ----
     const projectRoot = normalizePath(String(ctx.location?.project?.directory ?? process.cwd()))
     const projectID = String(ctx.location?.project?.id ?? projectRoot)
+    const installDir = pluginInstallDir()
+    const bootID = randomBootID()
     const personalWorkflowDir = normalizePath(
       `${process.env["HOME"] ?? homedir()}/.config/opencode/workflows`,
+    )
+    const prevLoads = loadedByProject.get(projectID) ?? []
+    let duplicateWarning: string | undefined
+    if (prevLoads.length > 0) {
+      duplicateWarning = `duplicate ultracode setup() for project ${projectID}: already loaded from ${prevLoads.join(", ")}; now ${installDir}`
+      warn(duplicateWarning)
+    }
+    loadedByProject.set(projectID, [...prevLoads, installDir])
+    warn(
+      `loaded v${PLUGIN_VERSION} installDir=${installDir} projectRoot=${projectRoot} projectID=${projectID} bootID=${bootID}`,
     )
 
     const kv: KvLike = {
@@ -264,9 +331,43 @@ export default Plugin.define({
     }
 
     const storage = new StorageImpl({ kv, fs, projectRoot, personalWorkflowDir, projectID })
+    const emitPrev = new Map<string, { status: string; agentKey: string }>()
+    let emitRunState:
+      | ((
+          name: "runState",
+          data: {
+            runID: string
+            status: string
+            reason?: string
+            parentSessionID?: string
+            projectID?: string
+            directory?: string
+            runningCount?: number
+          },
+        ) => Promise<void>)
+      | undefined
     const registry = new RegistryImpl({
-      persist: (record) => storage.saveRun(record),
+      persist: (record) => {
+        storage.saveRun(record)
+        const prev = emitPrev.get(record.id)
+        const event = runStateTransition(prev, record)
+        if (isFinalRunStatus(record.status)) emitPrev.delete(record.id)
+        else emitPrev.set(record.id, { status: record.status, agentKey: agentStatusKey(record.agents) })
+        const emit = emitRunState
+        if (event && emit) {
+          let runningCount = 0
+          for (const agent of record.agents) if (agent.status === "running") runningCount++
+          void emit("runState", {
+            ...event,
+            parentSessionID: record.parentSessionID,
+            projectID,
+            directory: record.directory ?? ctx.location.directory,
+            runningCount,
+          }).catch(() => {})
+        }
+      },
       loader: () => storage.loadRuns(),
+      bootID,
     })
 
     const controller = new AbortController()
@@ -280,6 +381,27 @@ export default Plugin.define({
         if (flipped > 0) warn(`marked ${flipped} orphaned run(s) as interrupted (server restart)`)
       })
       .catch((err) => warn("failed to reconcile persisted runs", err))
+
+    void (async () => {
+      try {
+        const hbKey = `instance/${sha256(projectID).slice(0, 16)}`
+        const prev = await kv.get(hbKey)
+        if (prev && typeof prev === "object" && !Array.isArray(prev)) {
+          const rec = prev as { installDir?: unknown; bootID?: unknown; startedAt?: unknown }
+          const otherDir = typeof rec.installDir === "string" ? rec.installDir : undefined
+          const startedAt = typeof rec.startedAt === "number" ? rec.startedAt : 0
+          const fresh = Date.now() - startedAt < 15 * 60 * 1000
+          if (fresh && otherDir && otherDir !== installDir) {
+            const msg = `another ultracode instance is live for this project (installDir=${otherDir} bootID=${String(rec.bootID)}; this load is ${installDir} bootID=${bootID})`
+            duplicateWarning = duplicateWarning ? `${duplicateWarning}; ${msg}` : msg
+            warn(msg)
+          }
+        }
+        await kv.set(hbKey, { installDir, bootID, startedAt: Date.now(), projectRoot })
+      } catch (err) {
+        warn("instance heartbeat write failed", err)
+      }
+    })()
 
     // ---- agent availability (fresh per invocation; failures fail the run) ----
     async function listAgents(): Promise<
@@ -339,9 +461,24 @@ export default Plugin.define({
       }
     }
 
+    let overlay: SettingsOverlay = {}
+    try {
+      overlay = (await storage.loadSettingsOverlayAsync()) ?? {}
+    } catch {
+      overlay = {}
+    }
+    let options = applyOverlay(baseOptions, overlay)
+
     // ---- supervisor (Builder B module; guarded dynamic import) ----
     let supervisor: Supervisor | undefined
     let supervisorError: string | undefined
+
+    const refreshDefaults = (nextOverlay: SettingsOverlay): typeof options => {
+      overlay = nextOverlay
+      options = applyOverlay(baseOptions, overlay)
+      supervisor?.updateDefaults(options)
+      return options
+    }
     try {
       const mod = await import("./supervisor.ts")
       // Composition seam (Builder B): workflow() bridge calls go through this
@@ -444,7 +581,9 @@ export default Plugin.define({
                     return {
                       content:
                         `error: workflow "${input.workflow}" not found.` +
-                        (available ? ` Saved workflows: ${available}.` : " No saved workflows exist yet — run one inline, then use /ultracode save <runID> <name>."),
+                        (available
+                          ? ` Saved workflows: ${available}.`
+                          : " No saved workflows exist yet — author `.opencode/workflows/<name>.js` then `/ultracode save <name>` (or `/ultracode save <runID> <name>` after a run)."),
                     }
                   }
                   script = saved.script
@@ -473,14 +612,20 @@ export default Plugin.define({
                 await maybeInjectCatalog(prep.agents)
 
                 const parent: ParentContext = {
+                  directory: ctx.location.directory,
+                  projectID,
                   sessionID: tool.sessionID,
                   agent: tool.agent,
                   messageID: tool.messageID,
                   report: makeReporter(tool.progress as (update: Record<string, unknown>) => Promise<void>),
                   availableAgents: prep.availableAgents,
                 }
-                const outcome = await supervisor.start({ script, meta, args, name, workflowName }, parent)
-                return { content: JSON.stringify(outcome.envelope, null, 1) }
+                return await executeWorkflowLaunch(
+                  supervisor,
+                  { script, meta, args, name, workflowName },
+                  parent,
+                  input.background === true,
+                )
               } catch (err) {
                 return { content: `error: workflow run failed — ${describeError(err)}` }
               }
@@ -489,6 +634,55 @@ export default Plugin.define({
         } catch (err) {
           warn("failed to register the ultracode_run tool", err)
         }
+        try {
+          editor.add({
+            name: "status",
+            options: { namespace: "ultracode" },
+            description:
+              "Read-only status of an ultracode run (registry lookup). Input { runID? }. Returns { runID, status, agents: { done, total, failed }, startedAt }.",
+            input: STATUS_TOOL_INPUT_SCHEMA,
+            execute: async (rawInput: unknown, tool) => {
+              try {
+                const parsed = validateStatusToolInput(rawInput)
+                if (!parsed.ok) return { content: `error: ${parsed.error}` }
+                const active = (supervisor?.activeRuns() ?? registry.activeRuns()).filter((r) => r.parentSessionID === tool.sessionID)
+                if (parsed.runID && registry.get(parsed.runID)?.parentSessionID !== tool.sessionID) {
+                  return { content: "error: run does not belong to this conversation" }
+                }
+                const resolved = resolveRunStatus(registry, parsed.runID ?? "", active)
+                if (!resolved.ok) return { content: `error: ${resolved.error}` }
+                const record = registry.get(resolved.payload.runID)
+                const children = await Promise.all((record?.agents ?? []).filter((a) => a.status === "running" && a.sessionID).map(async (a) => ({
+                  agentID: a.id, sessionID: a.sessionID, label: a.label,
+                  waitingForPermission: await pendingPermissions(a.sessionID!),
+                })))
+                return { content: JSON.stringify({ ...resolved.payload, children }) }
+              } catch (err) {
+                return { content: `error: ${describeError(err)}` }
+              }
+            },
+          })
+        } catch (err) {
+          warn("failed to register the ultracode_status tool", err)
+        }
+        editor.add({
+          name: "steer",
+          options: { namespace: "ultracode" },
+          description: "Send a user adjustment to a running workflow child without stopping the workflow. Only runs owned by this conversation. Specify agentID when several children are running. Does not restart completed children. Use background:true when launching to keep this conversation available.",
+          input: {
+            type: "object", additionalProperties: false, required: ["runID", "text"],
+            properties: { runID: { type: "string" }, agentID: { type: "string" }, text: { type: "string", minLength: 1, maxLength: 65536 } },
+          },
+          execute: async (raw, tool) => {
+            try {
+              const input = raw as { runID: string; text: string; agentID?: string }
+              const target = await steerRun(registry.get(input.runID), tool.sessionID, input, (request) => ctx.session.prompt(request))
+              return { content: JSON.stringify({ ...target, accepted: true, delivery: "steer" }) }
+            } catch (error) {
+              return { content: `error: ${describeError(error)}` }
+            }
+          },
+        })
       })
     } catch (err) {
       warn("tool transform failed — ultracode_run not registered", err)
@@ -513,6 +707,12 @@ export default Plugin.define({
           },
           listAgents,
           defaultAgent: options.agent,
+          nextRunSettings: () => panelSettingsFrom(options),
+          persistAndRefreshSettings: async (nextOverlay) => {
+            storage.saveSettingsOverlay(nextOverlay)
+            const next = refreshDefaults(nextOverlay)
+            return panelSettingsFrom(next)
+          },
         })
       } catch (err) {
         warn("/ultracode command failed", err)
@@ -524,8 +724,7 @@ export default Plugin.define({
         try {
           editor.add({
             name: "ultracode",
-            description:
-              "Inspect and manage ultracode workflow runs (show, result, stop, pause, resume, rerun, save, trust, untrust, help)",
+            description: `Inspect and manage ultracode workflow runs (${D2_VERBS.join(", ")})`,
             execute: commandHandler,
           })
         } catch (err) {
@@ -534,6 +733,64 @@ export default Plugin.define({
       })
     } catch (err) {
       warn("command transform failed — /ultracode not registered", err)
+    }
+
+    // ---- optional RPC channel (capability-gated; unconfirmed on pinned probe) ----
+    try {
+      const rpc = (ctx as { rpc?: { register?: unknown } }).rpc
+      if (hasRpcRegister(rpc)) {
+        const defined = typeof Rpc.define === "function" ? Rpc.define(ULTRACODE_RPC as never) : ULTRACODE_RPC
+        const registration = await (
+          rpc as {
+            register: (
+              definition: unknown,
+              handlers: unknown,
+            ) => Promise<{ events?: { emit?: (...args: unknown[]) => unknown }; dispose?: () => void }>
+          }
+        ).register(defined, {
+          runStatus: async (input: {
+            runID?: string
+            sessionID?: string
+            limit?: number
+            includeFinished?: boolean
+          } | undefined) => {
+            await runsReconciled
+            const runID = typeof input?.runID === "string" && input.runID !== "" ? input.runID : undefined
+            const sessionID = typeof input?.sessionID === "string" && input.sessionID !== "" ? input.sessionID : undefined
+            const limit = typeof input?.limit === "number" && Number.isFinite(input.limit) ? input.limit : undefined
+            const includeFinished = typeof input?.includeFinished === "boolean" ? input.includeFinished : undefined
+            return {
+              runs: collectRunStatus({
+                runID,
+                sessionID,
+                limit,
+                includeFinished,
+                liveGet: (id) => registry.get(id),
+                liveList: () => registry.listRecent(100),
+                persistedList: () => storage.loadRuns(),
+                projectID,
+                directory: ctx.location.directory,
+              }),
+            }
+          },
+          settings: async (input: { runID?: string } | undefined) => {
+            const overlayNow = panelSettingsFrom(options)
+            const runID = typeof input?.runID === "string" && input.runID !== "" ? input.runID : undefined
+            const live = runID ? registry.get(runID) : undefined
+            const persisted = runID ? storage.loadRuns().find((r) => r.id === runID) : undefined
+            return settingsPayload(overlayNow, runID, capturedFromRecord(live ?? persisted))
+          },
+        })
+        const emit = registration?.events?.emit
+        if (typeof emit === "function") {
+          emitRunState = (name, data) => Promise.resolve(emit(name, data)).then(() => undefined)
+        }
+        if (registration && typeof registration.dispose === "function") {
+          registrations.push(registration as RegistrationLike)
+        }
+      }
+    } catch (err) {
+      warn("rpc register failed — TUI uses session heuristics", err)
     }
 
     // ---- prompt hook: attach the authoring skill on a standalone "ultracode" keyword ----
@@ -654,68 +911,65 @@ export default Plugin.define({
       warn("event subscribe failed — tool-call counts disabled", err)
     }
 
-    // ---- permission hook (only when NOT delegating every ask to the user) ----
-    if (options.permissions !== "ask") {
-      /**
-       * Symlink-aware containment via the shared lstat resolver: file: URLs
-       * parsed with fileURLToPath (no string slicing), components walked with
-       * lstat, symlinks realpath'd. Resolution failure (dangling link, fs
-       * error, unclassifiable resource) FAILS CLOSED — no auto-allow.
-       */
-      const resourceInsideProject = async (resource: string): Promise<boolean> => {
-        try {
-          let path: string | undefined
-          if (resource.startsWith("file:")) {
-            path = fileURLToPath(new URL(resource))
-          } else if (resource.startsWith("/")) {
-            path = resource
-          } else {
-            return false // relative/opaque — unclassifiable => fail closed
-          }
-          const resolved = await resolveContainedPath(fs, projectRoot, path)
-          return resolved.ok
-        } catch {
-          return false
-        }
-      }
+    // ---- permission hook (always registered; ask delegates to the host) ----
+    /**
+     * Symlink-aware containment via the shared lstat resolver: file: URLs
+     * parsed with fileURLToPath (no string slicing), components walked with
+     * lstat, symlinks realpath'd. Resolution failure (dangling link, fs
+     * error, unclassifiable resource) FAILS CLOSED — no auto-allow.
+     */
+    const resourceInsideProject = async (resource: string): Promise<boolean> => {
       try {
-        const reg = await ctx.permission.hook("evaluate", async (event) => {
-          try {
-            const ev = event as unknown as {
-              sessionID?: string
-              action?: string
-              resources?: ReadonlyArray<string>
-              effect?: string
-              message?: string
-            }
-            const sessionID = ev.sessionID
-            if (typeof sessionID !== "string" || !registry.isOwnedActive(sessionID)) return
-            const action = ev.action
-            if (typeof action !== "string" || !EDIT_ACTIONS.has(action)) return
-
-            if (options.permissions === "autoEditsWorkflow") {
-              const resources = Array.isArray(ev.resources) ? ev.resources : []
-              if (resources.length === 0) return
-              const inside = await Promise.all(resources.map((r) => (typeof r === "string" ? resourceInsideProject(r) : Promise.resolve(false))))
-              if (!inside.every(Boolean)) return
-              // The async fs checks above open a window where the run could
-              // have finalized — re-verify active ownership immediately
-              // before allowing.
-              if (!registry.isOwnedActive(sessionID)) return
-              ev.effect = "allow"
-              return
-            }
-            // noEditTools: workflow children never edit, regardless of path.
-            ev.effect = "deny"
-            ev.message = "workflow run is in noEditTools mode"
-          } catch {
-            // never throw from a permission hook
-          }
-        })
-        registrations.push(reg as unknown as RegistrationLike)
-      } catch (err) {
-        warn("permission hook registration failed — child edits will use normal permission flow", err)
+        let path: string | undefined
+        if (resource.startsWith("file:")) {
+          path = fileURLToPath(new URL(resource))
+        } else if (resource.startsWith("/")) {
+          path = resource
+        } else {
+          return false // relative/opaque — unclassifiable => fail closed
+        }
+        const resolved = await resolveContainedPath(fs, projectRoot, path)
+        return resolved.ok
+      } catch {
+        return false
       }
+    }
+    try {
+      const reg = await ctx.permission.hook("evaluate", async (event) => {
+        try {
+          const ev = event as unknown as {
+            sessionID?: string
+            action?: string
+            resources?: ReadonlyArray<string>
+            effect?: string
+            message?: string
+          }
+          const sessionID = ev.sessionID
+          const decision = evaluateOwnedPermission(ev, registry)
+          if (decision === "skip" || decision === "delegate" || decision === "ignore") return
+
+          if (decision === "contain") {
+            const resources = Array.isArray(ev.resources) ? ev.resources : []
+            if (resources.length === 0) return
+            const inside = await Promise.all(resources.map((r) => (typeof r === "string" ? resourceInsideProject(r) : Promise.resolve(false))))
+            if (!inside.every(Boolean)) return
+            // The async fs checks above open a window where the run could
+            // have finalized — re-verify active ownership immediately
+            // before allowing.
+            if (typeof sessionID !== "string" || !registry.isOwnedActive(sessionID)) return
+            ev.effect = "allow"
+            return
+          }
+          // noEditTools: workflow children never edit, regardless of path.
+          ev.effect = "deny"
+          ev.message = "workflow run is in noEditTools mode"
+        } catch {
+          // never throw from a permission hook
+        }
+      })
+      registrations.push(reg as unknown as RegistrationLike)
+    } catch (err) {
+      warn("permission hook registration failed — child edits will use normal permission flow", err)
     }
 
     // ---- cleanup ----

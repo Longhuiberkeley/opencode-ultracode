@@ -16,6 +16,7 @@ import type {
   Storage,
   WorkflowMeta,
 } from "./types.ts"
+import { clampConcurrency } from "./types.ts"
 import type { SessionDriver } from "./sessions.ts"
 import { AgentCallError } from "./sessions.ts"
 import { validateScriptSource } from "./worker-script.ts"
@@ -150,7 +151,7 @@ export class AgentRunner {
     this.runID = options.runID
     this.defaultAgent = options.defaultAgent
     this.availableAgents = options.availableAgents
-    this.semaphore = new Semaphore(options.concurrency)
+    this.semaphore = new Semaphore(clampConcurrency(options.concurrency))
     this.maxAgents = options.maxAgents
     this.reportFn = options.report
     this.ambientPhase = options.ambientPhase

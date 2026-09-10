@@ -26,6 +26,7 @@ import type {
   WorkflowMeta,
 } from "./types.ts"
 import { addTokens, emptyTokens, isActiveRunStatus } from "./types.ts"
+import { freezeEffective, panelSettingsFrom, remainingTimeoutMs } from "./settings.ts"
 import { buildEnvelope, resultFits } from "./serialize.ts"
 import { createSessionDriver } from "./sessions.ts"
 import type { SessionDriver } from "./sessions.ts"
@@ -98,6 +99,8 @@ interface RunState {
   pausedMs: number
   watchdog: ReturnType<typeof setTimeout> | undefined
   pauseWaiters: PauseWaiter[]
+  /** Immutable copy of effective options for this run. */
+  effective: Required<UltracodeOptions>
 }
 
 type FinalOutcome = {
@@ -136,7 +139,7 @@ export class SupervisorImpl implements Supervisor {
   private readonly registry: Registry
   private readonly storage: Storage
   private readonly sessions: SessionCtx
-  private readonly options: Required<UltracodeOptions>
+  private options: Required<UltracodeOptions>
   private readonly pinForAgent:
     | ((agentId: string) => Promise<{ providerID: string; id: string; variant?: string } | undefined>)
     | undefined
@@ -151,7 +154,7 @@ export class SupervisorImpl implements Supervisor {
     this.registry = deps.registry
     this.storage = deps.storage
     this.sessions = deps.sessions
-    this.options = deps.options
+    this.options = { ...deps.options }
     this.pinForAgent = deps.pinForAgent
     this.settleGraceMs = deps.settleGraceMs ?? SETTLE_GRACE_MS
     this.stopKillMs = deps.stopKillGraceMs ?? STOP_KILL_GRACE_MS
@@ -189,6 +192,8 @@ export class SupervisorImpl implements Supervisor {
 
     // 2. Registry record. Spawn continues on the returned `done` promise.
     const record = this.registry.create({
+      directory: parent.directory,
+      projectID: parent.projectID,
       parentSessionID: parent.sessionID,
       parentAgent: parent.agent,
       script: input.script,
@@ -198,10 +203,17 @@ export class SupervisorImpl implements Supervisor {
       workflowName: input.workflowName,
     })
     const runID = record.id
-    const state = this.makeState(runID, parent)
+    const effective = freezeEffective(this.options)
+    record.effective = panelSettingsFrom(effective)
+    this.registry.persistNow(runID)
+    const state = this.makeState(runID, parent, effective)
     this.runs.set(runID, state)
     const done = this.executeRun(record, input, parent, state)
     return { runID, done }
+  }
+
+  updateDefaults(next: Required<UltracodeOptions>): void {
+    this.options = { ...next }
   }
 
   private async executeRun(
@@ -273,10 +285,10 @@ export class SupervisorImpl implements Supervisor {
         },
         registry: this.registry,
         runID,
-        defaultAgent: this.options.agent,
+        defaultAgent: state.effective.agent,
         availableAgents: parent.availableAgents,
-        concurrency: this.options.concurrency,
-        maxAgents: this.options.maxAgents,
+        concurrency: state.effective.concurrency,
+        maxAgents: state.effective.maxAgents,
         report: (status) => parent.report(status),
         ambientPhase: () => state.ambientPhase,
         ...(this.pinForAgent ? { pinForAgent: this.pinForAgent } : {}),
@@ -335,7 +347,7 @@ export class SupervisorImpl implements Supervisor {
       if (worker !== undefined) void worker.terminate(this.stopKillMs).catch(() => {})
     }
 
-    return this.finalize(runID, final)
+    return this.finalize(runID, final, state.effective.maxResultChars)
   }
 
   // -------------------------------------------------------------------------
@@ -435,7 +447,7 @@ export class SupervisorImpl implements Supervisor {
   // internals
   // -------------------------------------------------------------------------
 
-  private makeState(runID: string, parent: ParentContext): RunState {
+  private makeState(runID: string, parent: ParentContext, effective: Required<UltracodeOptions>): RunState {
     let resolveDone!: () => void
     const done = new Promise<void>((resolve) => {
       resolveDone = resolve
@@ -462,6 +474,7 @@ export class SupervisorImpl implements Supervisor {
       pausedMs: 0,
       watchdog: undefined,
       pauseWaiters: [],
+      effective,
     }
   }
 
@@ -565,10 +578,20 @@ export class SupervisorImpl implements Supervisor {
   }
 
   private remainingTimeoutMs(state: RunState): number {
-    const now = Date.now()
-    const pausedNow = state.paused && state.pausedAt !== undefined ? now - state.pausedAt : 0
-    const elapsed = now - state.startedAt - state.pausedMs - pausedNow
-    return this.options.timeoutMs - elapsed
+    return remainingTimeoutMs(
+      state.effective.timeoutMs,
+      state.startedAt,
+      state.pausedMs,
+      state.paused,
+      state.pausedAt,
+    )
+  }
+
+  /** Test seam: remaining watchdog budget from the frozen snapshot, not shared options. */
+  remainingTimeoutFor(runID: string): number | undefined {
+    const state = this.runs.get(runID)
+    if (!state) return undefined
+    return this.remainingTimeoutMs(state)
   }
 
   private armWatchdog(state: RunState): void {
@@ -653,7 +676,7 @@ export class SupervisorImpl implements Supervisor {
     return state.cleanup.size + Math.max(0, state.inFlight)
   }
 
-  private finalize(runID: string, final: FinalOutcome): RunOutcome {
+  private finalize(runID: string, final: FinalOutcome, maxResultChars = this.options.maxResultChars): RunOutcome {
     // Agents still pending/running (abort / dangling calls) -> interrupted.
     const run = this.registry.get(runID)
     if (run) {
@@ -669,7 +692,7 @@ export class SupervisorImpl implements Supervisor {
     }
 
     let artifactKey: string | undefined
-    if (final.result !== undefined && !resultFits(final.result, this.options.maxResultChars)) {
+    if (final.result !== undefined && !resultFits(final.result, maxResultChars)) {
       try {
         artifactKey = this.storage.saveResultArtifact(runID, final.result)
       } catch {
@@ -700,7 +723,7 @@ export class SupervisorImpl implements Supervisor {
     }
     if (finalRun.endedAt === undefined) finalRun.endedAt = Date.now()
 
-    const envelope = buildEnvelope(finalRun, this.options.maxResultChars)
+    const envelope = buildEnvelope(finalRun, maxResultChars)
     return { run: finalRun, envelope }
   }
 }

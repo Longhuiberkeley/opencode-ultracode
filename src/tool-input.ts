@@ -2,8 +2,8 @@
  * Workflow tool input validation (Builder A).
  *
  * Union input:
- *   inline: { script, name?, meta?, args? }
- *   saved:  { workflow, args?, confirm? }
+ *   inline: { script, name?, meta?, args?, background? }
+ *   saved:  { workflow, args?, background? }
  *
  * Discriminated on the presence of "workflow" vs "script". Rejects unknown
  * keys, wrong types and oversized inputs with precise messages.
@@ -88,6 +88,17 @@ function validateArgs(
   return { ok: true, args: JSON.parse(serialized) as Json, serializedBytes: byteLength(serialized) }
 }
 
+function validateBackground(
+  raw: Record<string, unknown>,
+): { ok: true; background?: boolean } | { ok: false; error: string } {
+  if (!has(raw, "background")) return { ok: true }
+  const value = raw["background"]
+  if (typeof value !== "boolean") {
+    return { ok: false, error: `"background" must be a boolean, got ${typeOf(value)}` }
+  }
+  return { ok: true, background: value }
+}
+
 export function validateToolInput(raw: unknown): ToolInputResult {
   if (!isObj(raw)) {
     return { ok: false, error: `input must be an object, got ${typeOf(raw)}` }
@@ -102,7 +113,7 @@ export function validateToolInput(raw: unknown): ToolInputResult {
 
   if (hasWorkflow) {
     // ---- saved-workflow shape ----
-    const extra = rejectExtras(raw, new Set(["workflow", "args"]))
+    const extra = rejectExtras(raw, new Set(["workflow", "args", "background"]))
     if (extra) return { ok: false, error: extra }
 
     const workflow = raw["workflow"]
@@ -119,14 +130,18 @@ export function validateToolInput(raw: unknown): ToolInputResult {
       }
     }
 
+    const background = validateBackground(raw)
+    if (!background.ok) return { ok: false, error: background.error }
+
     const input: SavedRunInput = { workflow }
     if (raw["args"] !== undefined) input.args = args.args
+    if (background.background !== undefined) input.background = background.background
     return { ok: true, input }
   }
 
   if (hasScript) {
     // ---- inline-script shape ----
-    const extra = rejectExtras(raw, new Set(["script", "name", "meta", "args"]))
+    const extra = rejectExtras(raw, new Set(["script", "name", "meta", "args", "background"]))
     if (extra) return { ok: false, error: extra }
 
     const script = raw["script"]
@@ -165,10 +180,14 @@ export function validateToolInput(raw: unknown): ToolInputResult {
       }
     }
 
+    const background = validateBackground(raw)
+    if (!background.ok) return { ok: false, error: background.error }
+
     const input: InlineRunInput = { script }
     if (name !== undefined) input.name = name as string
     if (meta !== undefined) input.meta = meta
     if (raw["args"] !== undefined) input.args = args.args
+    if (background.background !== undefined) input.background = background.background
     return { ok: true, input }
   }
 
@@ -176,4 +195,23 @@ export function validateToolInput(raw: unknown): ToolInputResult {
     ok: false,
     error: `input must specify either "script" (inline workflow source) or "workflow" (saved workflow name)`,
   }
+}
+
+/** Input for the read-only `ultracode_status` tool. */
+export function validateStatusToolInput(
+  raw: unknown,
+): { ok: true; runID?: string } | { ok: false; error: string } {
+  if (raw === undefined || raw === null) return { ok: true }
+  if (!isObj(raw)) return { ok: false, error: `input must be an object, got ${typeOf(raw)}` }
+  const extra = rejectExtras(raw, new Set(["runID"]))
+  if (extra) return { ok: false, error: extra }
+  if (!has(raw, "runID")) return { ok: true }
+  const runID = raw["runID"]
+  if (typeof runID !== "string" || runID.trim() === "") {
+    return {
+      ok: false,
+      error: `"runID" must be a non-empty string, got ${typeOf(runID) === "string" ? "empty string" : typeOf(runID)}`,
+    }
+  }
+  return { ok: true, runID }
 }

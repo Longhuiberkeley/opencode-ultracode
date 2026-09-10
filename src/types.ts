@@ -48,6 +48,23 @@ export const DEFAULT_OPTIONS: Required<UltracodeOptions> = {
   maxResultChars: 65_536,
 }
 
+/** Local admission clamp (this repo default). Not a host API. */
+export const CONCURRENCY_CAP = DEFAULT_OPTIONS.concurrency
+
+/** Clamp concurrency at the admission point (not in loadOptions). */
+export function clampConcurrency(value: number): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return CONCURRENCY_CAP
+  return Math.min(CONCURRENCY_CAP, Math.max(1, Math.floor(value)))
+}
+
+/** Per-run captured settings shown in the inspect pane (subset of options). */
+export type CapturedSettings = {
+  concurrency: number
+  maxAgents: number
+  timeoutMs: number
+  permissions: PermissionMode
+}
+
 // ---------------------------------------------------------------------------
 // Tool input (union, validated by src/tool-input.ts)
 // ---------------------------------------------------------------------------
@@ -67,12 +84,16 @@ export interface InlineRunInput {
   name?: string
   meta?: WorkflowMeta
   args?: Json
+  /** Default false: block until the envelope. true: return after admission. */
+  background?: boolean
 }
 
 /** Run a saved workflow by name (project dir beats personal dir). */
 export interface SavedRunInput {
   workflow: string
   args?: Json
+  /** Default false: block until the envelope. true: return after admission. */
+  background?: boolean
 }
 
 export type WorkflowToolInput = InlineRunInput | SavedRunInput
@@ -130,6 +151,8 @@ export interface AgentRecord {
 }
 
 export interface RunRecord {
+  directory?: string
+  projectID?: string
   /** "run_" + 12 random base32 chars. */
   id: string
   parentSessionID: string
@@ -154,6 +177,13 @@ export interface RunRecord {
   error?: string
   totalTokens?: TokenUsage
   stopReason?: string
+  /** Immutable effective options captured at startDetached. */
+  effective?: CapturedSettings
+  /**
+   * Process ownership for orphan reconciliation. Optional/additive: records
+   * without owner keep the legacy "flip on restart" behavior.
+   */
+  owner?: { bootID: string; updatedAt: number }
 }
 
 export function emptyTokens(): TokenUsage {
@@ -323,6 +353,8 @@ export interface SavedWorkflow {
 
 export interface Registry {
   create(init: {
+    directory?: string
+    projectID?: string
     parentSessionID: string
     parentAgent?: string
     script: string
@@ -364,6 +396,8 @@ export interface Registry {
   agentForSession(sessionID: string): { runID: string; agentID: string } | undefined
   /** On plugin load: mark persisted running/stopping/paused runs as interrupted (no auto-replay). */
   reconcileOrphans(): void
+  /** Persist the current in-memory record immediately (effective snapshot, etc.). */
+  persistNow(runID: string): void
 }
 
 // ---------------------------------------------------------------------------
@@ -391,6 +425,23 @@ export interface Storage {
   loadWorkflow(name: string): SavedWorkflow | undefined
   /** Save a run's script as a named workflow (js + json manifest). Throws on invalid name. */
   saveWorkflow(name: string, script: string, manifest: Omit<SavedWorkflowManifest, "version" | "hash" | "savedAt" | "source"> & { source: "project" | "personal" }): Promise<SavedWorkflow>
+  /**
+   * Plan-mode handoff: contained-read `<project>/.opencode/workflows/<name>.js`,
+   * then write the js+json pair. Omits `savedFromRunID`. Does not auto-trust.
+   */
+  saveWorkflowFromFile(name: string): Promise<SavedWorkflow>
+  /** Project-scoped settings overlay (`settings/<pid>`). Sync cache after load/save. */
+  loadSettingsOverlay(): SettingsOverlayLike | undefined
+  loadSettingsOverlayAsync(): Promise<SettingsOverlayLike | undefined>
+  saveSettingsOverlay(overlay: SettingsOverlayLike): void
+}
+
+/** KV overlay shape (partial panel settings). */
+export type SettingsOverlayLike = {
+  concurrency?: number
+  maxAgents?: number
+  timeoutMs?: number
+  permissions?: PermissionMode
 }
 
 // ---------------------------------------------------------------------------
@@ -398,6 +449,8 @@ export interface Storage {
 // ---------------------------------------------------------------------------
 
 export interface ParentContext {
+  directory?: string
+  projectID?: string
   sessionID: string
   agent?: string
   messageID?: string
@@ -430,6 +483,8 @@ export interface Supervisor {
     input: { script: string; meta?: WorkflowMeta; args?: Json; name?: string; workflowName?: string },
     parent: ParentContext,
   ): { runID: string; done: Promise<RunOutcome> }
+  /** Replace next-run defaults. In-flight runs keep their startDetached snapshot. */
+  updateDefaults(next: Required<UltracodeOptions>): void
   /** Idempotent stop. Returns false if runID unknown or already final. */
   stop(runID: string, reason: string): boolean
   /** Close admission of new agent() calls. Returns false if not running. */
