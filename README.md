@@ -69,6 +69,13 @@ multi-agent recipe, the model writes the orchestration on the fly and a runtime 
 
 ## Install
 
+Keep one installation scope per project: a global copy plus a project-local copy
+with the same plugin ID produces `Duplicate plugin ID: ultracode` in `/plugins`.
+The installer reports a known competing copy. Backups belong outside `plugins/`
+so auto-discovery cannot load them. Updates are built in a staging directory first;
+copy failures preserve the previous installation. Publishing uses two directory
+renames with rollback, not a zero-gap atomic directory exchange.
+
 **Precondition:** `npm install` in this repo so the runtime dependency tree exists for the
 installer to copy. The installer refuses to run until that is true.
 
@@ -168,11 +175,13 @@ back to defaults.
 | Option | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `agent` | string | `"general"` | Default agent id for `agent()` calls that omit `opts.agent`. Validated at run start — fail fast if missing. |
-| `concurrency` | number | `8` | Max concurrently *running* child sessions per run. Additional `agent()` calls queue FIFO. |
-| `maxAgents` | number | `200` | Max total `agent()` calls per run (a runaway fan-out fails the run instead of burning tokens forever). |
-| `timeoutMs` | number | `3600000` | Wall-clock limit per run (60 min). On timeout: children interrupted, worker terminated, run finalized. |
-| `permissions` | string | `"ask"` | `ask` (default permission flow for children — recommended), `autoEditsWorkflow` (auto-approve edit-class actions for active run children inside the project root), `noEditTools` (deny edit-class tools for active run children). |
+| `concurrency` | number | `8` | Parsed 1–64 in config; **effective max 8** at admission (local clamp to this repo default, not a host API). Extra `agent()` calls queue FIFO. |
+| `maxAgents` | number | `200` | Max total `agent()` calls per run (panel `+/-` steps by 10 within 1–10000). A runaway fan-out fails the run instead of burning tokens forever. |
+| `timeoutMs` | number | `3600000` | Wall-clock limit per run (60 min). Panel cycles presets `600000` / `1800000` / `3600000`. On timeout: children interrupted, worker terminated, run finalized. |
+| `permissions` | string | `"ask"` | `ask` (host user prompt for children — recommended), `autoEditsWorkflow` (auto-approve edit-class actions for active run children inside the project root), `noEditTools` (deny edit-class tools for active run children). Panel cycles these three. |
 | `maxResultChars` | number | `65536` | Max serialized result returned to the session; larger results come back as a preview + `truncated: true`, full value retrievable via `/ultracode result <runID>`. |
+
+Panel settings (`h`/`l` to the settings pane, `+/-` to edit) persist a project-scoped KV overlay and refresh next-run defaults. Changes apply to the **next** run only — in-flight runs keep the snapshot captured at `startDetached`.
 
 ```json
 {
@@ -206,6 +215,14 @@ prompt (whitespace-delimited, optionally followed by a colon). Before/after:
 | `look at opencode-ultracode/docs` | **no** — paths and names don't attach |
 | `use a workflow to fact-check this draft` | no auto-attach, but the model may still author one |
 
+Ultracode is for **multi-agent orchestration with an isolated script and structural verify**.
+Native subagents (`general` / `explore` / Task) are for **one** focused child. Ultracode
+composes with those native OpenCode subagents: it spawns ordinary child sessions users already
+know; it does not replace or hide them. Plan mode: author `.opencode/workflows/<name>.js` +
+`/ultracode save <name>` + `/ultracode trust <name>`. Build mode: `{ workflow: name }`. Do not
+mix native fan-out and a workflow in one task; children do not inherit parent skills — restate
+rules inside `agent()` prompts.
+
 Examples that work:
 
 - `ultracode: research the state of WASM audio engines and verify every claim before reporting`
@@ -222,7 +239,14 @@ The model invokes the `ultracode_run` tool, e.g.:
 
 or inline with a script it wrote itself (see `docs/AUTHORING.md` for the full script API).
 
-The tool returns when the run finishes, with an envelope:
+By default the tool **blocks** until the run finishes and returns an envelope. Pass
+`background: true` to return immediately after admission + script validation with
+`{ runID, status: "running", hint }` — watch the inspect panel (`ctrl+g`) or poll status.
+The host cannot deliver a late tool result after `execute` has returned, so the calling
+agent is **not** auto-woken on completion. Use `/ultracode status [runID]`, the
+`ultracode_status` tool (`{ runID? }`), the inspect panel, or ping the agent.
+
+The blocking envelope looks like:
 
 ```json
 {
@@ -258,16 +282,21 @@ global (registered from the always-mounted chip component).
 | --- | --- | --- |
 | `/ultracode` | Dashboard: plugin/min-build line, active (including paused), recent, saved workflows. | **Ctrl+G** or palette `ultracode.inspect` opens the panel |
 | `/ultracode show [runID]` | Full run report (D11 cells + sessionID): status, agents, tokens, tools, script. | — (server parity floor) |
+| `/ultracode status [runID]` | Compact run state: runID, status, agents done/total, elapsed. Same implicit-target rule as `show`. | — |
+| `ultracode_status` tool | Read-only `{ runID? }` → `{ runID, status, agents: { done, total, failed }, startedAt }`. | — |
 | `/ultracode result [runID]` | Print the **full** result of a run whose envelope came back truncated. | — |
 | `/ultracode stop [runID]` | Graceful stop: no new agent calls, children interrupted, worker terminated after a grace period. | `x` |
 | `/ultracode pause [runID]` | Close admission of new `agent()` calls; in-flight finish; watchdog suspended. | `p` (toggles pause) |
 | `/ultracode resume [runID]` | Reopen admission on a paused run. | `p` (toggles resume) |
 | `/ultracode rerun [runID] [argsJSON]` | Start a new run from a finished run's script (trust/digest checks if it was a named workflow). | — |
+| `/ultracode save <name>` | Save `.opencode/workflows/<name>.js` as a named workflow (no prior run). | — |
 | `/ultracode save <runID> <name>` | Save a run's script as a named workflow (`.js` + `.json` manifest). | `s` (name via `dialog.prompt`) |
+| `/ultracode settings [runID]` | Next-run overlay plus that run's captured snapshot. | settings pane (`h`/`l`); `r` refreshes an **active** run |
+| `/ultracode set <key> <value>` | Persist overlay (`concurrency`, `maxAgents`, `timeoutMs`, `permissions`); applies to the **next** run. | `+`/`-` in settings pane |
 | `/ultracode trust <name>` | One-time approval for a saved workflow (content digest). | — |
 | `/ultracode untrust <name>` | Revoke trust for a saved workflow. | — |
 | `/ultracode help` | Print this command list and the authoring hint. | — |
-| (select / drill) | Move the inspect highlight; open the selected child session tab. | `↑` `↓` select · `enter` / `→` drill |
+| (select / drill) | Move the inspect tree; expand/collapse; open the selected child session tab. | `↑` `↓` move · `←` `→` expand · `h` `l` pane · `enter` drill · `[` `]` run · `esc` or `ctrl+g` close |
 
 ## Inspect UI
 
@@ -279,13 +308,81 @@ parity floor. The Ctrl+G opener is spike-verified on beta-19271; on builds where
 claims Ctrl+G for its own navigation, the palette entry is the fallback once palette listing
 surfaces bindless entries.
 
+The inspect panel never auto-sends `settings` (or any other) `session.command` on open,
+pane switch, or run cycle — those writes are steered inbox items. The settings pane paints
+cached overlay / per-run effective values from already-received `session.synthetic` acks
+and shows **unknown** when stale. Press `r` in the settings pane for **one** deliberate
+refresh of an **active** run: when plugin RPC is present it calls `settings` on that
+channel (no session message, no agent wake); if RPC is missing or the call fails it
+falls back to `settings <runID>` via `session.command`. Pause/resume/stop stay on the
+existing user-intent command path.
+
+**Conversation-owned runs (v0.3.3):** Ctrl+G lists recent live and persisted runs for
+the current conversation. The selected run has a `*`; each row shows its lifecycle
+status. `[` / `]` select and pin history; `.` toggles **follow-latest** so a new run
+can take focus across Plan → Build. The status chip distinguishes workflow runs,
+active agents, queued agents, and requests **awaiting permission**. An authoritative
+running workflow remains visible between agent stages. The default inventory is the
+newest 50 runs (RPC limit up to 100); `/ultracode show <id>` remains available for older IDs.
+
+Permissions from owned children appear in this inspector: `y` opens a full-request
+confirmation for **allow once**, `n` reviews rejection, and Enter navigates to the
+blocked child. No permission is automatically approved. Full selected task labels
+wrap in the detail pane; `h/l` selects panes and up/down scrolls detail text. Press
+`f` for the host's full-screen presentation when supported. Stop/pause actions are
+disabled for finished runs.
+
+Launch long work with `background: true` to keep chatting. The orchestrator can use
+`ultracode_steer { runID, agentID?, text }` to pass an adjustment to a running child
+without killing the workflow or restarting finished children. This acknowledges
+admission, not that the child has already applied the adjustment. Background completion
+does not automatically wake the parent agent; use status/inspector to check results.
+
+**Authoritative status (RPC-gated):** the server registers an optional
+`ultracode` RPC (`runStatus`, `settings`) behind a capability check. `runStatus`
+reads the **live** registry first, then **persisted** run records for historical
+ids, including child-session references independent of the client session cache.
+Chip counts and panel run status prefer that snapshot. If `ctx.rpc.register` /
+`client.rpc` is missing or a call fails,
+the TUI keeps the session-derived heuristics **silently** — an RPC error never
+takes down the chip or panel. Heuristic children with empty outcome, no execution
+observation, and no session `time.updated` (else `created`) within 15 minutes
+(`FALLBACK_STALE_MS`) are not counted as running.
+
 | Piece | Where | What |
 | --- | --- | --- |
-| Chip | `prompt.footer.status` | `ultracode · N running` while any run is active |
-| Panel | `session.panel` contribution `ultracode.inspect` | Two-column inspector (phases \| agents), pagination, footer keys |
-| Palette | command `ultracode.inspect` (bind **Ctrl+G**) | Opens the panel; stay on the parent session |
-| Overlay keys | `keymap.layer` **inside** the panel component | `↑↓` select, `x` stop, `p` pause/resume, `s` save, `enter`/`→` drill |
+| Chip | `prompt.footer.status` | Conversation- and location-scoped; separate runs, agents and permission waits. Hides when idle. RPC is authoritative; fallback heuristics count observed running children. |
+| Panel | `session.panel` contribution `ultracode.inspect` | Same conversation scope; visible run list, phase→agent tree, wrapped detail pane and permission actions. |
+| Palette | command `ultracode.inspect` (bind **Ctrl+G**) | Toggles the panel via `ui.panel.current()`; stay on the parent session |
+| Overlay keys | `keymap.layer` **inside** the panel component | `↑↓` move, `←→` expand, `h/l` pane, `enter` drill, `[ ]` run, `p` pause/resume, `x` stop, `s` save, `r` refresh (settings, active run), `esc` or `ctrl+g` close |
 | Toast | `ui.toast.show` | Completion (envelope / quiet-window heuristic) and post-save trust hint |
+
+**Panel keymap**
+
+| Key | Action |
+| --- | --- |
+| Ctrl+G (chip, prompt owns input) | Toggle inspect panel |
+| Ctrl+G / Esc (panel owns input) | Close panel (`esc` and `escape` binds; footer: esc or ctrl+g close) |
+| ↑ / ↓ | Move tree (or detail scroll) |
+| ← / → | W3C collapse / expand (Right is not drill) |
+| h / l | Tree ↔ detail ↔ settings |
+| Enter | Open selected child tab when tabs enabled |
+| [ / ] | Previous / next run (tree header shows `run k of N` plus run id) |
+| . / f | Toggle follow-latest/pin; toggle full-screen presentation |
+| y / n | Review the first pending child permission and allow once / reject |
+| p / x / s | Pause/resume, stop, save (user-intent keypresses; same command transport) |
+| + / − | Edit focused settings row (next run) |
+| r | Settings pane: one deliberate refresh for the **selected active** run (RPC when available, else `session.command`). Never auto-queried; settled/unknown runs are skipped. |
+
+**Manual smoke-test checklist (physical keys; not covered by unit tests):**
+
+1. Open the empty inspect panel (`no ultracode runs`). Press Escape. Panel closes. Focus returns to the prompt.
+2. Reopen. Press Ctrl+G. Panel toggles closed. Focus returns to the prompt.
+3. Repeat 1–2 with an active run (tree populated). Escape closes; Ctrl+G toggles closed; focus returns to the prompt.
+4. Start a `background: true` run. Confirm the tool returns `runID` immediately; `/ultracode status` / `ultracode_status` show it running; chip/panel update; completion does not auto-wake the parent.
+5. Change a settings pane value (`+/-`). Confirm the live strip / `/ultracode settings` overlay updates and the **next** run uses it (current run unchanged).
+6. Settings pane shows cached overlay / per-run effective from already-received acks, or **unknown** when stale. Opening or cycling runs must **not** send a settings query. Press `r` on an active run to refresh once; `r` must no-op on settled/unknown runs.
+7. Tree pane header shows `run k of N` plus the run id; `[` / `]` cycle runs and restore per-run tree selection.
 
 **Why the two-column inspector is panel-hosted, not `ui.dialog.show`:** G1 on beta-19271 —
 the host dialog owns the keymap. `keymap.layer` from a component mounted inside `dialog.show`
@@ -298,8 +395,8 @@ when no host dialog is open. `ui.dialog.prompt` is used only for the save-name f
 | Surface | Here | Notes |
 | --- | --- | --- |
 | Header | yes | Short run id, agent counts, elapsed (`twoColumn` / `runHeaderCells`) |
-| Phases | yes (flat filter list — select a phase to filter agents; not expandable containers) | Left column; observed first-appearance order |
-| Agents | yes | Right column; D11 cells (status, label, phase, agent, model, …). Store `agent` is live; model/tools see below. |
+| Phases | yes (expandable phase→agent tree) | Left pane; observed first-appearance order; default expanded |
+| Agents | yes | Tree children + right detail pane (status, agent, model, tokens, session, tools). Store `agent` is live; model/tools see below. |
 | Tokens | yes | Per-agent from the client store (A2) |
 | Model | partial | Live in `/ultracode show`. TUI: on-demand for the **selected** row via session messages; "-" on other rows until selected. |
 | Tools | partial | Live in `/ultracode show` (`AgentRecord.toolCalls` reducer). TUI: on-demand for the **selected** row (tool parts); "-" elsewhere. |
@@ -308,8 +405,11 @@ when no host dialog is open. `ui.dialog.prompt` is used only for the save-name f
 | Stop | yes | Key `x` → `/ultracode stop` |
 | Pause | yes | Key `p` → pause/resume |
 | Save | yes | Key `s` → `dialog.prompt` → `/ultracode save` |
-| Select | yes | `↑` `↓` |
-| Drill | yes | `enter` / `→` → `tabs.open` child when tabs enabled |
+| Select | yes | `↑` `↓` move the tree (or detail scroll when the detail pane is focused and longer than 10 lines) |
+| Expand | yes | `←` `→` W3C expand/collapse (Right is not drill) |
+| Pane | yes | `h` / `l` tree ↔ detail |
+| Drill | yes | `enter` → `tabs.open` child when tabs enabled and the cursor is an agent |
+| Close | yes | `esc` closes; **Ctrl+G** toggles (chip when the prompt owns input; panel layer while the panel owns input) |
 | Dialog-hosted keys | **no** | Deliberate: host dialog steals the keymap (G1 NO-GO) |
 | Mid-tool freeze | **no** | Deliberate: in-flight tool calls finish; pause only closes admission |
 
@@ -331,8 +431,10 @@ grep -F 'ultracode ·' spike/out/tui-live-*.txt
 # panel marker (always painted, even with no runs)
 grep -F 'UC-INSPECT' spike/out/tui-live-*.txt
 grep -F 'ultracode inspect' spike/out/tui-live-*.txt
-# two-column + footer (present once a run is grouped)
-grep -F 'Phases' spike/out/tui-live-*.txt
+# two-pane footer (panel always paints these; no leftover "Phases" column)
+grep -F 'h/l pane' spike/out/tui-live-*.txt
+grep -F '←→ expand' spike/out/tui-live-*.txt
+grep -F 'esc or ctrl+g close' spike/out/tui-live-*.txt
 grep -F 'x stop' spike/out/tui-live-*.txt
 grep -F 'p pause' spike/out/tui-live-*.txt
 ```
@@ -385,11 +487,18 @@ Workflows multiply tokens. Controls, in order of leverage:
   re-trust. This is the trust gate for repo-shared workflows, by design.
 - **Sharing:** commit `.opencode/workflows/` (the pairs, not `runs/`) to your repo.
   Collaborators approve each workflow once with `/ultracode trust <name>` after reviewing it.
-- **Samples:** `workflows/samples/` ships `deep-research`, `code-audit`, and `fact-check` pairs
-  that use only stock agents. Copy both files into your project's `.opencode/workflows/`, review
-  them, then `/ultracode trust <name>` — samples are gated by the same trust flow as any other
-  saved workflow. Sample manifests carry `hash: ""` (the loader tolerates the empty hash for
-  these reviewed, in-repo samples); user-saved workflows always get a real hash.
+- **Samples:** `workflows/samples/` ships `deep-research`, `code-audit`, `fact-check`, and
+  `dev-loop` pairs that use stock agents (`dev-loop` review defaults to general; pass
+  `args.reviewer` when you have a reviewer specialist). Copy both files into your project's
+  `.opencode/workflows/`, review them, then `/ultracode trust <name>` — samples are gated by
+  the same trust flow as any other saved workflow. Sample manifests carry `hash: ""` (the
+  loader tolerates the empty hash for these reviewed, in-repo samples); user-saved workflows
+  always get a real hash.
+- **`dev-loop` usage:** `{ workflow: "dev-loop", args: { task: "…", repo?: ".", scope?: "…", fixPasses?: 3 } }`.
+  Phases: explore (one explore agent, findings schema) → implement (one general writer, tests
+  + typecheck until green) → verify (independent general rerun of tests/static checks) →
+  review (blockers schema; general fallback) → fix (bounded loop, max 3 passes with recheck).
+  Returns `{ ok, task, blockers, stats }`.
 - Saved workflows can be composed one level deep from another script via `workflow(name, args)`.
 
 ## Stock installs (zero config)
