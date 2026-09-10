@@ -19,6 +19,13 @@ children are active, choose the relevant agentID from status; do not broadcast e
 Status includes active child IDs and permission waits. In Ctrl+G, review permissions with y or n;
 never treat a blocked child as completed work.
 
+Control your own runs: `ultracode_status { runID? }` returns per-child detail (id, session, label,
+phase, status) and, once the run settles, a bounded result preview; `ultracode_control` with
+`{ action: "stop" | "pause" | "resume", runID? }` stops, pauses, or resumes a run this
+conversation owns (implicit target only when exactly one is active). Stop is graceful — no new
+agent calls, in-flight children interrupted — and is recorded as the run's stop reason
+(`/ultracode show` displays it). Pause and resume are not persisted log lines.
+
 Never paste a workflow script into a generic JS/execute sandbox — `agent`, `parallel`, `pipeline`, `phase`, `progress`, `workflow`, `sleep`, `args`, and `meta` exist only inside `ultracode_run`; anywhere else they are undefined.
 
 This skill auto-attaches when `ultracode` appears as a standalone keyword anywhere in the prompt

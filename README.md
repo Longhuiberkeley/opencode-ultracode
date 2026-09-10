@@ -294,11 +294,11 @@ or inline with a script it wrote itself (see `docs/AUTHORING.md` for the full sc
 
 By default the tool returns immediately after admission + script validation with
 `{ runID, status: "running", hint }` — the run continues detached and the conversation stays
-available; watch the inspect panel (`ctrl+g`) or poll status. The host cannot deliver a late
-tool result after `execute` has returned, so the calling agent is **not** auto-woken on
-completion. Use `/ultracode status [runID]`, the `ultracode_status` tool (`{ runID? }`), the
-inspect panel, or ping the agent. Pass `background: false` when you want the full envelope
-in-call instead.
+available; watch the inspect panel (`ctrl+g`) or poll status. When the run settles, the plugin
+appends a one-line settle notice to this session (status, agents, bounded result brief); whether
+that notice also *wakes* the agent is host-dependent — poll `/ultracode status [runID]`, the
+`ultracode_status` tool (`{ runID? }`), or the inspect panel when you need certainty. Pass
+`background: false` when you want the full envelope in-call instead.
 
 The blocking envelope looks like:
 
@@ -337,7 +337,8 @@ global (registered from the always-mounted chip component).
 | `/ultracode` | Dashboard: plugin/min-build line, active (including paused), recent, saved workflows. | **Ctrl+G** or palette `ultracode.inspect` opens the panel |
 | `/ultracode show [runID]` | Full run report (D11 cells + sessionID): status, agents, tokens, tools, script. | — (server parity floor) |
 | `/ultracode status [runID]` | Compact run state: runID, status, agents done/total, elapsed. Same implicit-target rule as `show`. | — |
-| `ultracode_status` tool | Read-only `{ runID? }` → `{ runID, status, agents: { done, total, failed }, startedAt }`. | — |
+| `ultracode_status` tool | Read-only `{ runID? }` → `{ runID, status, agents: { done, total, failed }, startedAt, elapsedMs, children: [{ agentID, sessionID?, label?, phase?, status, waitingForPermission? }] }`; settled runs add `resultPreview` + `resultTruncated`. | — |
+| `ultracode_control` tool | Orchestrator control of **owned** runs: `{ action: "stop" \| "pause" \| "resume", runID? }`. Implicit target only when exactly one active owned run. Stop is recorded as the run's stop reason (`/ultracode show` displays it). | same verbs via panel keys |
 | `/ultracode result [runID]` | Print the **full** result of a run whose envelope came back truncated. | — |
 | `/ultracode stop [runID]` | Graceful stop: no new agent calls, children interrupted, worker terminated after a grace period. | `x` |
 | `/ultracode pause [runID]` | Close admission of new `agent()` calls; in-flight finish; watchdog suspended. | `p` (toggles pause) |
@@ -388,9 +389,11 @@ disabled for finished runs.
 
 Launch long work normally — runs are background by default, so you can keep chatting. The orchestrator can use
 `ultracode_steer { runID, agentID?, text }` to pass an adjustment to a running child
-without killing the workflow or restarting finished children. This acknowledges
-admission, not that the child has already applied the adjustment. Background completion
-does not automatically wake the parent agent; use status/inspector to check results.
+without killing the workflow or restarting finished children, and
+`ultracode_control { action, runID? }` to stop / pause / resume runs it owns. Steering
+acknowledges admission, not that the child has already applied the adjustment. Background
+completion appends a one-line settle notice to the parent session; certainty still comes
+from status/inspector polling.
 
 **Authoritative status (RPC-gated):** the server registers an optional
 `ultracode` RPC (`runStatus`, `settings`) behind a capability check. `runStatus`
