@@ -74,7 +74,8 @@ test("background branch attaches a logged catch so a rejecting done is not unhan
   }
   const src = readFileSync(new URL("../src/command.ts", import.meta.url), "utf8")
   assert.match(src, /const \{ runID, done \} = supervisor\.startDetached/)
-  assert.match(src, /done\.catch/)
+  // Settle notice rides .then before the logged .catch; a rejecting done stays handled.
+  assert.match(src, /done\s*\n?\s*\.then\([\s\S]{0,400}\.catch\(/)
 })
 
 test("fast-return admission: background true returns runID + running without awaiting worker settlement", async () => {
@@ -191,4 +192,31 @@ test("synthetic completion event emission: settled background run still toasts v
   assert.deepEqual(applySettleTick([settled], maps, 1000, quietMs), [])
   assert.deepEqual(applySettleTick([settled], maps, 6000, quietMs), ["run_bgdone"])
   assert.deepEqual(applySettleTick([settled], maps, 99_000, quietMs), [])
+})
+
+test("background branch fires onSettled once with the final outcome", async () => {
+  const ctx = makeSupervisor()
+  const seen: RunOutcome[] = []
+  const ack = await executeWorkflowLaunch(
+    ctx.supervisor,
+    { script: `return 42;` },
+    ctx.parent,
+    true,
+    (outcome) => seen.push(outcome),
+  )
+  assert.equal(JSON.parse(ack.content).status, "running")
+  await waitFor(() => seen.length === 1, "onSettled outcome")
+  assert.equal(seen[0]!.envelope.status, "succeeded")
+  assert.equal(seen[0]!.envelope.result, 42)
+  await tick(150)
+  assert.equal(seen.length, 1, "onSettled fires exactly once")
+})
+
+test("blocking branch never fires onSettled (the envelope is the delivery)", async () => {
+  const ctx = makeSupervisor()
+  const seen: RunOutcome[] = []
+  const env = await executeWorkflowLaunch(ctx.supervisor, { script: `return 1;` }, ctx.parent, false, (o) => seen.push(o))
+  assert.equal(JSON.parse(env.content).status, "succeeded")
+  await tick(100)
+  assert.equal(seen.length, 0)
 })

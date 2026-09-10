@@ -5,6 +5,7 @@
 import test from "node:test"
 import assert from "node:assert/strict"
 import { createHash } from "node:crypto"
+import { readFileSync } from "node:fs"
 import {
   MIN_SUPPORTED_BUILD,
   NESTED_RUN_REFUSED,
@@ -692,4 +693,113 @@ test("dashboard empty saved-workflows mentions one-token and two-token save", as
   const { texts } = await invoke("")
   assert.match(texts[0]!, /\/ultracode save <name>/)
   assert.match(texts[0]!, /\/ultracode save <runID> <name>/)
+})
+
+// ---------------------------------------------------------------------------
+// Orchestrator status enrichment + settle notice (v0.5.0 control plane)
+// ---------------------------------------------------------------------------
+
+import { enrichStatusPayload, formatSettleNotice } from "../src/command.ts"
+
+const payloadOf = (run: RunRecord) => ({
+  runID: run.id,
+  status: run.status,
+  agents: { done: 0, total: 0, failed: 0 },
+  startedAt: run.startedAt,
+})
+
+test("enrichStatusPayload: running run carries identity, elapsed, children detail, no preview", () => {
+  const run = baseRun({
+    name: "panel-demo",
+    agents: [
+      { id: "a1", status: "succeeded", sessionID: "ses_a1", label: "first", phase: "scan" },
+      { id: "a2", status: "running" },
+    ],
+  })
+  const out = enrichStatusPayload(payloadOf(run), run, 3_000)
+  assert.equal(out.name, "panel-demo")
+  assert.equal(out.elapsedMs, 2_000)
+  assert.deepEqual(out.children, [
+    { agentID: "a1", status: "succeeded", sessionID: "ses_a1", label: "first", phase: "scan" },
+    { agentID: "a2", status: "running" },
+  ])
+  assert.equal("resultPreview" in out, false)
+})
+
+test("enrichStatusPayload: settled run gets a bounded preview; long results are truncated", () => {
+  const big = { blob: "x".repeat(5_000) }
+  const run = baseRun({ status: "succeeded", endedAt: 2_000, result: big })
+  const out = enrichStatusPayload(payloadOf(run), run, 5_000)
+  assert.ok((out.resultPreview ?? "").endsWith("…"))
+  assert.ok((out.resultPreview ?? "").length <= 2_001)
+  assert.equal(out.resultTruncated, true)
+  assert.equal(out.elapsedMs, 1_000)
+
+  const small = baseRun({ status: "failed", endedAt: 2_000, result: { ok: 1 }, error: "boom" })
+  const flat = enrichStatusPayload(payloadOf(small), small, 5_000)
+  assert.equal(flat.resultPreview, '{"ok":1}')
+  assert.equal(flat.resultTruncated, false)
+  assert.equal(flat.error, "boom")
+})
+
+test("enrichStatusPayload: missing record degrades to counts + empty children", () => {
+  const out = enrichStatusPayload({ runID: "run_x", status: "running", agents: { done: 0, total: 0, failed: 0 }, startedAt: 1 }, undefined)
+  assert.deepEqual(out.children, [])
+  assert.equal(out.elapsedMs, 0)
+})
+
+test("formatSettleNotice: status, agents, brief result, detail pointer", () => {
+  const line = formatSettleNotice({
+    runID: "run_abc",
+    status: "succeeded",
+    durationMs: 10,
+    agents: { total: 2, succeeded: 2, failed: 0, interrupted: 0 },
+    truncated: false,
+    result: { report: "ok" },
+  })
+  assert.match(line, /\[ultracode\] background run run_abc succeeded/)
+  assert.match(line, /agents 2\/2/)
+  assert.match(line, /result: \{"report":"ok"\}/)
+  assert.match(line, /ultracode_status/)
+})
+
+test("formatSettleNotice: failed run surfaces the error; long results are capped", () => {
+  const line = formatSettleNotice({
+    runID: "run_bad",
+    status: "failed",
+    durationMs: 10,
+    agents: { total: 3, succeeded: 0, failed: 3, interrupted: 0 },
+    truncated: true,
+    preview: "y".repeat(900),
+    error: "worker exploded",
+  })
+  assert.match(line, /failed/)
+  assert.match(line, /error: worker exploded/)
+  assert.ok(line.length < 700, "notice stays one bounded line")
+})
+
+test("PLUGIN_VERSION stays in sync with package.json (drift guard)", () => {
+  const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string }
+  assert.equal(PLUGIN_VERSION, pkg.version)
+})
+
+test("enrichStatusPayload caps the children list and reports the overflow", () => {
+  const many = Array.from({ length: 60 }, (_, i) => ({ id: `a${i + 1}`, status: "succeeded" as const }))
+  const run = baseRun({ agents: many })
+  const out = enrichStatusPayload(payloadOf(run), run)
+  assert.equal(out.children.length, 50)
+  assert.equal(out.childrenTruncated, true)
+  assert.equal(out.childrenOmitted, 10)
+})
+
+test("formatSettleNotice surfaces the stop reason (control plane / timeout stops)", () => {
+  const line = formatSettleNotice({
+    runID: "run_stopped",
+    status: "stopped",
+    durationMs: 10,
+    agents: { total: 4, succeeded: 2, failed: 0, interrupted: 2 },
+    truncated: true,
+    stopReason: "orchestrator stop via ultracode_control",
+  })
+  assert.match(line, /reason: orchestrator stop via ultracode_control/)
 })

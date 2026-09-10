@@ -83,7 +83,7 @@ export const NESTED_RUN_REFUSED =
   "cannot start a run from inside an active workflow session — use /ultracode from the parent"
 
 /** Plugin package version shown on the bare /ultracode dashboard. */
-export const PLUGIN_VERSION = "0.3.3"
+export const PLUGIN_VERSION = "0.5.0"
 /** Oldest OpenCode binary build the inspect TUI is gated on (A7 / D7). */
 export const MIN_SUPPORTED_BUILD = 19271
 
@@ -145,6 +145,7 @@ export const TOOL_DESCRIPTION: string = [
   "Caps: 8 concurrent agents (default), 200 agent() calls per run, 60 minutes wall clock, 512 KB max script, results truncated after 64 KB.",
   "Default / background: runs are background by default — the tool returns immediately after admission with { runID, status: \"running\", hint } (inspect panel via ctrl+g, or /ultracode status / ultracode_status). The host cannot deliver a late tool result after execute returns — the calling agent is not auto-woken on completion.",
   "background: false (opt-in) blocks until every agent settles, then returns { runID, status, agents, tokens, result | preview }.",
+  "Orchestrator tools: ultracode_status { runID? } (per-child detail, elapsed, settled result preview), ultracode_control { action: stop|pause|resume, runID? } (owned runs only), ultracode_steer { runID, agentID?, text } (running child).",
   "",
   "Full patterns + live catalogs load with the Ultracode skill (auto-attaches on the standalone keyword 'ultracode').",
 ].join("\n")
@@ -226,23 +227,119 @@ export function resolveRunStatus(
 
 /**
  * Tool launch: default awaits supervisor.start (blocking envelope).
- * `background: true` returns after startDetached admission (do not await done).
+ * `background: true` returns after startDetached admission (do not await done);
+ * `onSettled` fires once with the final outcome (best-effort, errors swallowed).
  */
 export async function executeWorkflowLaunch(
   supervisor: Pick<Supervisor, "start" | "startDetached">,
   input: { script: string; meta?: WorkflowMeta; args?: Json; name?: string; workflowName?: string },
   parent: ParentContext,
   background: boolean,
+  onSettled?: (outcome: RunOutcome) => void,
 ): Promise<{ content: string }> {
   if (background) {
     const { runID, done } = supervisor.startDetached(input, parent)
-    void done.catch((err: unknown) => {
-      console.error(`ultracode background run ${runID} failed: ${describeError(err)}`)
-    })
+    void done
+      .then((outcome) => {
+        try {
+          onSettled?.(outcome)
+        } catch (err) {
+          console.error(`ultracode settle notice for ${runID} failed: ${describeError(err)}`)
+        }
+      })
+      .catch((err: unknown) => {
+        console.error(`ultracode background run ${runID} failed: ${describeError(err)}`)
+      })
     return { content: JSON.stringify({ runID, status: "running", hint: BACKGROUND_RUN_HINT }) }
   }
   const outcome = await supervisor.start(input, parent)
   return { content: JSON.stringify(outcome.envelope, null, 1) }
+}
+
+/** Cap for the settled-run result preview inside ultracode_status payloads. */
+export const STATUS_RESULT_PREVIEW_CHARS = 2000
+
+/** Cap for the per-agent children list inside ultracode_status payloads. */
+export const STATUS_CHILDREN_LIMIT = 50
+
+export type StatusChildView = {
+  agentID: string
+  status: string
+  sessionID?: string
+  label?: string
+  phase?: string
+}
+
+/**
+ * Richer ultracode_status payload for the orchestrator: run identity, elapsed,
+ * per-child detail, and — once settled — a bounded result preview. The tool
+ * layer attaches async extras (permission waits) on top of `children`.
+ */
+export function enrichStatusPayload(
+  payload: RunStatusPayload,
+  run: RunRecord | undefined,
+  now: number = Date.now(),
+): RunStatusPayload & {
+  name?: string
+  workflowName?: string
+  elapsedMs: number
+  children: StatusChildView[]
+  childrenTruncated?: boolean
+  childrenOmitted?: number
+  resultPreview?: string
+  resultTruncated?: boolean
+  error?: string
+} {
+  if (!run) return { ...payload, elapsedMs: 0, children: [] }
+  const out: Record<string, unknown> = { ...payload }
+  if (run.name) out["name"] = run.name
+  if (run.workflowName) out["workflowName"] = run.workflowName
+  out["elapsedMs"] = Math.max(0, (run.endedAt ?? now) - run.startedAt)
+  const children: StatusChildView[] = run.agents.slice(0, STATUS_CHILDREN_LIMIT).map((a) => {
+    const child: StatusChildView = { agentID: a.id, status: a.status }
+    if (a.sessionID) child.sessionID = a.sessionID
+    if (a.label) child.label = a.label
+    if (a.phase) child.phase = a.phase
+    return child
+  })
+  out["children"] = children
+  if (run.agents.length > STATUS_CHILDREN_LIMIT) {
+    out["childrenTruncated"] = true
+    out["childrenOmitted"] = run.agents.length - STATUS_CHILDREN_LIMIT
+  }
+  if (!isActiveRunStatus(run.status)) {
+    const serialized = run.result === undefined ? undefined : JSON.stringify(run.result)
+    if (serialized !== undefined) {
+      out["resultPreview"] =
+        serialized.length > STATUS_RESULT_PREVIEW_CHARS
+          ? serialized.slice(0, STATUS_RESULT_PREVIEW_CHARS) + "…"
+          : serialized
+      out["resultTruncated"] = serialized.length > STATUS_RESULT_PREVIEW_CHARS || run.resultTruncated === true
+    }
+    if (run.error) out["error"] = run.error
+  }
+  return out as ReturnType<typeof enrichStatusPayload>
+}
+
+/** Cap for the result brief inside the parent-session settle notice. */
+export const SETTLE_NOTICE_PREVIEW_CHARS = 300
+
+/** One-line settle notice for a finished background run, delivered to the parent session. */
+export function formatSettleNotice(envelope: RunEnvelope): string {
+  const agents = envelope.agents
+  const parts = [
+    `[ultracode] background run ${envelope.runID}${envelope.name ? ` (${envelope.name})` : ""} ${envelope.status}`,
+    `agents ${agents.succeeded}/${agents.total}`,
+  ]
+  const brief =
+    envelope.result !== undefined ? JSON.stringify(envelope.result) : envelope.preview
+  if (brief !== undefined && brief !== "") {
+    parts.push(`result: ${brief.length > SETTLE_NOTICE_PREVIEW_CHARS ? brief.slice(0, SETTLE_NOTICE_PREVIEW_CHARS) + "…" : brief}`)
+  }
+  if (envelope.error) parts.push(`error: ${envelope.error}`)
+  if (envelope.stopReason) parts.push(`reason: ${envelope.stopReason}`)
+  parts.push("detail: ultracode_status / ctrl+g")
+  return parts.join(" · ")
 }
 
 // ---------------------------------------------------------------------------

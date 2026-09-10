@@ -20,15 +20,19 @@ import {
   D2_VERBS,
   PLUGIN_VERSION,
   TOOL_DESCRIPTION,
+  enrichStatusPayload,
   executeWorkflowLaunch,
   feedToolEvent,
   formatDoctorReport,
+  formatSettleNotice,
   handleUltracodeCommand,
   matchesUltracodeKeyword,
   prepareRunLaunch,
   resolveRunStatus,
+  type StatusChildView,
 } from "./command.ts"
 import { loadOptions } from "./config.ts"
+import { controlToolContent } from "./control.ts"
 import {
   applyOverlay,
   capturedFromRecord,
@@ -51,7 +55,7 @@ import { RegistryImpl } from "./registry.ts"
 import { emptyToolEventState } from "./run-events.ts"
 import { EMPTY_CATALOG, SKILL_CONTENT, SKILL_DESCRIPTION, SKILL_NAME, buildSkillContent } from "./skill-content.ts"
 import { StorageImpl, normalizePath, resolveContainedPath, sha256 } from "./storage.ts"
-import { resolveBackground, validateStatusToolInput, validateToolInput } from "./tool-input.ts"
+import { resolveBackground, validateControlToolInput, validateStatusToolInput, validateToolInput } from "./tool-input.ts"
 import type {
   FsLike,
   Json,
@@ -176,6 +180,23 @@ const STATUS_TOOL_INPUT_SCHEMA: Record<string, unknown> = {
     runID: {
       type: "string",
       description: "Run id to inspect. Omit to use the single active run; none or many active runs is an error listing ids.",
+    },
+  },
+}
+
+const CONTROL_TOOL_INPUT_SCHEMA: Record<string, unknown> = {
+  type: "object",
+  additionalProperties: false,
+  required: ["action"],
+  properties: {
+    action: {
+      type: "string",
+      enum: ["stop", "pause", "resume"],
+      description: "stop: graceful (no new agent calls, in-flight children interrupted). pause: close admission of new agent() calls. resume: reopen a paused run.",
+    },
+    runID: {
+      type: "string",
+      description: "Target run. Omit to use the single active run owned by this conversation; an error listing ids when 0 or several.",
     },
   },
 }
@@ -620,11 +641,17 @@ export default Plugin.define({
                   report: makeReporter(tool.progress as (update: Record<string, unknown>) => Promise<void>),
                   availableAgents: prep.availableAgents,
                 }
+                const background = resolveBackground(input)
                 return await executeWorkflowLaunch(
                   supervisor,
                   { script, meta, args, name, workflowName },
                   parent,
-                  resolveBackground(input),
+                  background,
+                  background
+                    ? (outcome) => {
+                        void say(tool.sessionID, formatSettleNotice(outcome.envelope))
+                      }
+                    : undefined,
                 )
               } catch (err) {
                 return { content: `error: workflow run failed — ${describeError(err)}` }
@@ -639,7 +666,7 @@ export default Plugin.define({
             name: "status",
             options: { namespace: "ultracode" },
             description:
-              "Read-only status of an ultracode run (registry lookup). Input { runID? }. Returns { runID, status, agents: { done, total, failed }, startedAt }.",
+              "Read-only status of an ultracode run owned by this conversation. Input { runID? } (omit → single active owned run). Returns { runID, status, agents: { done, total, failed }, startedAt, elapsedMs, children: [{ agentID, sessionID?, label?, phase?, status, waitingForPermission? }] } and, once settled, resultPreview + resultTruncated.",
             input: STATUS_TOOL_INPUT_SCHEMA,
             execute: async (rawInput: unknown, tool) => {
               try {
@@ -652,11 +679,15 @@ export default Plugin.define({
                 const resolved = resolveRunStatus(registry, parsed.runID ?? "", active)
                 if (!resolved.ok) return { content: `error: ${resolved.error}` }
                 const record = registry.get(resolved.payload.runID)
-                const children = await Promise.all((record?.agents ?? []).filter((a) => a.status === "running" && a.sessionID).map(async (a) => ({
-                  agentID: a.id, sessionID: a.sessionID, label: a.label,
-                  waitingForPermission: await pendingPermissions(a.sessionID!),
-                })))
-                return { content: JSON.stringify({ ...resolved.payload, children }) }
+                const payload = enrichStatusPayload(resolved.payload, record)
+                const children = await Promise.all(
+                  (payload.children as Array<StatusChildView & { sessionID?: string }>).map(async (c) =>
+                    c.status === "running" && c.sessionID
+                      ? { ...c, waitingForPermission: await pendingPermissions(c.sessionID) }
+                      : c,
+                  ),
+                )
+                return { content: JSON.stringify({ ...payload, children }) }
               } catch (err) {
                 return { content: `error: ${describeError(err)}` }
               }
@@ -665,6 +696,21 @@ export default Plugin.define({
         } catch (err) {
           warn("failed to register the ultracode_status tool", err)
         }
+        editor.add({
+          name: "control",
+          options: { namespace: "ultracode" },
+          description:
+            "Orchestrator control of runs owned by this conversation. Input { action: \"stop\"|\"pause\"|\"resume\", runID? }. stop is graceful (no new agent calls, children interrupted) and is recorded as the run's stop reason; pause closes admission of new agent() calls; resume reopens a paused run. Implicit target only when exactly one active owned run.",
+          input: CONTROL_TOOL_INPUT_SCHEMA,
+          execute: async (raw: unknown, tool) =>
+            controlToolContent(validateControlToolInput(raw), tool.sessionID, {
+              getRun: (runID) => registry.get(runID),
+              activeRuns: () => supervisor?.activeRuns() ?? registry.activeRuns(),
+              supervisor: supervisor ?? undefined,
+              supervisorError,
+              reconciled: runsReconciled,
+            }),
+        })
         editor.add({
           name: "steer",
           options: { namespace: "ultracode" },
