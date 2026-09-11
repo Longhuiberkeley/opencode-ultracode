@@ -699,7 +699,7 @@ test("dashboard empty saved-workflows mentions one-token and two-token save", as
 // Orchestrator status enrichment + settle notice (v0.5.0 control plane)
 // ---------------------------------------------------------------------------
 
-import { enrichStatusPayload, formatSettleNotice } from "../src/command.ts"
+import { buildResultChunk, enrichStatusPayload, formatSettleNotice } from "../src/command.ts"
 
 const payloadOf = (run: RunRecord) => ({
   runID: run.id,
@@ -726,20 +726,65 @@ test("enrichStatusPayload: running run carries identity, elapsed, children detai
   assert.equal("resultPreview" in out, false)
 })
 
-test("enrichStatusPayload: settled run gets a bounded preview; long results are truncated", () => {
-  const big = { blob: "x".repeat(5_000) }
-  const run = baseRun({ status: "succeeded", endedAt: 2_000, result: big })
-  const out = enrichStatusPayload(payloadOf(run), run, 5_000)
-  assert.ok((out.resultPreview ?? "").endsWith("…"))
-  assert.ok((out.resultPreview ?? "").length <= 2_001)
-  assert.equal(out.resultTruncated, true)
-  assert.equal(out.elapsedMs, 1_000)
-
+test("enrichStatusPayload: settled run gets the FULL result inline when it fits the cap", () => {
   const small = baseRun({ status: "failed", endedAt: 2_000, result: { ok: 1 }, error: "boom" })
   const flat = enrichStatusPayload(payloadOf(small), small, 5_000)
-  assert.equal(flat.resultPreview, '{"ok":1}')
+  assert.deepEqual(flat.result, { ok: 1 })
+  assert.equal(flat.resultPreview, undefined)
   assert.equal(flat.resultTruncated, false)
+  assert.equal(flat.resultChars, '{"ok":1}'.length)
   assert.equal(flat.error, "boom")
+
+  // 2–64 KB background results were previously invisible past 2000 chars.
+  const medium = baseRun({ status: "succeeded", endedAt: 2_000, result: { blob: "x".repeat(5_000) } })
+  const wide = enrichStatusPayload(payloadOf(medium), medium, 5_000)
+  assert.deepEqual(wide.result, { blob: "x".repeat(5_000) })
+  assert.equal(wide.resultTruncated, false)
+})
+
+test("enrichStatusPayload: oversized results get a bounded preview + recovery hint", () => {
+  const big = { blob: "x".repeat(5_000) }
+  const run = baseRun({
+    status: "succeeded",
+    endedAt: 2_000,
+    result: big,
+    resultTruncated: true,
+    resultArtifactKey: "results/p1/run_x",
+  })
+  const out = enrichStatusPayload(payloadOf(run), run, 5_000, 100)
+  assert.equal(out.result, undefined)
+  assert.ok((out.resultPreview ?? "").length <= 2_000)
+  assert.ok((out.resultPreview ?? "").startsWith('{"blob"'))
+  assert.equal(out.resultTruncated, true)
+  assert.ok(out.resultChars! > 2_000)
+  assert.equal(out.resultArtifactKey, "results/p1/run_x")
+  assert.match(out.resultHint ?? "", /ultracode_result/)
+  assert.match(out.resultHint ?? "", /\/ultracode result run_x/)
+  assert.equal(out.elapsedMs, 1_000)
+})
+
+test("enrichStatusPayload: legacy non-truncated flag with oversized result still previews (length decides)", () => {
+  const legacy = baseRun({
+    status: "succeeded",
+    endedAt: 2_000,
+    result: { blob: "x".repeat(5_000) },
+    resultTruncated: false, // stale flag from the old artifact-key semantics
+  })
+  const out = enrichStatusPayload(payloadOf(legacy), legacy, 5_000, 100)
+  assert.equal(out.result, undefined)
+  assert.equal(out.resultTruncated, true)
+  assert.ok(out.resultPreview !== undefined)
+})
+
+test("enrichStatusPayload: preview cap follows a small maxResultChars (no complete-but-truncated payloads)", () => {
+  // Configured cap below the 2000-char default preview: a result between the
+  // two must NOT ship its complete serialization while claiming truncated.
+  const run = baseRun({ status: "succeeded", endedAt: 2_000, result: { blob: "x".repeat(1_800) } })
+  const out = enrichStatusPayload(payloadOf(run), run, 5_000, 1_000)
+  assert.equal(out.result, undefined)
+  assert.equal(out.resultTruncated, true)
+  assert.ok((out.resultPreview ?? "").length <= 1_000)
+  assert.ok(out.resultChars! > 1_000)
 })
 
 test("enrichStatusPayload: missing record degrades to counts + empty children", () => {
@@ -761,6 +806,22 @@ test("formatSettleNotice: status, agents, brief result, detail pointer", () => {
   assert.match(line, /agents 2\/2/)
   assert.match(line, /result: \{"report":"ok"\}/)
   assert.match(line, /ultracode_status/)
+})
+
+test("formatSettleNotice: truncated result points at the recovery paths", () => {
+  const line = formatSettleNotice({
+    runID: "run_abc",
+    status: "succeeded",
+    durationMs: 10,
+    agents: { total: 2, succeeded: 2, failed: 0, interrupted: 0 },
+    truncated: true,
+    preview: '{"firstKey":"valueThatIsLongEnoughToBeCut","more"',
+    resultChars: 90_000,
+  })
+  assert.match(line, /result truncated \(90000 chars\)/)
+  assert.match(line, /full result: ultracode_result \{ runID: "run_abc", offset, maxLength \}/)
+  assert.match(line, /\/ultracode result run_abc/)
+  assert.match(line, /detail: ultracode_status \/ ctrl\+g/)
 })
 
 test("formatSettleNotice: failed run surfaces the error; long results are capped", () => {
@@ -802,4 +863,155 @@ test("formatSettleNotice surfaces the stop reason (control plane / timeout stops
     stopReason: "orchestrator stop via ultracode_control",
   })
   assert.match(line, /reason: orchestrator stop via ultracode_control/)
+})
+
+// ---------------------------------------------------------------------------
+// buildResultChunk (ultracode_result paging)
+// ---------------------------------------------------------------------------
+
+test("buildResultChunk: prefers the artifact, pages with nextOffset until complete", () => {
+  const value = { report: "z".repeat(100) }
+  const compact = JSON.stringify(value)
+  const run = baseRun({
+    status: "succeeded",
+    result: value,
+    resultTruncated: true,
+    resultArtifactKey: "results/p1/run_x",
+  })
+  const first = buildResultChunk(run, value, { offset: 0, maxLength: 50 })
+  assert.ok(first.ok)
+  assert.equal(first.view.source, "artifact")
+  assert.equal(first.view.totalChars, compact.length)
+  assert.equal(first.view.offset, 0)
+  assert.equal(first.view.chunk, compact.slice(0, 50))
+  assert.equal(first.view.complete, false)
+  assert.equal(first.view.nextOffset, 50)
+  assert.equal(first.view.resultArtifactKey, "results/p1/run_x")
+
+  const second = buildResultChunk(run, value, { offset: first.view.nextOffset!, maxLength: 50 })
+  assert.ok(second.ok)
+  assert.equal(second.view.offset, 50)
+  // Walking nextOffset to the end reassembles the exact serialization.
+  let acc = first.view.chunk
+  let cursor = second
+  let guard = 0
+  while (cursor.ok && !cursor.view.complete && guard++ < 100) {
+    acc += cursor.view.chunk
+    const next = buildResultChunk(run, value, { offset: cursor.view.nextOffset!, maxLength: 50 })
+    if (!next.ok) break
+    cursor = next
+  }
+  assert.ok(cursor.ok && cursor.view.complete)
+  acc += cursor.view.chunk
+  assert.equal(acc, compact)
+})
+
+test("buildResultChunk: falls back to the run record when no artifact exists", () => {
+  const run = baseRun({ status: "succeeded", result: { a: 1 }, resultTruncated: true })
+  const out = buildResultChunk(run, undefined, {})
+  assert.ok(out.ok)
+  assert.equal(out.view.source, "record")
+  assert.equal(out.view.chunk, '{"a":1}')
+  assert.equal(out.view.complete, true)
+  assert.equal(out.view.nextOffset, null)
+})
+
+test("buildResultChunk: no result is a typed error; past-the-end offset clamps", () => {
+  const empty = baseRun({ status: "failed", error: "boom" })
+  const err = buildResultChunk(empty, undefined, {})
+  assert.ok(!err.ok)
+  assert.match(err.error, /has no result/)
+
+  const run = baseRun({ status: "succeeded", result: { a: 1 } })
+  const beyond = buildResultChunk(run, undefined, { offset: 999, maxLength: 10 })
+  assert.ok(beyond.ok)
+  assert.equal(beyond.view.chunk, "")
+  assert.equal(beyond.view.complete, true)
+})
+
+test("buildResultChunk: pair-splitting offsets are adjusted back one code unit", () => {
+  const value = { faces: "😀😀😀😀😀" } // 2 code units per emoji in the serialization
+  const compact = JSON.stringify(value)
+  // Find an offset that splits a surrogate pair inside the string body.
+  const facesStart = compact.indexOf("😀")
+  const splitOffset = facesStart + 1 // between high and low surrogate
+  const run = baseRun({ status: "succeeded", result: value })
+  const out = buildResultChunk(run, undefined, { offset: splitOffset, maxLength: 20 })
+  assert.ok(out.ok)
+  assert.equal(out.view.offset, splitOffset - 1)
+  assert.equal(compact.slice(out.view.offset, out.view.offset + out.view.chunk.length), out.view.chunk)
+})
+
+test("buildResultChunk: progress invariant — every incomplete page advances (review regression)", () => {
+  const value = { faces: "😀😀😀😀😀😀😀😀", tail: "x" }
+  const compact = JSON.stringify(value)
+  const run = baseRun({ status: "succeeded", result: value })
+  // maxLength:1 (below the floor) clamps to 2; every walk must terminate and
+  // reassemble exactly — the degenerate case where a lone-unit page used to
+  // return chunk:"" and a nextOffset that never advanced (client hang).
+  for (const maxLength of [1, 2, 3]) {
+    let offset = 0
+    let acc = ""
+    let steps = 0
+    for (;;) {
+      const page = buildResultChunk(run, undefined, { offset, maxLength })
+      assert.ok(page.ok)
+      const view = page.view
+      if (!view.complete) {
+        assert.ok(view.chunk.length > 0, `maxLength=${maxLength}: zero-progress page at offset ${offset}`)
+        assert.notEqual(view.nextOffset, null)
+        assert.ok(view.nextOffset! > offset || (view.nextOffset === offset && view.chunk.length > 0))
+      }
+      assert.equal(compact.slice(view.offset, view.offset + view.chunk.length), view.chunk)
+      acc = compact.slice(0, view.offset) + view.chunk + compact.slice(view.offset + view.chunk.length)
+      if (view.complete || ++steps > 500) break
+      offset = view.nextOffset!
+    }
+    assert.ok(steps <= 500, `maxLength=${maxLength}: walk did not terminate`)
+    assert.equal(acc, compact)
+  }
+})
+
+// ---------------------------------------------------------------------------
+// /ultracode result — artifact first, run-record fallback
+// ---------------------------------------------------------------------------
+
+test("/ultracode result: prints from the artifact when present", async () => {
+  const registry = new FakeRegistry()
+  seed(registry, baseRun({
+    id: "run_done",
+    status: "succeeded",
+    result: { big: "x".repeat(80_000) },
+    resultTruncated: true,
+    resultArtifactKey: "results/p1/run_done",
+  }))
+  const storage = new MemoryStorage()
+  storage.artifacts.set("results/p1/run_done", { big: "x".repeat(80_000) })
+  const { texts } = await invoke("result run_done", { registry, storage })
+  assert.match(texts[0]!, /## Full result — `run_done` \(from artifact\)/)
+})
+
+test("/ultracode result: falls back to the run record when the artifact is missing", async () => {
+  const registry = new FakeRegistry()
+  seed(registry, baseRun({
+    id: "run_done",
+    status: "succeeded",
+    result: { big: "y".repeat(80_000) },
+    resultTruncated: true,
+    resultArtifactKey: "results/p1/run_done", // claimed but never persisted
+  }))
+  const { texts } = await invoke("result run_done", { registry, storage: new MemoryStorage() })
+  assert.match(texts[0]!, /## Full result — `run_done` \(from run record\)/)
+})
+
+test("/ultracode result: honest messages for no-result runs", async () => {
+  const registry = new FakeRegistry()
+  seed(registry, baseRun({ id: "run_failed", status: "failed", error: "kaboom" }))
+  const failed = await invoke("result run_failed", { registry })
+  assert.match(failed.texts[0]!, /produced no result \(status: failed — kaboom\)/)
+
+  const registry2 = new FakeRegistry()
+  seed(registry2, baseRun({ id: "run_done", status: "succeeded", result: { ok: 1 } }))
+  const ok = await invoke("result run_done", { registry: registry2 })
+  assert.match(ok.texts[0]!, /"ok": 1/) // fits — printed directly, background or not
 })

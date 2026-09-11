@@ -232,7 +232,7 @@ back to defaults.
 | `maxAgents` | number | `200` | Max total `agent()` calls per run (panel `+/-` steps by 10 within 1–10000). A runaway fan-out fails the run instead of burning tokens forever. |
 | `timeoutMs` | number | `3600000` | Wall-clock limit per run (60 min). Panel cycles presets `600000` / `1800000` / `3600000`. On timeout: children interrupted, worker terminated, run finalized. |
 | `permissions` | string | `"ask"` | `ask` (host user prompt for children — recommended), `autoEditsWorkflow` (auto-approve edit-class actions for active run children inside the project root), `noEditTools` (deny edit-class tools for active run children). Panel cycles these three. |
-| `maxResultChars` | number | `65536` | Max serialized result returned to the session; larger results come back as a preview + `truncated: true`, full value retrievable via `/ultracode result <runID>`. |
+| `maxResultChars` | number | `65536` | Max serialized result returned to the session; larger results come back as a compact `preview` + `truncated: true` + `resultChars`, full value retrievable page-by-page via the `ultracode_result` tool (or `/ultracode result <runID>` for humans). |
 
 Panel settings (`h`/`l` to the settings pane, `+/-` to edit) persist a project-scoped KV overlay and refresh next-run defaults. Changes apply to the **next** run only — in-flight runs keep the snapshot captured at `startDetached`.
 
@@ -337,9 +337,10 @@ global (registered from the always-mounted chip component).
 | `/ultracode` | Dashboard: plugin/min-build line, active (including paused), recent, saved workflows. | **Ctrl+G** or palette `ultracode.inspect` opens the panel |
 | `/ultracode show [runID]` | Full run report (D11 cells + sessionID): status, agents, tokens, tools, script. | — (server parity floor) |
 | `/ultracode status [runID]` | Compact run state: runID, status, agents done/total, elapsed. Same implicit-target rule as `show`. | — |
-| `ultracode_status` tool | Read-only `{ runID? }` → `{ runID, status, agents: { done, total, failed }, startedAt, elapsedMs, children: [{ agentID, sessionID?, label?, phase?, status, waitingForPermission? }] }`; settled runs add `resultPreview` + `resultTruncated`. | — |
+| `ultracode_status` tool | Read-only `{ runID? }` → `{ runID, status, agents: { done, total, failed }, startedAt, elapsedMs, children: [{ agentID, sessionID?, label?, phase?, status, waitingForPermission? }] }`; settled runs carry the result inline when it fits the cap, else `resultPreview` + `resultTruncated` + `resultChars` + `resultHint`. | — |
+| `ultracode_result` tool | `{ runID, offset?, maxLength? }` → one page of a settled run's FULL result: `{ source, totalChars, offset, chunk, complete, nextOffset }`. Chunks are substrings of the compact JSON — concatenate from offset 0 following `nextOffset`, then parse. | — |
 | `ultracode_control` tool | Orchestrator control of **owned** runs: `{ action: "stop" \| "pause" \| "resume", runID? }`. Implicit target only when exactly one active owned run. Stop is recorded as the run's stop reason (`/ultracode show` displays it). | same verbs via panel keys |
-| `/ultracode result [runID]` | Print the **full** result of a run whose envelope came back truncated. | — |
+| `/ultracode result [runID]` | Print the **full** result of a run (artifact first, run-record fallback — serves truncated and background runs alike). | — |
 | `/ultracode stop [runID]` | Graceful stop: no new agent calls, children interrupted, worker terminated after a grace period. | `x` |
 | `/ultracode pause [runID]` | Close admission of new `agent()` calls; in-flight finish; watchdog suspended. | `p` (toggles pause) |
 | `/ultracode resume [runID]` | Reopen admission on a paused run. | `p` (toggles resume) |
@@ -595,7 +596,7 @@ list of available agents and guidance instead of spawning a broken run.
 | The model hangs on a prompt | Session-driving must never happen inside plugin `setup()` (admission deadlock — spike-verified). The plugin is built around that rule; if you still see a hang, capture logs and report. |
 | `/ultracode stop` seems ignored | Stop is graceful: in-flight agent calls get a grace period, children are interrupted, then the worker terminates. The envelope arrives when the run actually finalizes. |
 | Child ran the "wrong" model (pin drift) | Children apply the agent pin from `~/.config/opencode/agents/<id>.md` / project `.opencode/agents/<id>.md` (project wins) at session create; re-pinning applies to the **next** spawned child. Unpinned agents use the location default — which on some installs is a free-tier model. Runs record `effectiveModel` per agent and the envelope lists distinct `models`; check `/ultracode show` to confirm. |
-| Result came back truncated | The script returned more than `maxResultChars`. The envelope carries a `preview` and a `resultArtifactKey`; print the full value with `/ultracode result <runID>`, raise the option, or return a summary instead of a dump. |
+| Result came back truncated | The script returned more than `maxResultChars`. The envelope carries a compact `preview`, `resultChars`, and usually a `resultArtifactKey`; page the full value with the `ultracode_result` tool (or print it with `/ultracode result <runID>`), raise the option, or return a summary instead of a dump. |
 | Run status `interrupted` after restart | Persisted `running`/`stopping` runs are marked `interrupted` on plugin load. There is no auto-replay; re-run the workflow. |
 | Nested `ultracode_run` tool call rejected | By design: sessions owned by a running workflow cannot start their own runs (no recursion). |
 | `/ultracode can …` (or other prose) is "Unknown argument" | `/ultracode` is management only. To author a workflow, send a normal message such as `please ultracode …` without the leading slash. |

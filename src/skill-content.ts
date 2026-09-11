@@ -24,7 +24,10 @@ script as globals. Runs are background by default: the tool returns immediately 
 so the parent chat stays available; pass \`background: false\` only when you need the envelope
 in-call. Progress and status are scoped to that run
 (\`ultracode_status\`, inspect, \`/ultracode status\`). When the run settles, a one-line notice lands
-in the parent session and wakes the calling agent (status, agents, result brief, stop reason).
+in the parent session and wakes the calling agent (status, agents, result brief, stop reason). If
+the result exceeds the size cap, the notice and \`ultracode_status\` carry a preview and the total
+size — fetch the full value with \`ultracode_result { runID, offset, maxLength }\`; chunks are
+substrings of the compact JSON, so concatenate from offset 0 following \`nextOffset\`, then parse once.
 
 For long interactive tasks, background is the default so the user can keep chatting.
 When the user changes requirements, use \`ultracode_steer\` with \`{ runID, agentID?, text }\`
@@ -34,7 +37,9 @@ Status includes active child IDs and permission waits. In Ctrl+G, review permiss
 never treat a blocked child as completed work.
 
 Control your own runs: \`ultracode_status { runID? }\` returns per-child detail (id, session, label,
-phase, status) and, once the run settles, a bounded result preview; \`ultracode_control\` with
+phase, status) and, once the run settles, the result itself — inline when it fits the size cap,
+else a bounded preview with the total size; \`ultracode_result\` \`{ runID, offset?, maxLength? }\`
+pages the FULL settled result when it was truncated; \`ultracode_control\` with
 \`{ action: "stop" | "pause" | "resume", runID? }\` stops, pauses, or resumes a run this
 conversation owns (implicit target only when exactly one is active). Stop is graceful — no new
 agent calls, in-flight children interrupted — and is recorded as the run's stop reason
@@ -111,7 +116,8 @@ script size, results truncated after 64 KB by default.
    starts. There are no file, network, or process APIs in the worker; all real work goes through
    \`agent\`.
 2. **Return small JSON.** A few keys: a report string, counts, verdicts. Bigger values come back
-   as a truncated preview.
+   as a truncated preview — recover the full value with \`ultracode_result\` (offset paging), never
+   by guessing past the cut.
 3. **Route by agent, never by model.** No provider or model ids anywhere. Pass an agent id in
    \`opts.agent\`; the user's own agent config decides which model runs.
 4. **Prompts are the entire world.** A child agent sees ONLY its prompt string, zero conversation

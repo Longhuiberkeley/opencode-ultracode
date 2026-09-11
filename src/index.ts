@@ -20,6 +20,7 @@ import {
   D2_VERBS,
   PLUGIN_VERSION,
   TOOL_DESCRIPTION,
+  buildResultChunk,
   enrichStatusPayload,
   executeWorkflowLaunch,
   feedToolEvent,
@@ -55,7 +56,7 @@ import { RegistryImpl } from "./registry.ts"
 import { emptyToolEventState } from "./run-events.ts"
 import { EMPTY_CATALOG, SKILL_CONTENT, SKILL_DESCRIPTION, SKILL_NAME, buildSkillContent } from "./skill-content.ts"
 import { StorageImpl, normalizePath, resolveContainedPath, sha256 } from "./storage.ts"
-import { resolveBackground, validateControlToolInput, validateStatusToolInput, validateToolInput } from "./tool-input.ts"
+import { resolveBackground, validateControlToolInput, validateResultToolInput, validateStatusToolInput, validateToolInput } from "./tool-input.ts"
 import type {
   FsLike,
   Json,
@@ -65,6 +66,7 @@ import type {
   Supervisor,
   WorkflowMeta,
 } from "./types.ts"
+import { isActiveRunStatus } from "./types.ts"
 
 /** Minimal shape of a plugin hook/transform registration (for cleanup). */
 interface RegistrationLike {
@@ -184,6 +186,29 @@ const STATUS_TOOL_INPUT_SCHEMA: Record<string, unknown> = {
   },
 }
 
+const RESULT_TOOL_INPUT_SCHEMA: Record<string, unknown> = {
+  type: "object",
+  additionalProperties: false,
+  required: ["runID"],
+  properties: {
+    runID: {
+      type: "string",
+      description: "Settled run id (must belong to this conversation).",
+    },
+    offset: {
+      type: "integer",
+      minimum: 0,
+      description: "Start offset into the compact-JSON serialization. Start at 0; follow nextOffset from previous calls.",
+    },
+    maxLength: {
+      type: "integer",
+      minimum: 2,
+      maximum: 131072,
+      description: "Max chars for this chunk (min 2 — one UTF-16 unit can be half a surrogate pair; default 24000, max 131072). Chunks concatenate; parse after the complete chunk.",
+    },
+  },
+}
+
 const CONTROL_TOOL_INPUT_SCHEMA: Record<string, unknown> = {
   type: "object",
   additionalProperties: false,
@@ -269,6 +294,7 @@ export default Plugin.define({
       duplicateWarning = `duplicate ultracode setup() for project ${projectID}: already loaded from ${prevLoads.join(", ")}; now ${installDir}`
       warn(duplicateWarning)
     }
+    let rpcRegistered = false
     loadedByProject.set(projectID, [...prevLoads, installDir])
     warn(
       `loaded v${PLUGIN_VERSION} installDir=${installDir} projectRoot=${projectRoot} projectID=${projectID} bootID=${bootID}`,
@@ -649,6 +675,7 @@ export default Plugin.define({
                   background,
                   background
                     ? (outcome) => {
+                        if (disposed) return // shutting down — no late synthetic messages
                         void say(tool.sessionID, formatSettleNotice(outcome.envelope))
                       }
                     : undefined,
@@ -666,12 +693,14 @@ export default Plugin.define({
             name: "status",
             options: { namespace: "ultracode" },
             description:
-              "Read-only status of an ultracode run owned by this conversation. Input { runID? } (omit → single active owned run). Returns { runID, status, agents: { done, total, failed }, startedAt, elapsedMs, children: [{ agentID, sessionID?, label?, phase?, status, waitingForPermission? }] } and, once settled, resultPreview + resultTruncated.",
+              "Read-only status of an ultracode run owned by this conversation. Input { runID? } (omit → single active owned run). Returns { runID, status, agents: { done, total, failed }, startedAt, elapsedMs, children: [{ agentID, sessionID?, label?, phase?, status, waitingForPermission? }] } and, once settled, the full result inline when it fits the size cap, else resultPreview + resultTruncated + resultChars (fetch the rest with ultracode_result).",
             input: STATUS_TOOL_INPUT_SCHEMA,
             execute: async (rawInput: unknown, tool) => {
               try {
                 const parsed = validateStatusToolInput(rawInput)
                 if (!parsed.ok) return { content: `error: ${parsed.error}` }
+                // Persisted-run warm-up (same rationale as ultracode_result).
+                await runsReconciled
                 const active = (supervisor?.activeRuns() ?? registry.activeRuns()).filter((r) => r.parentSessionID === tool.sessionID)
                 if (parsed.runID && registry.get(parsed.runID)?.parentSessionID !== tool.sessionID) {
                   return { content: "error: run does not belong to this conversation" }
@@ -679,7 +708,7 @@ export default Plugin.define({
                 const resolved = resolveRunStatus(registry, parsed.runID ?? "", active)
                 if (!resolved.ok) return { content: `error: ${resolved.error}` }
                 const record = registry.get(resolved.payload.runID)
-                const payload = enrichStatusPayload(resolved.payload, record)
+                const payload = enrichStatusPayload(resolved.payload, record, Date.now(), options.maxResultChars)
                 const children = await Promise.all(
                   (payload.children as Array<StatusChildView & { sessionID?: string }>).map(async (c) =>
                     c.status === "running" && c.sessionID
@@ -695,6 +724,53 @@ export default Plugin.define({
           })
         } catch (err) {
           warn("failed to register the ultracode_status tool", err)
+        }
+        try {
+          editor.add({
+            name: "result",
+            options: { namespace: "ultracode" },
+            description:
+              "Fetch the FULL settled result of an ultracode run owned by this conversation (the piece missing from truncated previews). Input { runID, offset?, maxLength? }. Returns { source, totalChars, offset, chunk, complete, nextOffset, resultArtifactKey? } where chunk is a substring of the compact JSON serialization — request offset 0 first, follow nextOffset, concatenate, then parse once.",
+            input: RESULT_TOOL_INPUT_SCHEMA,
+            execute: async (rawInput: unknown, tool) => {
+              try {
+                const parsed = validateResultToolInput(rawInput)
+                if (!parsed.ok) return { content: `error: ${parsed.error}` }
+                // Wait for the persisted-run warm-up: this tool's primary use
+                // case is fetching a truncated result from a run recorded by a
+                // previous process (server restart) — a cold registry would
+                // otherwise report it as "not found".
+                await runsReconciled
+                // Ownership before existence (matches ultracode_status — no
+                // runID existence oracle for foreign sessions).
+                if (registry.get(parsed.runID)?.parentSessionID !== tool.sessionID) {
+                  return { content: "error: run does not belong to this conversation" }
+                }
+                const run = registry.get(parsed.runID)
+                if (!run) {
+                  return { content: `error: run "${parsed.runID}" not found. See /ultracode for known runs.` }
+                }
+                if (isActiveRunStatus(run.status)) {
+                  return {
+                    content: `error: run "${parsed.runID}" is still ${run.status} — the result exists only after it settles. Poll ultracode_status.`,
+                  }
+                }
+                const artifact = run.resultArtifactKey
+                  ? await storage.loadResultArtifactFresh(run.resultArtifactKey)
+                  : undefined
+                const chunk = buildResultChunk(run, artifact, {
+                  ...(parsed.offset !== undefined ? { offset: parsed.offset } : {}),
+                  ...(parsed.maxLength !== undefined ? { maxLength: parsed.maxLength } : {}),
+                })
+                if (!chunk.ok) return { content: `error: ${chunk.error}` }
+                return { content: JSON.stringify(chunk.view) }
+              } catch (err) {
+                return { content: `error: ${describeError(err)}` }
+              }
+            },
+          })
+        } catch (err) {
+          warn("failed to register the ultracode_result tool", err)
         }
         editor.add({
           name: "control",
@@ -758,6 +834,52 @@ export default Plugin.define({
             storage.saveSettingsOverlay(nextOverlay)
             const next = refreshDefaults(nextOverlay)
             return panelSettingsFrom(next)
+          },
+          doctor: async () => {
+            const diag = storage.kvDiagnostics()
+            let marker: { v?: number; version?: string; tui?: number } | undefined
+            try {
+              const raw = JSON.parse(
+                await fsp.readFile(`${installDir}/.ultracode-install`, "utf8"),
+              ) as { v?: unknown; version?: unknown; tui?: unknown }
+              marker = {
+                ...(typeof raw.v === "number" ? { v: raw.v } : {}),
+                ...(typeof raw.version === "string" ? { version: raw.version } : {}),
+                ...(typeof raw.tui === "number" ? { tui: raw.tui } : {}),
+              }
+            } catch {
+              marker = undefined // not an installer tree — reported as missing
+            }
+            const entry = async (p: string): Promise<boolean> => {
+              try {
+                await fsp.stat(p)
+                return true
+              } catch {
+                return false
+              }
+            }
+            return formatDoctorReport({
+              version: PLUGIN_VERSION,
+              installDir,
+              projectRoot,
+              projectID,
+              marker,
+              entryFiles: {
+                index: await entry(`${installDir}/index.ts`),
+                srcIndex: await entry(`${installDir}/src/index.ts`),
+                tui: await entry(`${installDir}/tui.tsx`),
+                srcTui: await entry(`${installDir}/src/tui.tsx`),
+              },
+              rpc: rpcRegistered,
+              supervisor: supervisor !== undefined,
+              liveRuns: registry.activeRuns().length,
+              persistedRuns: diag.persistedRunCount,
+              kvErrorCount: diag.kvErrorCount,
+              ...(diag.lastKvError ? { lastKvError: diag.lastKvError } : {}),
+              artifactErrorCount: diag.artifactErrorCount,
+              ...(diag.lastArtifactError ? { lastArtifactError: diag.lastArtifactError } : {}),
+              ...(duplicateWarning ? { duplicateWarning } : {}),
+            })
           },
         })
       } catch (err) {
@@ -834,6 +956,7 @@ export default Plugin.define({
         if (registration && typeof registration.dispose === "function") {
           registrations.push(registration as RegistrationLike)
         }
+        rpcRegistered = true
       }
     } catch (err) {
       warn("rpc register failed — TUI uses session heuristics", err)

@@ -148,9 +148,48 @@ test("supervisor: oversized result truncated + artifact persisted", async () => 
   assert.equal(outcome.envelope.truncated, true)
   assert.equal(outcome.envelope.result, undefined)
   assert.ok(typeof outcome.envelope.preview === "string" && outcome.envelope.preview.length <= 20)
+  assert.ok(outcome.run.resultTruncated === true)
   assert.ok(outcome.run.resultArtifactKey)
   const stored = ctx.storage.loadResultArtifact(outcome.run.resultArtifactKey as string)
   assert.ok(stored && typeof stored === "object")
+})
+
+test("supervisor: artifact failure keeps resultTruncated honest, no phantom key", async () => {
+  const ctx = makeSupervisor({ maxResultChars: 20 })
+  ctx.storage.failSaveResultArtifact = true
+  const outcome = await ctx.supervisor.start(
+    { script: `return { blob: "${"x".repeat(500)}" };` },
+    ctx.parent,
+  )
+  assert.equal(outcome.envelope.status, "succeeded")
+  // Delivery is still truncated (preview), but no artifact key is claimed.
+  assert.equal(outcome.envelope.truncated, true)
+  assert.equal(outcome.envelope.resultArtifactKey, undefined)
+  assert.equal(outcome.run.resultTruncated, true)
+  assert.equal(outcome.run.resultArtifactKey, undefined)
+  // The full result survives on the run record (renderResult fallback path).
+  assert.ok(outcome.run.result && typeof outcome.run.result === "object")
+})
+
+test("supervisor: non-string agent() prompt fails the call, not silently empty", async () => {
+  const ctx = makeSupervisor()
+  const outcome = await ctx.supervisor.start(
+    { script: `await agent(42); return "unreachable";` },
+    ctx.parent,
+  )
+  assert.equal(outcome.envelope.status, "failed")
+  assert.match(outcome.envelope.error ?? "", /prompt must be a non-empty string/)
+  assert.equal(outcome.run.agents.length, 0)
+})
+
+test("supervisor: non-string workflow() name fails the call", async () => {
+  const ctx = makeSupervisor()
+  const outcome = await ctx.supervisor.start(
+    { script: `await workflow(undefined); return "unreachable";` },
+    ctx.parent,
+  )
+  assert.equal(outcome.envelope.status, "failed")
+  assert.match(outcome.envelope.error ?? "", /name must be a non-empty string/)
 })
 
 test("supervisor: timeout watchdog stops the run", async () => {

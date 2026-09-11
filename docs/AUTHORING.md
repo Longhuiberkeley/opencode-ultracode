@@ -62,9 +62,11 @@ Two input shapes (a union — anything else is rejected, extra keys included):
 
 The tool call returns immediately after admission (`background` defaults to true) with
 `{ runID, status: "running", hint }`. On completion the plugin appends a one-line settle
-notice to the parent session — status, agents, bounded result brief, stop reason — which
+notice to the parent session — status, agents, bounded result brief, stop reason, and for
+truncated results the `ultracode_result` recovery pointer — which
 **wakes the parent agent** (live-verified); `ultracode_status` remains the authoritative poll
-(carrying a bounded result preview once settled). Runs cannot
+(carrying the settled result inline when it fits the cap, else a bounded preview with the total
+size). Runs cannot
 nest: an `ultracode_run` call from a session owned by a
 running workflow is rejected. Pass `background: false` to block until the run finishes
 (success, failure, stop, or timeout) — never while agents are live.
@@ -566,14 +568,17 @@ in the prompt (prompts are the entire world); (7) small return with counts.
 
 The script's return value is the workflow's product:
 
-- It must be **JSON-safe**. The runtime attempts `structuredClone`; on failure it stringifies
-  with a replacer, stripping symbols/functions with a warning. Return plain data, not class
+- It must be **JSON-safe**. The runtime sanitizes the done value before it crosses the worker
+  boundary (bigint → string, cycles → `"[circular]"`, functions/symbols/undefined stripped;
+  non-plain objects like `Date`/`Map`/`Set` degrade to `{}`). Return plain data, not class
   instances.
-- It must be **small**: if the serialized form exceeds `maxResultChars` (default 65536 chars),
-  the envelope carries a `preview` (the first `maxResultChars` characters of pretty-printed JSON)
-  plus `truncated: true` and a `resultArtifactKey`; the full value is persisted in plugin
-  storage and can be printed with `/ultracode result <runID>`. Return summaries + pointers, not
-  dumps.
+- It should be **small**: if the compact serialization exceeds `maxResultChars` (default 65536
+  chars), the envelope carries a `preview` (the first `maxResultChars` characters of the COMPACT
+  JSON) plus `truncated: true`, `resultChars` (total compact length) and, when the artifact write
+  succeeded, a `resultArtifactKey`. The full value is persisted in plugin storage; the parent
+  agent pages it back with the `ultracode_result` tool (`{ runID, offset, maxLength }` — chunks
+  concatenate from offset 0 following `nextOffset`, then parse once), and a human can print it
+  with `/ultracode result <runID>`. Return summaries + pointers, not dumps.
 - Shape is yours, but convention: `{ report: string, stats: { ...counts } }` or
   `{ findings: [...bounded], stats: {...} }`. Keep arrays bounded (`slice`) before returning.
 
@@ -590,9 +595,10 @@ What the `ultracode_run` tool returns to the parent session (always valid JSON):
 | `agents` | object | always | `{ total, succeeded, failed, interrupted }` across the whole run (composed workflows included). |
 | `tokens` | object | on success paths | Summed `TokenUsage` over all child sessions: `{ input, output, reasoning, cache: { read, write } }`. |
 | `result` | JSON | when it fit | The script's return value (see the return contract). |
-| `preview` | string | when truncated | First `maxResultChars` chars of the pretty-printed result. |
+| `preview` | string | when truncated | First `maxResultChars` chars of the COMPACT-JSON result (surrogate-pair safe). |
 | `truncated` | boolean | always | Whether `result` was replaced by `preview`. |
-| `resultArtifactKey` | string | when truncated | Storage key of the persisted full result; print it with `/ultracode result <runID>`. |
+| `resultChars` | number | when a result exists | Total compact-JSON length of the result — how much `ultracode_result` paging would fetch. |
+| `resultArtifactKey` | string | when truncated + persisted | Storage key of the persisted full result; page it with `ultracode_result` or print via `/ultracode result <runID>` (falls back to the run-record copy when the artifact is missing). |
 | `scriptPath` | string | when persisted | Absolute path of the run's script artifact. |
 | `workflowName` | string | when saved-run | The saved workflow that was executed. |
 | `error` | string | on failure | The failing error (script throw, validation, preflight, timeout, untrusted workflow). |

@@ -218,6 +218,8 @@ export interface RunEnvelope {
   /** Present instead of `result` when truncated. */
   preview?: string
   truncated: boolean
+  /** Total compact-JSON length of the result (present whenever there is a result). */
+  resultChars?: number
   /** Storage key of the full result artifact (present when truncated; additive — Builder B). */
   resultArtifactKey?: string
   scriptPath?: string
@@ -417,8 +419,12 @@ export interface Storage {
   loadRuns(): RunRecord[]
   /** Write the script artifact file; returns absolute path. */
   writeScriptArtifact(runID: string, script: string): Promise<string | undefined>
-  /** Persist a large result; returns the storage key. */
-  saveResultArtifact(runID: string, result: Json): string
+  /**
+   * Persist a large result; returns the storage key, or undefined when the
+   * value could not be serialized (no key is claimed in that case — callers
+   * must not mark the run as having an artifact).
+   */
+  saveResultArtifact(runID: string, result: Json): string | undefined
   loadResultArtifact(key: string): Json | undefined
   /** List saved workflows (project dir beats personal dir on name collision). */
   listWorkflows(): SavedWorkflow[]

@@ -249,3 +249,39 @@ export function validateControlToolInput(
   }
   return { ok: true, action: action as ControlAction, runID }
 }
+
+/** Input for the read-only `ultracode_result` tool (full-result paging). */
+export function validateResultToolInput(
+  raw: unknown,
+): { ok: true; runID: string; offset?: number; maxLength?: number } | { ok: false; error: string } {
+  if (!isObj(raw)) return { ok: false, error: `input must be an object, got ${typeOf(raw)}` }
+  const extra = rejectExtras(raw, new Set(["runID", "offset", "maxLength"]))
+  if (extra) return { ok: false, error: extra }
+  const runID = raw["runID"]
+  if (typeof runID !== "string" || runID.trim() === "") {
+    return {
+      ok: false,
+      error: `"runID" must be a non-empty string, got ${typeOf(runID) === "string" ? "empty string" : typeOf(runID)}`,
+    }
+  }
+  let offset: number | undefined
+  if (has(raw, "offset")) {
+    const v = raw["offset"]
+    if (typeof v !== "number" || !Number.isInteger(v) || v < 0) {
+      return { ok: false, error: `"offset" must be a non-negative integer, got ${typeOf(v) === "number" ? v : typeOf(v)}` }
+    }
+    offset = v
+  }
+  let maxLength: number | undefined
+  if (has(raw, "maxLength")) {
+    const v = raw["maxLength"]
+    if (typeof v !== "number" || !Number.isInteger(v) || v < 2) {
+      return { ok: false, error: `"maxLength" must be an integer of at least 2 (one UTF-16 unit can be half a surrogate pair), got ${typeOf(v) === "number" ? v : typeOf(v)}` }
+    }
+    maxLength = v
+  }
+  const out: { ok: true; runID: string; offset?: number; maxLength?: number } = { ok: true, runID }
+  if (offset !== undefined) out.offset = offset
+  if (maxLength !== undefined) out.maxLength = maxLength
+  return out
+}

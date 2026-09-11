@@ -7,6 +7,7 @@ import {
   MAX_ARGS_BYTES,
   MAX_SCRIPT_BYTES,
   resolveBackground,
+  validateResultToolInput,
   validateStatusToolInput,
   validateToolInput,
 } from "../src/tool-input.ts"
@@ -231,4 +232,32 @@ test("status tool input: omitted, runID, extras, wrong types", () => {
   const empty = validateStatusToolInput({ runID: "" })
   assert.equal(empty.ok, false)
   if (!empty.ok) assert.match(empty.error, /empty string/)
+})
+
+test("result tool input: runID required; offset/maxLength validated; extras rejected", () => {
+  assert.deepEqual(validateResultToolInput({ runID: "run_abc" }), { ok: true, runID: "run_abc" })
+  assert.deepEqual(validateResultToolInput({ runID: "run_abc", offset: 50, maxLength: 1000 }), {
+    ok: true,
+    runID: "run_abc",
+    offset: 50,
+    maxLength: 1000,
+  })
+  const missing = validateResultToolInput({})
+  assert.equal(missing.ok, false)
+  if (!missing.ok) assert.match(missing.error, /"runID" must be a non-empty string/)
+  const badOffset = validateResultToolInput({ runID: "r", offset: -1 })
+  assert.equal(badOffset.ok, false)
+  if (!badOffset.ok) assert.match(badOffset.error, /"offset" must be a non-negative integer/)
+  const fracOffset = validateResultToolInput({ runID: "r", offset: 1.5 })
+  assert.equal(fracOffset.ok, false)
+  if (!fracOffset.ok) assert.match(fracOffset.error, /"offset" must be a non-negative integer/)
+  const badLength = validateResultToolInput({ runID: "r", maxLength: 0 })
+  assert.equal(badLength.ok, false)
+  if (!badLength.ok) assert.match(badLength.error, /"maxLength" must be an integer of at least 2/)
+  const lone = validateResultToolInput({ runID: "r", maxLength: 1 })
+  assert.equal(lone.ok, false)
+  if (!lone.ok) assert.match(lone.error, /at least 2 \(one UTF-16 unit can be half a surrogate pair\)/)
+  const extra = validateResultToolInput({ runID: "r", nope: 1 })
+  assert.equal(extra.ok, false)
+  if (!extra.ok) assert.match(extra.error, /unexpected key "nope"/)
 })

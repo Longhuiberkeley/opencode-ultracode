@@ -193,6 +193,8 @@ export class StorageImpl implements Storage {
   private lastScanError: string | undefined
   private workflowCache = new Map<string, CachedWorkflow>()
   private resultCache = new Map<string, Json>()
+  private artifactFailures = 0
+  private lastArtifactError: string | undefined
   /** name -> approved sha256 digest of the script (KV-backed, cache-loaded). */
   private trustDigests = new Map<string, string>()
 
@@ -233,6 +235,9 @@ export class StorageImpl implements Storage {
     persistedRunCount: number
     kvErrorCount: number
     lastKvError?: string
+    /** Result-artifact KV write failures (previously swallowed silently). */
+    artifactErrorCount: number
+    lastArtifactError?: string
     runsPrefix: string
   } {
     const lastKvError = this.lastPersistError ?? this.lastScanError
@@ -242,6 +247,8 @@ export class StorageImpl implements Storage {
       persistedRunCount: this.runsCache.length,
       kvErrorCount: this.persistFailures + this.scanFailures,
       lastKvError,
+      artifactErrorCount: this.artifactFailures,
+      lastArtifactError: this.lastArtifactError,
       runsPrefix: this.runsPrefix,
     }
   }
@@ -293,13 +300,39 @@ export class StorageImpl implements Storage {
   // Result artifacts (KV-backed cache, project-scoped)
   // ------------------------------------------------------------------
 
-  saveResultArtifact(runID: string, result: Json): string {
-    const key = `${this.resultsPrefix}/${runID}`
-    this.resultCache.set(key, result)
+  /** Max full-result artifacts kept in the in-memory cache (LRU eviction). */
+  static readonly RESULT_CACHE_LIMIT = 32
+
+  /**
+   * Persist the full result for a truncated run. The KV write is
+   * fire-and-forget but failures are COUNTED (visible via kvDiagnostics /
+   * `/ultracode doctor`), unlike the old silent swallow. Returns the storage
+   * key, or `undefined` when the value cannot be serialized — in that case no
+   * key is claimed and callers must not mark the run as having an artifact.
+   */
+  saveResultArtifact(runID: string, result: Json): string | undefined {
+    let json: Json
     try {
-      void this.kv.set(key, toJson(result)).catch(() => {})
-    } catch {
-      // Best effort — the envelope preview still describes the run.
+      json = toJson(result)
+    } catch (err) {
+      this.noteArtifactError(err)
+      return undefined
+    }
+    const key = `${this.resultsPrefix}/${runID}`
+    // Map.set on an existing key does NOT move it — fine today (one save per
+    // runID); if saves can ever repeat, re-delete first to refresh recency.
+    this.resultCache.set(key, json)
+    if (this.resultCache.size > StorageImpl.RESULT_CACHE_LIMIT) {
+      const oldest = this.resultCache.keys().next().value
+      if (oldest !== undefined) this.resultCache.delete(oldest)
+    }
+    try {
+      void this.kv.set(key, json).then(
+        undefined,
+        (err: unknown) => this.noteArtifactError(err),
+      )
+    } catch (err) {
+      this.noteArtifactError(err)
     }
     return key
   }
@@ -307,10 +340,16 @@ export class StorageImpl implements Storage {
   /**
    * Sync by interface contract — reads the in-memory artifact cache (same
    * process). Artifacts are additionally mirrored to the KV for durability.
+   * Cache hits re-insert (LRU refresh) so eviction order follows recency.
    */
   loadResultArtifact(key: string): Json | undefined {
     if (typeof key !== "string" || !key.startsWith(this.resultsPrefix + "/")) return undefined
-    return this.resultCache.get(key)
+    const hit = this.resultCache.get(key)
+    if (hit !== undefined) {
+      this.resultCache.delete(key)
+      this.resultCache.set(key, hit)
+    }
+    return hit
   }
 
   /** Cache-first, KV-fallback read (used by `/ultracode result`). */
@@ -581,6 +620,11 @@ export class StorageImpl implements Storage {
   private noteScanError(err: unknown): void {
     this.scanFailures++
     this.lastScanError = err instanceof Error ? err.message : String(err)
+  }
+
+  private noteArtifactError(err: unknown): void {
+    this.artifactFailures++
+    this.lastArtifactError = err instanceof Error ? err.message : String(err)
   }
 
   private async mkdir(dir: string): Promise<void> {

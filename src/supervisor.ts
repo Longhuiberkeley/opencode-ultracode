@@ -481,13 +481,20 @@ export class SupervisorImpl implements Supervisor {
   private async dispatch(fn: string, args: Json[], runner: AgentRunner, state: RunState): Promise<Json> {
     if (fn === "agent") {
       await this.waitIfPaused(state)
-      const prompt = typeof args[0] === "string" ? args[0] : ""
+      if (typeof args[0] !== "string" || args[0].length === 0) {
+        // Silent "" coercion used to spawn a no-op child (audit finding).
+        throw new Error("agent(prompt, opts) — prompt must be a non-empty string")
+      }
+      const prompt = args[0]
       const opts = this.coerceAgentOpts(args[1])
       const result = await runner.call(prompt, opts)
       return result as unknown as Json
     }
     if (fn === "workflow") {
-      const name = typeof args[0] === "string" ? args[0] : ""
+      if (typeof args[0] !== "string" || args[0].length === 0) {
+        throw new Error('workflow(name, args) — name must be a non-empty string')
+      }
+      const name = args[0]
       const depth = typeof args[2] === "number" ? args[2] : 0
       const composed = await getWorkflowComposer(this.workflowLoader, name, args[1], depth)
       return composed as unknown as Json
@@ -692,8 +699,11 @@ export class SupervisorImpl implements Supervisor {
     }
 
     let artifactKey: string | undefined
-    if (final.result !== undefined && !resultFits(final.result, maxResultChars)) {
+    const resultOverBudget = final.result !== undefined && !resultFits(final.result, maxResultChars)
+    if (resultOverBudget && final.result !== undefined) {
       try {
+        // undefined return = the value could not be serialized — no key is
+        // claimed (renderResult then falls back to the run record copy).
         artifactKey = this.storage.saveResultArtifact(runID, final.result)
       } catch {
         artifactKey = undefined
@@ -703,7 +713,11 @@ export class SupervisorImpl implements Supervisor {
     this.registry.finish(runID, {
       status: final.status,
       result: final.result,
-      resultTruncated: artifactKey !== undefined,
+      // Truncated describes DELIVERY (the envelope will carry a preview),
+      // independent of whether the artifact write succeeded — a swallowed
+      // artifact failure previously left resultTruncated=false while the
+      // envelope said truncated=true.
+      resultTruncated: resultOverBudget,
       resultArtifactKey: artifactKey,
       error: final.error,
       stopReason: final.stopReason,

@@ -266,6 +266,52 @@ test("loadResultArtifactFresh falls back to KV when the cache misses", async () 
   assert.equal(await fresh.loadResultArtifactFresh("results/nope"), undefined)
 })
 
+test("saveResultArtifact: unserializable value claims no key and counts the failure", () => {
+  const { storage } = makeStorage()
+  const circular: Json = { self: null } as unknown as Json
+  ;(circular as { self: unknown }).self = circular
+  const key = storage.saveResultArtifact("run_bad", circular)
+  assert.equal(key, undefined)
+  assert.equal(storage.loadResultArtifact(RESULTS_KEY("run_bad")), undefined)
+  const diag = storage.kvDiagnostics()
+  assert.equal(diag.artifactErrorCount, 1)
+  assert.match(diag.lastArtifactError ?? "", /circular/i)
+})
+
+test("saveResultArtifact: async KV failure is counted in kvDiagnostics (doctor)", async () => {
+  const kv: KvLike = new FakeKv()
+  const failing: KvLike = {
+    get: kv.get.bind(kv),
+    set: async () => {
+      throw new Error("kv quota exceeded")
+    },
+    ...(kv.scan ? { scan: kv.scan.bind(kv) } : {}),
+  }
+  const { storage } = makeStorage({ kv: failing })
+  const key = storage.saveResultArtifact("run_kvfail", { ok: true })
+  assert.equal(key, RESULTS_KEY("run_kvfail")) // cache still holds it
+  await new Promise((r) => setTimeout(r, 10)) // let the fire-and-forget reject
+  const diag = storage.kvDiagnostics()
+  assert.equal(diag.artifactErrorCount, 1)
+  assert.match(diag.lastArtifactError ?? "", /quota/)
+  // Same-process reads still work from the cache.
+  assert.deepEqual(storage.loadResultArtifact(key!), { ok: true })
+})
+
+test("resultCache is a bounded LRU: oldest entries evict, reads refresh recency", () => {
+  const { storage } = makeStorage()
+  const limit = StorageImpl.RESULT_CACHE_LIMIT
+  for (let i = 0; i < limit; i++) {
+    storage.saveResultArtifact(`run_${String(i).padStart(2, "0")}`, { i })
+  }
+  // Touch the oldest so it becomes most-recent.
+  assert.deepEqual(storage.loadResultArtifact(RESULTS_KEY("run_00")), { i: 0 })
+  storage.saveResultArtifact("run_overflow", { i: limit }) // evicts run_01 now
+  assert.deepEqual(storage.loadResultArtifact(RESULTS_KEY("run_00")), { i: 0 })
+  assert.equal(storage.loadResultArtifact(RESULTS_KEY("run_01")), undefined)
+  assert.deepEqual(storage.loadResultArtifact(RESULTS_KEY("run_overflow")), { i: limit })
+})
+
 // ---------------------------------------------------------------------------
 // Saved workflows: pairs, precedence, trust gate
 // ---------------------------------------------------------------------------

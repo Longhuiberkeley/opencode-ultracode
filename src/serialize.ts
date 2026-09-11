@@ -264,27 +264,32 @@ function findBalancedEnd(text: string, start: number): number {
 // Envelope assembly + bounded stringify
 // ---------------------------------------------------------------------------
 
-/** Compact JSON.stringify that never returns undefined (falls back to "null"). */
-export function boundedStringify(value: Json | undefined, maxChars = Number.MAX_SAFE_INTEGER): string {
-  let s: string
-  try {
-    s = JSON.stringify(value) ?? "null"
-  } catch {
-    s = '"[unserializable]"'
-  }
-  return s.length <= maxChars ? s : s.slice(0, maxChars)
+/**
+ * UTF-16 surrogate-pair-safe slice: never cuts between a high surrogate and
+ * its low surrogate (backing off one code unit instead of emitting mojibake).
+ */
+export function safeSlice(s: string, maxChars: number): string {
+  if (s.length <= maxChars) return s
+  const cut = Math.max(0, maxChars)
+  const prev = s.charCodeAt(cut - 1)
+  const next = s.charCodeAt(cut)
+  const splitsSurrogate =
+    prev >= 0xd800 && prev <= 0xdbff && next >= 0xdc00 && next <= 0xdfff
+  return splitsSurrogate ? s.slice(0, cut - 1) : s.slice(0, cut)
 }
 
-/** Pretty JSON sliced to maxChars (used for envelope previews). */
-export function boundedPrettyStringify(value: Json | undefined, maxChars: number): string {
-  let s: string
+/** Compact JSON.stringify that never returns undefined (falls back to "null"). */
+export function compactStringify(value: Json | undefined): string {
   try {
-    s = JSON.stringify(value, null, 2) ?? "null"
+    return JSON.stringify(value) ?? "null"
   } catch {
-    s = '"[unserializable]"'
+    return '"[unserializable]"'
   }
-  if (s.length <= maxChars) return s
-  return s.slice(0, maxChars)
+}
+
+/** Compact JSON safely sliced to maxChars (surrogate pairs never split). */
+export function boundedStringify(value: Json | undefined, maxChars = Number.MAX_SAFE_INTEGER): string {
+  return safeSlice(compactStringify(value), maxChars)
 }
 
 /** True when the compact serialization of `value` fits within `maxChars`. */
@@ -301,7 +306,9 @@ export function resultFits(value: Json | undefined, maxChars: number): boolean {
 /**
  * Build the tool-result envelope from a (final) run record.
  * `result` is included when its compact serialization fits `maxChars`;
- * otherwise `preview` (first maxChars chars of pretty JSON) + truncated: true.
+ * otherwise `preview` (first maxChars chars of COMPACT JSON, surrogate-safe)
+ * + truncated: true + resultChars (total compact length, so consumers know
+ * how much there is to fetch via ultracode_result / `/ultracode result`).
  */
 export function buildEnvelope(run: RunRecord, maxChars: number): RunEnvelope {
   const counts = countAgents(run)
@@ -331,12 +338,19 @@ export function buildEnvelope(run: RunRecord, maxChars: number): RunEnvelope {
   if (models.size > 0) envelope.models = [...models].sort()
 
   if (run.result !== undefined) {
-    if (resultFits(run.result, maxChars)) {
+    // Compact serialization drives BOTH the fit decision and the preview so
+    // the budget means the same thing in either branch (review fix: the old
+    // pretty-printed preview covered far less data per char than the compact
+    // length it was budgeted against).
+    const compact = compactStringify(run.result)
+    envelope.resultChars = compact.length
+    if (compact.length <= maxChars) {
       envelope.result = run.result
     } else {
-      envelope.preview = boundedPrettyStringify(run.result, maxChars)
+      envelope.preview = safeSlice(compact, maxChars)
       envelope.truncated = true
-      // Give consumers (e.g. `/ultracode result`) a handle on the full artifact.
+      // Give consumers (e.g. `/ultracode result`, ultracode_result) a handle
+      // on the full artifact.
       if (run.resultArtifactKey !== undefined) envelope.resultArtifactKey = run.resultArtifactKey
     }
   }

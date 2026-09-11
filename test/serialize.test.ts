@@ -10,6 +10,7 @@ import {
   collectBalancedSpans,
   extractJson,
   resultFits,
+  safeSlice,
   validateJsonSchemaValue,
 } from "../src/serialize.ts"
 import type { AgentRecord, Json, RunRecord } from "../src/types.ts"
@@ -199,6 +200,17 @@ test("boundedStringify truncates to maxChars", () => {
   assert.equal(boundedStringify(undefined), "null")
 })
 
+test("safeSlice never splits a surrogate pair", () => {
+  const s = "😀😀😀" // each emoji is one surrogate pair (2 code units)
+  assert.equal(s.length, 6)
+  assert.equal(safeSlice(s, 3).length, 2) // would split the 2nd pair — backs off
+  assert.equal(safeSlice(s, 4), "😀😀")
+  assert.equal(safeSlice(s, 100), s)
+  assert.equal(safeSlice("abc", 0), "")
+  // BMP boundary: no surrogate at the cut — untouched
+  assert.equal(safeSlice("abcdef", 3), "abc")
+})
+
 test("resultFits boundary is inclusive", () => {
   assert.equal(resultFits({ a: "12345" }, 13), true) // {"a":"12345"} is 13 chars
   assert.equal(resultFits({ a: "12345" }, 12), false)
@@ -273,24 +285,35 @@ test("buildEnvelope: result fits at exactly maxChars", () => {
   assert.deepEqual(env.result, value)
   assert.equal(env.truncated, false)
   assert.equal(env.preview, undefined)
+  assert.equal(env.resultChars, 13)
 })
 
-test("buildEnvelope: result over budget becomes preview + truncated", () => {
+test("buildEnvelope: result over budget becomes COMPACT preview + truncated", () => {
   const value: Json = { a: "12345" }
   const env = buildEnvelope(fakeRun({ result: value }), 12)
   assert.equal(env.result, undefined)
   assert.equal(env.truncated, true)
   assert.ok(typeof env.preview === "string")
-  assert.equal(env.preview.length, 12)
-  assert.ok(env.preview.startsWith('{\n  "a": "1'))
+  assert.equal(env.preview, '{"a":"12345"') // compact prefix, exactly 12 chars
+  assert.equal(env.resultChars, 13)
 })
 
-test("buildEnvelope: large result preview is a prefix of pretty JSON", () => {
+test("buildEnvelope: large result preview is a prefix of compact JSON, surrogate-safe", () => {
   const value: Json = { rows: ["x".repeat(300), "y".repeat(300)] }
   const env = buildEnvelope(fakeRun({ result: value }), 64)
   assert.equal(env.truncated, true)
-  const pretty = JSON.stringify(value, null, 2)
-  assert.equal(env.preview, pretty.slice(0, 64))
+  const compact = JSON.stringify(value)
+  assert.equal(env.preview, compact.slice(0, 64))
+  assert.equal(env.resultChars, compact.length)
+
+  // Surrogate pair at the cut boundary: preview backs off, never splits.
+  // '{"faces":"' is 10 chars; emoji #2's high surrogate sits at index 12 —
+  // a maxChars of 13 would split it, so the preview backs off to 12.
+  const emoji: Json = { faces: "😀😀😀😀😀" }
+  const env2 = buildEnvelope(fakeRun({ result: emoji }), 13)
+  const compact2 = JSON.stringify(emoji)
+  assert.equal(env2.preview, compact2.slice(0, 12))
+  assert.ok(!/[\ud800-\udbff]$/.test(env2.preview!))
 })
 
 test("buildEnvelope: truncated result carries resultArtifactKey", () => {

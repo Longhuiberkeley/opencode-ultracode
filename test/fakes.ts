@@ -520,6 +520,8 @@ export class FakeStorage implements Storage {
   resultArtifacts = new Map<string, Json>()
   workflows = new Map<string, SavedWorkflow>()
   failWriteScriptArtifact = false
+  /** When set, saveResultArtifact simulates an unserializable value / storage failure. */
+  failSaveResultArtifact = false
 
   saveRun(record: RunRecord): void {
     this.runSnapshots.push({ ...record, agents: record.agents.map((a) => ({ ...a })) })
@@ -536,7 +538,8 @@ export class FakeStorage implements Storage {
     return path
   }
 
-  saveResultArtifact(runID: string, result: Json): string {
+  saveResultArtifact(runID: string, result: Json): string | undefined {
+    if (this.failSaveResultArtifact) return undefined
     const key = `results/${runID}`
     this.resultArtifacts.set(key, result)
     return key

@@ -3,6 +3,7 @@
  * and session.tool.* → toolCalls wiring. Plugin-free so unit tests cover it.
  */
 import { agentCells, compactCount, compactElapsed, compactTokens, runHeaderCells } from "./run-format.ts"
+import { compactStringify, safeSlice } from "./serialize.ts"
 import { reduceToolEvent, toolCallsFor, type ToolEvent, type ToolEventState } from "./run-events.ts"
 import { normalizePath, sha256 } from "./storage.ts"
 import type {
@@ -18,7 +19,7 @@ import type {
   UltracodeOptions,
   WorkflowMeta,
 } from "./types.ts"
-import { countAgents, isActiveRunStatus } from "./types.ts"
+import { countAgents, DEFAULT_OPTIONS, isActiveRunStatus } from "./types.ts"
 import {
   applySetValue,
   capturedFromRecord,
@@ -83,7 +84,7 @@ export const NESTED_RUN_REFUSED =
   "cannot start a run from inside an active workflow session — use /ultracode from the parent"
 
 /** Plugin package version shown on the bare /ultracode dashboard. */
-export const PLUGIN_VERSION = "0.5.0"
+export const PLUGIN_VERSION = "0.6.0"
 /** Oldest OpenCode binary build the inspect TUI is gated on (A7 / D7). */
 export const MIN_SUPPORTED_BUILD = 19271
 
@@ -145,7 +146,8 @@ export const TOOL_DESCRIPTION: string = [
   "Caps: 8 concurrent agents (default), 200 agent() calls per run, 60 minutes wall clock, 512 KB max script, results truncated after 64 KB.",
   "Default / background: runs are background by default — the tool returns immediately after admission with { runID, status: \"running\", hint } (inspect panel via ctrl+g, or /ultracode status / ultracode_status). A late tool result cannot be delivered after execute returns; instead a settle notice lands in the parent session on completion and wakes the calling agent.",
   "background: false (opt-in) blocks until every agent settles, then returns { runID, status, agents, tokens, result | preview }.",
-  "Orchestrator tools: ultracode_status { runID? } (per-child detail, elapsed, settled result preview), ultracode_control { action: stop|pause|resume, runID? } (owned runs only), ultracode_steer { runID, agentID?, text } (running child).",
+  "Orchestrator tools: ultracode_status { runID? } (per-child detail, elapsed, settled result — full when it fits), ultracode_result { runID, offset?, maxLength? } (full settled result, page-by-page), ultracode_control { action: stop|pause|resume, runID? } (owned runs only), ultracode_steer { runID, agentID?, text } (running child).",
+  "Truncated results: when a result exceeds the size cap, envelopes and status carry a preview plus resultChars/total size. Fetch the full value with ultracode_result — each call returns a chunk of the COMPACT JSON serialization plus nextOffset; concatenate chunks from offset 0 following nextOffset, then parse.",
   "",
   "Full patterns + live catalogs load with the Ultracode skill (auto-attaches on the standalone keyword 'ultracode').",
 ].join("\n")
@@ -279,6 +281,7 @@ export function enrichStatusPayload(
   payload: RunStatusPayload,
   run: RunRecord | undefined,
   now: number = Date.now(),
+  maxResultChars: number = DEFAULT_OPTIONS.maxResultChars,
 ): RunStatusPayload & {
   name?: string
   workflowName?: string
@@ -286,8 +289,15 @@ export function enrichStatusPayload(
   children: StatusChildView[]
   childrenTruncated?: boolean
   childrenOmitted?: number
+  result?: Json
   resultPreview?: string
+  /** True when THIS payload does not contain the complete result. */
   resultTruncated?: boolean
+  /** Total compact-JSON length of the run result. */
+  resultChars?: number
+  resultArtifactKey?: string
+  /** Recovery pointer when resultTruncated is true. */
+  resultHint?: string
   error?: string
 } {
   if (!run) return { ...payload, elapsedMs: 0, children: [] }
@@ -307,17 +317,29 @@ export function enrichStatusPayload(
     out["childrenTruncated"] = true
     out["childrenOmitted"] = run.agents.length - STATUS_CHILDREN_LIMIT
   }
-  if (!isActiveRunStatus(run.status)) {
-    const serialized = run.result === undefined ? undefined : JSON.stringify(run.result)
-    if (serialized !== undefined) {
-      out["resultPreview"] =
-        serialized.length > STATUS_RESULT_PREVIEW_CHARS
-          ? serialized.slice(0, STATUS_RESULT_PREVIEW_CHARS) + "…"
-          : serialized
-      out["resultTruncated"] = serialized.length > STATUS_RESULT_PREVIEW_CHARS || run.resultTruncated === true
+  if (!isActiveRunStatus(run.status) && run.result !== undefined) {
+    // Compact length decides delivery — NOT the persisted resultTruncated flag
+    // (legacy records can claim non-truncated with an oversized result).
+    const serialized = compactStringify(run.result)
+    out["resultChars"] = serialized.length
+    if (serialized.length <= maxResultChars) {
+      // Complete result inline: background runs previously lost everything
+      // past the 2000-char preview even when nothing was truncated.
+      out["result"] = run.result
+      out["resultTruncated"] = false
+    } else {
+      // Cap the preview by the same budget that decided truncation — with a
+      // configured maxResultChars below 2000 the fixed cap would otherwise
+      // ship the COMPLETE serialization while still claiming resultTruncated.
+      out["resultPreview"] = safeSlice(serialized, Math.min(STATUS_RESULT_PREVIEW_CHARS, maxResultChars))
+      out["resultTruncated"] = true
+      if (run.resultArtifactKey) out["resultArtifactKey"] = run.resultArtifactKey
+      out["resultHint"] =
+        `result is ${serialized.length} chars — fetch the rest with the ultracode_result tool ` +
+        `({ runID: ${JSON.stringify(run.id)}, offset, maxLength }) or ask the user to run /ultracode result ${run.id}`
     }
-    if (run.error) out["error"] = run.error
   }
+  if (!isActiveRunStatus(run.status) && run.error) out["error"] = run.error
   return out as ReturnType<typeof enrichStatusPayload>
 }
 
@@ -331,15 +353,116 @@ export function formatSettleNotice(envelope: RunEnvelope): string {
     `[ultracode] background run ${envelope.runID}${envelope.name ? ` (${envelope.name})` : ""} ${envelope.status}`,
     `agents ${agents.succeeded}/${agents.total}`,
   ]
-  const brief =
-    envelope.result !== undefined ? JSON.stringify(envelope.result) : envelope.preview
+  const brief = envelope.result !== undefined ? compactStringify(envelope.result) : envelope.preview
   if (brief !== undefined && brief !== "") {
-    parts.push(`result: ${brief.length > SETTLE_NOTICE_PREVIEW_CHARS ? brief.slice(0, SETTLE_NOTICE_PREVIEW_CHARS) + "…" : brief}`)
+    parts.push(`result: ${safeSlice(brief, SETTLE_NOTICE_PREVIEW_CHARS)}${brief.length > SETTLE_NOTICE_PREVIEW_CHARS ? "…" : ""}`)
+  }
+  if (envelope.truncated) {
+    parts.push(
+      `result truncated${envelope.resultChars ? ` (${envelope.resultChars} chars)` : ""} — ` +
+        `full result: ultracode_result { runID: "${envelope.runID}", offset, maxLength } or /ultracode result ${envelope.runID}`,
+    )
   }
   if (envelope.error) parts.push(`error: ${envelope.error}`)
   if (envelope.stopReason) parts.push(`reason: ${envelope.stopReason}`)
   parts.push("detail: ultracode_status / ctrl+g")
   return parts.join(" · ")
+}
+
+// ---------------------------------------------------------------------------
+// Result chunking (ultracode_result tool + renderResult fallback)
+// ---------------------------------------------------------------------------
+
+/** Default chunk length for the ultracode_result tool (compact-JSON chars). */
+export const RESULT_CHUNK_DEFAULT_CHARS = 24_000
+/** Max chunk length for one ultracode_result call. */
+export const RESULT_CHUNK_MAX_CHARS = 131_072
+
+export type ResultChunkView = {
+  runID: string
+  status: RunStatus
+  /** Where the value came from: KV artifact or the run record copy. */
+  source: "artifact" | "record"
+  /** Total compact-JSON length of the full result. */
+  totalChars: number
+  /** Effective (pair-safe, possibly adjusted-back) start offset of this chunk. */
+  offset: number
+  maxLength: number
+  /** Substring of the COMPACT serialization starting at `offset`. */
+  chunk: string
+  /** True when offset+chunk reaches the end of the serialization. */
+  complete: boolean
+  /** Next pair-safe offset to request, or null when complete. */
+  nextOffset: number | null
+  resultArtifactKey?: string
+}
+
+/**
+ * Floor for one page: a single UTF-16 code unit can be half a surrogate pair,
+ * so a maxLength below 2 can produce a ZERO-length chunk (safeSlice backs
+ * off) and nextOffset would never advance — a paging client would hang.
+ */
+export const RESULT_CHUNK_MIN_CHARS = 2
+
+function pairSafeOffset(s: string, offset: number): number {
+  if (offset <= 0 || offset >= s.length) return offset
+  const prev = s.charCodeAt(offset - 1)
+  const curr = s.charCodeAt(offset)
+  const splitsSurrogate =
+    prev >= 0xd800 && prev <= 0xdbff && curr >= 0xdc00 && curr <= 0xdfff
+  return splitsSurrogate ? offset - 1 : offset
+}
+
+/**
+ * Resolve one page of a settled run's full result. `artifact` is the stored
+ * full value when present (preferred); the run-record copy is the fallback.
+ * Chunks are substrings of the COMPACT serialization — concatenate chunks
+ * from offset 0 following nextOffset, then parse once.
+ *
+ * Invariant: every incomplete page makes progress (chunk.length > 0), so a
+ * client walking nextOffset always terminates.
+ */
+export function buildResultChunk(
+  run: RunRecord,
+  artifact: Json | undefined,
+  opts: { offset?: number; maxLength?: number } = {},
+): { ok: true; view: ResultChunkView } | { ok: false; error: string } {
+  const value = artifact !== undefined ? artifact : run.result
+  if (value === undefined) {
+    return {
+      ok: false,
+      error: `run "${run.id}" has no result (status: ${run.status}${run.error ? ` — ${run.error}` : ""})`,
+    }
+  }
+  const compact = compactStringify(value)
+  const requested = opts.maxLength ?? RESULT_CHUNK_DEFAULT_CHARS
+  const maxLength = Math.min(
+    RESULT_CHUNK_MAX_CHARS,
+    Math.max(RESULT_CHUNK_MIN_CHARS, Math.floor(Number.isFinite(requested) ? requested : RESULT_CHUNK_DEFAULT_CHARS)),
+  )
+  const requestedOffset = Math.max(0, Math.floor(opts.offset ?? 0))
+  const offset = Math.min(pairSafeOffset(compact, requestedOffset), compact.length)
+  const view: ResultChunkView = {
+    runID: run.id,
+    status: run.status,
+    source: artifact !== undefined ? "artifact" : "record",
+    totalChars: compact.length,
+    offset,
+    maxLength,
+    chunk: safeSlice(compact.slice(offset), maxLength),
+    complete: false,
+    nextOffset: null,
+  }
+  // Progress guarantee: an incomplete page must return a non-empty chunk.
+  // safeSlice can legally return "" when maxLength would split a surrogate
+  // pair at the very start — force one code unit so nextOffset advances.
+  if (view.chunk.length === 0 && offset < compact.length) {
+    view.chunk = compact.slice(offset, offset + 1)
+  }
+  view.complete = offset + view.chunk.length >= compact.length
+  view.nextOffset = view.complete ? null : offset + view.chunk.length
+  if (run.resultArtifactKey) view.resultArtifactKey = run.resultArtifactKey
+  return { ok: true, view }
 }
 
 // ---------------------------------------------------------------------------
@@ -369,6 +492,11 @@ export function formatShowRun(run: RunRecord, extra?: { pending?: readonly strin
   if (run.resultTruncated && run.resultArtifactKey) {
     lines.push(
       `- result truncated — full result: /ultracode result \`${run.id}\` (artifact key \`${run.resultArtifactKey}\`)`,
+    )
+  } else if (run.resultTruncated) {
+    // Artifact never persisted (or failed): the run-record copy is the fallback.
+    lines.push(
+      `- result truncated — no artifact key recorded; /ultracode result \`${run.id}\` falls back to the run record copy`,
     )
   }
   lines.push("")
@@ -550,6 +678,9 @@ export type DoctorReport = {
   persistedRuns: number
   kvErrorCount: number
   lastKvError?: string
+  /** Result-artifact KV write failures (additive; surfaced via kvDiagnostics). */
+  artifactErrorCount?: number
+  lastArtifactError?: string
   tuiGate?: { version: string; channel?: string; enabled: boolean }
   duplicateWarning?: string
 }
@@ -573,6 +704,11 @@ export function formatDoctorReport(report: DoctorReport): string {
   lines.push(`- supervisor: ${report.supervisor ? "loaded" : "unavailable"}`)
   lines.push(`- runs: live=${report.liveRuns} persisted=${report.persistedRuns}`)
   lines.push(`- kv errors: ${report.kvErrorCount}${report.lastKvError ? ` last=${report.lastKvError}` : ""}`)
+  if (report.artifactErrorCount !== undefined) {
+    lines.push(
+      `- artifact kv errors: ${report.artifactErrorCount}${report.lastArtifactError ? ` last=${report.lastArtifactError}` : ""}`,
+    )
+  }
   if (report.tuiGate) {
     lines.push(
       `- tui gate: version=${report.tuiGate.version} channel=${report.tuiGate.channel ?? "(none)"} enabled=${report.tuiGate.enabled}`,
@@ -859,21 +995,31 @@ async function renderResult(deps: CommandDeps, sessionID: string, runID: string)
     await deps.say(sessionID, `Run \`${runID}\` not found. See /ultracode for known runs.`)
     return
   }
-  if (!run.resultArtifactKey) {
+  if (run.result === undefined && !run.resultArtifactKey) {
     await deps.say(
       sessionID,
-      run.resultTruncated
-        ? `Run \`${runID}\` was truncated but no result artifact was recorded.`
-        : `Run \`${runID}\` was not truncated — its result is already in the tool output (see /ultracode show).`,
+      `Run \`${runID}\` produced no result (status: ${run.status}${run.error ? ` — ${run.error}` : ""}).`,
     )
     return
   }
-  const result = await deps.storage.loadResultArtifactFresh(run.resultArtifactKey)
-  if (result === undefined) {
-    await deps.say(sessionID, `No stored result found for run \`${runID}\` (key \`${run.resultArtifactKey}\`).`)
+  // Artifact first (authoritative copy); fall back to the run-record copy —
+  // both hold the full value, and the record survives artifact-write failures.
+  const artifact = run.resultArtifactKey
+    ? await deps.storage.loadResultArtifactFresh(run.resultArtifactKey)
+    : undefined
+  const value = artifact !== undefined ? artifact : run.result
+  if (value === undefined) {
+    await deps.say(
+      sessionID,
+      `No stored result found for run \`${runID}\` (artifact key \`${run.resultArtifactKey}\` is missing from storage — check /ultracode doctor for KV errors).`,
+    )
     return
   }
-  await deps.say(sessionID, `## Full result — \`${runID}\`\n\n\`\`\`json\n${JSON.stringify(result, null, 1)}\n\`\`\``)
+  const source = artifact !== undefined ? "artifact" : "run record"
+  await deps.say(
+    sessionID,
+    `## Full result — \`${runID}\` (from ${source})\n\n\`\`\`json\n${JSON.stringify(value, null, 1)}\n\`\`\``,
+  )
 }
 
 async function pauseRun(deps: CommandDeps, sessionID: string, runID: string): Promise<void> {
