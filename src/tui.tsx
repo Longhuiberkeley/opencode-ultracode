@@ -63,6 +63,7 @@ import {
   type SessionView,
   type SettingsHydration,
   type SettleMaps,
+  type TreeRow,
   type TreeSelection,
 } from "./tui-render.ts"
 import { SETTINGS_KEYS, stepPanelSetting, type PanelSettings } from "./settings.ts"
@@ -887,7 +888,41 @@ export default Plugin.define({
         close?: () => void
         toggleFullscreen?: () => void
       }) {
-        void context.theme
+        // Theme tokens, fail-soft. The host hands plugins a ResolvedTheme whose
+        // values are nested RGBA token objects (text.subdued,
+        // text.action.primary.default, text.feedback.<kind>.default); OpenTUI
+        // <text fg> accepts those directly. Anything missing renders unstyled.
+        type ThemeTextTree = {
+          default?: unknown
+          subdued?: unknown
+          action?: Record<string, { default?: unknown }>
+          feedback?: Record<string, { default?: unknown }>
+        }
+        const themeText = (): ThemeTextTree => {
+          try {
+            const t = (context as { theme?: { text?: ThemeTextTree } }).theme
+            return t?.text ?? {}
+          } catch {
+            return {}
+          }
+        }
+        const tok = (v: unknown): string | object | undefined => {
+          if (typeof v === "string" && v.length > 0) return v
+          if (v && typeof v === "object") return v
+          return undefined
+        }
+        const mutedFg = (): string | object | undefined => tok(themeText().subdued)
+        const errorFg = (): string | object | undefined => tok(themeText().feedback?.error?.default)
+        const successFg = (): string | object | undefined => tok(themeText().feedback?.success?.default)
+        const focusFg = (): string | object | undefined =>
+          tok(themeText().action?.primary?.default) ?? tok(themeText().default)
+        const treeRowFg = (row: TreeRow): string | object | undefined => {
+          if (row.kind === "phase") return focusFg()
+          if (row.status === "succeeded") return successFg()
+          if (row.status === "failed") return errorFg()
+          if (row.status === "running") return focusFg()
+          return mutedFg()
+        }
         if (input?.name === PANEL_NAME && !input.focused) {
           requestedPanelFocus = true
           try {
@@ -963,7 +998,13 @@ export default Plugin.define({
           if (!run) return
           const agentIdx =
             treeSel.cursor.kind === "agent" ? run.agents.findIndex((a) => a.sessionID === treeSel.cursor.id) : -1
-          const selected = agentIdx >= 0 ? agentIdx : sel().selected
+          // A phase cursor selects that phase's first agent (not a stale index
+          // from wherever the cursor was before — RC3 fix).
+          const phaseFirst =
+            treeSel.cursor.kind === "phase"
+              ? run.agents.findIndex((a) => (a.phase ?? "-") === treeSel.cursor.id)
+              : -1
+          const selected = agentIdx >= 0 ? agentIdx : phaseFirst >= 0 ? phaseFirst : sel().selected
           const off = sel().offset
           commitSel({
             parentSessionID: openParent(),
@@ -990,9 +1031,13 @@ export default Plugin.define({
           if (pane === "detail") {
             const count = wrapPaneLines(m.detail, Math.max(1, splitPanelWidth(input.width ?? 80).detail - 2)).length
             const maxOff = Math.max(0, count - PAGE_HEIGHT)
-            const nextOff = Math.min(maxOff, Math.max(0, m.treeSel.detailOffset + delta))
-            commitTree({ ...m.treeSel, detailOffset: nextOff }, pane)
-            return
+            // Only capture ↑↓ for detail scrolling when there is something to
+            // scroll; a short detail pane must not trap the tree cursor (RC1 fix).
+            if (maxOff > 0) {
+              const nextOff = Math.min(maxOff, Math.max(0, m.treeSel.detailOffset + delta))
+              commitTree({ ...m.treeSel, detailOffset: nextOff }, pane)
+              return
+            }
           }
           commitTree(moveTree(m.tree, m.treeSel, delta), pane)
         }
@@ -1349,9 +1394,12 @@ export default Plugin.define({
           inspectPaneView(model(), sel().pane, typeof input?.width === "number" ? input.width : 0),
         )
         const treeLines = createMemo(() => paneView().treeLines)
+        const treeRows = createMemo(() => paneView().treeWindow)
         const detailLines = createMemo(() => paneView().detailLines)
         const treePageLabel = createMemo(() => paneView().treePageLabel)
-        const treeTitle = createMemo(() => paneView().treeTitle)
+        const focusedPane = (): InspectSelection["pane"] => sel().pane ?? "tree"
+        const treeTitle = createMemo(() => paneView().treeTitle + (focusedPane() === "tree" ? " ◀" : ""))
+        const detailTitle = createMemo(() => PANE_TITLE_DETAIL + (focusedPane() === "detail" ? " ◀" : ""))
         const settingsView = createMemo(() =>
           settingsPaneView(
             model().run,
@@ -1367,20 +1415,19 @@ export default Plugin.define({
 
         return (
           <box flexDirection="column">
-            <text>ultracode inspect UC-INSPECT</text>
-            <text>Runs · [ ] switch · . follow/pin · f fullscreen</text>
-            {pickerLines().length > 0 ? <text>{wrapPaneLines(pickerLines(), input.width ?? 80).join("\n")}</text> : <text></text>}
-            {permLines().length > 0 ? <text>{wrapPaneLines(permLines(), input.width ?? 80).join("\n")}</text> : <text></text>}
+            <text fg={mutedFg()}>ultracode inspect</text>
+            {pickerLines().length > 0 ? <text fg={mutedFg()}>{wrapPaneLines(pickerLines(), input.width ?? 80).join("\n")}</text> : <text></text>}
+            {permLines().length > 0 ? <text fg={errorFg()}>{wrapPaneLines(permLines(), input.width ?? 80).join("\n")}</text> : <text></text>}
             {(sel().pane ?? "tree") === "settings" ? (
               <box flexDirection="column">
                 {model().run ? <text>{model().header}</text> : <text></text>}
                 <box flexDirection="row">
                   <box flexGrow={1} flexDirection="column">
-                    <text>{PANE_TITLE_SETTINGS}</text>
+                    <text fg={focusedPane() === "settings" ? focusFg() : mutedFg()}>{PANE_TITLE_SETTINGS}</text>
                     <text>{settingsView().settingsLines.join("\n")}</text>
                   </box>
                   <box flexGrow={1} flexDirection="column">
-                    <text>{PANE_TITLE_LIVE}</text>
+                    <text fg={mutedFg()}>{PANE_TITLE_LIVE}</text>
                     <text>{settingsView().liveLines.join("\n")}</text>
                   </box>
                 </box>
@@ -1390,20 +1437,24 @@ export default Plugin.define({
                 <text>{model().header}</text>
                 <box flexDirection="row">
                   <box width={paneView().cols.tree} flexShrink={0} flexDirection="column">
-                    <text>{treeTitle()}</text>
-                    <text>{treeLines().join("\n")}</text>
+                    <text fg={focusedPane() === "tree" ? focusFg() : mutedFg()}>{treeTitle()}</text>
+                    {treeLines().map((line, i) => (
+                      <text fg={treeRowFg(treeRows()[i]!)}>{line}</text>
+                    ))}
                   </box>
                   <box width={paneView().cols.detail} flexShrink={0} flexDirection="column">
-                    <text>{PANE_TITLE_DETAIL}</text>
-                    <text>{detailLines().join("\n")}</text>
+                    <text fg={focusedPane() === "detail" ? focusFg() : mutedFg()}>{detailTitle()}</text>
+                    {detailLines().map((line) => (
+                      <text>{line}</text>
+                    ))}
                   </box>
                 </box>
-                <text>{treePageLabel()}</text>
+                <text fg={mutedFg()}>{treePageLabel()}</text>
               </box>
             ) : (
               <text>no ultracode runs</text>
             )}
-            <text>{wrapPaneLines([hints], input.width ?? 80).join("\n")}</text>
+            <text fg={mutedFg()}>{wrapPaneLines([hints], input.width ?? 80).join("\n")}</text>
           </box>
         )
       }

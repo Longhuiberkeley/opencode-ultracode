@@ -296,6 +296,34 @@ Authoring tips:
 
 Expanded from the skill; each names when to reach for it.
 
+### 0. Sizing: partition, budget, merge (read before any wide fan-out)
+
+*When:* always, before a fan-out over more than a handful of files or sources.
+
+Production post-mortem (2026-09-12): unbounded `general` children reached 300-400k context on a
+2M-window model and would have died on smaller ones; the biggest driver was full-file reads plus a
+shared context file every child had to read in full. The cure is distribution discipline, not
+context caps:
+
+- **Scout before you fan out** — one cheap `explore` child inventories the material (paths + line
+  counts); the script partitions it into lanes. The `partitioned-review` sample implements the
+  whole pattern end to end.
+- **~30-40k tokens of source per lane** (≈3-4k lines at ~10 tokens/line — convert
+  the scout's line counts), keyed to the smallest context window in the user's model
+  rotation (pins change between runs).
+- **Arithmetic coverage assertion** — every inventoried file lands in ≥1 lane; assert it in the
+  script so coverage is a checkable invariant, not vibes.
+- **Lane schemas carry `overflow`** (paths not read within budget); the script subdivides overflow
+  in a bounded gap-fill pass instead of silently under-covering.
+- **Merge reads REPORTS only, in batches of ~8** (hierarchical for more) — one mega-merge child
+  recreates the context blowup one level up.
+- **One cross-cutting lane** greps the cross-file question's symbols repo-wide so
+  partition-by-file seams have an owner.
+- **Wall clock beats the agent cap** — waves × stages × ~5-10 min per child must fit `timeoutMs`
+  (default 60 min). Prefer wide-not-deep; raise per project with `/ultracode set timeoutMs <ms>`.
+- **Read-discipline in every child prompt**: grep + ranged reads, no whole-file reads of large
+  files, never echo file contents back; the child's output is the schema JSON only.
+
 ### 1. Fan-out and synthesize
 
 *When:* the task is read-only and embarrassingly parallel (many files, many sources, many
@@ -620,6 +648,12 @@ What the `ultracode_run` tool returns to the parent session (always valid JSON):
 Budget arithmetic is part of authoring: a script that fans out 30 claims x (1 verify + 1 repair
 round) + merges + synthesizes should keep `items x stages + overhead` comfortably inside
 `maxAgents`, with `slice()` as the seatbelt.
+
+The wall clock is usually the binding constraint before `maxAgents` is: `waves
+(ceil(agents / concurrency)) x dependent stages x ~5-10 min per child` must fit `timeoutMs`.
+A production run died at 63 min with 7/8 agents done and the fix loop never reached (2026-09-12) —
+budget time before you write the first `agent()` call, prefer wide-not-deep, and raise
+`timeoutMs` per project when a wide run legitimately needs it.
 
 ## Testing your workflows
 

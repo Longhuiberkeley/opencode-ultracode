@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "name": "partitioned-review",
+  "description": "Material-budgeted review of a large repo area: a scout inventories files, the script partitions them into ~35k-estimated-token lanes (line counts × ~10) with an arithmetic coverage assertion, a cross-cutting lane greps the seams, lanes report covered/overflow, failed lanes and overflow are subdivided in a bounded gap-fill pass, and lane reports are merged in batches of eight (reports only — never source material).",
+  "phases": ["scout", "lanes", "cross", "merge"],
+  "requires": ["general", "explore"],
+  "hash": "",
+  "source": "project",
+  "savedAt": 0
+}

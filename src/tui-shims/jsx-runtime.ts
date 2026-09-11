@@ -10,7 +10,9 @@ export namespace JSX {
     children: any
   }
   export interface IntrinsicElements {
-    text: { children?: any }
+    // OpenTUI TextRenderable accepts fg/bg as a color string OR a theme
+    // RGBA token object; keep in sync with src/tui-jsx.d.ts.
+    text: { children?: any; fg?: string | object; bg?: string | object }
     box: { children?: any; flexDirection?: string; flexGrow?: number | string; width?: number; flexShrink?: number }
   }
 }

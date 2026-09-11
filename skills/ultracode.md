@@ -95,7 +95,10 @@ rejected. Injected globals, nothing else:
 | `meta` | `meta` | Your tool-input metadata: name, description, phases, requires. |
 
 Caps: 8 concurrent agents (default), 200 agent calls per run, 60 minutes wall clock, 512 KB max
-script size, results truncated after 64 KB by default.
+script size, results truncated after 64 KB by default. Budget the wall clock before anything else:
+waves (ceil(agents / concurrency)) × dependent stages × ~5-10 minutes per child must fit — prefer
+wide-not-deep, and raise the ceiling per project with `/ultracode set timeoutMs <ms>` when a wide
+run legitimately needs it.
 
 ## Hard rules
 
@@ -118,7 +121,8 @@ script size, results truncated after 64 KB by default.
 8. **`parallel` swallows failures as `null`.** Null-check every result before merging, then
    decide: skip, retry, or abort.
 9. **Bound everything.** Cap items, claims, and retry iterations. A runaway fan-out hits the
-   200-agent cap and fails the whole run.
+   200-agent cap and fails the whole run; a wide one dies on the 60-minute wall clock — budget
+   waves × stages × ~5-10 min per child before you write the first `agent()` call.
 10. **`meta` and `args` come from tool input**, never from inside the script. Declare every
     non-stock agent in `meta.requires` so the preflight fails fast with the available-agents list.
 11. **Verify before you trust.** Generators fan out, independent verifiers check, a skeptic pass
@@ -130,7 +134,70 @@ script size, results truncated after 64 KB by default.
 Skeletons assume SCHEMA constants are JSON Schema objects you define inline (see the complete
 example below).
 
-### Fan-out and synthesize (read-only, parallel-safe)
+### Sizing: partition, budget, merge (read this before any wide fan-out)
+
+A 300k-token child is a lane that was too wide, not a model problem. Budget **input material**
+(files, line counts), not context tokens — reasoning models inflate their own numbers, so material
+is the only unit comparable across the user's model rotation.
+
+1. **Scout before you fan out** — one cheap `explore` child returns an inventory (paths + line
+   counts). The script, not the children, partitions it into lanes.
+2. **~30-40k tokens of source per lane** (≈3-4k lines at ~10 tokens per line — the
+   scout reports lines, the script converts), keyed to the smallest window that
+   might run it.
+3. **Arithmetic coverage assertion** — every inventoried file lands in ≥1 lane; assert it in the
+   script. Coverage comes from the map, not from each child reading everything.
+4. **Every lane schema carries `overflow`** (paths not read within budget); the script subdivides
+   overflow into new lanes instead of silently under-covering.
+5. **Merge reads REPORTS only, in batches of ~8** (hierarchical for more). One mega-merge child
+   recreates the exact blowup fan-out exists to avoid.
+6. **One cross-cutting lane** greps the cross-file question's symbols repo-wide, so
+   partition-by-file seams have an owner.
+7. **Wall clock beats the agent cap**: waves (ceil(agents / concurrency)) × stages × ~5-10 min per
+   child must fit 60 min. Prefer wide-not-deep; raise per project via `/ultracode set timeoutMs`.
+8. **Read-discipline in every child prompt**: grep + ranged reads, no whole-file reads of large
+   files, never echo file contents back; output = the schema JSON only.
+
+### Scout → partition → fan-out (material-budgeted, coverage-checked)
+
+```
+const LANE_BUDGET = 35000 // ESTIMATED TOKENS of source; scout reports lines
+const TOKENS_PER_LINE = 10
+const SCOUT = { type: "object", required: ["files"], properties: { files: { type: "array",
+  items: { type: "object", required: ["path", "lines"], properties: { path: { type: "string" },
+  lines: { type: "number" } } } } } }
+const REPORT = { type: "object", required: ["summary", "covered", "overflow"], properties: {
+  summary: { type: "string" }, covered: { type: "array", items: { type: "string" } },
+  overflow: { type: "array", items: { type: "string" } } } }
+
+phase("scout")
+const scout = await agent("Inventory the repo area " + area + ". Per file: path, line count. " +
+  "Use glob, grep, wc — do NOT read file contents.", { agent: "explore", phase: "scout", schema: SCOUT })
+const files = (scout && scout.data && scout.data.files) || []
+
+// Script-side partition under the token budget (lines × ~10), then assert coverage.
+const est = (f) => Math.max(1, Math.round((f.lines || 0) * TOKENS_PER_LINE))
+const lanes = []
+let cur = { files: [], lines: 0 }
+for (const f of files) {
+  if (cur.files.length > 0 && cur.lines + est(f) > LANE_BUDGET) { lanes.push(cur); cur = { files: [], lines: 0 } }
+  cur.files.push(f); cur.lines += est(f)
+}
+if (cur.files.length) lanes.push(cur)
+const assigned = new Set(lanes.flatMap((l) => l.files.map((f) => f.path)))
+const unassigned = files.filter((f) => !assigned.has(f.path)).map((f) => f.path)
+if (unassigned.length) throw new Error("coverage assertion failed: " + unassigned.join(", "))
+
+phase("lanes")
+const reports = await parallel(lanes.map((lane, i) => () =>
+  agent("Review exactly these files (grep + ranged reads only; never whole-read files over ~500 " +
+    "lines; never echo contents back):\n" + JSON.stringify(lane.files) +
+    "\nReturn summary, covered paths, overflow = paths you could not review within budget.",
+    { agent: "explore", phase: "lanes", label: "lane" + (i + 1), schema: REPORT })))
+// overflow paths → subdivide and re-run (bounded gap-fill, same partition helper)
+```
+
+### Fan-out and synthesize (batched merge; merge reads reports only)
 
 ```
 phase("research")
@@ -138,8 +205,15 @@ const parts = await parallel(["api", "storage", "ui"].map((area) => () =>
   agent("Summarize the " + area + " layer of this repo. Read the code; be concrete.",
     { agent: "explore", phase: "research", schema: SUMMARY })))
 const good = parts.filter(Boolean)
-const report = await agent("Merge these summaries into one report:\n" +
-  JSON.stringify(good.map((p) => p.data)), { agent: "general", phase: "synthesize" })
+// Batched merge: reports only, ~8 per merge child (one mega-merge recreates
+// the context blowup fan-out exists to avoid).
+const batches = []
+for (let i = 0; i < good.length; i += 8) batches.push(good.slice(i, i + 8))
+const drafts = await parallel(batches.map((batch, bi) => () =>
+  agent("Merge these lane reports into one section list. Reports only — do not read source files.\n" +
+    JSON.stringify(batch.map((p) => p.data)), { agent: "general", phase: "synthesize", label: "merge" + (bi + 1) })))
+const report = await agent("Combine these merged sections into one report:\n" +
+  drafts.filter(Boolean).map((d) => d.text).join("\n---\n"), { agent: "general", phase: "synthesize" })
 return { report: report.text, sections: good.length }
 ```
 

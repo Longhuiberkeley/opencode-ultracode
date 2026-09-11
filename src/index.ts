@@ -618,7 +618,13 @@ export default Plugin.define({
                   try {
                     saved = storage.loadWorkflow(input.workflow)
                   } catch (err) {
-                    return { content: `error: ${describeError(err)}` }
+                    const message = describeError(err)
+                    // Model-facing reroute guard, appended ONLY at the tool
+                    // boundary (humans see the bare storage message via /ultracode).
+                    const trustHint = /is not trusted/.test(message)
+                      ? " Trust is user-only: relay the /ultracode trust command to the user and wait — do not silently reroute to an inline script."
+                      : ""
+                    return { content: `error: ${message}${trustHint}` }
                   }
                   if (!saved) {
                     const available = storage
@@ -630,7 +636,8 @@ export default Plugin.define({
                         `error: workflow "${input.workflow}" not found.` +
                         (available
                           ? ` Saved workflows: ${available}.`
-                          : " No saved workflows exist yet — author `.opencode/workflows/<name>.js` then `/ultracode save <name>` (or `/ultracode save <runID> <name>` after a run)."),
+                          : " No saved workflows exist yet — author `.opencode/workflows/<name>.js` then `/ultracode save <name>` (or `/ultracode save <runID> <name>` after a run).") +
+                        ` Alternatively call ultracode_run directly with { script } for an inline run — never wrap this call in a generic execute/JS sandbox.`,
                     }
                   }
                   script = saved.script
@@ -693,7 +700,7 @@ export default Plugin.define({
             name: "status",
             options: { namespace: "ultracode" },
             description:
-              "Read-only status of an ultracode run owned by this conversation. Input { runID? } (omit → single active owned run). Returns { runID, status, agents: { done, total, failed }, startedAt, elapsedMs, children: [{ agentID, sessionID?, label?, phase?, status, waitingForPermission? }] } and, once settled, the full result inline when it fits the size cap, else resultPreview + resultTruncated + resultChars (fetch the rest with ultracode_result).",
+              "Read-only status of an ultracode run owned by this conversation. Input { runID? } (omit → single active owned run). Returns { runID, status, agents: { done, total, failed }, startedAt, elapsedMs, children: [{ agentID, sessionID?, label?, phase?, status, tokens?: { input, output, reasoning }, toolCalls?, waitingForPermission? }] } and, once settled, the full result inline when it fits the size cap, else resultPreview + resultTruncated + resultChars (fetch the rest with ultracode_result). Per-child tokens expose which lane blew its budget.",
             input: STATUS_TOOL_INPUT_SCHEMA,
             execute: async (rawInput: unknown, tool) => {
               try {

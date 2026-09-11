@@ -24,7 +24,7 @@ import {
 
 const samplesDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "workflows", "samples")
 
-const SAMPLE_NAMES = ["deep-research", "code-audit", "fact-check", "dev-loop"] as const
+const SAMPLE_NAMES = ["deep-research", "code-audit", "fact-check", "dev-loop", "partitioned-review"] as const
 const STOCK_AGENTS = new Set(["general", "explore"])
 
 function readSample(name: string, ext: "js" | "json"): string {
@@ -47,8 +47,10 @@ test("skill metadata: name and one-sentence trigger description", () => {
 test("skill content covers every injected global", () => {
   const lines = SKILL_CONTENT.split("\n")
   assert.ok(
-    lines.length >= 120 && lines.length <= 320,
-    `expected a lean 120-320 line skill, got ${lines.length}`,
+    lines.length >= 120 && lines.length <= 380,
+    // 320 → 380 (2026-09-12): the sizing/partitioning contract added after
+    // production runs blew single-child contexts to 300-400k.
+    `expected a lean 120-380 line skill, got ${lines.length}`,
   )
   for (const name of ["agent", "parallel", "pipeline", "phase", "progress", "workflow", "sleep", "args", "meta", "console"]) {
     assert.match(SKILL_CONTENT, new RegExp(`\\b${name}\\b`), `SKILL_CONTENT must mention the global \`${name}\``)
@@ -568,4 +570,62 @@ test("dev-loop sample fails closed when implementer does not confirm green", asy
   // run — and its non-green result must fail the whole loop closed.
   assert.equal(result.ok, false)
   assert.equal(result.stats.implementOk, false)
+})
+
+test("partitioned-review executes end to end (partition, coverage assertion, overflow gap-fill, batched merge)", async () => {
+  const h = makeHarness(async (_prompt, opts) => {
+    const phase = String(opts.phase)
+    if (phase === "scout") {
+      return {
+        text: "",
+        data: {
+          files: [
+            { path: "src/a.ts", lines: 1200 },
+            { path: "src/b.ts", lines: 1500 },
+            { path: "src/c.ts", lines: 400 },
+          ],
+        },
+      }
+    }
+    if (phase === "lanes") {
+      // lane2 (b.ts + c.ts) cannot cover c.ts within budget → overflow
+      return {
+        text: "",
+        data: {
+          summary: "lane report",
+          covered: [],
+          overflow: String(opts.label) === "lane2" ? ["src/c.ts"] : [],
+        },
+      }
+    }
+    if (phase.startsWith("lanes-gap")) {
+      return { text: "", data: { summary: "gap lane report", covered: ["src/c.ts"], overflow: [] } }
+    }
+    if (phase === "cross") {
+      return { text: "", data: { summary: "cross-cutting report", covered: ["(greps)"], overflow: [] } }
+    }
+    if (phase === "merge") return { text: "MERGED" }
+    throw new Error(`unexpected phase ${phase}`)
+  })
+  const result = (await h.run(readSample("partitioned-review", "js"), { area: "src", budget: 25000 })) as {
+    report: string
+    stats: Record<string, unknown>
+  }
+  assert.equal(result.report, "MERGED")
+  assert.equal(result.stats.files, 3)
+  assert.equal(result.stats.lanes, 2, "two lanes under the 25k-token budget")
+  assert.equal(result.stats.reports, 4, "2 lanes + 1 overflow gap lane + 1 cross-cutting lane")
+  assert.equal(result.stats.mergeBatches, 1)
+  // call shape: 1 scout + 2 lanes + 1 gap + 1 cross + 1 merge; every call pins a phase
+  assert.equal(h.calls.length, 6)
+  for (const c of h.calls) assert.equal(typeof c.opts.phase, "string")
+  // read discipline reaches the child prompts
+  const laneCall = h.calls.find((c) => String(c.opts.phase) === "lanes")
+  assert.ok(laneCall?.prompt.includes("ranged reads"), "lane prompts carry the read-discipline rule")
+})
+
+test("partitioned-review fails fast when the scout returns no files", async () => {
+  const h = makeHarness(async () => ({ text: "", data: { files: [] } }))
+  await assert.rejects(() => h.run(readSample("partitioned-review", "js"), { area: "empty" }), /no files/)
+  assert.equal(h.calls.length, 1, "only the scout ran")
 })

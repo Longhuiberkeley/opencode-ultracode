@@ -726,6 +726,41 @@ test("enrichStatusPayload: running run carries identity, elapsed, children detai
   assert.equal("resultPreview" in out, false)
 })
 
+test("enrichStatusPayload: children carry per-lane tokens and tool counts (budget feedback loop)", () => {
+  const run = baseRun({
+    agents: [
+      {
+        id: "a1",
+        status: "succeeded",
+        sessionID: "ses_a1",
+        label: "lane-1",
+        phase: "scan",
+        tokens: { input: 350_000, output: 12_000, reasoning: 1_000, cache: { read: 1_800_000, write: 5 } },
+        toolCalls: 23,
+      },
+      { id: "a2", status: "running" },
+    ],
+  })
+  const out = enrichStatusPayload(payloadOf(run), run, 3_000)
+  assert.deepEqual(out.children[0]!.tokens, { input: 350_000, output: 12_000, reasoning: 1_000 })
+  assert.equal(out.children[0]!.toolCalls, 23)
+  assert.equal("tokens" in (out.children[1] ?? {}), false)
+})
+
+test("formatSettleNotice: token totals land on the notice line", () => {
+  const line = formatSettleNotice({
+    runID: "run_toks",
+    status: "succeeded",
+    durationMs: 10,
+    agents: { total: 2, succeeded: 2, failed: 0, interrupted: 0 },
+    truncated: false,
+    result: { ok: true },
+    tokens: { input: 1_100_000, output: 90_000, reasoning: 40_000, cache: { read: 9_500_000, write: 0 } },
+  })
+  assert.match(line, /tokens in [\d.]+[KkM]? · out [\d.]+[KkM]? · reasoning [\d.]+[KkM]? · cache-read [\d.]+[KkM]?/)
+  assert.ok(line.length < 700, "notice stays one bounded line")
+})
+
 test("enrichStatusPayload: settled run gets the FULL result inline when it fits the cap", () => {
   const small = baseRun({ status: "failed", endedAt: 2_000, result: { ok: 1 }, error: "boom" })
   const flat = enrichStatusPayload(payloadOf(small), small, 5_000)

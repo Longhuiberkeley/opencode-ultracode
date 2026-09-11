@@ -84,7 +84,7 @@ export const NESTED_RUN_REFUSED =
   "cannot start a run from inside an active workflow session — use /ultracode from the parent"
 
 /** Plugin package version shown on the bare /ultracode dashboard. */
-export const PLUGIN_VERSION = "0.6.0"
+export const PLUGIN_VERSION = "0.6.1"
 /** Oldest OpenCode binary build the inspect TUI is gated on (A7 / D7). */
 export const MIN_SUPPORTED_BUILD = 19271
 
@@ -123,6 +123,8 @@ export function verbsListedInHelp(): string[] {
 export const TOOL_DESCRIPTION: string = [
   "Run an ultracode workflow (invoke this tool as ultracode_run).",
   "",
+  "CALL THIS TOOL DIRECTLY. Never wrap it in a generic execute/JS sandbox: agent, parallel, pipeline, progress and the other workflow globals exist ONLY inside this tool — anywhere else they are undefined and the script fails.",
+  "",
   "WHEN: the task outgrows one context window, needs fan-out, needs structural verification, or should be a repeatable orchestration.",
   "NOT: one reply answers it, or a single subagent is enough.",
   "",
@@ -142,6 +144,12 @@ export const TOOL_DESCRIPTION: string = [
   "- meta — tool-input metadata: name, description, phases, requires",
   "",
   "Route by agent, never by model: pass opts.agent; the user's agent config picks the model. Never name provider/model ids.",
+  "",
+  "Authoring contract — size and time budget the run (observed failure modes):",
+  "- Partition before you fan out. A cheap scout pass inventories the material (paths + line counts); the script then assigns each lane an EXPLICIT slice. Budget ~30-40k tokens of source per lane (≈3-4k lines — convert line counts at ~10 tokens/line) so any model in the user's rotation can run it.",
+  "- Read-discipline in every child prompt: grep + ranged reads, never whole-file reads of large files, never echo file contents back; the child's output is the schema JSON only.",
+  "- Merge reads REPORTS only — never source material — in batches of ~8 (hierarchical merge for more); one mega-merge child recreates the very context blowup fan-out exists to avoid.",
+  "- Budget the wall clock: waves (ceil(agents / concurrency)) × stages × ~5-10 min per child must fit the cap. Prefer wide-not-deep; a project can raise the ceiling with /ultracode set timeoutMs <ms>.",
   "",
   "Caps: 8 concurrent agents (default), 200 agent() calls per run, 60 minutes wall clock, 512 KB max script, results truncated after 64 KB.",
   "Default / background: runs are background by default — the tool returns immediately after admission with { runID, status: \"running\", hint } (inspect panel via ctrl+g, or /ultracode status / ultracode_status). A late tool result cannot be delivered after execute returns; instead a settle notice lands in the parent session on completion and wakes the calling agent.",
@@ -270,6 +278,10 @@ export type StatusChildView = {
   sessionID?: string
   label?: string
   phase?: string
+  /** Child token usage (input/output/reasoning), when known — the per-lane budget feedback loop. */
+  tokens?: { input: number; output: number; reasoning: number }
+  /** Unique tool calls this child made, when known. */
+  toolCalls?: number
 }
 
 /**
@@ -310,6 +322,10 @@ export function enrichStatusPayload(
     if (a.sessionID) child.sessionID = a.sessionID
     if (a.label) child.label = a.label
     if (a.phase) child.phase = a.phase
+    if (a.tokens) {
+      child.tokens = { input: a.tokens.input, output: a.tokens.output, reasoning: a.tokens.reasoning }
+    }
+    if (typeof a.toolCalls === "number") child.toolCalls = a.toolCalls
     return child
   })
   out["children"] = children
@@ -353,6 +369,12 @@ export function formatSettleNotice(envelope: RunEnvelope): string {
     `[ultracode] background run ${envelope.runID}${envelope.name ? ` (${envelope.name})` : ""} ${envelope.status}`,
     `agents ${agents.succeeded}/${agents.total}`,
   ]
+  if (envelope.tokens) {
+    const t = envelope.tokens
+    parts.push(
+      `tokens in ${compactCount(t.input)} · out ${compactCount(t.output)} · reasoning ${compactCount(t.reasoning)} · cache-read ${compactCount(t.cache.read)}`,
+    )
+  }
   const brief = envelope.result !== undefined ? compactStringify(envelope.result) : envelope.preview
   if (brief !== undefined && brief !== "") {
     parts.push(`result: ${safeSlice(brief, SETTLE_NOTICE_PREVIEW_CHARS)}${brief.length > SETTLE_NOTICE_PREVIEW_CHARS ? "…" : ""}`)

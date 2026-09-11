@@ -984,7 +984,7 @@ export function runStripLines(
   if (runs.length === 0) return []
   const limit = Math.max(1, opts?.limit ?? 8)
   const follow = opts?.pinned ? "pinned" : "follow-latest"
-  const lines = [`runs ${runs.length} · ${follow} · [ ] switch  . pin`]
+  const lines = [`runs ${runs.length} · ${follow}`]
   const selected = runs.findIndex((run) => run.runID === selectedRunID)
   const start = Math.max(0, Math.min(selected - limit + 1, runs.length - limit))
   for (const run of runs.slice(start, start + limit)) {
@@ -1204,11 +1204,22 @@ export function agentDetailLines(agent: RunAgentView): string[] {
 export function phaseDetailLines(run: RunView, phaseId: string): string[] {
   const agents = phaseAgents(run, phaseId)
   const done = agents.filter((a) => isFinalStatus(a.status)).length
-  return [
+  const lines = [
     phaseId,
     `agents  ${done}/${agents.length}`,
     `tokens  ${phaseTokenSum(agents)}`,
   ]
+  // Child rows make a phase row reachable/informative on its own (the tree is
+  // the only other place its agents appear).
+  const shown = agents.slice(0, PAGE_HEIGHT + 4)
+  for (const a of shown) {
+    const dot = STATUS_DOT[a.status]
+    const label = agentLineLabel(a)
+    const tok = a.tokens ? compactCount(a.tokens.input + a.tokens.output + a.tokens.reasoning) : "-"
+    lines.push(`${dot} ${label} · ${tok}`)
+  }
+  if (agents.length > shown.length) lines.push(`… +${agents.length - shown.length} more`)
+  return lines
 }
 
 export const PANE_TITLE_TREE = "── tree"
@@ -1235,9 +1246,12 @@ export function formatTreeLines(
   cursor: TreeCursor,
   pane: InspectPane = "tree",
 ): string[] {
+  void pane // focus indication lives on pane titles; the cursor mark is always shown
   return tree.map((row, i) => {
     const selected = row.kind === cursor.kind && row.id === cursor.id
-    const mark = selected && pane !== "detail" ? ">" : " "
+    // The tree cursor is always visible — even when the detail pane is
+    // focused — so selection identity never disappears (RC1 fix).
+    const mark = selected ? ">" : " "
     if (row.kind === "phase") {
       const glyph = row.expanded === false ? "▸" : "▾"
       return `${mark}${glyph} ${row.label}`
@@ -1295,6 +1309,8 @@ export type InspectPaneView = {
   pane: InspectPane
   cols: { tree: number; detail: number }
   treeLines: string[]
+  /** Tree rows parallel to treeLines (1:1) — per-row coloring metadata. */
+  treeWindow: TreeRow[]
   detailLines: string[]
   treePageLabel: string
   treeTitle: string
@@ -1325,6 +1341,7 @@ export function inspectPaneView(
     pane: activePane,
     cols,
     treeLines,
+    treeWindow: treePage.window,
     detailLines,
     treePageLabel: treeMore ? `${treePage.label} ↓` : treePage.label,
     treeTitle: treePaneTitle(model),
@@ -1386,7 +1403,6 @@ export function formatLiveStrip(
   } else if (overlay) {
     lines.push("applies on next start")
   }
-  lines.push("+/- edit  r refresh  h/l pane")
   return lines
 }
 
@@ -1504,7 +1520,7 @@ export function permissionsForRun(
 
 export function formatPermissionLines(items: readonly PendingPermissionView[]): string[] {
   if (items.length === 0) return []
-  const lines = [`awaiting permission ${items.length} · y allow once (review first)  n reject first  enter child`]
+  const lines = [`awaiting permission ${items.length}`]
   for (const item of items.slice(0, 3)) {
     const res = item.resources.join(", ") || "?"
     const child = shortRunID(item.sessionID)
@@ -1516,6 +1532,10 @@ export function formatPermissionLines(items: readonly PendingPermissionView[]): 
 /** First blocked child session — inspector drill target. */
 export function firstBlockedSessionID(items: readonly PendingPermissionView[]): string | undefined {
   return items[0]?.sessionID
+}
+
+function firstPhaseChildSession(run: RunView, phaseId: string): string | undefined {
+  return phaseAgents(run, phaseId).find((a) => a.sessionID && a.sessionID.length > 0)?.sessionID
 }
 
 /**
@@ -1601,7 +1621,10 @@ export function inspectModel(
     ...treeSel,
     detailOffset: Math.min(Math.max(0, Math.floor(treeSel.detailOffset)), maxDetailOff),
   }
-  const treeSessionID = resolvedTreeSel.cursor.kind === "agent" ? resolvedTreeSel.cursor.id : undefined
+  const treeSessionID =
+    resolvedTreeSel.cursor.kind === "agent"
+      ? resolvedTreeSel.cursor.id
+      : firstPhaseChildSession(run, resolvedTreeSel.cursor.id)
 
   const model: InspectModel = {
     runs,
@@ -1676,6 +1699,7 @@ export function footerHints(bound: string[]): string {
   if (has("return", "enter", "enter/→")) parts.push("enter drill")
   if (has("[") || has("]")) parts.push("[ ] run")
   if (has(".")) parts.push(". follow/pin")
+  if (has("f")) parts.push("f fullscreen")
   if (has("y") || has("n")) parts.push("y/n perm")
   if (has("p")) parts.push("p pause/resume")
   if (has("x")) parts.push("x stop")
@@ -1707,6 +1731,7 @@ export function footerHints(bound: string[]): string {
     "←→",
     "h",
     "l",
+    "f",
     "ctrl+g",
     "+",
     "-",

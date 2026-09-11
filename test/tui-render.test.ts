@@ -39,6 +39,7 @@ import {
   parseRunAck,
   pausedRunIDsFromAcks,
   permissionsForRun,
+  phaseDetailLines,
   runStripLines,
   runsForParent,
   phaseColumns,
@@ -367,6 +368,7 @@ test("footerHints: only bound keys, collapsed chords", () => {
   assert.equal(footerHints(["+", "-", "="]), "+/- edit")
   assert.equal(footerHints(["r"]), "r refresh")
   assert.equal(footerHints(["escape"]), "esc or ctrl+g close")
+  assert.equal(footerHints(["f"]), "f fullscreen")
   assert.doesNotMatch(footerHints(["esc", "escape", "ctrl+g"]), /\bescape\b/)
 })
 
@@ -902,7 +904,7 @@ test("inspectModel tree: default expanded, cursor on first agent, skip synthetic
   assert.ok(lines[0]!.includes("▾"))
 })
 
-test("inspectModel tree: cursor on phase ⇒ selectedSessionID undefined", () => {
+test("inspectModel tree: cursor on phase ⇒ selectedSessionID is the phase's first child (Enter drills)", () => {
   const treeSel: TreeSelection = {
     expanded: { research: true, extract: true },
     cursor: { kind: "phase", id: "research" },
@@ -915,7 +917,7 @@ test("inspectModel tree: cursor on phase ⇒ selectedSessionID undefined", () =>
   )
   assert.equal(model.treeSel.cursor.kind, "phase")
   assert.equal(model.treeSel.cursor.id, "research")
-  assert.equal(model.selectedSessionID, undefined)
+  assert.equal(model.selectedSessionID, "ses_a1")
   assert.ok(model.detail[0] === "research")
 })
 
@@ -959,6 +961,35 @@ test("W3C expand/collapse: right expands then first child; left collapses / pare
   assert.equal(collapsedAgain.expanded.research, false)
 })
 
+test("phase detail lists its children (status, label, tokens) — a phase row is informative alone", () => {
+  const model = inspectModel(
+    TREE_SESSIONS,
+    { offset: 0, selected: 0, parentSessionID: "ses_p", treeSel: { expanded: {}, cursor: { kind: "phase", id: "research" }, detailOffset: 0 } },
+    1000,
+  )
+  const lines = phaseDetailLines(model.run!, "research")
+  assert.equal(lines[0], "research")
+  assert.match(lines[1]!, /agents  \d+\/\d+/)
+  // child rows: status dot + label
+  assert.ok(lines.slice(3).some((l) => l.includes("seeker")), "child labels appear in phase detail")
+  assert.ok(lines.slice(3).some((l) => /✓|●|○|✗|■/.test(l)), "child status dots appear")
+})
+
+test("phase cursor drills into the phase's first child session (Enter works on phase rows)", () => {
+  const model = inspectModel(
+    TREE_SESSIONS,
+    { offset: 0, selected: 0, parentSessionID: "ses_p", treeSel: { expanded: {}, cursor: { kind: "phase", id: "extract" }, detailOffset: 0 } },
+    1000,
+  )
+  assert.equal(model.selectedSessionID, "ses_a2")
+})
+
+test("tree cursor mark stays visible while the detail pane is focused (RC1)", () => {
+  const model = inspectModel(TREE_SESSIONS, { offset: 0, selected: 0, parentSessionID: "ses_p" }, 1000)
+  const lines = formatTreeLines(model.tree, model.treeSel.cursor, "detail")
+  assert.ok(lines.some((l) => l.startsWith(">")), "cursor mark renders even in detail focus")
+})
+
 test("tree selection: collapse while a child row is selected moves cursor to the parent phase", () => {
   const treeSel: TreeSelection = {
     expanded: { research: false, extract: true },
@@ -971,7 +1002,7 @@ test("tree selection: collapse while a child row is selected moves cursor to the
     1000,
   )
   assert.deepEqual(model.treeSel.cursor, { kind: "phase", id: "research" })
-  assert.equal(model.selectedSessionID, undefined)
+  assert.equal(model.selectedSessionID, "ses_a1")
 })
 
 test("tree selection: newly arriving agents do not steal the cursor", () => {
@@ -1155,9 +1186,9 @@ test("inspect pane paint: mounted accessors update (run, selection, collapse, de
   assert.match(tuiSrc, /const treeLines = createMemo\(\(\) => paneView\(\)\.treeLines\)/)
   assert.match(tuiSrc, /const detailLines = createMemo\(\(\) => paneView\(\)\.detailLines\)/)
   assert.match(tuiSrc, /const treePageLabel = createMemo\(\(\) => paneView\(\)\.treePageLabel\)/)
-  assert.match(tuiSrc, /const treeTitle = createMemo\(\(\) => paneView\(\)\.treeTitle\)/)
-  assert.match(tuiSrc, /\{treeLines\(\)\.join\("\\n"\)\}/)
-  assert.match(tuiSrc, /\{detailLines\(\)\.join\("\\n"\)\}/)
+  assert.match(tuiSrc, /const treeTitle = createMemo\(\(\) => paneView\(\)\.treeTitle \+/)
+  assert.match(tuiSrc, /\{treeLines\(\)\.map\(/)
+  assert.match(tuiSrc, /\{detailLines\(\)\.map\(/)
   assert.match(tuiSrc, /\{treePageLabel\(\)\}/)
   assert.match(tuiSrc, /\{treeTitle\(\)\}/)
 
@@ -1206,7 +1237,7 @@ test("inspect pane paint: mounted accessors update (run, selection, collapse, de
 
   pane = "detail"
   assert.equal(mounted.pane(), "detail")
-  assert.equal(mounted.tree().split("\n").some((line) => line.startsWith(">")), false)
+  assert.equal(mounted.tree().split("\n").some((line) => line.startsWith(">")), true)
   assert.ok(mounted.detail().startsWith(">"))
 
   const beforeDetails = mounted.detail()
@@ -1542,7 +1573,7 @@ test("runStripLines: visible picker marks follow-latest vs pinned", () => {
   ]
   const follow = runStripLines(runs, "run_alpha")
   assert.match(follow[0]!, /follow-latest/)
-  assert.match(follow[0]!, /\[ \] switch/)
+  assert.doesNotMatch(follow[0]!, /\[ \] switch/, "picker header carries view context, not key hints")
   assert.ok(follow.some((l) => l.startsWith("* ") && l.includes("run_alpha")))
   const pinned = runStripLines(runs, "run_beta", { pinned: true })
   assert.match(pinned[0]!, /pinned/)
@@ -1627,7 +1658,7 @@ test("parsePermissionList and formatPermissionLines: blocked child, never always
   assert.equal(forRun.length, 1)
   const lines = formatPermissionLines(forRun)
   assert.match(lines[0]!, /awaiting permission 1/)
-  assert.match(lines[0]!, /allow once/)
+  assert.doesNotMatch(lines[0]!, /allow once/, "key hints live in the footer only")
   assert.match(lines[1]!, /ses_child/)
   assert.doesNotMatch(lines.join("\n"), /always/)
 })

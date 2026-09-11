@@ -11,7 +11,9 @@ declare global {
       children: any
     }
     interface IntrinsicElements {
-      text: { children?: any }
+      // OpenTUI TextRenderable accepts fg/bg color strings or theme RGBA
+      // token objects, passed through fail-soft helpers in tui.tsx.
+      text: { children?: any; fg?: string | object; bg?: string | object }
       box: { children?: any; flexDirection?: string; flexGrow?: number | string; width?: number; flexShrink?: number }
     }
   }
