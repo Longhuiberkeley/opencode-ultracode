@@ -1009,6 +1009,45 @@ export function selectForOpen(
   return fresh()
 }
 
+/**
+ * Selection committed by in-run navigation (tree move, detail scroll,
+ * expand/collapse, pane cycle). Navigating within a run PINS it: every commit
+ * carries `pinned: true` so the follow-latest effect cannot snap the view to a
+ * newer active run mid-inspection. (Regression: commitTree used to rebuild the
+ * selection without `pinned`; the first ↑↓ after a `[` jump dropped the pin and
+ * the 1s status poll follow-latest'd to the other run.) `.` (toggleFollowPin)
+ * remains the explicit unpin.
+ */
+export function treeNavSelection(
+  run: Pick<RunView, "runID" | "agents">,
+  prev: InspectSelection,
+  treeSel: TreeSelection,
+  pane?: InspectPane,
+  pageHeight: number = PAGE_HEIGHT,
+): InspectSelection {
+  const agentIdx =
+    treeSel.cursor.kind === "agent" ? run.agents.findIndex((a) => a.sessionID === treeSel.cursor.id) : -1
+  // A phase cursor selects that phase's first agent (not a stale index
+  // from wherever the cursor was before — RC3 fix).
+  const phaseFirst =
+    treeSel.cursor.kind === "phase"
+      ? run.agents.findIndex((a) => (a.phase ?? "-") === treeSel.cursor.id)
+      : -1
+  const selected = agentIdx >= 0 ? agentIdx : phaseFirst >= 0 ? phaseFirst : prev.selected
+  const off = prev.offset
+  return {
+    parentSessionID: prev.parentSessionID,
+    runID: run.runID,
+    phase: prev.phase,
+    selected,
+    offset: selected < off ? selected : selected >= off + pageHeight ? selected - pageHeight + 1 : off,
+    treeSel,
+    pane: pane ?? prev.pane ?? "tree",
+    settingsRow: prev.settingsRow,
+    pinned: true,
+  }
+}
+
 export function toggleFollowPin(sel: InspectSelection): InspectSelection {
   return { ...sel, pinned: sel.pinned !== true }
 }

@@ -52,6 +52,7 @@ import {
   runningRunCount,
   sessionToStatus,
   selectForOpen,
+  treeNavSelection,
   selectedSessionID,
   selectionMapKey,
   UNSEEN_RUN_SELECTION,
@@ -1663,6 +1664,57 @@ test("selectForOpen: pinned history sticks; unpinned follows latest after settle
   assert.equal(follow.pinned, false)
   const toggled = toggleFollowPin(follow)
   assert.equal(toggled.pinned, true)
+})
+
+test("treeNavSelection: in-run navigation pins the run (pin-drop regression)", () => {
+  const older: RunView = {
+    runID: "run_old",
+    parent: "ses_p",
+    agents: [
+      { sessionID: "s1", status: "succeeded", title: "t", phase: "scout" },
+      { sessionID: "s2", status: "running", title: "t", phase: "review" },
+    ],
+    phases: [],
+    counts: { total: 2, done: 1, failed: 0 },
+    startedAt: 1,
+    settled: false,
+  }
+  const newer: RunView = {
+    runID: "run_new",
+    parent: "ses_p",
+    agents: [{ sessionID: "s3", status: "running", title: "t" }],
+    phases: [],
+    counts: { total: 1, done: 0, failed: 0 },
+    startedAt: 9,
+    settled: false,
+  }
+  const prev: InspectSelection = { parentSessionID: "ses_p", runID: "run_old", phase: "all", offset: 0, selected: 0 }
+  const next = treeNavSelection(older, prev, { expanded: {}, cursor: { kind: "agent", id: "s2" }, detailOffset: 0 }, "tree")
+  // The commit from an arrow key must carry pinned: true …
+  assert.equal(next.pinned, true)
+  assert.equal(next.runID, "run_old")
+  assert.equal(next.selected, 1)
+  // … so a newer active run cannot steal the view on the next status poll.
+  const kept = selectForOpen(next, [older, newer], "ses_p")
+  assert.equal(kept.runID, "run_old")
+  assert.equal(kept.pinned, true)
+})
+
+test("treeNavSelection: phase cursor selects the phase's first agent; window clamps", () => {
+  const agents = Array.from({ length: 12 }, (_, i) => ({
+    sessionID: `s${i + 1}`,
+    status: "succeeded" as const,
+    title: "t",
+    phase: i < 6 ? "scout" : "review",
+  }))
+  const run = { runID: "run_x", agents }
+  const prev: InspectSelection = { parentSessionID: "ses_p", runID: "run_x", phase: "all", offset: 0, selected: 0 }
+  const phaseSel = treeNavSelection(run, prev, { expanded: {}, cursor: { kind: "phase", id: "review" }, detailOffset: 0 })
+  assert.equal(phaseSel.selected, 6)
+  assert.equal(phaseSel.offset, 0)
+  const deep = treeNavSelection(run, prev, { expanded: {}, cursor: { kind: "agent", id: "s11" }, detailOffset: 0 })
+  assert.equal(deep.selected, 10)
+  assert.equal(deep.offset, 1)
 })
 
 test("inspectModel and runsForParent scope inventory to the open parent", () => {

@@ -52,6 +52,7 @@ import {
   wrapPaneLines,
   splitPanelWidth,
   toggleFollowPin,
+  treeNavSelection,
   type AuthoritativeSnapshot,
   type ChipScope,
   type DetailCacheEntry,
@@ -1006,26 +1007,9 @@ export default Plugin.define({
           const m = model()
           const run = m.run
           if (!run) return
-          const agentIdx =
-            treeSel.cursor.kind === "agent" ? run.agents.findIndex((a) => a.sessionID === treeSel.cursor.id) : -1
-          // A phase cursor selects that phase's first agent (not a stale index
-          // from wherever the cursor was before — RC3 fix).
-          const phaseFirst =
-            treeSel.cursor.kind === "phase"
-              ? run.agents.findIndex((a) => (a.phase ?? "-") === treeSel.cursor.id)
-              : -1
-          const selected = agentIdx >= 0 ? agentIdx : phaseFirst >= 0 ? phaseFirst : sel().selected
-          const off = sel().offset
-          commitSel({
-            parentSessionID: openParent(),
-            runID: run.runID,
-            phase: sel().phase,
-            selected,
-            offset: selected < off ? selected : selected >= off + PAGE_HEIGHT ? selected - PAGE_HEIGHT + 1 : off,
-            treeSel,
-            pane: pane ?? sel().pane ?? "tree",
-            settingsRow: sel().settingsRow,
-          })
+          // treeNavSelection pins the run: in-run navigation must not be
+          // follow-latest'd away by the status-poll effect.
+          commitSel(treeNavSelection(run, sel(), treeSel, pane))
         }
 
         const moveInspect = (delta: number): void => {
@@ -1033,7 +1017,9 @@ export default Plugin.define({
           const pane = sel().pane ?? "tree"
           if (pane === "settings") {
             const nextRow = Math.min(SETTINGS_KEYS.length - 1, Math.max(0, (sel().settingsRow ?? 0) + delta))
-            commitSel({ ...sel(), settingsRow: nextRow })
+            // Settings-row navigation is in-run interaction too: pin so a new
+            // run appearing cannot snap the pane away mid-navigation.
+            commitSel({ ...sel(), settingsRow: nextRow, pinned: true })
             return
           }
           const m = model()
