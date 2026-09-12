@@ -2,7 +2,7 @@
  * Host-free run status: live/persisted snapshots, fallback expiry, RPC parse.
  * TUI heuristics live in tui-render; this module is the merge/lookup core.
  */
-import { countAgents, isActiveRunStatus, type AgentRecord, type RunRecord, type RunStatus } from "./types.ts"
+import { countAgents, isActiveRunStatus, type AgentRecord, type RunRecord, type RunStatus, type TokenUsage } from "./types.ts"
 import { parsePanelSettings, type PanelSettings, type SettingsAck } from "./settings.ts"
 
 /** Bounded staleness window for session-derived "still running" heuristics. */
@@ -24,7 +24,19 @@ export type AuthoritativeSnapshot = {
   runningCount?: number
   projectID?: string
   directory?: string
-  agentDetails?: Pick<AgentRecord, "id" | "sessionID" | "status" | "phase" | "label">[]
+  agentDetails?: Pick<
+    AgentRecord,
+    | "id"
+    | "sessionID"
+    | "status"
+    | "phase"
+    | "label"
+    | "requestedAgent"
+    | "effectiveAgent"
+    | "effectiveModel"
+    | "tokens"
+    | "toolCalls"
+  >[]
   queuedCount?: number
 }
 
@@ -118,7 +130,24 @@ export function authoritativeFromRecord(
     parentSessionID: record.parentSessionID,
     runningCount: runningAgentCount(record),
     queuedCount: record.agents.filter((a) => a.status === "pending").length,
-    agentDetails: record.agents.map(({ id, sessionID, status, phase, label }) => ({ id, sessionID, status, phase, label })),
+    // Provenance fields ride along so warm-replayed (cached) children — which
+    // have no session in THIS run for the panel's heuristic join — still
+    // render agent/model/tokens/toolCalls instead of "-". Undefined-valued
+    // keys drop at serialization, so unfinished children stay lean.
+    agentDetails: record.agents.map(
+      ({ id, sessionID, status, phase, label, requestedAgent, effectiveAgent, effectiveModel, tokens, toolCalls }) => ({
+        id,
+        sessionID,
+        status,
+        phase,
+        label,
+        requestedAgent,
+        effectiveAgent,
+        effectiveModel,
+        tokens,
+        toolCalls,
+      }),
+    ),
   }
   if (record.name) snap.name = record.name
   if (record.workflowName) snap.workflowName = record.workflowName
@@ -312,7 +341,18 @@ function parseSnapshot(raw: unknown): AuthoritativeSnapshot | undefined {
       if (!value || typeof value !== "object") return []
       const a = value as Record<string, unknown>
       if (typeof a.id !== "string" || !["pending", "running", "succeeded", "failed", "interrupted"].includes(String(a.status))) return []
-      return [{ id: a.id, status: a.status as AgentRecord["status"], sessionID: optionalNonEmptyString(a.sessionID), phase: optionalNonEmptyString(a.phase), label: optionalNonEmptyString(a.label) }]
+      return [{
+        id: a.id,
+        status: a.status as AgentRecord["status"],
+        sessionID: optionalNonEmptyString(a.sessionID),
+        phase: optionalNonEmptyString(a.phase),
+        label: optionalNonEmptyString(a.label),
+        requestedAgent: optionalNonEmptyString(a.requestedAgent),
+        effectiveAgent: optionalNonEmptyString(a.effectiveAgent),
+        effectiveModel: parseModelRef(a.effectiveModel),
+        tokens: parseTokenUsage(a.tokens),
+        toolCalls: optionalFiniteNumber(a.toolCalls),
+      }]
     })
   }
   const projectID = optionalNonEmptyString(rec.projectID)
@@ -324,6 +364,28 @@ function parseSnapshot(raw: unknown): AuthoritativeSnapshot | undefined {
 
 function optionalNonEmptyString(value: unknown): string | undefined {
   return typeof value === "string" && value !== "" ? value : undefined
+}
+
+function parseModelRef(value: unknown): { providerID: string; id: string } | undefined {
+  if (!value || typeof value !== "object") return undefined
+  const v = value as { providerID?: unknown; id?: unknown }
+  if (typeof v.providerID !== "string" || typeof v.id !== "string") return undefined
+  return { providerID: v.providerID, id: v.id }
+}
+
+function parseTokenUsage(value: unknown): TokenUsage | undefined {
+  if (!value || typeof value !== "object") return undefined
+  const v = value as Record<string, unknown>
+  const input = optionalFiniteNumber(v.input)
+  const output = optionalFiniteNumber(v.output)
+  if (input === undefined || output === undefined) return undefined
+  const c = (v.cache && typeof v.cache === "object" ? v.cache : {}) as Record<string, unknown>
+  return {
+    input,
+    output,
+    reasoning: optionalFiniteNumber(v.reasoning) ?? 0,
+    cache: { read: optionalFiniteNumber(c.read) ?? 0, write: optionalFiniteNumber(c.write) ?? 0 },
+  }
 }
 
 function optionalFiniteNumber(value: unknown): number | undefined {

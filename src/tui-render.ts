@@ -456,15 +456,25 @@ export function groupRuns(sessions: SessionView[], nowTs?: number): RunView[] {
 
 function snapshotAgents(snap: AuthoritativeSnapshot, cached: readonly RunAgentView[] = []): RunAgentView[] {
   if (!snap.agentDetails) return [...cached]
-  return snap.agentDetails.filter((a) => !!a.sessionID).map((a) => ({
-    ...cached.find((c) => c.ord === a.id || (a.sessionID && c.sessionID === a.sessionID)),
-    sessionID: a.sessionID ?? "",
-    ord: a.id,
-    status: a.status,
-    phase: a.phase,
-    label: a.label,
-    title: a.label ?? a.id,
-  }))
+  return snap.agentDetails.filter((a) => !!a.sessionID).map((a) => {
+    const prev = cached.find((c) => c.ord === a.id || (a.sessionID && c.sessionID === a.sessionID))
+    // Record provenance fills what the session-heuristic join cannot: a
+    // warm-replayed (cached) child has no session in THIS run, so without
+    // this fallback its detail rows render "-".
+    return {
+      ...prev,
+      sessionID: a.sessionID ?? "",
+      ord: a.id,
+      status: a.status,
+      phase: a.phase,
+      label: a.label,
+      title: a.label ?? a.id,
+      agent: a.effectiveAgent ?? a.requestedAgent ?? prev?.agent,
+      model: a.effectiveModel ?? prev?.model,
+      tokens: a.tokens ?? prev?.tokens,
+      toolCalls: a.toolCalls ?? prev?.toolCalls,
+    }
+  })
 }
 
 function overlaySnapshot(run: RunView, snap: AuthoritativeSnapshot): RunView {

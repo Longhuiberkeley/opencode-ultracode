@@ -67,6 +67,29 @@ export const ULTRACODE_RPC = {
                       status: RUN_STATUS,
                       phase: { type: "string" as const },
                       label: { type: "string" as const },
+                      // Provenance for children with no session in this run
+                      // (warm-replayed): the panel joins details by session.
+                      requestedAgent: { type: "string" as const },
+                      effectiveAgent: { type: "string" as const },
+                      effectiveModel: {
+                        type: "object" as const,
+                        required: ["providerID", "id"],
+                        properties: {
+                          providerID: { type: "string" as const },
+                          id: { type: "string" as const },
+                          variant: { type: "string" as const },
+                        },
+                      },
+                      tokens: {
+                        type: "object" as const,
+                        required: ["input", "output"],
+                        properties: {
+                          input: NUMBER,
+                          output: NUMBER,
+                          reasoning: NUMBER,
+                        },
+                      },
+                      toolCalls: NUMBER,
                     },
                   },
                 },

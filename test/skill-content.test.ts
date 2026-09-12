@@ -91,6 +91,7 @@ test("skill content is graph-first: structure before plumbing", () => {
   for (const kind of ["agent", "fanout", "partition", "merge", "gate", "checkpoint", "workflow"]) {
     assert.match(SKILL_CONTENT, new RegExp(`\`${kind}\``), `node kind \`${kind}\` must be documented`)
   }
+  assert.match(SKILL_CONTENT, /compiles as a root/, "a write node referencing no node is a root — the parallel-writer trap")
   assert.match(SKILL_CONTENT, /\{\{\s*item\s*\}\}|\{\{item\}\}/, "fanout templates must be shown")
   assert.match(SKILL_CONTENT, /auto `key` on every call/, "auto-keying is the warm-rerun story")
 })

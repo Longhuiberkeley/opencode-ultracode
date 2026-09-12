@@ -174,6 +174,8 @@ run legitimately needs it.
    context. Make every prompt self-contained: paths, pasted snippets, criteria, output format.
 6. **Serialize write agents.** A clean context is NOT filesystem isolation: two write agents
    racing in one worktree corrupt it. One write agent at a time; parallelize read-only agents.
+   In a graph, a write node's prompt must reference its predecessor's output (even just a
+   baseline count): a prompt naming no node compiles as a root and schedules beside it.
 7. **Prefer explicit \`opts.phase\`.** The ambient \`phase()\` label races across parallel branches;
    an explicit \`opts.phase\` on every \`agent\` call always wins. (Graph nodes set it for you.)
 8. **Use \`opts.schema\` for anything you merge or branch on.** \`.data\` is validated JSON; \`.text\`

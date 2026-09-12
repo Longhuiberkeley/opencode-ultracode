@@ -17,7 +17,7 @@ import {
   selectAuthoritative,
   sessionActivityMs,
 } from "../src/run-status.ts"
-import { chipCounts, filterSnapshotsForChip, inspectModel, mergeAuthoritativeRuns, parsePermissionList, permissionsForRun, sessionToStatus, wrapPaneLines, type RunView } from "../src/tui-render.ts"
+import { agentDetailLines, chipCounts, filterSnapshotsForChip, inspectModel, mergeAuthoritativeRuns, parsePermissionList, permissionsForRun, sessionToStatus, wrapPaneLines, type RunView } from "../src/tui-render.ts"
 import type { RunRecord } from "../src/types.ts"
 import { RegistryImpl } from "../src/registry.ts"
 
@@ -44,6 +44,38 @@ function heuristicRun(overrides: Partial<RunView> = {}): RunView {
     ...overrides,
   }
 }
+
+test("cached (warm-replayed) children keep agent/model/tool provenance in panel details", () => {
+  const r = record({
+    agents: [{
+      id: "a1",
+      status: "succeeded",
+      sessionID: "ses_source",
+      label: "scout",
+      phase: "scout",
+      cached: true,
+      requestedAgent: "explore",
+      effectiveAgent: "explore",
+      effectiveModel: { providerID: "xai", id: "grok-4.6" },
+      tokens: { input: 53200, output: 2100, reasoning: 3000, cache: { read: 37200, write: 5 } },
+      toolCalls: 7,
+    }],
+  })
+  // Round-trip through the RPC parse: the widened agentDetails must survive
+  // serialization AND the defensive parse of the wire shape.
+  const snapshots = parseRunStatusResponse(JSON.parse(JSON.stringify({ runs: [authoritativeFromRecord(r, "persisted")] })))!
+  const snap = snapshots[0]!
+  assert.equal(snap.agentDetails?.[0]?.effectiveAgent, "explore")
+  assert.equal(snap.agentDetails?.[0]?.effectiveModel?.id, "grok-4.6")
+  assert.equal(snap.agentDetails?.[0]?.toolCalls, 7)
+  // No session heuristic at all (the cached child's session belongs to the
+  // SOURCE run): the panel must still render provenance, not dashes.
+  const [view] = mergeAuthoritativeRuns([], [], [snap])
+  const lines = agentDetailLines(view!.agents[0]!)
+  assert.ok(lines.some((l) => l.startsWith("agent   explore")), `agent row missing: ${lines.join(" | ")}`)
+  assert.ok(lines.some((l) => l.startsWith("model   xai/grok-4.6")), `model row missing: ${lines.join(" | ")}`)
+  assert.ok(lines.some((l) => l.startsWith("tools   7")), `tools row missing: ${lines.join(" | ")}`)
+})
 
 test("cold-client inventory preserves child identity and permission routing without session titles", () => {
   const r = record({ directory: "/repo", agents: [{ id: "a1", sessionID: "ses_child", status: "running", label: "A complete long task label", phase: "build" }] })
