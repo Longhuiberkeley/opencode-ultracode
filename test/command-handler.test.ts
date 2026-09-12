@@ -13,17 +13,30 @@ import {
   PLUGIN_VERSION,
   SOURCE_STILL_ACTIVE,
   feedToolEvent,
+  formatGraphView,
   formatShowRun,
   handleUltracodeCommand,
+  helpText,
   multipleActiveMessage,
   resolveRunStatus,
   type CommandDeps,
   type CommandStorage,
   type CommandSupervisor,
 } from "../src/command.ts"
+import { compileGraphSpec } from "../src/graph.ts"
+import type { GraphSpec } from "../src/graph.ts"
 import { emptyToolEventState, toolCallsFor } from "../src/run-events.ts"
 import { agentCells, runHeaderCells } from "../src/run-format.ts"
-import type { AgentRecord, Json, ParentContext, RunOutcome, RunRecord, SavedWorkflow } from "../src/types.ts"
+import type {
+  AgentRecord,
+  Json,
+  ParentContext,
+  RunLaunchInput,
+  RunOutcome,
+  RunRecord,
+  SaveWorkflowManifestInput,
+  SavedWorkflow,
+} from "../src/types.ts"
 import { DEFAULT_OPTIONS } from "../src/types.ts"
 import { applyOverlay, overlayFromPanel, panelSettingsFrom, parseSettingsAckPayload } from "../src/settings.ts"
 import { FakeRegistry } from "./fakes.ts"
@@ -94,6 +107,29 @@ class MemoryStorage implements CommandStorage {
     this.workflows.set(name, saved)
     return saved
   }
+  graphSaves: Array<{ name: string; spec: Json }> = []
+  async saveGraphWorkflow(name: string, spec: Json, manifest: SaveWorkflowManifestInput): Promise<SavedWorkflow> {
+    this.graphSaves.push({ name, spec })
+    const compiled = compileGraphSpec(spec as unknown as GraphSpec)
+    const saved: SavedWorkflow = {
+      manifest: {
+        version: 1,
+        name,
+        description: manifest.description,
+        phases: manifest.phases ?? compiled.meta.phases,
+        requires: manifest.requires ?? compiled.meta.requires,
+        hash: digest(compiled.script),
+        source: manifest.source,
+        savedAt: Date.now(),
+        kind: "graph",
+        ...(manifest.savedFromRunID ? { savedFromRunID: manifest.savedFromRunID } : {}),
+      },
+      script: compiled.script,
+      graphSpec: spec,
+    }
+    this.workflows.set(name, saved)
+    return saved
+  }
   fileScripts = new Map<string, string>()
   async saveWorkflowFromFile(name: string): Promise<SavedWorkflow> {
     const script = this.fileScripts.get(name)
@@ -150,10 +186,7 @@ class MemorySupervisor implements CommandSupervisor {
     if (!run || (run.status !== "running" && run.status !== "paused" && run.status !== "stopping")) return false
     return this.registry.setStatus(runID, "stopped", { stopReason: reason })
   }
-  startDetached(
-    input: { script: string; meta?: RunRecord["meta"]; args?: Json; name?: string; workflowName?: string },
-    parent: ParentContext,
-  ): { runID: string; done: Promise<RunOutcome> } {
+  startDetached(input: RunLaunchInput, parent: ParentContext): { runID: string; done: Promise<RunOutcome> } {
     this.startCalls.push({ input, parent })
     const run = this.registry.create({
       parentSessionID: parent.sessionID,
@@ -162,6 +195,7 @@ class MemorySupervisor implements CommandSupervisor {
       args: input.args,
       name: input.name,
       workflowName: input.workflowName,
+      graphSpec: input.graphSpec,
     })
     let resolve!: (value: RunOutcome) => void
     const done = new Promise<RunOutcome>((r) => {
@@ -693,6 +727,230 @@ test("dashboard empty saved-workflows mentions one-token and two-token save", as
   const { texts } = await invoke("")
   assert.match(texts[0]!, /\/ultracode save <name>/)
   assert.match(texts[0]!, /\/ultracode save <runID> <name>/)
+})
+
+// ---------------------------------------------------------------------------
+// Graph workflows on the command surface (B2): graph, save, rerun, show
+// ---------------------------------------------------------------------------
+
+const GRAPH_FIXTURE = {
+  name: "lane-review",
+  description: "scout, partition, review",
+  nodes: [
+    { id: "scout", kind: "agent", agent: "explore", prompt: "Inventory {{args.area}}." },
+    { id: "lanes", kind: "partition", from: "$scout.items", budgetTokens: 100 },
+    { id: "review", kind: "fanout", over: "$lanes", agent: "explore", max: 4, prompt: "Review {{item}}" },
+  ],
+  returns: { report: "$review" },
+}
+
+function compiledOf(spec: unknown): string {
+  return compileGraphSpec(spec as never).script
+}
+
+function jsonCopy<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T
+}
+
+function savedGraph(name: string, spec: unknown, extra: Partial<SavedWorkflow> = {}): SavedWorkflow {
+  return {
+    manifest: {
+      version: 1,
+      name,
+      description: "a saved graph",
+      phases: ["scout", "review"],
+      requires: ["explore"],
+      hash: "",
+      source: "project",
+      savedAt: 0,
+      kind: "graph",
+    },
+    script: compiledOf(spec),
+    graphSpec: jsonCopy(spec) as Json,
+    ...extra,
+  }
+}
+
+test("help lists /ultracode graph and the graph artifact in save usage", () => {
+  assert.match(helpText(), /`\/ultracode graph <name\|runID>`/)
+  assert.match(helpText(), /works before trust/)
+  assert.match(helpText(), /<name>\.graph\.json/)
+  assert.match(helpText(), /a graph run saves its spec, not the compiled script/)
+})
+
+test("/ultracode graph <runID> renders waves, node table, returns and mermaid", async () => {
+  const registry = new FakeRegistry()
+  seed(
+    registry,
+    baseRun({ id: "run_g", status: "succeeded", script: compiledOf(GRAPH_FIXTURE), graphSpec: jsonCopy(GRAPH_FIXTURE) }),
+  )
+  const { texts } = await invoke("graph run_g", { registry })
+  const out = texts[0]!
+  assert.match(out, /## Graph `lane-review` — 3 nodes/)
+  assert.match(out, /source: run `run_g`/)
+  assert.match(out, /description: scout, partition, review/)
+  assert.match(out, /### Execution order/)
+  assert.match(out, /wave 1: scout\(agent\)/)
+  assert.match(out, /wave 2: lanes\(partition\)/)
+  assert.match(out, /wave 3: review\(fanout\)/)
+  assert.match(out, /\| `scout` \| agent \| explore \| - \| - \|/)
+  assert.match(out, /\| `lanes` \| partition \| - \| \$scout\.items \| ~100 tokens per lane \|/)
+  assert.match(out, /\| `review` \| fanout \| explore \| \$lanes \| max 4 \|/)
+  assert.match(out, /### Returns/)
+  assert.match(out, /`report` ← \$review/)
+  assert.match(out, /```mermaid/)
+  assert.match(out, /scout --> lanes/)
+  assert.match(out, /lanes --> review/)
+  assert.match(out, /\/ultracode rerun run_g --warm/)
+})
+
+test("/ultracode graph of a script run says there is no DAG and points at show", async () => {
+  const registry = new FakeRegistry()
+  seed(registry, baseRun({ id: "run_js", status: "succeeded", script: "return 1" }))
+  const { texts } = await invoke("graph run_js", { registry })
+  assert.match(texts[0]!, /was not graph-authored/)
+  assert.match(texts[0]!, /\/ultracode show run_js/)
+})
+
+test("/ultracode graph <name> renders a saved graph WITHOUT requiring trust", async () => {
+  const storage = new MemoryStorage()
+  storage.workflows.set("lane-review", savedGraph("lane-review", GRAPH_FIXTURE))
+  const { texts } = await invoke("graph lane-review", { storage })
+  const out = texts[0]!
+  assert.match(out, /## Graph `lane-review` — 3 nodes/)
+  assert.match(out, /source: saved workflow `lane-review` \(project\)/)
+  assert.match(out, /trust: NOT trusted/)
+  assert.match(out, /\/ultracode trust/)
+  assert.match(out, /```mermaid/)
+  assert.doesNotMatch(out, /--warm/, "the warm-rerun hint belongs to runs, not saved workflows")
+
+  storage.trust.set("lane-review", digest(compiledOf(GRAPH_FIXTURE)))
+  const trusted = await invoke("graph lane-review", { storage })
+  assert.match(trusted.texts[0]!, /trust: trusted \(the compiled script matches the approval\)/)
+})
+
+test("/ultracode graph <name> of a script workflow points at the file", async () => {
+  const storage = new MemoryStorage()
+  storage.workflows.set("plain", {
+    manifest: { version: 1, name: "plain", hash: "", source: "project", savedAt: 0 },
+    script: "return 1",
+  })
+  const { texts } = await invoke("graph plain", { storage })
+  assert.match(texts[0]!, /is a script workflow \(`plain\.js`\)/)
+  assert.match(texts[0]!, /\/ultracode trust plain/)
+})
+
+test("/ultracode graph <name> of a broken graph prints the validator error", async () => {
+  const storage = new MemoryStorage()
+  storage.workflows.set(
+    "broken",
+    savedGraph("broken", GRAPH_FIXTURE, { script: "", graphSpec: undefined, graphError: "the graph spec failed validation: nodes[0]: prompt is required" }),
+  )
+  const { texts } = await invoke("graph broken", { storage })
+  assert.match(texts[0]!, /cannot run: the graph spec failed validation/)
+})
+
+test("/ultracode graph usage and unknown-target messages", async () => {
+  const noArg = await invoke("graph")
+  assert.match(noArg.texts[0]!, /Usage: \/ultracode graph <name\|runID>/)
+  const twoTokens = await invoke("graph one two")
+  assert.match(twoTokens.texts[0]!, /Usage: \/ultracode graph/)
+
+  const storage = new MemoryStorage()
+  storage.workflows.set("lane-review", savedGraph("lane-review", GRAPH_FIXTURE))
+  const unknown = await invoke("graph nope", { storage })
+  assert.match(unknown.texts[0]!, /No run or saved workflow named `nope`\./)
+  assert.match(unknown.texts[0]!, /Saved workflows: lane-review\./)
+})
+
+test("formatGraphView refuses to render an invalid spec as if it were runnable", () => {
+  const out = formatGraphView({ nodes: [{ id: "a", kind: "agent" }] } as Json, { source: "run `run_x`" })
+  assert.match(out, /This spec is not valid; it cannot run/)
+  assert.match(out, /prompt is required for kind agent/)
+  assert.doesNotMatch(out, /```mermaid/, "an invalid spec must not render a confident DAG")
+})
+
+test("save <runID> <name> of a graph run saves the SPEC, not the compiled script", async () => {
+  const registry = new FakeRegistry()
+  seed(
+    registry,
+    baseRun({
+      id: "run_g",
+      status: "succeeded",
+      name: "lane review",
+      script: compiledOf(GRAPH_FIXTURE),
+      graphSpec: jsonCopy(GRAPH_FIXTURE),
+      meta: { phases: ["scout", "review"], requires: ["explore"] },
+    }),
+  )
+  const { texts, storage } = await invoke("save run_g lane-review", { registry })
+  assert.equal(storage.graphSaves.length, 1, "the graph save path was used")
+  assert.deepEqual(storage.graphSaves[0]!.spec, jsonCopy(GRAPH_FIXTURE))
+  const saved = storage.workflows.get("lane-review")
+  assert.equal(saved?.manifest.kind, "graph")
+  assert.deepEqual(saved?.graphSpec, jsonCopy(GRAPH_FIXTURE))
+  assert.equal(saved?.manifest.savedFromRunID, "run_g")
+  assert.match(texts[0]!, /Saved workflow `lane-review` \(project, wrote `lane-review\.graph\.json` \+ `lane-review\.json`\)/)
+  assert.match(texts[0]!, /review it with `\/ultracode graph lane-review`/)
+  assert.match(texts[0]!, /\/ultracode trust lane-review/)
+})
+
+test("save <runID> <name> of a script run still writes the script pair", async () => {
+  const registry = new FakeRegistry()
+  seed(registry, baseRun({ id: "run_js", status: "succeeded", script: "return 7" }))
+  const { texts, storage } = await invoke("save run_js plain-flow", { registry })
+  assert.equal(storage.graphSaves.length, 0)
+  assert.equal(storage.workflows.get("plain-flow")?.script, "return 7")
+  assert.equal(storage.workflows.get("plain-flow")?.manifest.kind, undefined)
+  assert.match(texts[0]!, /wrote `plain-flow\.js`/)
+  assert.doesNotMatch(texts[0]!, /\/ultracode graph/)
+})
+
+test("rerun carries graphSpec forward, so re-saving the rerun stays a graph", async () => {
+  const registry = new FakeRegistry()
+  seed(
+    registry,
+    baseRun({ id: "run_g", status: "succeeded", script: compiledOf(GRAPH_FIXTURE), graphSpec: jsonCopy(GRAPH_FIXTURE) }),
+  )
+  const { texts, supervisor, registry: reg } = await invoke("rerun run_g", { registry })
+  assert.match(texts[0]!, /rerun started: run_fake1 \(from run_g\)/)
+  const input = supervisor.startCalls[0]!.input as RunLaunchInput
+  assert.deepEqual(input.graphSpec, jsonCopy(GRAPH_FIXTURE), "the launch input keeps the spec")
+  assert.deepEqual(reg.get("run_fake1")?.graphSpec, jsonCopy(GRAPH_FIXTURE), "the new run record keeps the spec")
+
+  // And the rerun can be saved as a graph again (the laundering hole, closed).
+  const saved = await invoke("save run_fake1 lane-review", { registry: reg })
+  assert.equal(saved.storage.graphSaves.length, 1)
+  assert.equal(saved.storage.workflows.get("lane-review")?.manifest.kind, "graph")
+})
+
+test("dashboard tags saved graph workflows and surfaces an unloadable spec", async () => {
+  const storage = new MemoryStorage()
+  storage.workflows.set("lane-review", savedGraph("lane-review", GRAPH_FIXTURE))
+  storage.workflows.set("plain", {
+    manifest: { version: 1, name: "plain", hash: "", source: "personal", savedAt: 0 },
+    script: "return 1",
+  })
+  storage.workflows.set(
+    "broken",
+    savedGraph("broken", GRAPH_FIXTURE, { script: "", graphSpec: undefined, graphError: "the graph spec is not valid JSON" }),
+  )
+  const { texts } = await invoke("", { storage })
+  const out = texts[0]!
+  assert.match(out, /`broken`[\s\S]*\[project · graph · untrusted \(changed\)\][\s\S]*CANNOT RUN: the graph spec is not valid JSON/)
+  assert.match(out, /`lane-review`[\s\S]*\[project · graph · untrusted \(changed\)\] — `\/ultracode graph lane-review` renders it/)
+  assert.match(out, /`plain`[\s\S]*\[personal · script · untrusted \(changed\)\]/)
+})
+
+test("show reports the graph size and marks the script as compiled output", async () => {
+  const out = formatShowRun(
+    baseRun({ id: "run_g", status: "succeeded", script: compiledOf(GRAPH_FIXTURE), graphSpec: jsonCopy(GRAPH_FIXTURE) }),
+  )
+  assert.match(out, /- graph: 3 node\(s\) — `\/ultracode graph run_g` renders the DAG/)
+  assert.match(out, /### Script \(compiled from the graph spec — regenerate from the spec, do not hand-edit\)/)
+  const plain = formatShowRun(baseRun({ id: "run_js", status: "succeeded", script: "return 1" }))
+  assert.match(plain, /### Script\n/)
+  assert.doesNotMatch(plain, /- graph:/)
 })
 
 // ---------------------------------------------------------------------------

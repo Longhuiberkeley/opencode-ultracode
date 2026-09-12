@@ -3,21 +3,26 @@
  * and session.tool.* → toolCalls wiring. Plugin-free so unit tests cover it.
  */
 import { agentCells, compactCount, compactElapsed, compactTokens, runHeaderCells } from "./run-format.ts"
+import { canonicalGraphSpec, graphNodeCount, graphToAscii, graphToMermaid, validateGraphSpec } from "./graph.ts"
+import type { GraphNode, GraphSpec } from "./graph.ts"
 import { MAX_CHECKPOINTS } from "./registry.ts"
 import { compactStringify, safeSlice } from "./serialize.ts"
 import { reduceToolEvent, toolCallsFor, type ToolEvent, type ToolEventState } from "./run-events.ts"
-import { normalizePath, sha256 } from "./storage.ts"
+import { GRAPH_ARTIFACT_SUFFIX, normalizePath, sha256 } from "./storage.ts"
 import type {
   Json,
   ParentContext,
   Registry,
   RunEnvelope,
+  RunLaunchInput,
   RunOutcome,
   RunRecord,
   RunStatus,
+  SaveWorkflowManifestInput,
   SavedWorkflow,
   Supervisor,
   UltracodeOptions,
+  WorkflowKind,
   WorkflowMeta,
 } from "./types.ts"
 import { countAgents, DEFAULT_OPTIONS, isActiveRunStatus } from "./types.ts"
@@ -56,11 +61,12 @@ export function parseSubcommand(argsText: string): { sub: string; rest: string }
   return { sub: (m?.[1] ?? "").toLowerCase(), rest: (m?.[2] ?? "").trim() }
 }
 
-/** D2 verb set (13; bare dashboard is not a verb). */
+/** D2 verb set (15; the bare dashboard is not a verb). */
 export const D2_VERBS = [
   "show",
   "status",
   "result",
+  "graph",
   "stop",
   "pause",
   "resume",
@@ -85,7 +91,7 @@ export const NESTED_RUN_REFUSED =
   "cannot start a run from inside an active workflow session — use /ultracode from the parent"
 
 /** Plugin package version shown on the bare /ultracode dashboard. */
-export const PLUGIN_VERSION = "0.8.0"
+export const PLUGIN_VERSION = "0.9.0"
 /** Oldest OpenCode binary build the inspect TUI is gated on (A7 / D7). */
 export const MIN_SUPPORTED_BUILD = 19271
 
@@ -96,11 +102,12 @@ export function helpText(): string {
     "- `/ultracode show [runID]` — full run report (agents, sessions, tokens, script)",
     "- `/ultracode status [runID]` — compact run state (runID, status, agents done/total, elapsed)",
     "- `/ultracode result [runID]` — print a truncated run's full result",
+    "- `/ultracode graph <name|runID>` — render a graph workflow's DAG (waves + mermaid); works before trust, so you can review what you are approving",
     "- `/ultracode stop [runID]` — stop an active run (explicit runID required when several are active)",
     "- `/ultracode pause [runID]` — pause an active run (close admission of new agent() calls)",
     "- `/ultracode resume [runID]` — resume a paused run",
     "- `/ultracode rerun [runID] [argsJSON]` — start a new run from a finished run's script",
-    "- `/ultracode save` `<name>` (from a project `<name>.js` file) or `<runID> <name>` (from a run)",
+    "- `/ultracode save` `<name>` (from a project `<name>.js` or `<name>.graph.json` file) or `<runID> <name>` (from a run — a graph run saves its spec, not the compiled script)",
     "- `/ultracode trust <name>` — approve the current version of a saved workflow",
     "- `/ultracode untrust <name>` — revoke trust for a saved workflow",
     "- `/ultracode settings [runID]` — next-run defaults and a run's captured settings",
@@ -129,15 +136,17 @@ export const TOOL_DESCRIPTION: string = [
   "WHEN: the task outgrows one context window, needs fan-out, needs structural verification, or should be a repeatable orchestration.",
   "NOT: one reply answers it, or a single subagent is enough.",
   "",
-  "Input: { script, name?, meta?, args?, background? } (inline) or { workflow: name, args?, background? } (saved; trust first via /ultracode trust <name>).",
+  "Input: { graph, name?, args? } (a JSON DAG — validated then compiled for you; preferred for standard shapes), { script, name?, meta?, args? } (inline JS), or { workflow: name, args? } (saved; trust first via /ultracode trust <name>). Every form also takes background? and resumeFrom? (warm-start from a prior runID: keyed succeeded agents replay from cache).",
   "Script = plain-JS async function body (no import/export). Return a small JSON value.",
+  "Graph = { nodes: [{ id, kind, ... }], returns? }; kinds: agent, fanout (over a ref, {{item}}), partition (token-budgeted lanes), merge (batched), gate (QC verdict, aborts on fail), checkpoint, workflow. Refs like \"$scout.items\" must flow forward; node ids are phases; every call is auto-keyed. /ultracode graph <name|runID> renders the DAG.",
   "",
   "Injected globals:",
-  "- agent(prompt, opts?) — spawn one subagent; opts: agent, label, phase, schema",
+  "- agent(prompt, opts?) — spawn one subagent; opts: agent, label, phase, schema, key",
   "- parallel(thunks) — barrier; a thrown thunk resolves null",
   "- pipeline(items, ...stages) — per-item stages; a failing item becomes null",
   "- phase(name) — ambient phase label for progress grouping",
   "- progress(text) — emit a line into the run log",
+  "- checkpoint(name, value?) — persist a phase-boundary snapshot on the run record",
   "- workflow(name, args?) — run a saved workflow (depth 1 only)",
   "- sleep(ms) — pause, capped at 60000 ms per call",
   "- console.log(x) — buffered into the run log",
@@ -243,7 +252,7 @@ export function resolveRunStatus(
  */
 export async function executeWorkflowLaunch(
   supervisor: Pick<Supervisor, "start" | "startDetached">,
-  input: { script: string; meta?: WorkflowMeta; args?: Json; name?: string; workflowName?: string; resumeFrom?: string },
+  input: RunLaunchInput,
   parent: ParentContext,
   background: boolean,
   onSettled?: (outcome: RunOutcome) => void,
@@ -513,6 +522,9 @@ export function formatShowRun(run: RunRecord, extra?: { pending?: readonly strin
   lines.push("")
   lines.push(`- status: **${run.status}**`)
   if (run.workflowName) lines.push(`- workflow: ${run.workflowName}`)
+  if (run.graphSpec !== undefined) {
+    lines.push(`- graph: ${graphNodeCount(run.graphSpec)} node(s) — \`/ultracode graph ${run.id}\` renders the DAG`)
+  }
   if (run.error) lines.push(`- error: ${run.error}`)
   if (run.stopReason) lines.push(`- stop reason: ${run.stopReason}`)
   if (run.totalTokens) {
@@ -579,11 +591,113 @@ export function formatShowRun(run: RunRecord, extra?: { pending?: readonly strin
     lines.push(run.error)
   }
   lines.push("")
-  lines.push("### Script")
+  lines.push(
+    run.graphSpec !== undefined
+      ? "### Script (compiled from the graph spec — regenerate from the spec, do not hand-edit)"
+      : "### Script",
+  )
   lines.push("")
   lines.push("```js")
   lines.push(run.script)
   lines.push("```")
+  return lines.join("\n")
+}
+
+// ---------------------------------------------------------------------------
+// Graph rendering (/ultracode graph)
+// ---------------------------------------------------------------------------
+
+const GRAPH_NODE_HEADERS = ["node", "kind", "agent", "source", "bounds"]
+
+export type GraphViewExtra = {
+  /** Human-readable origin: `saved workflow "x"` or `run run_x`. */
+  source: string
+  /** Trust state — only meaningful for a saved workflow. */
+  trusted?: boolean
+  /** Set when rendering a run: adds the warm-rerun pointer. */
+  runID?: string
+}
+
+function graphSourceCell(node: GraphNode): string {
+  if (node.kind === "workflow") return `workflow ${node.name ?? "?"}${node.argsFrom ? ` ${node.argsFrom}` : ""}`
+  return node.over ?? node.from ?? node.value ?? "-"
+}
+
+function graphBoundsCell(node: GraphNode): string {
+  const bits: string[] = []
+  if (node.max !== undefined) bits.push(`max ${node.max}`)
+  if (node.batches !== undefined) bits.push(`batches ${node.batches}`)
+  if (node.budgetTokens !== undefined) bits.push(`~${node.budgetTokens} tokens per lane`)
+  if (node.tokensPerLine !== undefined) bits.push(`${node.tokensPerLine} tokens per line`)
+  if (node.onFail !== undefined) bits.push(`onFail ${node.onFail}`)
+  if (node.schema !== undefined) bits.push("schema")
+  return bits.length > 0 ? bits.join(", ") : "-"
+}
+
+/**
+ * Render a persisted DAG spec: execution waves, a node table, and the mermaid
+ * flowchart. Re-validates first — a spec loaded from a run record or a
+ * hand-edited file must never render as if it were runnable when it is not.
+ */
+export function formatGraphView(spec: Json, extra: GraphViewExtra): string {
+  const check = validateGraphSpec(spec)
+  if (!check.ok) {
+    return [
+      `## Graph — ${extra.source}`,
+      "",
+      "**This spec is not valid; it cannot run.**",
+      "",
+      ...check.errors.slice(0, 10).map((e) => `- ${e}`),
+      ...(check.errors.length > 10 ? [`- (+${check.errors.length - 10} more)`] : []),
+    ].join("\n")
+  }
+  const graph = spec as unknown as GraphSpec
+  const lines: string[] = []
+  lines.push(`## Graph \`${graph.name ?? extra.source}\` — ${graphNodeCount(graph)} nodes`)
+  lines.push("")
+  lines.push(`- source: ${extra.source}`)
+  if (graph.description) lines.push(`- description: ${graph.description}`)
+  if (extra.trusted !== undefined) {
+    lines.push(
+      extra.trusted
+        ? "- trust: trusted (the compiled script matches the approval)"
+        : "- trust: NOT trusted — review it here, then `/ultracode trust` to approve",
+    )
+  }
+  lines.push("")
+  lines.push("### Execution order")
+  lines.push("")
+  lines.push("```")
+  lines.push(graphToAscii(graph))
+  lines.push("```")
+  lines.push("")
+  lines.push("### Nodes")
+  lines.push("")
+  lines.push(`| ${GRAPH_NODE_HEADERS.join(" | ")} |`)
+  lines.push(`| ${GRAPH_NODE_HEADERS.map(() => "---").join(" | ")} |`)
+  for (const node of graph.nodes) {
+    lines.push(
+      `| \`${node.id}\` | ${node.kind} | ${node.agent ?? "-"} | ${graphSourceCell(node)} | ${graphBoundsCell(node)} |`,
+    )
+  }
+  if (graph.returns && Object.keys(graph.returns).length > 0) {
+    lines.push("")
+    lines.push("### Returns")
+    lines.push("")
+    for (const [key, ref] of Object.entries(graph.returns)) lines.push(`- \`${key}\` ← ${ref}`)
+  }
+  lines.push("")
+  lines.push("### Mermaid")
+  lines.push("")
+  lines.push("```mermaid")
+  lines.push(graphToMermaid(graph))
+  lines.push("```")
+  if (extra.runID) {
+    lines.push("")
+    lines.push(
+      `Every call in this graph is auto-keyed, so \`/ultracode rerun ${extra.runID} --warm\` replays finished children instead of respawning them.`,
+    )
+  }
   return lines.join("\n")
 }
 
@@ -616,18 +730,9 @@ export function feedToolEvent(
 export interface CommandStorage {
   listWorkflows(): SavedWorkflow[]
   loadWorkflow(name: string): SavedWorkflow | undefined
-  saveWorkflow(
-    name: string,
-    script: string,
-    manifest: {
-      name: string
-      description?: string
-      phases?: string[]
-      requires?: string[]
-      savedFromRunID?: string
-      source: "project" | "personal"
-    },
-  ): Promise<SavedWorkflow>
+  saveWorkflow(name: string, script: string, manifest: SaveWorkflowManifestInput): Promise<SavedWorkflow>
+  /** Persist a run's originating DAG spec (a graph run must not save compiled JS). */
+  saveGraphWorkflow(name: string, spec: Json, manifest: SaveWorkflowManifestInput): Promise<SavedWorkflow>
   saveWorkflowFromFile(name: string): Promise<SavedWorkflow>
   trustWorkflow(name: string): Promise<{ workflow: SavedWorkflow; digest: string } | undefined>
   revokeTrust(name: string): Promise<void>
@@ -873,6 +978,11 @@ export async function handleUltracodeCommand(invocation: CommandInvocation, deps
     return
   }
 
+  if (sub === "graph") {
+    await renderGraph(deps, sessionID, rest)
+    return
+  }
+
   if (sub === "stop") {
     const target = resolveActiveTarget(rest, activeList(deps))
     if (!target.ok) {
@@ -1024,7 +1134,11 @@ async function renderDashboard(deps: CommandDeps, sessionID: string): Promise<vo
             const state = deps.storage.workflowTrustState(w.manifest.name)
             const stateText =
               state === "trusted" ? "trusted" : state === "untrusted" ? "untrusted (changed)" : "unknown"
-            return `- \`${w.manifest.name}\` — ${w.manifest.description ?? "(no description)"} [${w.manifest.source} · ${stateText}]`
+            const isGraph = w.manifest.kind === "graph"
+            const bits = [w.manifest.source, isGraph ? "graph" : "script", stateText]
+            const detail = isGraph ? ` — \`/ultracode graph ${w.manifest.name}\` renders it` : ""
+            const broken = w.graphError !== undefined ? ` — CANNOT RUN: ${w.graphError}` : ""
+            return `- \`${w.manifest.name}\` — ${w.manifest.description ?? "(no description)"} [${bits.join(" · ")}]${detail}${broken}`
           })
           .join("\n")
       : "(none — save one with `/ultracode save <name>` or `/ultracode save <runID> <name>`)",
@@ -1066,6 +1180,65 @@ async function renderResult(deps: CommandDeps, sessionID: string, runID: string)
   await deps.say(
     sessionID,
     `## Full result — \`${runID}\` (from ${source})\n\n\`\`\`json\n${JSON.stringify(value, null, 1)}\n\`\`\``,
+  )
+}
+
+const GRAPH_USAGE =
+  "Usage: /ultracode graph <name|runID>\n(renders a saved graph workflow or a graph-authored run: execution waves, node table, mermaid)"
+
+/**
+ * `/ultracode graph <name|runID>`. Rendering is deliberately NOT trust-gated:
+ * seeing the DAG is how a user reviews a graph before approving it (the same
+ * role `cat <name>.js` plays for a script workflow).
+ */
+async function renderGraph(deps: CommandDeps, sessionID: string, rest: string): Promise<void> {
+  const target = rest.trim()
+  if (target === "" || /\s/.test(target)) {
+    await deps.say(sessionID, GRAPH_USAGE)
+    return
+  }
+  const run = deps.registry.get(target)
+  if (run) {
+    if (run.graphSpec === undefined) {
+      await deps.say(
+        sessionID,
+        `Run \`${target}\` was not graph-authored — it ran a script, so there is no DAG to render. ` +
+          `\`/ultracode show ${target}\` prints the script.`,
+      )
+      return
+    }
+    await deps.say(sessionID, formatGraphView(run.graphSpec, { source: `run \`${target}\``, runID: target }))
+    return
+  }
+  const saved = deps.storage.listWorkflows().find((w) => w.manifest.name === target)
+  if (saved) {
+    if (saved.graphError !== undefined) {
+      await deps.say(sessionID, `Saved workflow \`${target}\` cannot run: ${saved.graphError}`)
+      return
+    }
+    if (saved.graphSpec === undefined) {
+      await deps.say(
+        sessionID,
+        `Saved workflow \`${target}\` is a script workflow (\`${target}.js\`) — there is no DAG to render. ` +
+          `Open the file to review it, then \`/ultracode trust ${target}\`.`,
+      )
+      return
+    }
+    await deps.say(
+      sessionID,
+      formatGraphView(saved.graphSpec, {
+        source: `saved workflow \`${target}\` (${saved.manifest.source})`,
+        trusted: deps.storage.workflowTrustState(target) === "trusted",
+      }),
+    )
+    return
+  }
+  const known = deps.storage.listWorkflows().map((w) => w.manifest.name)
+  await deps.say(
+    sessionID,
+    `No run or saved workflow named \`${target}\`.` +
+      (known.length > 0 ? ` Saved workflows: ${known.join(", ")}.` : " No saved workflows yet.") +
+      `\n\n${GRAPH_USAGE}`,
   )
 }
 
@@ -1163,10 +1336,21 @@ async function rerunRun(deps: CommandDeps, sessionID: string, rest: string): Pro
       )
       return
     }
-    if (sha256(source.script) !== sha256(saved.script)) {
+    // Graph workflows compare the SPEC, not the compiled output: a rerun replays
+    // the run's own recorded script, so a newer compiler must not read as "the
+    // user changed the workflow" (that would be an unfixable dead end — the run
+    // script is historical and can never match a fresh compile).
+    const sameGraph =
+      source.graphSpec !== undefined &&
+      saved.graphSpec !== undefined &&
+      canonicalGraphSpec(source.graphSpec) === canonicalGraphSpec(saved.graphSpec)
+    if (!sameGraph && sha256(source.script) !== sha256(saved.script)) {
+      const isGraph = source.graphSpec !== undefined || saved.graphSpec !== undefined
       await deps.say(
         sessionID,
-        `cannot rerun: workflow "${source.workflowName}" has changed since this run (script digest ≠ current trusted script). Re-trust the current version with /ultracode trust ${source.workflowName}.`,
+        `cannot rerun: workflow "${source.workflowName}" has changed since this run ` +
+          `(${isGraph ? "graph spec ≠ the spec this run was launched from" : "script digest ≠ current trusted script"}). ` +
+          `Re-trust the current version with /ultracode trust ${source.workflowName}.`,
       )
       return
     }
@@ -1206,6 +1390,10 @@ async function rerunRun(deps: CommandDeps, sessionID: string, rest: string): Pro
         args,
         name: source.name,
         workflowName: source.workflowName,
+        // Carry the spec forward: without it a rerun of a graph run would look
+        // script-authored, and `/ultracode save <newRunID> <name>` would write
+        // the compiled JS instead of the graph.
+        graphSpec: source.graphSpec,
         ...(warm ? { resumeFrom: source.id } : {}),
       },
       { sessionID, report: () => {}, availableAgents: prep.availableAgents },
@@ -1245,15 +1433,22 @@ async function saveRun(deps: CommandDeps, sessionID: string, rest: string): Prom
     }
     try {
       const display = run.meta?.name ?? run.name
-      const saved = await deps.storage.saveWorkflow(name, run.script, {
+      const manifest: SaveWorkflowManifestInput = {
         name,
         description: display && display !== name ? `saved from run ${run.id} (${display})` : `saved from run ${run.id}`,
         phases: run.meta?.phases,
         requires: run.meta?.requires,
         savedFromRunID: run.id,
         source: "project",
-      })
-      await saySavedWorkflow(deps, sessionID, saved.manifest.name, saved.manifest.source)
+      }
+      // A graph run saves its SPEC. Saving run.script instead would launder
+      // generated plumbing into a hand-editable `.js` pair and lose validation,
+      // auto-keys and `/ultracode graph` rendering.
+      const saved =
+        run.graphSpec !== undefined
+          ? await deps.storage.saveGraphWorkflow(name, run.graphSpec, manifest)
+          : await deps.storage.saveWorkflow(name, run.script, manifest)
+      await saySavedWorkflow(deps, sessionID, saved.manifest.name, saved.manifest.source, saved.manifest.kind)
     } catch (err) {
       await deps.say(sessionID, `error: could not save workflow — ${describeError(err)}`)
     }
@@ -1263,7 +1458,7 @@ async function saveRun(deps: CommandDeps, sessionID: string, rest: string): Prom
   if (name && !/\s/.test(name) && !deps.registry.get(name)) {
     try {
       const saved = await deps.storage.saveWorkflowFromFile(name)
-      await saySavedWorkflow(deps, sessionID, saved.manifest.name, saved.manifest.source)
+      await saySavedWorkflow(deps, sessionID, saved.manifest.name, saved.manifest.source, saved.manifest.kind)
     } catch (err) {
       await deps.say(sessionID, `error: could not save workflow — ${describeError(err)}`)
     }
@@ -1271,7 +1466,9 @@ async function saveRun(deps: CommandDeps, sessionID: string, rest: string): Prom
   }
   await deps.say(
     sessionID,
-    "Usage: /ultracode save <name>\n       /ultracode save <runID> <name>\n(name: lowercase alphanumerics, `-`/`_`, max 64 chars)",
+    "Usage: /ultracode save <name>\n       /ultracode save <runID> <name>\n" +
+      `(<name> reads \`${normalizePath(`${deps.projectRoot}/.opencode/workflows`)}/<name>.js\` or \`<name>${GRAPH_ARTIFACT_SUFFIX}\`; ` +
+      "name: lowercase alphanumerics, `-`/`_`, max 64 chars)",
   )
 }
 
@@ -1280,10 +1477,13 @@ async function saySavedWorkflow(
   sessionID: string,
   name: string,
   source: string,
+  kind?: WorkflowKind,
 ): Promise<void> {
+  const artifact = kind === "graph" ? `${name}${GRAPH_ARTIFACT_SUFFIX}` : `${name}.js`
+  const review = kind === "graph" ? `review it with \`/ultracode graph ${name}\`, then ` : ""
   await deps.say(
     sessionID,
-    `Saved workflow \`${name}\` (${source}) — approve it once with \`/ultracode trust ${name}\`, then run it with { workflow: "${name}" }`,
+    `Saved workflow \`${name}\` (${source}, wrote \`${artifact}\` + \`${name}.json\`) — ${review}approve it once with \`/ultracode trust ${name}\`, then run it with { workflow: "${name}" }`,
   )
 }
 

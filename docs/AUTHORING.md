@@ -122,13 +122,47 @@ for warm reruns:
 - JS scripts remain the escape hatch for anything the node kinds don't cover; both run through the
   same runtime, caps, inspector, and resume machinery.
 
+### Saved graph workflows (v0.9.0)
+
+A graph can be a named, trusted, shareable artifact exactly like a script:
+
+- **Artifact:** `<project>/.opencode/workflows/<name>.graph.json` (the spec) + `<name>.json`
+  (manifest v1 with `kind: "graph"`). The script is **compiled fresh on every load** — the spec is
+  the only stored truth, so there is never a stale generated file to drift.
+- **Saving:** `/ultracode save <name>` picks up a hand-authored `<name>.graph.json` (it writes only
+  the manifest and never reformats your spec), and `/ultracode save <runID> <name>` saves the spec
+  a graph run was launched from — not the compiled JS.
+- **Trust:** `/ultracode trust <name>` records the digest of the **compiled script**, i.e. you
+  approve what will actually execute. Editing the spec invalidates trust; so does upgrading the
+  plugin when the compiler's output changes. That is deliberate (fail closed): a graph is trusted
+  code, and "the spec looks the same" is not proof "the code is the same". A spec that fails to
+  parse, validate or compile can never be trusted or run — it stays listed with the validator's
+  own errors so you can see why.
+- **One artifact kind per name:** saving a graph while `<name>.js` exists (or vice versa) is
+  refused rather than silently shadowed. If both files exist on disk, `<name>.js` wins.
+- **Review:** `/ultracode graph <name>` renders the DAG — execution waves, a node table (kind,
+  agent, source ref, bounds), returns and a mermaid flowchart — and is *not* trust-gated, because
+  seeing the structure is how you decide whether to approve it. `/ultracode graph <runID>` renders
+  the spec of any graph-authored run.
+- **Rerun:** `/ultracode rerun <runID>` replays the run's own recorded script and carries the spec
+  forward (so re-saving the rerun stays a graph). For a named graph workflow the "has it changed?"
+  check compares **canonical specs**, not compiled output — a compiler upgrade is not mistaken for
+  an edit you never made. `--warm` still replays every finished child: the compiler keys each call
+  by node id (`scout`, `review:3`, `report:b1`), and keys are stable across recompiles.
+- **Composition:** a graph node of `kind: "workflow"` can compose a saved graph workflow (depth 1),
+  because the loader compiles fresh on every call.
+
 ### Plan → Build (no prior run)
 
 OpenCode plan/build is a host agent mode. Handoff is file + trust + named run:
 
-1. **Plan:** write only `<project>/.opencode/workflows/<name>.js` (async-function body). Do not call `ultracode_run` inline.
-2. `/ultracode save <name>` (one-token). After a run, `/ultracode save <runID> <name>` still works.
-3. `/ultracode trust <name>` (digest-bound; a changed script is refused until re-trusted).
+1. **Plan:** write only `<project>/.opencode/workflows/<name>.js` (async-function body) — or, for a
+   standard shape, `<name>.graph.json` (pure JSON, no escaping hazards). Do not call `ultracode_run` inline.
+2. `/ultracode save <name>` (one-token; picks up either artifact, and preserves a hand-written
+   `<name>.json` manifest's `description` / `phases` / `requires` / `params`). After a run,
+   `/ultracode save <runID> <name>` still works.
+3. Review a graph with `/ultracode graph <name>` (works before trust), then
+   `/ultracode trust <name>` (digest-bound; a changed script or spec is refused until re-trusted).
 4. **Build:** `{ workflow: "name", args? }`. Do not mix native subagent fan-out with a workflow in the same task.
 
 The registered skill is `buildSkillContent` in `src/skill-content.ts`, not an on-disk markdown file.

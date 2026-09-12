@@ -117,6 +117,22 @@ export interface GraphRunInput {
 
 export type WorkflowToolInput = InlineRunInput | SavedRunInput | GraphRunInput
 
+/**
+ * Resolved launch payload: what the tool executor hands the supervisor after
+ * validation/compilation, and what the supervisor records on the RunRecord.
+ */
+export interface RunLaunchInput {
+  script: string
+  meta?: WorkflowMeta
+  args?: Json
+  name?: string
+  workflowName?: string
+  /** Warm-start from a prior run: keyed succeeded agents replay from cache. */
+  resumeFrom?: string
+  /** Originating DAG spec for graph-authored runs (persisted on the RunRecord). */
+  graphSpec?: Json
+}
+
 // ---------------------------------------------------------------------------
 // Run + agent records (registry domain)
 // ---------------------------------------------------------------------------
@@ -196,6 +212,13 @@ export interface RunRecord {
   script: string
   meta?: WorkflowMeta
   args?: Json
+  /**
+   * Originating DAG spec for graph-authored runs (inline `{ graph }`, a saved
+   * graph workflow, or a rerun of either). `script` is the COMPILED artifact;
+   * this is the source of truth for `/ultracode graph`, `/ultracode save` and
+   * the rerun "has this workflow changed?" check.
+   */
+  graphSpec?: Json
   /** Absolute path of the persisted script artifact. */
   scriptPath?: string
   /** Set when launched via {workflow: "name"}. */
@@ -380,6 +403,9 @@ export type HostMessage = BridgeResultOk | BridgeResultErr | BridgeInit
 // Saved workflows (storage domain)
 // ---------------------------------------------------------------------------
 
+/** Saved-workflow artifact kind. Absent on manifests written before graphs = "script". */
+export type WorkflowKind = "script" | "graph"
+
 export interface SavedWorkflowManifest {
   /** Format version. */
   version: 1
@@ -387,17 +413,43 @@ export interface SavedWorkflowManifest {
   description?: string
   phases?: string[]
   requires?: string[]
-  /** sha256 of the script body. Changed hash after save => trust re-confirmation. */
+  /**
+   * sha256 of the executable script body. For `kind: "graph"` this is the digest
+   * of the COMPILED script — the thing that actually runs — so a compiler change
+   * invalidates trust (fail closed). Changed hash after save => re-confirmation.
+   */
   hash: string
   /** Where it was loaded from. */
   source: "project" | "personal"
   savedAt: number
   savedFromRunID?: string
+  /** Artifact kind: `<name>.js` (script) or `<name>.graph.json` (graph spec). */
+  kind?: WorkflowKind
+  /** Declared `args` shape — see WorkflowParams (workstream C). */
+  params?: Json
 }
+
+/**
+ * What a caller may supply when saving; `version`, `hash`, `savedAt` and `kind`
+ * are always computed by storage (never trusted from the caller).
+ */
+export type SaveWorkflowManifestInput = Omit<
+  SavedWorkflowManifest,
+  "version" | "hash" | "savedAt" | "source" | "kind"
+> & { source: "project" | "personal" }
 
 export interface SavedWorkflow {
   manifest: SavedWorkflowManifest
+  /**
+   * Executable script body. For a graph workflow this is COMPILED FRESH from the
+   * spec on every load (never a stale artifact). Empty with `graphError` set when
+   * the spec could not be loaded — such an entry can never be trusted or run.
+   */
   script: string
+  /** Parsed spec for `manifest.kind === "graph"` (absent for script workflows). */
+  graphSpec?: Json
+  /** Why a graph spec failed to parse, validate or compile (load-time diagnostic). */
+  graphError?: string
 }
 
 // ---------------------------------------------------------------------------
@@ -415,6 +467,7 @@ export interface Registry {
     args?: Json
     name?: string
     workflowName?: string
+    graphSpec?: Json
   }): RunRecord
   get(runID: string): RunRecord | undefined
   listRecent(limit: number): RunRecord[]
@@ -483,10 +536,23 @@ export interface Storage {
   listWorkflows(): SavedWorkflow[]
   loadWorkflow(name: string): SavedWorkflow | undefined
   /** Save a run's script as a named workflow (js + json manifest). Throws on invalid name. */
-  saveWorkflow(name: string, script: string, manifest: Omit<SavedWorkflowManifest, "version" | "hash" | "savedAt" | "source"> & { source: "project" | "personal" }): Promise<SavedWorkflow>
+  saveWorkflow(name: string, script: string, manifest: SaveWorkflowManifestInput): Promise<SavedWorkflow>
   /**
-   * Plan-mode handoff: contained-read `<project>/.opencode/workflows/<name>.js`,
-   * then write the js+json pair. Omits `savedFromRunID`. Does not auto-trust.
+   * Save a graph spec as a named workflow (`<name>.graph.json` + json manifest).
+   * Validates and compiles BEFORE writing — an invalid spec is never persisted.
+   * `opts.rewriteSpec: false` writes only the manifest (the Plan→Build handoff
+   * leaves the authored spec file untouched).
+   */
+  saveGraphWorkflow(
+    name: string,
+    spec: Json,
+    manifest: SaveWorkflowManifestInput,
+    opts?: { rewriteSpec?: boolean },
+  ): Promise<SavedWorkflow>
+  /**
+   * Plan-mode handoff: contained-read `<project>/.opencode/workflows/<name>.js`
+   * (or `<name>.graph.json` when there is no script), then write the manifest
+   * pair. Omits `savedFromRunID`. Does not auto-trust.
    */
   saveWorkflowFromFile(name: string): Promise<SavedWorkflow>
   /** Project-scoped settings overlay (`settings/<pid>`). Sync cache after load/save. */
@@ -533,15 +599,12 @@ export interface Supervisor {
    * Execute a resolved run. Resolves only after all children are settled
    * (success, failure, stop, or timeout) — never while agents are live.
    */
-  start(input: { script: string; meta?: WorkflowMeta; args?: Json; name?: string; workflowName?: string; resumeFrom?: string }, parent: ParentContext): Promise<RunOutcome>
+  start(input: RunLaunchInput, parent: ParentContext): Promise<RunOutcome>
   /**
    * Same spawn path as start(), but returns the runID immediately. `done`
    * settles with the envelope (never rejects after the run is created).
    */
-  startDetached(
-    input: { script: string; meta?: WorkflowMeta; args?: Json; name?: string; workflowName?: string; resumeFrom?: string },
-    parent: ParentContext,
-  ): { runID: string; done: Promise<RunOutcome> }
+  startDetached(input: RunLaunchInput, parent: ParentContext): { runID: string; done: Promise<RunOutcome> }
   /** Replace next-run defaults. In-flight runs keep their startDetached snapshot. */
   updateDefaults(next: Required<UltracodeOptions>): void
   /** Idempotent stop. Returns false if runID unknown or already final. */

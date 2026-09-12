@@ -89,6 +89,14 @@ export type CompiledGraph = {
   meta: { name?: string; description?: string; phases: string[]; requires: string[] }
 }
 
+/**
+ * Spec + compiler generation. Stamped into the compiled header comment and
+ * into saved graph manifests. Bumping it changes every compiled script, which
+ * deliberately invalidates saved-graph trust (fail closed on a compiler change).
+ * NOT a required input field: `{ nodes: [...] }` stays valid.
+ */
+export const GRAPH_SPEC_VERSION = 1
+
 export const MAX_GRAPH_NODES = 64
 export const DEFAULT_FANOUT_MAX = 64
 export const DEFAULT_LANE_BUDGET_TOKENS = 35000
@@ -437,7 +445,10 @@ export function compileGraphSpec(spec: GraphSpec): CompiledGraph {
   const defined = new Set<string>()
   const lines: string[] = []
   lines.push(
-    `// compiled from graph${spec.name ? ` "${spec.name}"` : ""} (opencode-ultracode graph v1) — regenerate from the spec, do not hand-edit`,
+    // Stable on purpose: the compiled script is the TRUST digest basis for saved
+    // graph workflows, so nothing that does not change execution (a rename, for
+    // example) may appear here. Spec identity lives in the manifest, not the header.
+    `// compiled from a graph spec (opencode-ultracode graph v${GRAPH_SPEC_VERSION}) — regenerate from the spec, do not hand-edit`,
   )
   lines.push(`const G_args = args && typeof args === "object" && !Array.isArray(args) ? args : {}`)
   lines.push(`const G_str = (x) => JSON.stringify(x === undefined ? null : x)`)
@@ -605,7 +616,7 @@ export function compileGraphSpec(spec: GraphSpec): CompiledGraph {
 }
 
 // ---------------------------------------------------------------------------
-// Rendering (pure; command wiring lands with /ultracode graph)
+// Rendering (pure; `/ultracode graph` in command.ts consumes both)
 // ---------------------------------------------------------------------------
 
 /** Mermaid flowchart of the DAG (data-flow edges only). */
@@ -632,4 +643,55 @@ export function graphToAscii(spec: GraphSpec): string {
     rows.push(`wave ${i + 1}${wave.length > 1 ? " [parallel]" : ""}: ${items}`)
   })
   return rows.join("\n")
+}
+
+// ---------------------------------------------------------------------------
+// Persistence helpers (saved graph workflows, run-record provenance)
+// ---------------------------------------------------------------------------
+
+function canonicalize(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalize)
+  if (value !== null && typeof value === "object") {
+    const source = value as Record<string, unknown>
+    const out: Record<string, unknown> = {}
+    for (const key of Object.keys(source).sort()) {
+      const next = canonicalize(source[key])
+      if (next !== undefined) out[key] = next
+    }
+    return out
+  }
+  return value
+}
+
+/**
+ * Canonical JSON of a spec: object keys sorted recursively, no whitespace.
+ * Two semantically identical specs written with different key order produce the
+ * same string, so this is safe as a comparison basis (saved-graph rerun checks,
+ * dedup). It is NOT the trust digest basis — that is the compiled script, the
+ * thing that actually executes.
+ */
+export function canonicalGraphSpec(spec: unknown): string {
+  return JSON.stringify(canonicalize(spec)) ?? "null"
+}
+
+/** Node count of a persisted spec (unknown/invalid shapes count 0). */
+export function graphNodeCount(spec: unknown): number {
+  if (spec === null || typeof spec !== "object" || Array.isArray(spec)) return 0
+  const nodes = (spec as { nodes?: unknown }).nodes
+  return Array.isArray(nodes) ? nodes.length : 0
+}
+
+/** Node ids in spec order (execution order) — used by the catalog and `/ultracode graph`. */
+export function graphNodeIds(spec: unknown): string[] {
+  if (spec === null || typeof spec !== "object" || Array.isArray(spec)) return []
+  const nodes = (spec as { nodes?: unknown }).nodes
+  if (!Array.isArray(nodes)) return []
+  const ids: string[] = []
+  for (const n of nodes) {
+    if (n !== null && typeof n === "object" && !Array.isArray(n)) {
+      const id = (n as { id?: unknown }).id
+      if (typeof id === "string") ids.push(id)
+    }
+  }
+  return ids
 }

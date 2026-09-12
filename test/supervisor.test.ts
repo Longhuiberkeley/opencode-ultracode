@@ -410,6 +410,18 @@ test("supervisor: startDetached returns runID before finalize; done settles with
   assert.equal(outcome.envelope.result, 7)
 })
 
+test("supervisor: graphSpec on the launch input lands on the run record (and is persisted)", async () => {
+  const ctx = makeSupervisor()
+  const spec = { nodes: [{ id: "a", kind: "agent", prompt: "say hi" }] } as Json
+  const { runID, done } = ctx.supervisor.startDetached({ script: `return 1;`, graphSpec: spec }, ctx.parent)
+  assert.deepEqual(ctx.registry.get(runID)?.graphSpec, spec)
+  const snapshot = ctx.registry.saveCalls.find((r) => r.id === runID)
+  assert.deepEqual(snapshot?.graphSpec, spec, "the first snapshot carries the spec (crash-visible)")
+  const plain = ctx.supervisor.startDetached({ script: `return 1;` }, ctx.parent)
+  assert.equal("graphSpec" in (ctx.registry.get(plain.runID) ?? {}), false)
+  await Promise.all([done, plain.done])
+})
+
 test("supervisor: startDetached rejects nested-owned parents", async () => {
   const ctx = makeSupervisor()
   const other = ctx.registry.create({ parentSessionID: "ses_other", script: "s" })

@@ -61,6 +61,14 @@ test("create initializes a running record and persists immediately", () => {
   assert.equal(persisted[0]!.id, run.id)
 })
 
+test("create records graphSpec for graph-authored runs and omits it otherwise", () => {
+  const { registry } = makeRegistry()
+  const graph = registry.create({ parentSessionID: "ses", script: "compiled", graphSpec: { nodes: [] } })
+  assert.deepEqual(graph.graphSpec, { nodes: [] })
+  const plain = registry.create({ parentSessionID: "ses", script: "return 1" })
+  assert.equal("graphSpec" in plain, false, "absent rather than undefined — script runs stay small")
+})
+
 test("addAgent assigns run-scoped ordinals a1, a2, ...", () => {
   const { registry } = makeRegistry()
   const runA = registry.create({ parentSessionID: "ses", script: "s" })

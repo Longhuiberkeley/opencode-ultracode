@@ -15,6 +15,7 @@ import type {
   Json,
   ParentContext,
   Registry,
+  RunLaunchInput,
   RunOutcome,
   RunRecord,
   RunStatus,
@@ -169,18 +170,12 @@ export class SupervisorImpl implements Supervisor {
   // start / startDetached
   // -------------------------------------------------------------------------
 
-  async start(
-    input: { script: string; meta?: WorkflowMeta; args?: Json; name?: string; workflowName?: string; resumeFrom?: string },
-    parent: ParentContext,
-  ): Promise<RunOutcome> {
+  async start(input: RunLaunchInput, parent: ParentContext): Promise<RunOutcome> {
     const { done } = this.startDetached(input, parent)
     return await done
   }
 
-  startDetached(
-    input: { script: string; meta?: WorkflowMeta; args?: Json; name?: string; workflowName?: string; resumeFrom?: string },
-    parent: ParentContext,
-  ): { runID: string; done: Promise<RunOutcome> } {
+  startDetached(input: RunLaunchInput, parent: ParentContext): { runID: string; done: Promise<RunOutcome> } {
     if (this.disposed) throw new Error("supervisor disposed")
     if (this.registry.isOwnedActive(parent.sessionID)) {
       throw new Error("nested workflow runs are not allowed")
@@ -201,6 +196,7 @@ export class SupervisorImpl implements Supervisor {
       args: input.args,
       name: input.name,
       workflowName: input.workflowName,
+      graphSpec: input.graphSpec,
     })
     const runID = record.id
     if (input.resumeFrom) record.resumedFrom = input.resumeFrom
@@ -219,7 +215,7 @@ export class SupervisorImpl implements Supervisor {
 
   private async executeRun(
     record: RunRecord,
-    input: { script: string; meta?: WorkflowMeta; args?: Json; name?: string; workflowName?: string; resumeFrom?: string },
+    input: RunLaunchInput,
     parent: ParentContext,
     state: RunState,
   ): Promise<RunOutcome> {

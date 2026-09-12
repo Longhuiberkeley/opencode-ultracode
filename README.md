@@ -107,11 +107,13 @@ The rest of this README covers security, internals, and the full command surface
   capability-isolated VM, the isolation is **enforced by omission** rather than a hard boundary,
   and **memory is not bounded**. Treat workflow scripts like any other code you would run.
 - **Saved workflows are executable content, gated by the trust store.** A `.js` file under
-  `.opencode/workflows/` runs with whatever permissions your agents have. Every saved workflow
+  `.opencode/workflows/` runs with whatever permissions your agents have — and so does a
+  `.graph.json` spec, which compiles to a script before it runs. Every saved workflow
   (samples included) requires a **one-time user approval** via `/ultracode trust <name>`, which
-  records an approved digest of the script content. Editing the script invalidates trust until it
+  records an approved digest of the script content that will execute (for a graph, the digest of
+  the compiled output). Editing the script or the spec invalidates trust until it
   is re-approved — a changed workflow never runs silently. Review workflow diffs in code review
-  like any other code.
+  like any other code; `/ultracode graph <name>` renders a spec's structure for that review.
 - **Child sessions are real agents.** They inherit your config. The default permission mode
   `"ask"` keeps edit approval manual for workflow children. `autoEditsWorkflow` auto-approves
   edit-class actions for active run children scoped to the project root; `noEditTools` denies
@@ -342,12 +344,13 @@ global (registered from the always-mounted chip component).
 | `ultracode_result` tool | `{ runID, offset?, maxLength? }` → one page of a settled run's FULL result: `{ source, totalChars, offset, chunk, complete, nextOffset }`. Chunks are substrings of the compact JSON — concatenate from offset 0 following `nextOffset`, then parse. | — |
 | `ultracode_control` tool | Orchestrator control of **owned** runs: `{ action: "stop" \| "pause" \| "resume", runID? }`. Implicit target only when exactly one active owned run. Stop is recorded as the run's stop reason (`/ultracode show` displays it). | same verbs via panel keys |
 | `/ultracode result [runID]` | Print the **full** result of a run (artifact first, run-record fallback — serves truncated and background runs alike). | — |
+| `/ultracode graph <name\|runID>` | Render a graph workflow's DAG: execution waves, a node table (kind, agent, source ref, bounds), returns, and a mermaid flowchart. **Not trust-gated** — rendering is how you review a graph before approving it. Works for a saved `<name>.graph.json` workflow or any graph-authored run. | — |
 | `/ultracode stop [runID]` | Graceful stop: no new agent calls, children interrupted, worker terminated after a grace period. | `x` |
 | `/ultracode pause [runID]` | Close admission of new `agent()` calls; in-flight finish; watchdog suspended. | `p` (toggles pause) |
 | `/ultracode resume [runID]` | Reopen admission on a paused run. | `p` (toggles resume) |
-| `/ultracode rerun [runID] [argsJSON]` | Start a new run from a finished run's script (trust/digest checks if it was a named workflow). Add `--warm` to warm-start: keyed succeeded agents replay from the source run's cache instead of respawning (see [Warm reruns](#warm-reruns)). | — |
-| `/ultracode save <name>` | Save `.opencode/workflows/<name>.js` as a named workflow (no prior run). | — |
-| `/ultracode save <runID> <name>` | Save a run's script as a named workflow (`.js` + `.json` manifest). | `s` (name via `dialog.prompt`) |
+| `/ultracode rerun [runID] [argsJSON]` | Start a new run from a finished run's script (trust/digest checks if it was a named workflow; graph runs compare the **spec**, so a newer compiler is not mistaken for an edit). Add `--warm` to warm-start: keyed succeeded agents replay from the source run's cache instead of respawning (see [Warm reruns](#warm-reruns)). | — |
+| `/ultracode save <name>` | Save `.opencode/workflows/<name>.js` **or** `<name>.graph.json` as a named workflow (no prior run). An authored `<name>.json` manifest is preserved; a graph spec file is never rewritten. | — |
+| `/ultracode save <runID> <name>` | Save a run as a named workflow: a graph run saves its **spec** (`.graph.json` + manifest), a script run saves its script (`.js` + manifest). | `s` (name via `dialog.prompt`) |
 | `/ultracode settings [runID]` | Next-run overlay plus that run's captured snapshot. | settings pane (`h`/`l`); `r` refreshes an **active** run |
 | `/ultracode set <key> <value>` | Persist overlay (`concurrency`, `maxAgents`, `timeoutMs`, `permissions`); applies to the **next** run. | `+`/`-` in settings pane |
 | `/ultracode trust <name>` | One-time approval for a saved workflow (content digest). | — |
@@ -556,13 +559,25 @@ Workflows multiply tokens. Controls, in order of leverage:
 
 ## Saved workflows
 
-- Stored as a pair: `<name>.js` (the script, plain async body) + `<name>.json` (manifest v1:
-  `version`, `name`, `description`, `phases`, `requires`, `hash`, `source`, `savedAt`).
+- Two artifact kinds, one manifest: a **script** workflow is `<name>.js` (plain async body) +
+  `<name>.json`; a **graph** workflow is `<name>.graph.json` (the DAG spec) + `<name>.json` with
+  `kind: "graph"`. Manifest v1 fields: `version`, `name`, `description`, `phases`, `requires`,
+  `hash`, `source`, `savedAt`, optional `savedFromRunID`, `kind`, `params`. A graph's script is
+  **compiled fresh on every load** — the spec is the artifact, never a stale generated file.
+- A name is either a script or a graph, never both: saving one kind while the other artifact
+  exists is **refused** (a silent shadow would make the save a no-op). If both somehow exist on
+  disk, `<name>.js` wins and the graph is ignored.
 - Locations: `<project>/.opencode/workflows/` **beats** `~/.config/opencode/workflows/` on name
   collisions. Names match `^[a-z0-9][a-z0-9-_]{0,63}$`; no path traversal.
 - **Trust:** running a saved workflow requires a one-time `/ultracode trust <name>`. Trust is
-  bound to the script's *content digest* — edit the file and the run is refused until you
-  re-trust. This is the trust gate for repo-shared workflows, by design.
+  bound to the digest of the script that will actually execute — for a graph workflow that is the
+  digest of the **compiled** output, so approving a graph approves the code that runs. Editing the
+  script or the spec refuses the run until you re-trust, and so does upgrading the plugin when the
+  compiler output changes (fail closed, by design). A spec that fails to parse, validate or compile
+  can never be trusted or run: it is listed with its validator errors instead of disappearing.
+- **Reviewing a graph before approving it:** `/ultracode graph <name>` renders the DAG (execution
+  waves, node table, mermaid) and is deliberately **not** trust-gated — seeing the structure is
+  how you decide. `/ultracode graph <runID>` renders the spec a run was launched from.
 - **Sharing:** commit `.opencode/workflows/` (the pairs, not `runs/`) to your repo.
   Collaborators approve each workflow once with `/ultracode trust <name>` after reviewing it.
 - **Samples:** `workflows/samples/` ships `deep-research`, `code-audit`, `fact-check`, and
@@ -623,11 +638,14 @@ list of available agents and guidance instead of spawning a broken run.
 
 ## Roadmap
 
-- **Graph authoring layer (partial, v0.8.0)** — inline `{ graph }` runs land: a JSON DAG spec
+- **Graph authoring layer (v0.8.0 inline, v0.9.0 saved)** — a JSON DAG spec
   (agent / fanout / partition / merge / gate / checkpoint / workflow nodes) validated before any
   token is spent and compiled to the plain script runtime, with auto-keyed calls (warm rerun free)
-  and automatic `parallel()` waves. Still future: saved graph workflows by name, `/ultracode graph`
-  rendering, and the catalog tool.
+  and automatic `parallel()` waves. v0.9.0 makes graphs first-class citizens: they save as
+  `<name>.graph.json` pairs (compiled fresh on load, trust bound to the compiled output), a graph
+  run keeps its spec on the run record so `save`/`rerun`/`show` work from the source of truth, and
+  `/ultracode graph <name|runID>` renders the DAG. Still future: the catalog tool (saved-workflow
+  params + graph templates) and a graph-first skill rewrite.
 - **Dialog-key overlay** — blocked on the host: `ui.dialog.show` owns the keymap (G1 NO-GO on
   beta-19271). Inspect stays panel-hosted until a host API delivers keys inside a dialog
   without leaking to the prompt.

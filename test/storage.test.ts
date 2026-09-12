@@ -2,13 +2,22 @@
  * Builder A tests — src/storage.ts: project-scoped KV snapshots, script/result
  * artifacts, saved-workflow pairs + trust gate, precedence, name validation,
  * shared lstat-aware containment resolver (symlinks fail closed), KV cursor
- * pagination, fresh composition loader.
+ * pagination, fresh composition loader, and saved GRAPH workflows
+ * (`<name>.graph.json` compiled fresh on load, digest over the compiled script).
  */
 import { test } from "node:test"
 import assert from "node:assert/strict"
 import { createHash } from "node:crypto"
 import { readFileSync } from "node:fs"
-import { StorageImpl, WORKFLOW_NAME_RE, normalizePath, resolveContainedPath } from "../src/storage.ts"
+import {
+  GRAPH_ARTIFACT_SUFFIX,
+  StorageImpl,
+  WORKFLOW_NAME_RE,
+  buildGraphBody,
+  normalizePath,
+  resolveContainedPath,
+} from "../src/storage.ts"
+import { compileGraphSpec } from "../src/graph.ts"
 import type { FsLike, Json, KvLike, RunRecord } from "../src/types.ts"
 import { FakeFs, FakeKv } from "./fakes.ts"
 
@@ -754,4 +763,377 @@ test("saveWorkflowFromFile changed-script trust rejection until re-trust", async
   const trusted = await storage.trustWorkflow("gamma")
   assert.equal(trusted?.digest, createHash("sha256").update("return 2 // changed").digest("hex"))
   assert.equal(storage.loadWorkflow("gamma")?.script, "return 2 // changed")
+})
+
+// ---------------------------------------------------------------------------
+// Saved GRAPH workflows (<name>.graph.json + <name>.json, compiled fresh)
+// ---------------------------------------------------------------------------
+
+const GRAPH_SPEC = {
+  name: "lane-review",
+  description: "scout, partition, review",
+  nodes: [
+    {
+      id: "scout",
+      kind: "agent",
+      agent: "explore",
+      prompt: "Inventory {{args.area}}. Per file: name + line count.",
+      schema: {
+        type: "object",
+        required: ["items"],
+        properties: {
+          items: {
+            type: "array",
+            items: {
+              type: "object",
+              required: ["name", "lines"],
+              properties: { name: { type: "string" }, lines: { type: "number" } },
+            },
+          },
+        },
+      },
+    },
+    { id: "lanes", kind: "partition", from: "$scout.items", budgetTokens: 100 },
+    {
+      id: "review",
+      kind: "fanout",
+      over: "$lanes",
+      agent: "explore",
+      max: 4,
+      prompt: "Review exactly these files (ranged reads only):\n{{item}}",
+    },
+  ],
+  returns: { report: "$review" },
+}
+
+function compiledScript(spec: unknown): string {
+  return compileGraphSpec(spec as never).script
+}
+
+function scriptDigest(spec: unknown): string {
+  return createHash("sha256").update(compiledScript(spec), "utf8").digest("hex")
+}
+
+/** Deep JSON copy — persisted specs are normalized through a JSON round-trip. */
+function jsonCopy<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T
+}
+
+function bodyError(body: ReturnType<typeof buildGraphBody>): string {
+  return body.ok ? "" : body.error
+}
+
+/** Hand-authored graph pair (the manifest hash is a placeholder, like the samples). */
+async function writeGraphPair(
+  fs: FakeFs,
+  dir: string,
+  name: string,
+  spec: unknown,
+  manifest: Record<string, unknown> = {},
+): Promise<void> {
+  await fs.writeFile(`${dir}/${name}${GRAPH_ARTIFACT_SUFFIX}`, JSON.stringify(spec, null, 2))
+  await fs.writeFile(
+    `${dir}/${name}.json`,
+    JSON.stringify({ version: 1, name, hash: "", savedAt: 1, kind: "graph", ...manifest }),
+  )
+}
+
+test("saveGraphWorkflow writes spec + manifest; load compiles fresh and stays trust-gated", async () => {
+  const { storage, fs } = makeStorage()
+  seedAnchors(fs)
+  const saved = await storage.saveGraphWorkflow("lane-review", jsonCopy(GRAPH_SPEC) as Json, {
+    name: "lane-review",
+    source: "project",
+  })
+  assert.equal(saved.manifest.kind, "graph")
+  assert.equal(saved.manifest.hash, scriptDigest(GRAPH_SPEC), "hash is over the COMPILED script")
+  assert.deepEqual(saved.manifest.phases, ["scout", "review"], "compiler-synthesized phases")
+  assert.deepEqual(saved.manifest.requires, ["explore"], "compiler-synthesized agent preflight")
+  assert.equal(saved.manifest.description, "scout, partition, review", "spec description becomes the manifest's")
+  assert.deepEqual(JSON.parse(await fs.readFile(`${PROJECT_WF}/lane-review${GRAPH_ARTIFACT_SUFFIX}`)), jsonCopy(GRAPH_SPEC))
+  assert.equal((JSON.parse(await fs.readFile(`${PROJECT_WF}/lane-review.json`)) as Record<string, unknown>).kind, "graph")
+
+  await storage.refreshWorkflows()
+  const listed = storage.listWorkflows()
+  assert.equal(listed.length, 1)
+  assert.equal(listed[0]!.manifest.kind, "graph")
+  assert.equal(storage.workflowTrustState("lane-review"), "untrusted")
+  assert.throws(() => storage.loadWorkflow("lane-review"), /is not trusted \(new or changed since approval\)/)
+
+  const trusted = await storage.trustWorkflow("lane-review")
+  assert.equal(trusted?.digest, scriptDigest(GRAPH_SPEC))
+  assert.equal(storage.workflowTrustState("lane-review"), "trusted")
+  const loaded = storage.loadWorkflow("lane-review")
+  assert.equal(loaded?.script, compiledScript(GRAPH_SPEC))
+  assert.deepEqual(loaded?.graphSpec, jsonCopy(GRAPH_SPEC))
+  assert.equal(loaded?.graphError, undefined)
+})
+
+test("graph trust follows the compiled output: editing the spec blocks until re-trust", async () => {
+  const { storage, fs } = makeStorage()
+  seedAnchors(fs)
+  await storage.saveGraphWorkflow("lane-review", jsonCopy(GRAPH_SPEC) as Json, { name: "lane-review", source: "project" })
+  await storage.trustWorkflow("lane-review")
+  assert.equal(storage.workflowTrustState("lane-review"), "trusted")
+
+  const edited = jsonCopy(GRAPH_SPEC)
+  edited.nodes[0]!.prompt = "Inventory {{args.area}} and report module boundaries too."
+  await fs.writeFile(`${PROJECT_WF}/lane-review${GRAPH_ARTIFACT_SUFFIX}`, JSON.stringify(edited, null, 2))
+  await storage.refreshWorkflows()
+  assert.equal(storage.workflowTrustState("lane-review"), "untrusted")
+  assert.throws(() => storage.loadWorkflow("lane-review"), /is not trusted/)
+  await assert.rejects(() => storage.loadWorkflowFresh("lane-review"), /is not trusted/)
+
+  await storage.trustWorkflow("lane-review")
+  assert.equal(storage.loadWorkflow("lane-review")?.script, compiledScript(edited))
+  assert.deepEqual(storage.loadWorkflow("lane-review")?.graphSpec, jsonCopy(edited))
+})
+
+test("loadWorkflowFresh recompiles the CURRENT spec per call (no stale graph cache)", async () => {
+  const { storage, fs } = makeStorage()
+  seedAnchors(fs)
+  await storage.saveGraphWorkflow("fresh", jsonCopy(GRAPH_SPEC) as Json, { name: "fresh", source: "project" })
+  await storage.trustWorkflow("fresh")
+  assert.equal((await storage.loadWorkflowFresh("fresh"))?.script, compiledScript(GRAPH_SPEC))
+  const edited = jsonCopy(GRAPH_SPEC)
+  edited.nodes[2]!.prompt = "Review {{item}} with fresh eyes."
+  await fs.writeFile(`${PROJECT_WF}/fresh${GRAPH_ARTIFACT_SUFFIX}`, JSON.stringify(edited, null, 2))
+  // Snapshot-per-call: the edit is visible without any refreshWorkflows, and it
+  // invalidates trust because the compiled script moved.
+  await assert.rejects(() => storage.loadWorkflowFresh("fresh"), /is not trusted/)
+  await storage.trustWorkflow("fresh")
+  assert.equal((await storage.loadWorkflowFresh("fresh"))?.script, compiledScript(edited))
+})
+
+test("an invalid graph spec is LISTED with its validator errors — never trustable, never 'not found'", async () => {
+  const { storage, fs } = makeStorage()
+  seedAnchors(fs)
+  await writeGraphPair(fs, PROJECT_WF, "broken", { nodes: [{ id: "a", kind: "agent" }] })
+  await storage.refreshWorkflows()
+  const listed = storage.listWorkflows()
+  assert.equal(listed.length, 1, "a broken graph is listed, not silently dropped")
+  assert.match(listed[0]!.graphError ?? "", /prompt is required for kind agent/)
+  assert.equal(listed[0]!.script, "", "an unloadable graph has no executable script")
+  assert.equal(listed[0]!.manifest.kind, "graph")
+  assert.equal(storage.workflowTrustState("broken"), "untrusted")
+  assert.throws(() => storage.loadWorkflow("broken"), /cannot run: the graph spec failed validation/)
+  // The fail-open this ordering prevents: trusting sha256("") of a broken spec.
+  await assert.rejects(() => storage.trustWorkflow("broken"), /cannot run: the graph spec failed validation/)
+  await assert.rejects(() => storage.loadWorkflowFresh("broken"), /cannot run/)
+})
+
+test("a malformed graph spec file reports a JSON error instead of vanishing", async () => {
+  const { storage, fs } = makeStorage()
+  seedAnchors(fs)
+  await fs.writeFile(`${PROJECT_WF}/junk${GRAPH_ARTIFACT_SUFFIX}`, "{ not json at all")
+  await fs.writeFile(`${PROJECT_WF}/junk.json`, JSON.stringify({ version: 1, name: "junk", hash: "", savedAt: 1 }))
+  await storage.refreshWorkflows()
+  const listed = storage.listWorkflows()
+  assert.equal(listed.length, 1)
+  assert.match(listed[0]!.graphError ?? "", /is not valid JSON/)
+  assert.throws(() => storage.loadWorkflow("junk"), /cannot run/)
+})
+
+test("artifact precedence is explicit: <name>.js wins over <name>.graph.json", async () => {
+  const { storage, fs } = makeStorage()
+  seedAnchors(fs)
+  await writePair(fs, PROJECT_WF, "dual", "return 1")
+  await writeGraphPair(fs, PROJECT_WF, "dual", GRAPH_SPEC)
+  await storage.refreshWorkflows()
+  const found = storage.listWorkflows().filter((w) => w.manifest.name === "dual")
+  assert.equal(found.length, 1, "one name, one workflow — never both artifacts")
+  assert.equal(found[0]!.manifest.kind, "script", "the artifact present decides the kind, not the manifest")
+  assert.equal(found[0]!.script, "return 1")
+  assert.equal(found[0]!.graphSpec, undefined)
+})
+
+test("saving the other artifact kind over an existing name is refused (no silent shadow)", async () => {
+  const { storage, fs } = makeStorage()
+  seedAnchors(fs)
+  await storage.saveWorkflow("alpha", "return 1", { name: "alpha", source: "project" })
+  await assert.rejects(
+    () => storage.saveGraphWorkflow("alpha", jsonCopy(GRAPH_SPEC) as Json, { name: "alpha", source: "project" }),
+    /already exists and would shadow it/,
+  )
+  assert.equal(await fs.exists(`${PROJECT_WF}/alpha${GRAPH_ARTIFACT_SUFFIX}`), false)
+  await storage.refreshWorkflows()
+  assert.deepEqual(storage.listWorkflows().map((w) => w.manifest.name), ["alpha"], "the refused save changed nothing")
+  assert.equal(storage.listWorkflows()[0]!.script, "return 1", "the original pair still loads")
+
+  await storage.saveGraphWorkflow("beta", jsonCopy(GRAPH_SPEC) as Json, { name: "beta", source: "project" })
+  await assert.rejects(
+    () => storage.saveWorkflow("beta", "return 2", { name: "beta", source: "project" }),
+    /already exists and would shadow it/,
+  )
+  assert.equal(await fs.exists(`${PROJECT_WF}/beta.js`), false)
+})
+
+test("saveGraphWorkflow rejects an invalid spec before writing anything", async () => {
+  const { storage, fs } = makeStorage()
+  seedAnchors(fs)
+  await assert.rejects(
+    () => storage.saveGraphWorkflow("nope", { nodes: [{ id: "a", kind: "agent" }] } as Json, { name: "nope", source: "project" }),
+    /refusing to save graph workflow "nope": the graph spec failed validation/,
+  )
+  await assert.rejects(
+    () => storage.saveGraphWorkflow("nope2", "{ json string" as unknown as Json, { name: "nope2", source: "project" }),
+    /refusing to save graph workflow "nope2"/,
+  )
+  assert.equal(await fs.exists(`${PROJECT_WF}/nope${GRAPH_ARTIFACT_SUFFIX}`), false)
+  assert.equal(await fs.exists(`${PROJECT_WF}/nope.json`), false)
+})
+
+test("saveWorkflowFromFile: a hand-authored .graph.json is preserved byte-for-byte; only the manifest is written", async () => {
+  const { storage, fs } = makeStorage()
+  seedAnchors(fs)
+  // Deliberately odd key order + formatting: the handoff must not reformat it.
+  const authored = '{\n  "nodes": [\n    { "kind": "agent", "id": "only", "prompt": "Say hi about {{args.topic}}." }\n  ]\n}\n'
+  await fs.writeFile(`${PROJECT_WF}/hand.graph.json`, authored)
+  await fs.writeFile(
+    `${PROJECT_WF}/hand.json`,
+    JSON.stringify({
+      version: 1,
+      name: "hand",
+      hash: "",
+      savedAt: 0,
+      description: "hand-authored graph",
+      params: { args: [{ name: "topic" }] },
+    }),
+  )
+  const saved = await storage.saveWorkflowFromFile("hand")
+  assert.equal(await fs.readFile(`${PROJECT_WF}/hand.graph.json`), authored, "authored spec file untouched")
+  assert.equal(saved.manifest.kind, "graph")
+  assert.equal(saved.manifest.description, "hand-authored graph", "a hand-written manifest is preserved, not clobbered")
+  assert.deepEqual(saved.manifest.params, { args: [{ name: "topic" }] })
+  assert.equal(saved.manifest.hash, scriptDigest(JSON.parse(authored)))
+  assert.equal("savedFromRunID" in saved.manifest, false)
+  assert.equal(saved.script, compiledScript(JSON.parse(authored)))
+  await storage.refreshWorkflows()
+  assert.equal(storage.workflowTrustState("hand"), "untrusted", "the handoff never auto-trusts")
+})
+
+test("saveWorkflowFromFile preserves hand-written metadata for script workflows too", async () => {
+  const { storage, fs } = makeStorage()
+  seedAnchors(fs)
+  await writePair(fs, PROJECT_WF, "authored", "return 1", {
+    description: "authored by hand",
+    phases: ["one"],
+    requires: ["general"],
+  })
+  const saved = await storage.saveWorkflowFromFile("authored")
+  assert.equal(saved.manifest.description, "authored by hand")
+  assert.deepEqual(saved.manifest.phases, ["one"])
+  assert.deepEqual(saved.manifest.requires, ["general"])
+  assert.equal(saved.script, "return 1")
+})
+
+test("saveWorkflowFromFile refuses an invalid graph spec before writing a manifest", async () => {
+  const { storage, fs } = makeStorage()
+  seedAnchors(fs)
+  await fs.writeFile(`${PROJECT_WF}/bad.graph.json`, JSON.stringify({ nodes: [{ id: "x", kind: "nope" }] }))
+  await assert.rejects(
+    () => storage.saveWorkflowFromFile("bad"),
+    /refusing to save workflow "bad": the graph spec failed validation/,
+  )
+  assert.equal(await fs.exists(`${PROJECT_WF}/bad.json`), false)
+})
+
+test("saveWorkflowFromFile names both artifacts when nothing is found", async () => {
+  const { storage, fs } = makeStorage()
+  seedAnchors(fs)
+  await assert.rejects(() => storage.saveWorkflowFromFile("ghost"), /not found \(ghost\.js or ghost\.graph\.json\)/)
+})
+
+test("graph workflows load from the personal dir; project still wins a name collision", async () => {
+  const { storage, fs } = makeStorage()
+  seedAnchors(fs)
+  await storage.saveGraphWorkflow("shared", jsonCopy(GRAPH_SPEC) as Json, { name: "shared", source: "personal" })
+  await storage.refreshWorkflows()
+  assert.deepEqual(
+    storage.listWorkflows().map((w) => `${w.manifest.name}:${w.manifest.source}:${w.manifest.kind ?? "script"}`),
+    ["shared:personal:graph"],
+  )
+  await storage.saveWorkflow("shared", "return 'project script'", { name: "shared", source: "project" })
+  await storage.refreshWorkflows()
+  assert.deepEqual(
+    storage.listWorkflows().map((w) => `${w.manifest.name}:${w.manifest.source}:${w.manifest.kind ?? "script"}`),
+    ["shared:project:script"],
+  )
+  assert.equal(await fs.exists(`${PERSONAL}/shared${GRAPH_ARTIFACT_SUFFIX}`), true, "the personal graph file is left alone")
+})
+
+test("refreshWorkflows skips a graph artifact without a manifest and dotted names", async () => {
+  const { storage, fs } = makeStorage()
+  seedAnchors(fs)
+  await fs.writeFile(`${PROJECT_WF}/lonely.graph.json`, JSON.stringify(GRAPH_SPEC))
+  await fs.writeFile(`${PROJECT_WF}/a.b.graph.json`, JSON.stringify(GRAPH_SPEC))
+  await writeGraphPair(fs, PROJECT_WF, "good-graph", GRAPH_SPEC)
+  await storage.refreshWorkflows()
+  assert.deepEqual(storage.listWorkflows().map((w) => w.manifest.name), ["good-graph"])
+})
+
+test("an empty saved script is reported, never trusted", async () => {
+  const { storage, fs } = makeStorage()
+  seedAnchors(fs)
+  await writePair(fs, PROJECT_WF, "blank", "   ")
+  await storage.refreshWorkflows()
+  assert.equal(storage.workflowTrustState("blank"), "untrusted")
+  assert.throws(() => storage.loadWorkflow("blank"), /cannot run: the saved script is empty/)
+  await assert.rejects(() => storage.trustWorkflow("blank"), /cannot run: the saved script is empty/)
+})
+
+test("saveGraphWorkflow rejects a symlinked workflows dir that escapes the project root", async () => {
+  const { storage, fs } = makeStorage()
+  seedAnchors(fs)
+  fs.symlinks.set(`${PROJECT}/.opencode`, "/elsewhere")
+  await fs.writeFile("/elsewhere/.keep", "x")
+  await assert.rejects(
+    () => storage.saveGraphWorkflow("evil", jsonCopy(GRAPH_SPEC) as Json, { name: "evil", source: "project" }),
+    /refusing to write workflow "evil"/,
+  )
+  assert.equal(await fs.exists(`/elsewhere/evil${GRAPH_ARTIFACT_SUFFIX}`), false)
+})
+
+test("graph writes and reads use resolved.path, not the lexical target", () => {
+  const src = readFileSync(new URL("../src/storage.ts", import.meta.url), "utf8")
+  assert.match(src, /writeFile\(resolvedSpec\.path/)
+  assert.match(src, /readFile\(resolvedGraph\.path\)/)
+})
+
+test("buildGraphBody: precise errors for parse, validation and compile failures", () => {
+  assert.match(bodyError(buildGraphBody("{ nope")), /is not valid JSON/)
+  assert.match(bodyError(buildGraphBody(JSON.stringify({ nodes: [{ id: "a", kind: "agent" }] }))), /prompt is required/)
+  assert.match(bodyError(buildGraphBody(JSON.stringify([]))), /must be a JSON object/)
+  assert.match(bodyError(buildGraphBody(JSON.stringify({ nodes: [] }))), /at least one node/)
+  const ok = buildGraphBody(JSON.stringify(GRAPH_SPEC))
+  assert.equal(ok.ok, true)
+  if (ok.ok) {
+    assert.equal(ok.script, compiledScript(GRAPH_SPEC))
+    assert.deepEqual(ok.phases, ["scout", "review"])
+    assert.deepEqual(ok.requires, ["explore"])
+    assert.equal(ok.description, "scout, partition, review")
+    assert.deepEqual(ok.spec, jsonCopy(GRAPH_SPEC))
+  }
+  // Truncated validator output stays quotable (MAX_GRAPH_ERRORS).
+  const many = buildGraphBody(
+    JSON.stringify({
+      nodes: Array.from({ length: 8 }, (_, i) => ({ id: `n${i}`, kind: "agent" })),
+    }),
+  )
+  assert.match(bodyError(many), /\(\+3 more\)/)
+})
+
+test("RunRecord.graphSpec survives the KV round-trip (a restarted server can still render it)", async () => {
+  const { kv } = makeStorage()
+  const run = makeRun({
+    id: "run_graph1",
+    script: "const G_args = args",
+    graphSpec: { nodes: [{ id: "a", kind: "agent", prompt: "p {{args.x}}" }] },
+  })
+  const first = makeStorage({ kv })
+  first.storage.saveRun(run)
+  const second = makeStorage({ kv })
+  await second.storage.loadRunsAsync()
+  const loaded = second.storage.loadRuns().find((r) => r.id === "run_graph1")
+  assert.deepEqual(loaded?.graphSpec, run.graphSpec)
 })

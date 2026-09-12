@@ -22,6 +22,8 @@ import type {
   WorkflowMeta,
 } from "../src/types.ts"
 import { createHash } from "node:crypto"
+import { compileGraphSpec } from "../src/graph.ts"
+import type { GraphSpec } from "../src/graph.ts"
 import { emptyTokens, isActiveRunStatus } from "../src/types.ts"
 
 // ---------------------------------------------------------------------------
@@ -368,6 +370,7 @@ export class FakeRegistry implements Registry {
     args?: Json
     name?: string
     workflowName?: string
+    graphSpec?: Json
   }): RunRecord {
     this.runCounter += 1
     const run: RunRecord = {
@@ -380,6 +383,7 @@ export class FakeRegistry implements Registry {
       script: init.script,
       meta: init.meta,
       args: init.args,
+      ...(init.graphSpec !== undefined ? { graphSpec: init.graphSpec } : {}),
       startedAt: Date.now(),
       agents: [],
     }
@@ -581,6 +585,35 @@ export class FakeStorage implements Storage {
         savedAt: Date.now(),
       },
       script,
+    }
+    this.workflows.set(name, saved)
+    return saved
+  }
+
+  async saveGraphWorkflow(
+    name: string,
+    spec: Json,
+    manifest: Omit<SavedWorkflowManifest, "version" | "hash" | "savedAt" | "source" | "kind"> & {
+      source: "project" | "personal"
+    },
+  ): Promise<SavedWorkflow> {
+    // Mirrors StorageImpl: the spec is compiled fresh and the COMPILED script is
+    // the digest basis, so a fake trust record hashes what would really run.
+    const compiled = compileGraphSpec(spec as unknown as GraphSpec)
+    const saved: SavedWorkflow = {
+      manifest: {
+        version: 1,
+        name,
+        description: manifest.description ?? compiled.meta.description,
+        phases: manifest.phases ?? compiled.meta.phases,
+        requires: manifest.requires ?? compiled.meta.requires,
+        hash: createHash("sha256").update(compiled.script).digest("hex"),
+        source: manifest.source,
+        savedAt: Date.now(),
+        kind: "graph",
+      },
+      script: compiled.script,
+      graphSpec: spec,
     }
     this.workflows.set(name, saved)
     return saved

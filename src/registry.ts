@@ -82,6 +82,7 @@ export class RegistryImpl implements Registry {
     args?: Json
     name?: string
     workflowName?: string
+    graphSpec?: Json
   }): RunRecord {
     let id = randomRunID()
     while (this.runs.has(id)) id = randomRunID()
@@ -97,6 +98,7 @@ export class RegistryImpl implements Registry {
       script: init.script,
       meta: init.meta,
       args: init.args,
+      ...(init.graphSpec !== undefined ? { graphSpec: init.graphSpec } : {}),
       startedAt: this.now(),
       agents: [],
     }

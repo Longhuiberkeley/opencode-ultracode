@@ -10,7 +10,11 @@ import type { Json } from "../src/types.ts"
 import { WORKER_SOURCE, validateScriptSource } from "../src/worker-script.ts"
 import {
   DEFAULT_FANOUT_MAX,
+  GRAPH_SPEC_VERSION,
+  canonicalGraphSpec,
   compileGraphSpec,
+  graphNodeCount,
+  graphNodeIds,
   graphToAscii,
   graphToMermaid,
   graphLevels,
@@ -413,4 +417,43 @@ test("graph: mermaid + ascii renders", () => {
   assert.match(ascii, /wave 1: scout\(agent\)/)
   assert.match(ascii, /wave 3: review\(fanout\)/)
   assert.match(ascii, /wave 4 \[parallel\]: qc\(gate\)\s+\+\s+report\(merge\)/)
+})
+
+// ---------------------------------------------------------------------------
+// Persistence helpers (saved graph workflows + run-record provenance)
+// ---------------------------------------------------------------------------
+
+test("graph: canonicalGraphSpec is key-order independent but order-sensitive where it matters", () => {
+  const a = { name: "n", nodes: [{ id: "a", kind: "agent", prompt: "p {{args.x}}" }], returns: { r: "$a" } }
+  const b = { returns: { r: "$a" }, nodes: [{ kind: "agent", id: "a", prompt: "p {{args.x}}" }], name: "n" }
+  assert.equal(canonicalGraphSpec(a), canonicalGraphSpec(b), "key order is not semantic")
+  assert.notEqual(canonicalGraphSpec(a), canonicalGraphSpec({ ...a, name: "other" }))
+  // Node order IS the topological order, so arrays must not be sorted.
+  const nodes = [
+    { id: "b", kind: "agent", prompt: "p" },
+    { id: "a", kind: "agent", prompt: "p" },
+  ]
+  assert.notEqual(canonicalGraphSpec({ nodes }), canonicalGraphSpec({ nodes: [...nodes].reverse() }))
+  assert.equal(canonicalGraphSpec(undefined), "null")
+  assert.equal(canonicalGraphSpec(null), "null")
+})
+
+test("graph: node count and ids tolerate junk specs", () => {
+  assert.equal(graphNodeCount(CANONICAL), 5)
+  assert.deepEqual(graphNodeIds(CANONICAL), ["scout", "lanes", "review", "qc", "report"])
+  for (const junk of [null, undefined, 3, "x", [], {}, { nodes: "nope" }, { nodes: [null, 1, { id: "ok" }] }]) {
+    assert.doesNotThrow(() => graphNodeCount(junk))
+    assert.doesNotThrow(() => graphNodeIds(junk))
+  }
+  assert.equal(graphNodeCount({ nodes: "nope" }), 0)
+  assert.deepEqual(graphNodeIds({ nodes: [null, { id: "ok" }, 5] }), ["ok"])
+})
+
+test("graph: compiled header is name-independent, so a rename cannot move the trust digest", () => {
+  const base = compileGraphSpec(CANONICAL).script
+  const renamed = compileGraphSpec({ ...CANONICAL, name: "renamed-flow" }).script
+  assert.equal(base, renamed, "the spec name must not appear in the compiled script")
+  assert.doesNotMatch(base, /partitioned-review/)
+  assert.match(base, new RegExp(`graph v${GRAPH_SPEC_VERSION}`))
+  assert.match(base, /do not hand-edit/)
 })

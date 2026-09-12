@@ -155,6 +155,11 @@ const WORKFLOW_TOOL_INPUT_SCHEMA: Record<string, unknown> = {
           description:
             "Default true: return immediately after admission with { runID, status: \"running\", hint }. Pass false to block until the envelope. On completion a one-line settle notice lands in the parent session and wakes the calling agent; poll ultracode_status for detail.",
         },
+        resumeFrom: {
+          type: "string",
+          description:
+            "Warm-start from a prior run id (run_…): keyed succeeded agents replay from that run's cache instead of respawning, so an interrupted long run costs only its unfinished tail.",
+        },
       },
     },
     {
@@ -171,6 +176,11 @@ const WORKFLOW_TOOL_INPUT_SCHEMA: Record<string, unknown> = {
           type: "boolean",
           description:
             "Default true: return immediately after admission with { runID, status: \"running\", hint }. Pass false to block until the envelope. On completion a one-line settle notice lands in the parent session and wakes the calling agent; poll ultracode_status for detail.",
+        },
+        resumeFrom: {
+          type: "string",
+          description:
+            "Warm-start from a prior run id (run_…): keyed succeeded agents replay from that run's cache instead of respawning, so an interrupted long run costs only its unfinished tail.",
         },
       },
     },
@@ -194,6 +204,11 @@ const WORKFLOW_TOOL_INPUT_SCHEMA: Record<string, unknown> = {
           type: "boolean",
           description:
             "Default true: return immediately after admission. Pass false to block until the envelope.",
+        },
+        resumeFrom: {
+          type: "string",
+          description:
+            "Warm-start from a prior run id (run_…). Graph calls are auto-keyed per node, so every finished child replays from cache and only the unfinished tail respawns.",
         },
       },
     },
@@ -634,10 +649,14 @@ export default Plugin.define({
                 let name: string | undefined
                 let workflowName: string | undefined
                 let args: Json | undefined
+                let graphSpec: Json | undefined
 
                 if ("graph" in input) {
                   // Graph-authored run: validate the DAG, compile to a plain
-                  // async-body script, then proceed down the inline path.
+                  // async-body script, then proceed down the inline path. The
+                  // spec is recorded on the run so `/ultracode graph`,
+                  // `/ultracode save` and rerun keep working with the source of
+                  // truth instead of the compiled artifact.
                   const graphCheck = validateGraphSpec(input.graph)
                   if (!graphCheck.ok) {
                     return {
@@ -648,6 +667,7 @@ export default Plugin.define({
                   }
                   const compiled = compileGraphSpec(input.graph as unknown as GraphSpec)
                   script = compiled.script
+                  graphSpec = input.graph as Json
                   workflowName = undefined
                   name = input.name ?? compiled.meta.name
                   meta = {
@@ -685,11 +705,14 @@ export default Plugin.define({
                         `error: workflow "${input.workflow}" not found.` +
                         (available
                           ? ` Saved workflows: ${available}.`
-                          : " No saved workflows exist yet — author `.opencode/workflows/<name>.js` then `/ultracode save <name>` (or `/ultracode save <runID> <name>` after a run).") +
-                        ` Alternatively call ultracode_run directly with { script } for an inline run — never wrap this call in a generic execute/JS sandbox.`,
+                          : " No saved workflows exist yet — author `.opencode/workflows/<name>.js` (or `<name>.graph.json` for a graph) then `/ultracode save <name>` (or `/ultracode save <runID> <name>` after a run).") +
+                        ` Alternatively call ultracode_run directly with { graph } or { script } for an inline run — never wrap this call in a generic execute/JS sandbox.`,
                     }
                   }
                   script = saved.script
+                  // A saved GRAPH workflow keeps its spec on the run record, so
+                  // re-saving or re-rendering the run works with the DAG.
+                  graphSpec = saved.graphSpec
                   workflowName = input.workflow
                   name = saved.manifest.name
                   meta = {
@@ -726,7 +749,7 @@ export default Plugin.define({
                 const background = resolveBackground(input)
                 return await executeWorkflowLaunch(
                   supervisor,
-                  { script, meta, args, name, workflowName, resumeFrom: input.resumeFrom },
+                  { script, meta, args, name, workflowName, graphSpec, resumeFrom: input.resumeFrom },
                   parent,
                   background,
                   background
