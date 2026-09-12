@@ -344,6 +344,21 @@ test("supervisor: workflow() composition uses the injected loadWorkflowFresh dep
   assert.deepEqual(loads, ["helper"])
 })
 
+test("supervisor: workflow() of a saved graph executes the compiled script against fake agents", async () => {
+  const ctx = makeSupervisor()
+  const spec = {
+    nodes: [{ id: "say", kind: "agent", prompt: "Say GRAPH_OK" }],
+    returns: { said: "$say" },
+  }
+  await ctx.storage.saveGraphWorkflow("hello-graph", spec as Json, { name: "hello-graph", source: "project" })
+  ctx.sessions.push({ text: "GRAPH_OK" })
+  const outcome = await ctx.supervisor.start({ script: `return await workflow("hello-graph");` }, ctx.parent)
+  assert.equal(outcome.envelope.status, "succeeded")
+  assert.deepEqual(outcome.envelope.result, { said: "GRAPH_OK" })
+  assert.equal(outcome.run.agents.length, 1, "the compiled graph spawned the one agent node")
+  assert.equal(outcome.run.agents[0]!.status, "succeeded")
+})
+
 test("supervisor: stop during settle grace reports stopped, not succeeded", async () => {
   const ctx = makeSupervisor({}, { settleGraceMs: 900, stopKillGraceMs: 100 })
   ctx.sessions.hangWait = true // dangling agent call never settles on its own

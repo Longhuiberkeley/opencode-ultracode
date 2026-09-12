@@ -98,7 +98,7 @@ test("skill content is graph-first: structure before plumbing", () => {
 test("skill content teaches the catalog tool and graph templates", () => {
   assert.ok(SKILL_CONTENT.includes("ultracode_catalog"), "discovery tool must be named")
   assert.match(SKILL_CONTENT, /Discovery first/, "catalog comes before authoring")
-  assert.match(SKILL_CONTENT, /params with JSON types/, "the catalog answers 'what args does it take'")
+  assert.match(SKILL_CONTENT, /params \(names always; JSON types only when declared/, "the catalog answers 'what args does it take'")
   assert.match(SKILL_CONTENT, /\{ workflow: "name" \}/, "detail drill-down")
   assert.match(SKILL_CONTENT, /\{ template: "name" \}/, "single-template drill-down")
   assert.match(SKILL_CONTENT, /template/, "templates are the anti-blank-page answer")

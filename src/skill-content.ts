@@ -35,7 +35,8 @@ interrupted long run costs only its unfinished tail. \`meta\` and \`args\` are i
 
 \`ultracode_catalog\` is read-only, cheap, and fresher than anything in this skill. Call it before
 choosing a saved workflow or authoring a graph from a blank page. With no input it returns the
-agent roster, every saved workflow (kind, description, **params with JSON types**, phases,
+agent roster, every saved workflow (kind, description, **params (names always; JSON types only when declared —
+explicit params, a // Tool input: header, or a saved run's real args; graph-derived params are names only)**, phases,
 required agents, trust state, last-run stats) and the graph template summaries. Drill in with
 \`{ workflow: "name" }\` for one workflow's full spec (graph) or script head, \`{ template: "name" }\`
 for one ready-made spec, or \`{ templates: true }\` for all of them.

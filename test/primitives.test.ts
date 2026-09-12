@@ -6,9 +6,11 @@
 import test from "node:test"
 import assert from "node:assert/strict"
 import { AgentRunner, Semaphore, getWorkflowComposer, parallelHelper, pipelineHelper, storageWorkflowLoader, buildWarmCache, agentCacheDigest } from "../src/primitives.ts"
+import { compileGraphSpec } from "../src/graph.ts"
+import type { GraphSpec } from "../src/graph.ts"
 import type { AgentRunnerOptions } from "../src/primitives.ts"
 import type { AgentResult } from "../src/types.ts"
-import type { SavedWorkflow, Storage } from "../src/types.ts"
+import type { Json, SavedWorkflow, Storage } from "../src/types.ts"
 import type { AgentRunHooks, AgentRunInput, SessionDriver } from "../src/sessions.ts"
 import { AgentCallError } from "../src/sessions.ts"
 import { FakeRegistry, FakeStorage } from "./fakes.ts"
@@ -347,6 +349,27 @@ test("composer: loads saved workflow at depth 0 (storage fallback loader)", asyn
   assert.equal(composed.script, "return 41 + 1")
   assert.equal(composed.meta.name, "helper")
   assert.equal(composed.meta.description, "d")
+})
+
+test("composer: graph-kind save returns the compiled script, not the spec", async () => {
+  const storage = new FakeStorage()
+  const spec: GraphSpec = {
+    nodes: [{ id: "say", kind: "agent", prompt: "Say hi about {{args.topic}}." }],
+  }
+  await storage.saveGraphWorkflow("helper-g", spec as unknown as Json, {
+    name: "helper-g",
+    source: "project",
+    description: "graph helper",
+  })
+  const composed = await getWorkflowComposer(storageWorkflowLoader(storage), "helper-g", { topic: "x" }, 0)
+  const compiled = compileGraphSpec(spec)
+  assert.equal(composed.script, compiled.script, "composition must run the compiled body, not the JSON spec")
+  assert.notEqual(composed.script, JSON.stringify(spec))
+  assert.match(composed.script, /compiled from a graph spec/)
+  assert.equal("graphSpec" in composed, false)
+  assert.equal(composed.meta.name, "helper-g")
+  assert.equal(composed.meta.description, "graph helper")
+  assert.deepEqual(composed.meta.phases, compiled.meta.phases)
 })
 
 test("composer: depth > 0 rejected with nested-composition error", async () => {

@@ -14,6 +14,7 @@ import {
   MAX_CATALOG_AGENTS,
   MAX_CATALOG_DESCRIPTION_CHARS,
   MAX_CATALOG_WORKFLOWS,
+  MAX_DETAIL_GRAPH_CHARS,
   MAX_DETAIL_SCRIPT_HEAD,
   buildCatalog,
 } from "../src/catalog.ts"
@@ -210,6 +211,20 @@ test("catalog: the graph detail view hands over the whole spec plus an invoke hi
   assert.equal(detail["invoke"], 'ultracode_run { workflow: "lane-review", args: { … } }')
   assert.equal("scriptHead" in detail, false, "a graph's compiled script is noise — the spec is the artifact")
   assert.equal("workflows" in out, false, "the detail view replaces the listing")
+})
+
+test("catalog: a graph spec over MAX_DETAIL_GRAPH_CHARS is omitted with a pointer at the file", () => {
+  const bigSpec = { nodes: [{ id: "only", kind: "agent", prompt: "P".repeat(MAX_DETAIL_GRAPH_CHARS + 1) }] }
+  const out = buildCatalog({
+    workflows: [entry(graphWorkflow("huge", { graphSpec: bigSpec as Json }))],
+    workflow: "huge",
+  }) as Record<string, Json>
+  const detail = out["workflow"] as Record<string, Json>
+  assert.equal("graph" in detail, false, "the oversized spec must not be inlined")
+  assert.equal(detail["graphChars"], JSON.stringify(bigSpec).length)
+  assert.ok((detail["graphChars"] as number) > MAX_DETAIL_GRAPH_CHARS)
+  assert.match(String(detail["graphOmitted"]), /huge\.graph\.json/)
+  assert.match(String(detail["graphOmitted"]), /\/ultracode graph huge/)
 })
 
 test("catalog: the script detail view bounds the script to a head slice", () => {

@@ -257,7 +257,7 @@ const CATALOG_TOOL_INPUT_SCHEMA: Record<string, unknown> = {
     workflow: {
       type: "string",
       description:
-        "One saved workflow name → detail view: params (names, JSON types, optional markers), phases, required agents, trust state, the full graph spec (graph kind) or the script head (script kind), and last-run stats from this conversation.",
+        "One saved workflow name → detail view: params (names always; JSON types only when declared — explicit params, a // Tool input: header, or a saved run's real args; graph-derived params are names only), phases, required agents, trust state, the full graph spec (graph kind) or the script head (script kind), and last-run stats from this conversation.",
     },
     template: {
       type: "string",
@@ -876,7 +876,7 @@ export default Plugin.define({
           name: "catalog",
           options: { namespace: "ultracode" },
           description:
-            "Read-only discovery of what this project can run: saved workflows (kind, params with JSON types, phases, required agents, trust state, last-run stats from THIS conversation), the available agent ids, and graph templates to adapt. Call it BEFORE choosing a saved workflow or authoring a graph — cheaper than reading workflow files, and it executes nothing. Input { workflow? | template? | templates? }: no input returns the whole bounded catalog; one view per call. A workflow listed as trusted can be run immediately; an untrusted one needs the user's /ultracode trust first (relay that, never work around it).",
+            "Read-only discovery of what this project can run: saved workflows (kind, params (names always; JSON types only when declared — explicit params, a // Tool input: header, or a saved run's real args; graph-derived params are names only), phases, required agents, trust state, last-run stats from THIS conversation), the available agent ids, and graph templates to adapt. Call it BEFORE choosing a saved workflow or authoring a graph — cheaper than reading workflow files, and it executes nothing. Input { workflow? | template? | templates? }: no input returns the whole bounded catalog; one view per call. A workflow listed as trusted can be run immediately; an untrusted one needs the user's /ultracode trust first (relay that, never work around it).",
           input: CATALOG_TOOL_INPUT_SCHEMA,
           execute: async (rawInput: unknown, tool) => {
             try {

@@ -14,6 +14,9 @@
  *     and example types) or, failing that, every `args.x` reference in the code
  *     — including the `const input = args && …` alias idiom the samples use —
  *     or, for a graph spec, its `{{args.x}}` templates and `$args.x` refs.
+ *     The code scan is textual: `args.x` inside comments or string literals
+ *     counts as a reference (harmless — args are not enforced — but manifests
+ *     can over-list).
  *
  * Pure module: no plugin imports, no I/O. Derivation is best-effort by design —
  * a missed name costs a doc gap, never a wrong run (args are not enforced).
@@ -190,6 +193,8 @@ export function paramsFromToolInputHeader(script: string): WorkflowParam[] {
  * Params referenced in code: `args.x`, `args?.x`, `args["x"]`, the same through
  * a local alias assigned from `args` (the samples' `const input = args && …`
  * idiom), and `const { a, b } = args` destructuring.
+ * The scan is textual — `args.x` inside comments or string literals counts as a
+ * reference; harmless because args are not enforced, but manifests can over-list.
  */
 export function paramsFromScriptCode(script: string): WorkflowParam[] {
   const out = new Map<string, WorkflowParam>()

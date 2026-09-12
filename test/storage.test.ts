@@ -1044,6 +1044,21 @@ test("saveWorkflowFromFile names both artifacts when nothing is found", async ()
   await assert.rejects(() => storage.saveWorkflowFromFile("ghost"), /not found \(ghost\.js or ghost\.graph\.json\)/)
 })
 
+test("saveWorkflowFromFile refuses when both .js and .graph.json exist (no silent shadow)", async () => {
+  const { storage, fs } = makeStorage()
+  seedAnchors(fs)
+  const script = "return 'from-js'"
+  const specRaw = JSON.stringify(GRAPH_SPEC)
+  await fs.writeFile(`${PROJECT_WF}/dual.js`, script)
+  await fs.writeFile(`${PROJECT_WF}/dual${GRAPH_ARTIFACT_SUFFIX}`, specRaw)
+  const before = new Map(fs.files)
+  await assert.rejects(() => storage.saveWorkflowFromFile("dual"), /already exists and would shadow/)
+  assert.deepEqual([...fs.files.entries()], [...before.entries()], "the refused save wrote nothing")
+  assert.equal(await fs.readFile(`${PROJECT_WF}/dual.js`), script)
+  assert.equal(await fs.readFile(`${PROJECT_WF}/dual${GRAPH_ARTIFACT_SUFFIX}`), specRaw)
+  assert.equal(await fs.exists(`${PROJECT_WF}/dual.json`), false, "no manifest pair was created")
+})
+
 test("graph workflows load from the personal dir; project still wins a name collision", async () => {
   const { storage, fs } = makeStorage()
   seedAnchors(fs)

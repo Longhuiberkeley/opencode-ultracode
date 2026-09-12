@@ -84,6 +84,10 @@ test("params: object properties and unrelated identifiers are not params", () =>
   assert.deepEqual(names(paramsFromScriptCode("return 1")), [])
 })
 
+test("params: the code scan is textual — args.x in comments still counts", () => {
+  assert.deepEqual(names(paramsFromScriptCode("// see args.secret")), ["secret"])
+})
+
 test("params: header wins on type and optionality, code refs fill the gaps", () => {
   const script = [
     '// Tool input: { args: { area: "src", budget?: 35000 } }',
