@@ -610,6 +610,9 @@ export function formatShowRun(run: RunRecord, extra?: { pending?: readonly strin
 
 const GRAPH_NODE_HEADERS = ["node", "kind", "agent", "source", "bounds"]
 
+/** Prompt chars shown per node — enough to see intent, bounded for chat. */
+export const GRAPH_PROMPT_PREVIEW_CHARS = 240
+
 export type GraphViewExtra = {
   /** Human-readable origin: `saved workflow "x"` or `run run_x`. */
   source: string
@@ -680,6 +683,27 @@ export function formatGraphView(spec: Json, extra: GraphViewExtra): string {
     lines.push(
       `| \`${node.id}\` | ${node.kind} | ${node.agent ?? "-"} | ${graphSourceCell(node)} | ${graphBoundsCell(node)} |`,
     )
+  }
+  // Prompts are the payload that actually executes, so a review that hides them
+  // is not a review. Sliced per node; the artifact holds the full text.
+  const prompted = graph.nodes.filter((n) => n.kind === "agent" || n.kind === "fanout" || n.kind === "merge" || n.kind === "gate")
+  if (prompted.length > 0) {
+    lines.push("")
+    lines.push("### Prompts (what each child is told)")
+    lines.push("")
+    for (const node of prompted) {
+      if (node.prompt === undefined) {
+        lines.push(
+          `- \`${node.id}\` (${node.kind}${node.agent ? `, ${node.agent}` : ""}): the built-in QC prompt — verdict \`{ pass, action, issues }\`, only concrete defects fail`,
+        )
+        continue
+      }
+      const full = node.prompt
+      const shown = safeSlice(full, GRAPH_PROMPT_PREVIEW_CHARS).replace(/\s+/g, " ")
+      lines.push(
+        `- \`${node.id}\` (${node.kind}${node.agent ? `, ${node.agent}` : ""}, ${full.length} chars): ${shown}${full.length > GRAPH_PROMPT_PREVIEW_CHARS ? " …" : ""}`,
+      )
+    }
   }
   if (graph.returns && Object.keys(graph.returns).length > 0) {
     lines.push("")

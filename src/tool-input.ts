@@ -392,10 +392,11 @@ export function validateCatalogToolInput(raw: unknown): CatalogToolInput | { ok:
     names.push(key)
   }
   const wantsAllTemplates = has(raw, "templates")
-  if (names.length > 1 || (names.length === 1 && wantsAllTemplates && names[0] !== "template")) {
+  if (wantsAllTemplates) names.push("templates")
+  if (names.length > 1) {
     return {
       ok: false,
-      error: `choose ONE view per call: { workflow }, { template }, { templates } or no input for the whole catalog`,
+      error: `choose ONE view per call: { workflow }, { template }, { templates } or no input for the whole catalog (got ${names.join(" + ")})`,
     }
   }
 

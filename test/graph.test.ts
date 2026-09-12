@@ -595,3 +595,70 @@ test("graph e2e: the partitioned-review template runs end to end (partition, fan
     "the gate auto-checkpointed",
   )
 })
+
+// ---------------------------------------------------------------------------
+// Mixed waves (regression: a partition sharing a wave with an agent was emitted
+// but never marked defined, so a later `over: "$lanes"` compiled to `G_list([])`
+// — the fan-out ran zero children and the run "succeeded" with no work done)
+// ---------------------------------------------------------------------------
+
+const MIXED_WAVE: GraphSpec = {
+  nodes: [
+    {
+      id: "scout",
+      kind: "agent",
+      agent: "explore",
+      prompt: "Inventory {{args.area}} with line counts.",
+      schema: INVENTORY_SCHEMA,
+    },
+    { id: "lanes", kind: "partition", from: "$scout.items", budgetTokens: 35000 },
+    // Reads scout ONLY through a template, so it shares wave 2 with `lanes`.
+    { id: "summary", kind: "agent", agent: "general", prompt: "Summarize this inventory in one line: {{scout}}" },
+    { id: "review", kind: "fanout", over: "$lanes", agent: "explore", max: 4, prompt: "Review these files: {{item}}" },
+  ],
+  returns: { reviewed: "$review", lanes: "$lanes.length", summary: "$summary" },
+}
+
+test("graph: a mixed wave keeps the sync node visible to later refs", () => {
+  assert.equal(validateGraphSpec(MIXED_WAVE).ok, true)
+  assert.deepEqual(
+    graphLevels(MIXED_WAVE).map((w) => w.map((n) => n.id)),
+    [["scout"], ["lanes", "summary"], ["review"]],
+  )
+  const { script } = compileGraphSpec(MIXED_WAVE)
+  assert.match(script, /G_list\(v_lanes\)/, "the fan-out reads the partition's value")
+  assert.doesNotMatch(script, /G_list\(\[\]\)/, "the partition must not resolve to an empty fallback")
+  assert.match(script, /G_str\(v_scout\)/, "the template reader still interpolates its source")
+  assert.deepEqual(validateScriptSource(script), { ok: true })
+})
+
+test("graph e2e: a mixed wave actually fans out over the partitioned lanes", async () => {
+  const { script } = compileGraphSpec(MIXED_WAVE)
+  const prompts: string[] = []
+  const result = await runInWorker(script, { area: "src/api" }, async (_fn, callArgs) => {
+    const prompt = String(callArgs[0] ?? "")
+    prompts.push(prompt)
+    const opts = (callArgs[1] ?? {}) as { schema?: Json; key?: string }
+    const schema = (opts.schema ?? {}) as { properties?: Record<string, unknown> }
+    const sessionID = `ses_${String(opts.key ?? prompts.length).replace(/[^a-z0-9]/gi, "")}`
+    if (schema.properties?.["items"]) {
+      return {
+        text: "inventory",
+        sessionID,
+        agent: "explore",
+        data: { items: [{ name: "a.ts", lines: 10 }, { name: "b.ts", lines: 8 }] },
+      } as unknown as Json
+    }
+    return { text: `reply-${prompts.length}`, sessionID, agent: "general" } as unknown as Json
+  })
+  assert.equal(result.ok, true, result.error ?? "run failed")
+  const value = result.value as { reviewed?: string[]; lanes?: number; summary?: string }
+  assert.equal(value.lanes, 1, "two small files make one lane")
+  assert.equal(prompts.length, 3, "scout + summary + one lane child (the empty fan-out bug made this 2)")
+  assert.ok(
+    prompts.some((p) => p.startsWith("Review these files:") && p.includes("a.ts") && p.includes("b.ts")),
+    "the lane child received the partitioned files, not an empty list",
+  )
+  assert.deepEqual(value.reviewed, ["reply-3"])
+  assert.equal(value.summary, "reply-2")
+})

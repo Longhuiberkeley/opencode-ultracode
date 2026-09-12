@@ -312,14 +312,16 @@ test("catalog input: exactly one view per call", () => {
   for (const raw of [
     { workflow: "a", template: "b" },
     { workflow: "a", templates: true },
+    { template: "a", templates: true },
+    { workflow: "a", template: "b", templates: true },
   ]) {
     const parsed = validateCatalogToolInput(raw)
     assert.equal(parsed.ok, false, `expected rejection for ${JSON.stringify(raw)}`)
     if (!parsed.ok) assert.match(parsed.error, /choose ONE view per call/)
   }
-  // template + templates is redundant but unambiguous (the named one wins)
-  const both = validateCatalogToolInput({ template: "a", templates: true })
-  assert.equal(both.ok, true)
+  const rejected = validateCatalogToolInput({ template: "a", templates: true })
+  assert.ok(!rejected.ok)
+  assert.match(rejected.error, /got template \+ templates/, "the message names the conflicting views")
 })
 
 test("catalog input: bad names, bad flags and unknown keys are rejected precisely", () => {

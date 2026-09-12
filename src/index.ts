@@ -33,7 +33,7 @@ import {
   type StatusChildView,
 } from "./command.ts"
 import { loadOptions } from "./config.ts"
-import { buildCatalog } from "./catalog.ts"
+import { CATALOG_RUN_LIMIT, CATALOG_RUN_SCAN, buildCatalog } from "./catalog.ts"
 import { controlToolContent } from "./control.ts"
 import {
   applyOverlay,
@@ -887,9 +887,14 @@ export default Plugin.define({
               await runsReconciled
               await storage.refreshWorkflows()
               const listed = await listAgents()
-              // Ownership: run history is per-conversation provenance, so stats
-              // never leak another session's runs (same rule as status/result).
-              const runs = registry.listRecent(50).filter((r) => r.parentSessionID === tool.sessionID)
+              // Ownership FIRST, then the cap: listRecent is process-wide, so
+              // capping before filtering would let 50 other sessions' runs push
+              // this conversation's stats out of the view entirely. Run history
+              // is per-conversation provenance (same rule as status/result).
+              const runs = registry
+                .listRecent(CATALOG_RUN_SCAN)
+                .filter((r) => r.parentSessionID === tool.sessionID)
+                .slice(0, CATALOG_RUN_LIMIT)
               const catalog = buildCatalog({
                 ...(listed.ok ? { agents: listed.agents } : { agentsUnavailable: listed.error }),
                 workflows: storage.listWorkflows().map((workflow) => ({

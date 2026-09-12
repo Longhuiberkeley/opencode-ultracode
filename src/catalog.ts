@@ -11,14 +11,16 @@
  *
  * This module is pure (no plugin imports, no I/O): the caller supplies agents,
  * workflows with their trust state, and ALREADY ownership-filtered runs; the
- * builder returns a bounded JSON view. Every list is capped and every string is
- * sliced, because the output lands in a context window — the same discipline the
+ * builder returns a bounded JSON view. Every list is capped, free text is sliced,
+ * and the two payloads that are inherently unbounded — a script body and a graph
+ * spec — are cut to a head/size cap with the overflow reported rather than
+ * dumped, because the output lands in a context window. Same discipline the
  * envelope and status payloads follow.
  */
 import { graphNodeCount, graphNodeIds } from "./graph.ts"
 import { GRAPH_TEMPLATES, graphTemplate, graphTemplateSummaries } from "./graph-templates.ts"
 import { paramsLine, parseParams } from "./params.ts"
-import { safeSlice } from "./serialize.ts"
+import { safeSlice, compactStringify } from "./serialize.ts"
 import type { Json, RunRecord, SavedWorkflow, WorkflowKind } from "./types.ts"
 import { countAgents } from "./types.ts"
 
@@ -28,6 +30,17 @@ export const MAX_CATALOG_DESCRIPTION_CHARS = 200
 export const MAX_CATALOG_AGENTS = 60
 /** Head of a script workflow shown in the detail view (the `// Tool input:` header lives here). */
 export const MAX_DETAIL_SCRIPT_HEAD = 1200
+/**
+ * Cap on the serialized graph spec inlined by the detail view. A spec is bounded
+ * in NODE count (MAX_GRAPH_NODES) but not in bytes — a prompt can carry pasted
+ * source — so past this the detail view returns the structure and points at the
+ * file instead of dumping text into a context window.
+ */
+export const MAX_DETAIL_GRAPH_CHARS = 24_000
+/** Runs the tool executor scans before ownership filtering (see index.ts). */
+export const CATALOG_RUN_SCAN = 200
+/** Runs kept for last-run stats after filtering to the calling conversation. */
+export const CATALOG_RUN_LIMIT = 50
 
 export interface CatalogAgent {
   id: string
@@ -139,18 +152,28 @@ function workflowDetail(entry: CatalogWorkflow, runs: readonly RunRecord[]): Jso
     trusted: workflow.graphError !== undefined ? false : trusted,
     source: manifest.source,
   }
-  if (manifest.description !== undefined) detail["description"] = manifest.description
+  if (manifest.description !== undefined) detail["description"] = safeSlice(manifest.description, MAX_CATALOG_DESCRIPTION_CHARS)
   if (manifest.phases !== undefined) detail["phases"] = manifest.phases
   if (manifest.requires !== undefined) detail["requires"] = manifest.requires
   if (manifest.savedFromRunID !== undefined) detail["savedFromRunID"] = manifest.savedFromRunID
   const params = parseParams(manifest.params)
   if (params && params.args.length > 0) detail["params"] = params.args as unknown as Json
-  if (workflow.graphError !== undefined) detail["broken"] = workflow.graphError
+  if (workflow.graphError !== undefined) detail["broken"] = safeSlice(workflow.graphError, MAX_CATALOG_DESCRIPTION_CHARS)
   if (kind === "graph") {
-    // The spec is compact by construction (MAX_GRAPH_NODES) and is the thing
-    // worth adapting — hand it over whole.
-    if (workflow.graphSpec !== undefined) detail["graph"] = workflow.graphSpec
     detail["nodeIds"] = graphNodeIds(workflow.graphSpec)
+    if (workflow.graphSpec !== undefined) {
+      // The spec is the thing worth adapting, so hand it over whole — but it is
+      // bounded in NODE count only, and a prompt can carry pasted source. Past
+      // the cap, describe the structure and point at the file instead.
+      const chars = compactStringify(workflow.graphSpec).length
+      if (chars <= MAX_DETAIL_GRAPH_CHARS) detail["graph"] = workflow.graphSpec
+      else {
+        detail["graphChars"] = chars
+        detail["graphOmitted"] =
+          `spec is ${chars} chars, over the ${MAX_DETAIL_GRAPH_CHARS} inline cap — ` +
+          `read ${manifest.name}.graph.json in the workflows directory (or /ultracode graph ${manifest.name} for the structure)`
+      }
+    }
   } else {
     detail["scriptChars"] = workflow.script.length
     detail["scriptHead"] = safeSlice(workflow.script, MAX_DETAIL_SCRIPT_HEAD)

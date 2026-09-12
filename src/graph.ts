@@ -503,10 +503,11 @@ export function compileGraphSpec(spec: GraphSpec): CompiledGraph {
 
   /**
    * Invariant: a prompt template may only interpolate a node that has already
-   * been emitted. graphLevels schedules on the same edges, so a validated spec
-   * cannot trip this — it fires for a spec compiled without validation, where
-   * the alternative is silently emitting the literal `{{node}}` into a child's
-   * prompt (a confidently wrong run, not an error).
+   * been emitted. graphLevels schedules on the same edges and sync nodes are
+   * defined as soon as they are emitted, so a validated spec cannot trip this —
+   * it fires for a cycle or a forward reference in a spec compiled WITHOUT
+   * validation, where the alternative is silently emitting the literal
+   * `{{node}}` into a child's prompt (a confidently wrong run, not an error).
    */
   const assertTemplateDepsEmitted = (node: GraphNode): void => {
     for (const dep of nodeTemplateDeps(node)) {
@@ -615,15 +616,18 @@ export function compileGraphSpec(spec: GraphSpec): CompiledGraph {
 
   const levels = graphLevels(spec)
   levels.forEach((wave, li) => {
-    // synchronous nodes (partition / checkpoint) run first, in spec order
+    // Synchronous nodes (partition / checkpoint) run first, in spec order — and
+    // are DEFINED as soon as they are emitted. Skipping the add left a mixed
+    // wave (partition beside an agent) with an invisible partition: a later
+    // `over: "$lanes"` silently compiled to an empty list and the fan-out "ran"
+    // zero children, and a later `{{lanes}}` tripped the emit-order invariant.
     for (const node of wave) {
-      if (!AGENTISH.has(node.kind)) emitSyncNode(node)
+      if (AGENTISH.has(node.kind)) continue
+      emitSyncNode(node)
+      defined.add(node.id)
     }
     const agentish = wave.filter((n) => AGENTISH.has(n.kind))
-    if (agentish.length === 0) {
-      for (const n of wave) defined.add(n.id)
-      return
-    }
+    if (agentish.length === 0) return
     if (agentish.length === 1) {
       const node = agentish[0]!
       lines.push(`phase(${jsonLiteral(node.id)})`)

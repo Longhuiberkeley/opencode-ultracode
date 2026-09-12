@@ -42,6 +42,7 @@ import { createHash } from "node:crypto"
 import { compileGraphSpec, validateGraphSpec } from "./graph.ts"
 import type { GraphSpec } from "./graph.ts"
 import { mergeParams, paramsFromGraph, paramsFromScript } from "./params.ts"
+import type { WorkflowParam } from "./params.ts"
 import type {
   FsLike,
   Json,
@@ -802,7 +803,11 @@ export class StorageImpl implements Storage {
       return undefined // unreadable pair — skip
     }
     if (hasScript) {
-      return { workflow: { manifest: { ...manifest, kind: "script" }, script }, nameMismatch: manifest.name !== name }
+      const scriptManifest: SavedWorkflowManifest = { ...manifest, kind: "script" }
+      return {
+        workflow: { manifest: withDerivedParams(scriptManifest, paramsFromScript(script)), script },
+        nameMismatch: manifest.name !== name,
+      }
     }
     const body = buildGraphBody(rawSpec ?? "")
     if (!body.ok) {
@@ -818,7 +823,11 @@ export class StorageImpl implements Storage {
       requires: manifest.requires ?? body.requires,
     }
     return {
-      workflow: { manifest: graphManifest, script: body.script, graphSpec: body.spec },
+      workflow: {
+        manifest: withDerivedParams(graphManifest, paramsFromGraph(body.spec)),
+        script: body.script,
+        graphSpec: body.spec,
+      },
       nameMismatch: manifest.name !== name,
     }
   }
@@ -937,6 +946,19 @@ function throwMismatch(name: string, manifestName: string): never {
     `workflow "${name}": manifest name ${JSON.stringify(manifestName)} does not match ` +
       `filename "${name}" — re-save the workflow`,
   )
+}
+
+/**
+ * Params for a pair whose manifest declares none — a hand-authored `.js`, a
+ * committed sample, or a `.graph.json` dropped in without `/ultracode save`.
+ * Derived at load so the catalog can answer "what args does this take?" for
+ * every workflow, not only the ones this machine saved. An authored `params`
+ * always wins; nothing is written back to disk.
+ */
+function withDerivedParams(manifest: SavedWorkflowManifest, derived: WorkflowParam[]): SavedWorkflowManifest {
+  if (manifest.params !== undefined) return manifest
+  const params = mergeParams(undefined, derived)
+  return params === undefined ? manifest : { ...manifest, params }
 }
 
 function parseManifest(raw: unknown, source: "project" | "personal"): SavedWorkflowManifest | undefined {
