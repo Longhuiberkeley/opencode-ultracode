@@ -5,7 +5,7 @@ import test from "node:test"
 import assert from "node:assert/strict"
 import { readFileSync } from "node:fs"
 import { agentCells } from "../src/run-format.ts"
-import type { AgentRecord, TokenUsage } from "../src/types.ts"
+import type { AgentRecord, AgentStatus, TokenUsage } from "../src/types.ts"
 import {
   STATUS_DOT,
   agentRows,
@@ -32,6 +32,8 @@ import {
   inspectSelFromSelection,
   moveTree,
   nextSettlePrev,
+  buildInspectTree,
+  MIXED_DOT,
   outcomeToStatus,
   PAGE_HEIGHT,
   paginate,
@@ -39,10 +41,12 @@ import {
   parseRunAck,
   pausedRunIDsFromAcks,
   permissionsForRun,
+  phaseAggregateStatus,
   phaseDetailLines,
   runStripLines,
   runsForParent,
   phaseColumns,
+  statusDot,
   planSettleCheck,
   runFingerprint,
   runningRunCount,
@@ -67,6 +71,7 @@ import {
   twoColumn,
   type InspectPane,
   type InspectSelection,
+  type RunAgentView,
   type RunView,
   type SessionView,
   type SettlePrev,
@@ -904,6 +909,48 @@ test("inspectModel tree: default expanded, cursor on first agent, skip synthetic
   assert.ok(lines[0]!.includes("▾"))
 })
 
+test("phase aggregate status, dots, and detail status line (phase-row color model)", () => {
+  const mk = (status: AgentStatus, sessionID: string, phase = "p"): RunAgentView => ({
+    sessionID,
+    ord: "a1",
+    phase,
+    status,
+    title: "t",
+  })
+  assert.equal(phaseAggregateStatus([]), undefined)
+  assert.equal(phaseAggregateStatus([mk("running", "s1"), mk("succeeded", "s2")]), "running")
+  assert.equal(phaseAggregateStatus([mk("pending", "s1")]), "pending")
+  assert.equal(phaseAggregateStatus([mk("succeeded", "s1"), mk("succeeded", "s2")]), "succeeded")
+  assert.equal(phaseAggregateStatus([mk("failed", "s1"), mk("interrupted", "s2")]), "failed")
+  assert.equal(phaseAggregateStatus([mk("succeeded", "s1"), mk("failed", "s2")]), "mixed")
+  assert.equal(statusDot("mixed"), MIXED_DOT)
+  assert.equal(statusDot(undefined), STATUS_DOT.pending)
+  assert.equal(statusDot("succeeded"), STATUS_DOT.succeeded)
+
+  const run: RunView = {
+    runID: "run_abc123def456",
+    phases: ["scan", "fix"],
+    startedAt: 1,
+    settled: true,
+    counts: { total: 3, done: 3, failed: 1 },
+    agents: [
+      mk("succeeded", "s1", "scan"),
+      mk("failed", "s2", "fix"),
+      mk("succeeded", "s3", "fix"),
+    ],
+  }
+  const tree = buildInspectTree(run, { scan: true, fix: true })
+  assert.equal(tree.find((r) => r.kind === "phase" && r.id === "scan")?.status, "succeeded")
+  assert.equal(tree.find((r) => r.kind === "phase" && r.id === "fix")?.status, "mixed")
+  const lines = formatTreeLines(tree, { kind: "phase", id: "scan" })
+  const fixLine = lines.find((l) => l.includes("fix"))
+  assert.ok(fixLine?.includes(MIXED_DOT), "mixed phase row carries the ◐ glyph")
+  assert.ok(lines.some((l) => l.includes("scan") && l.includes(STATUS_DOT.succeeded)))
+  const detail = phaseDetailLines(run, "fix")
+  assert.ok(detail.some((l) => l.startsWith("status  ") && l.includes("mixed") && l.includes(MIXED_DOT)))
+  assert.ok(phaseDetailLines(run, "fix").includes("agents  2/2"))
+})
+
 test("inspectModel tree: cursor on phase ⇒ selectedSessionID is the phase's first child (Enter drills)", () => {
   const treeSel: TreeSelection = {
     expanded: { research: true, extract: true },
@@ -969,10 +1016,11 @@ test("phase detail lists its children (status, label, tokens) — a phase row is
   )
   const lines = phaseDetailLines(model.run!, "research")
   assert.equal(lines[0], "research")
-  assert.match(lines[1]!, /agents  \d+\/\d+/)
+  assert.match(lines[1]!, /^status  /)
+  assert.match(lines[2]!, /agents  \d+\/\d+/)
   // child rows: status dot + label
-  assert.ok(lines.slice(3).some((l) => l.includes("seeker")), "child labels appear in phase detail")
-  assert.ok(lines.slice(3).some((l) => /✓|●|○|✗|■/.test(l)), "child status dots appear")
+  assert.ok(lines.slice(4).some((l) => l.includes("seeker")), "child labels appear in phase detail")
+  assert.ok(lines.slice(4).some((l) => /✓|●|○|✗|■/.test(l)), "child status dots appear")
 })
 
 test("phase cursor drills into the phase's first child session (Enter works on phase rows)", () => {

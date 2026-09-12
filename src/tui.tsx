@@ -914,13 +914,23 @@ export default Plugin.define({
         const mutedFg = (): string | object | undefined => tok(themeText().subdued)
         const errorFg = (): string | object | undefined => tok(themeText().feedback?.error?.default)
         const successFg = (): string | object | undefined => tok(themeText().feedback?.success?.default)
+        const warnFg = (): string | object | undefined => tok(themeText().feedback?.warning?.default)
         const focusFg = (): string | object | undefined =>
           tok(themeText().action?.primary?.default) ?? tok(themeText().default)
         const treeRowFg = (row: TreeRow): string | object | undefined => {
-          if (row.kind === "phase") return focusFg()
+          if (row.kind === "phase") {
+            // Phase rows aggregate their children: green all-succeeded, red
+            // nothing-succeeded, amber mixed bag, accent while running.
+            if (row.status === "succeeded") return successFg()
+            if (row.status === "failed") return errorFg()
+            if (row.status === "mixed") return warnFg()
+            if (row.status === "running") return focusFg()
+            return mutedFg()
+          }
           if (row.status === "succeeded") return successFg()
           if (row.status === "failed") return errorFg()
           if (row.status === "running") return focusFg()
+          if (row.status === "interrupted") return warnFg()
           return mutedFg()
         }
         if (input?.name === PANEL_NAME && !input.focused) {
@@ -1396,6 +1406,20 @@ export default Plugin.define({
         const treeLines = createMemo(() => paneView().treeLines)
         const treeRows = createMemo(() => paneView().treeWindow)
         const detailLines = createMemo(() => paneView().detailLines)
+        const selectedTreeRow = (): TreeRow | undefined => {
+          const m = model()
+          const cursor = m.treeSel?.cursor
+          if (!cursor) return undefined
+          return (m.tree ?? []).find((r) => r.kind === cursor.kind && r.id === cursor.id)
+        }
+        // Detail-pane accents: the status line takes the selected row's color
+        // (phase rows carry the aggregate), error lines render in error red.
+        const detailLineFg = (line: string): string | object | undefined => {
+          const row = selectedTreeRow()
+          if (row && row.status !== undefined && line.startsWith("status  ")) return treeRowFg(row)
+          if (line.startsWith("error")) return errorFg()
+          return undefined
+        }
         const treePageLabel = createMemo(() => paneView().treePageLabel)
         const focusedPane = (): InspectSelection["pane"] => sel().pane ?? "tree"
         const treeTitle = createMemo(() => paneView().treeTitle + (focusedPane() === "tree" ? " ◀" : ""))
@@ -1445,7 +1469,7 @@ export default Plugin.define({
                   <box width={paneView().cols.detail} flexShrink={0} flexDirection="column">
                     <text fg={focusedPane() === "detail" ? focusFg() : mutedFg()}>{detailTitle()}</text>
                     {detailLines().map((line) => (
-                      <text>{line}</text>
+                      <text fg={detailLineFg(line)}>{line}</text>
                     ))}
                   </box>
                 </box>

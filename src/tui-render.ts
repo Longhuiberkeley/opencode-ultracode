@@ -41,6 +41,33 @@ export const STATUS_DOT: Record<AgentStatus, string> = {
   interrupted: "■",
 }
 
+/** Phase-level aggregate: some children succeeded, some did not. */
+export const MIXED_DOT = "◐"
+
+/** Dot glyph for any row status, including the phase-only "mixed" aggregate. */
+export function statusDot(status: AgentStatus | "mixed" | undefined): string {
+  if (status === "mixed") return MIXED_DOT
+  if (status === undefined) return STATUS_DOT.pending
+  return STATUS_DOT[status]
+}
+
+/**
+ * Aggregate outcome of a phase's children for row coloring and dots:
+ * any running → running; nothing final yet → pending; all final and all
+ * succeeded → succeeded; all final with zero successes → failed; otherwise
+ * (successes mixed with failures/interrupts) → "mixed".
+ */
+export function phaseAggregateStatus(agents: readonly RunAgentView[]): AgentStatus | "mixed" | undefined {
+  if (agents.length === 0) return undefined
+  if (agents.some((a) => a.status === "running")) return "running"
+  const finals = agents.filter((a) => isFinalStatus(a.status))
+  if (finals.length === 0) return "pending"
+  const ok = finals.filter((a) => a.status === "succeeded").length
+  if (ok === finals.length) return "succeeded"
+  if (ok === 0) return "failed"
+  return "mixed"
+}
+
 export type SessionView = {
   id: string
   title: string
@@ -829,7 +856,8 @@ export type TreeRow = {
   label: string
   phase?: string
   sessionID?: string
-  status?: AgentStatus
+  /** Agent status, or the phase-level aggregate ("mixed" = successes + failures). */
+  status?: AgentStatus | "mixed"
   expanded?: boolean
   depth: number
 }
@@ -1072,6 +1100,7 @@ export function buildInspectTree(run: RunView, expanded: Readonly<Record<string,
       id: phaseId,
       label: phaseLineLabel(phaseId, agents),
       phase: phaseId,
+      status: phaseAggregateStatus(agents),
       expanded: isExp,
       depth: 0,
     })
@@ -1204,8 +1233,10 @@ export function agentDetailLines(agent: RunAgentView): string[] {
 export function phaseDetailLines(run: RunView, phaseId: string): string[] {
   const agents = phaseAgents(run, phaseId)
   const done = agents.filter((a) => isFinalStatus(a.status)).length
+  const agg = phaseAggregateStatus(agents)
   const lines = [
     phaseId,
+    ...(agg ? [`status  ${statusDot(agg)} ${agg}`] : []),
     `agents  ${done}/${agents.length}`,
     `tokens  ${phaseTokenSum(agents)}`,
   ]
@@ -1254,9 +1285,9 @@ export function formatTreeLines(
     const mark = selected ? ">" : " "
     if (row.kind === "phase") {
       const glyph = row.expanded === false ? "▸" : "▾"
-      return `${mark}${glyph} ${row.label}`
+      return `${mark}${glyph}${statusDot(row.status)} ${row.label}`
     }
-    const dot = row.status ? STATUS_DOT[row.status] : " "
+    const dot = statusDot(row.status)
     const next = tree[i + 1]
     const last = !next || next.kind === "phase" || (next.depth ?? 0) < (row.depth ?? 1)
     const branch = last ? "└─" : "├─"
