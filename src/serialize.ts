@@ -325,6 +325,7 @@ export function buildEnvelope(run: RunRecord, maxChars: number): RunEnvelope {
   if (run.scriptPath !== undefined) envelope.scriptPath = run.scriptPath
   if (run.error !== undefined) envelope.error = run.error
   if (run.stopReason !== undefined) envelope.stopReason = run.stopReason
+  if (run.resumedFrom !== undefined) envelope.resumedFrom = run.resumedFrom
   if (run.totalTokens !== undefined) envelope.tokens = run.totalTokens
 
   // Distinct effective models: makes pin drift (children on an unexpected

@@ -12,12 +12,12 @@ import type { Json, WorkflowMeta } from "./types.ts"
 import { WORKER_SOURCE } from "./worker-script.ts"
 
 export type BridgeFn = string
-export type EventKind = "progress" | "phase" | "log"
+export type EventKind = "progress" | "phase" | "log" | "checkpoint"
 
 export interface WorkerBridgeHandlers {
   /** Dispatch a bridge call (agent / workflow). Rejects on failure. */
   onCall(fn: BridgeFn, args: Json[]): Promise<Json>
-  /** progress/phase/log events from the script. */
+  /** progress/phase/log/checkpoint events from the script. */
   onEvent(kind: EventKind, data: Json): void
 }
 

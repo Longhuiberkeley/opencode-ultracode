@@ -35,7 +35,9 @@ Two input shapes (a union — anything else is rejected, extra keys included):
   "script": "<plain JS async function body>",
   "name": "optional display name",
   "meta": { "name": "...", "description": "...", "phases": ["..."], "requires": ["..."] },
-  "args": { "any": "JSON value" }
+  "args": { "any": "JSON value" },
+  "background": true,
+  "resumeFrom": "run_ab12cd34ef56"
 }
 ```
 
@@ -48,7 +50,7 @@ Two input shapes (a union — anything else is rejected, extra keys included):
 ### Saved run
 
 ```json
-{ "workflow": "deep-research", "args": { "topic": "..." } }
+{ "workflow": "deep-research", "args": { "topic": "..." }, "resumeFrom": "run_ab12cd34ef56" }
 ```
 
 - Loads the saved pair `<name>.js` + `<name>.json` (project dir beats personal dir; names match
@@ -132,6 +134,7 @@ agent(prompt: string, opts?: {
   label?: string    // short label for progress + run records, e.g. "verify:3"
   phase?: string    // phase grouping; explicit beats the ambient phase() label
   schema?: Json     // JSON Schema -> reply parsed+validated into .data
+  key?: string      // stable idempotency key -> warm-rerun replay (see below)
 }): Promise<{
   text: string      // concatenated text parts of the final assistant message
   sessionID: string
@@ -139,6 +142,7 @@ agent(prompt: string, opts?: {
   model?: { providerID: string; id: string } | null  // informational
   tokens?: TokenUsage
   data?: Json       // present iff opts.schema was given and validation succeeded
+  cachedFrom?: string  // source runID when this result was warm-replayed
 }>
 ```
 
@@ -199,7 +203,7 @@ const rated = await pipeline(files,
 // rated[i] === null  <=>  file i failed at some stage
 ```
 
-### `phase(name)` / `progress(text)`
+### `phase(name)` / `progress(text)` / `checkpoint(name, value?)`
 
 - `phase(name)`: sets the *ambient* phase label applied to subsequent `agent()` calls that omit
   `opts.phase`. Cheap, never throws. **Racy across concurrent branches** — when you `parallel()`,
@@ -209,6 +213,12 @@ const rated = await pipeline(files,
 - `progress(text)`: emits a human-readable line into the run's progress log (throttled ~500 ms,
   surfaced through tool progress and `/ultracode show`). Use it at phase boundaries and inside
   bounded loops ("pass 3: 4 issues left").
+- `checkpoint(name, value?)`: persists a named phase-boundary snapshot (a small JSON value) onto
+  the run record. Checkpoints are visible in `/ultracode show` and `ultracode_status`
+  (`checkpoints: [{name, at}]`; values only in `show`), capped at the newest 50. Call it after
+  each expensive phase with the merged intermediate — `checkpoint("survey-done", { signals: 12 })`
+  — so the boundary is inspectable and a warm rerun has a narrative of how far the first attempt
+  got. Values are sanitized (functions/symbols stripped) before they cross the worker boundary.
 
 ### `workflow(name, args?) -> Promise<Json>`
 
@@ -444,13 +454,68 @@ return { fixed: issues.length - open.length, open }
 *Notes:* always bound the loop AND break on no-progress; recheck with a *different* agent than
 the fixer (structural verification again).
 
-### 7. Compose via workflow()
+### 7. Gate + checkpoint between phases (cheap QC)
+
+*When:* an expensive phase consumes a cheap phase's output. One small reviewer guards the merge;
+the checkpoint marks the boundary. Never gate with a fan-out — the wall clock is the binding
+constraint, and the gate is one agent with a tiny schema.
+
+```js
+const GATE = {
+  type: "object", required: ["pass", "action"],
+  properties: {
+    pass: { type: "boolean" },
+    action: { type: "string", enum: ["continue", "retry", "abort"] },
+    issues: { type: "array", items: { type: "string" } },
+  },
+}
+phase("gate")
+const gate = await agent(
+  "QC this merged batch. pass=false only for concrete defects (empty, duplicated, off-scope).\n" +
+  JSON.stringify(merged.slice(0, 10)),
+  { agent: "explore", phase: "gate", schema: GATE })
+const g = gate && gate.data
+if (g && g.pass === false && g.action === "abort") {
+  throw new Error("gate rejected the merge: " + JSON.stringify(g.issues || []))
+}
+checkpoint("merge-done", { count: merged.length })
+```
+
+### 8. Warm reruns: keyed replay (`opts.key` + `resumeFrom`)
+
+*When:* a long run dies mid-flight (timeout, restart, stop) and rerunning from zero would re-pay
+for children that already succeeded. Pending-write semantics: a warm rerun never redoes
+successful children.
+
+- Give deterministic calls a stable `opts.key` (e.g. `"scout"`, `"lane:" + i`, `"verify:" + i`).
+  Keyed successes persist their replay identity (a digest over prompt + schema + resolved agent)
+  and their final text on the run record.
+- Warm-start the rerun: tool input `{ workflow, args, resumeFrom: "<prior runID>" }` (or inline
+  `{ script, args, resumeFrom }`), or `/ultracode rerun <runID> --warm`. A keyed call whose key
+  AND digest match a succeeded agent in the source run returns from cache — no session spawned,
+  no concurrency slot, no `maxAgents` consumption; the new run records it as `cached: true` and
+  the envelope carries `resumedFrom`.
+- Digest mismatch (you changed the prompt, schema, or agent id) falls through to a real spawn —
+  stale results are never silently reused. Unkeyed calls always spawn.
+- The replayed `AgentResult` keeps the original `sessionID` (provenance) and sets `cachedFrom` to
+  the source run id. Replayed children contribute **zero** tokens to the new run's totals.
+
+```js
+// in a long partitioned review, every deterministic child is keyed:
+const scout = await agent("Inventory " + area + "…", { agent: "explore", phase: "scout", key: "scout" })
+const reports = await parallel(lanes.map((lane, i) => () =>
+  agent("Review exactly these files…\n" + JSON.stringify(lane.files),
+    { agent: "explore", phase: "lanes", label: "lane" + (i + 1), key: "lane:" + i, schema: REPORT })))
+// interrupted at lane 5/8? rerun warm: scout + lanes 0-4 replay, 5-7 spawn.
+```
+
+### 9. Compose via workflow()
 
 *When:* the orchestration already exists as a saved workflow. See
 [`workflow()`](#workflowname-args--promisejson). Depth 1, shared budget — compose for reuse, not
 for depth.
 
-### 8. Write-safe serialization (the meta-pattern)
+### 10. Write-safe serialization (the meta-pattern)
 
 A clean context is **not** filesystem isolation. Parallel read-only agents are safe; parallel
 *write* agents race on the same worktree. All workflow children share ONE checkout: two write
@@ -629,6 +694,7 @@ What the `ultracode_run` tool returns to the parent session (always valid JSON):
 | `resultArtifactKey` | string | when truncated + persisted | Storage key of the persisted full result; page it with `ultracode_result` or print via `/ultracode result <runID>` (falls back to the run-record copy when the artifact is missing). |
 | `scriptPath` | string | when persisted | Absolute path of the run's script artifact. |
 | `workflowName` | string | when saved-run | The saved workflow that was executed. |
+| `resumedFrom` | string | when warm-started | Source run id this run replayed keyed results from (`resumeFrom` / `rerun --warm`). |
 | `error` | string | on failure | The failing error (script throw, validation, preflight, timeout, untrusted workflow). |
 | `stopReason` | string | when stopped/interrupted | e.g. `"server restart"` for reconciled orphans. |
 

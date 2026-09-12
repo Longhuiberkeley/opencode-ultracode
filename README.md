@@ -337,14 +337,14 @@ global (registered from the always-mounted chip component).
 | `/ultracode` | Dashboard: plugin/min-build line, active (including paused), recent, saved workflows. | **Ctrl+G** or palette `ultracode.inspect` opens the panel |
 | `/ultracode show [runID]` | Full run report (D11 cells + sessionID): status, agents, tokens, tools, script. | — (server parity floor) |
 | `/ultracode status [runID]` | Compact run state: runID, status, agents done/total, elapsed. Same implicit-target rule as `show`. | — |
-| `ultracode_status` tool | Read-only `{ runID? }` → `{ runID, status, agents: { done, total, failed }, startedAt, elapsedMs, children: [{ agentID, sessionID?, label?, phase?, status, waitingForPermission? }] }`; settled runs carry the result inline when it fits the cap, else `resultPreview` + `resultTruncated` + `resultChars` + `resultHint`. | — |
+| `ultracode_status` tool | Read-only `{ runID? }` → `{ runID, status, agents: { done, total, failed }, startedAt, elapsedMs, checkpoints?: [{name, at}], resumedFrom?, children: [{ agentID, sessionID?, label?, phase?, status, cached?, waitingForPermission? }] }`; settled runs carry the result inline when it fits the cap, else `resultPreview` + `resultTruncated` + `resultChars` + `resultHint`. | — |
 | `ultracode_result` tool | `{ runID, offset?, maxLength? }` → one page of a settled run's FULL result: `{ source, totalChars, offset, chunk, complete, nextOffset }`. Chunks are substrings of the compact JSON — concatenate from offset 0 following `nextOffset`, then parse. | — |
 | `ultracode_control` tool | Orchestrator control of **owned** runs: `{ action: "stop" \| "pause" \| "resume", runID? }`. Implicit target only when exactly one active owned run. Stop is recorded as the run's stop reason (`/ultracode show` displays it). | same verbs via panel keys |
 | `/ultracode result [runID]` | Print the **full** result of a run (artifact first, run-record fallback — serves truncated and background runs alike). | — |
 | `/ultracode stop [runID]` | Graceful stop: no new agent calls, children interrupted, worker terminated after a grace period. | `x` |
 | `/ultracode pause [runID]` | Close admission of new `agent()` calls; in-flight finish; watchdog suspended. | `p` (toggles pause) |
 | `/ultracode resume [runID]` | Reopen admission on a paused run. | `p` (toggles resume) |
-| `/ultracode rerun [runID] [argsJSON]` | Start a new run from a finished run's script (trust/digest checks if it was a named workflow). | — |
+| `/ultracode rerun [runID] [argsJSON]` | Start a new run from a finished run's script (trust/digest checks if it was a named workflow). Add `--warm` to warm-start: keyed succeeded agents replay from the source run's cache instead of respawning (see [Warm reruns](#warm-reruns)). | — |
 | `/ultracode save <name>` | Save `.opencode/workflows/<name>.js` as a named workflow (no prior run). | — |
 | `/ultracode save <runID> <name>` | Save a run's script as a named workflow (`.js` + `.json` manifest). | `s` (name via `dialog.prompt`) |
 | `/ultracode settings [runID]` | Next-run overlay plus that run's captured snapshot. | settings pane (`h`/`l`); `r` refreshes an **active** run |
@@ -511,6 +511,24 @@ G1 dialog-keys (expect **NO-GO** on beta-19271): `scripts/tui-probe.sh --dialog-
 Builds differ; the TUI version gate keys off the **binary** build, not the plugin package.
 The `/ultracode` dashboard first line repeats the plugin version and min OpenCode beta-19271.
 
+## Checkpoints and warm reruns
+
+Long runs die — timeouts, restarts, stops. Two primitives make that cheap instead of fatal:
+
+- **`checkpoint(name, value?)`** (script global): persists a named phase-boundary snapshot onto the
+  run record. Visible in `/ultracode show` (name, time, value preview) and `ultracode_status`
+  (`checkpoints`); newest 50 kept. Gates between phases stay one cheap reviewer child — never a
+  gate fan-out (the wall clock is the binding constraint).
+- **Keyed replay** (`opts.key` on `agent()` + `resumeFrom` tool input / `/ultracode rerun --warm`):
+  keyed successes persist a digest (prompt + schema + resolved agent) and their final text. A warm
+  rerun returns matching key+digest results from cache — no session, no concurrency slot, no
+  `maxAgents` consumption; the replay is recorded as `cached: true`, the envelope carries
+  `resumedFrom`, and replays contribute zero tokens to the new run. Pending-write semantics: a
+  resumed run never redoes successful children; changed prompts (digest mismatch) always spawn.
+
+Design grounding and the evidence behind "no direct child-to-child channels" live in
+`docs/DESIGN-DECISIONS.md` (D1).
+
 ## Cost control
 
 Workflows multiply tokens. Controls, in order of leverage:
@@ -607,8 +625,10 @@ list of available agents and guidance instead of spawning a broken run.
 - **Dialog-key overlay** — blocked on the host: `ui.dialog.show` owns the keymap (G1 NO-GO on
   beta-19271). Inspect stays panel-hosted until a host API delivers keys inside a dialog
   without leaking to the prompt.
-- **Resume** — checkpoint long runs and resume after interruption instead of replaying from zero.
-  (`/ultracode resume` today only reopens a *paused* in-process run.)
+- **Resume (partial)** — `checkpoint()` + keyed warm replay landed (v0.7.0): interrupted long runs
+  rerun warm via `resumeFrom` / `/ultracode rerun --warm`. Still future: mid-flight pause/resume
+  across server restarts (`/ultracode resume` today only reopens a *paused* in-process run), and
+  session continuation as a checkpoint-integrated conditional (D1, `docs/DESIGN-DECISIONS.md`).
 - **Worktree isolation** — give write agents separate git worktrees so they can run in parallel safely.
 - **QuickJS sandbox** — replace omission-based isolation with a real capability sandbox for scripts.
 - **npm publish** — local installs are self-contained copies that auto-load `tui.tsx` next to

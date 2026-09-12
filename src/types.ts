@@ -86,6 +86,8 @@ export interface InlineRunInput {
   args?: Json
   /** Default true: return after admission. Explicit false blocks until the envelope. */
   background?: boolean
+  /** Warm-start from a prior run: keyed succeeded agents replay from cache. */
+  resumeFrom?: string
 }
 
 /** Run a saved workflow by name (project dir beats personal dir). */
@@ -94,6 +96,8 @@ export interface SavedRunInput {
   args?: Json
   /** Default true: return after admission. Explicit false blocks until the envelope. */
   background?: boolean
+  /** Warm-start from a prior run: keyed succeeded agents replay from cache. */
+  resumeFrom?: string
 }
 
 export type WorkflowToolInput = InlineRunInput | SavedRunInput
@@ -148,6 +152,21 @@ export interface AgentRecord {
   data?: Json
   /** Unique tool-call count for this agent's session (from run-events reducer). */
   toolCalls?: number
+  /** Idempotency key from opts.key (present only for keyed calls). */
+  key?: string
+  /** sha256 over prompt + schema + agent — warm-rerun cache identity. */
+  promptDigest?: string
+  /** True when this record was replayed from a prior run (no session spawned). */
+  cached?: boolean
+  /** Final text (stored only for keyed calls, so future warm reruns can replay it). */
+  resultText?: string
+}
+
+/** Phase-boundary checkpoint persisted on the run record (checkpoint() global). */
+export interface CheckpointRecord {
+  name: string
+  at: number
+  value?: Json
 }
 
 export interface RunRecord {
@@ -179,6 +198,10 @@ export interface RunRecord {
   stopReason?: string
   /** Immutable effective options captured at startDetached. */
   effective?: CapturedSettings
+  /** Phase-boundary checkpoints (checkpoint() global; newest last, capped). */
+  checkpoints?: CheckpointRecord[]
+  /** Source runID when this run was started warm (resumeFrom / rerun --warm). */
+  resumedFrom?: string
   /**
    * Process ownership for orphan reconciliation. Optional/additive: records
    * without owner keep the legacy "flip on restart" behavior.
@@ -226,6 +249,8 @@ export interface RunEnvelope {
   workflowName?: string
   error?: string
   stopReason?: string
+  /** Source runID when this run warm-started from another (additive). */
+  resumedFrom?: string
 }
 
 // ---------------------------------------------------------------------------
@@ -241,6 +266,13 @@ export interface AgentOpts {
   phase?: string
   /** JSON Schema for structured output; agent() returns { data } parsed + validated. */
   schema?: Json
+  /**
+   * Stable idempotency key. On a warm rerun (resumeFrom / rerun --warm), a
+   * succeeded agent with the same key AND the same prompt digest is replayed
+   * from the source run's record instead of spawning — pending-write
+   * semantics: a resumed run never redoes successful children.
+   */
+  key?: string
 }
 
 export interface AgentResult {
@@ -252,6 +284,8 @@ export interface AgentResult {
   tokens?: TokenUsage
   /** Parsed structured output (present when opts.schema was given and validation succeeded). */
   data?: Json
+  /** Present when this result was replayed from a prior run's warm cache. */
+  cachedFrom?: string
 }
 
 /** The globals injected into the worker sandbox (see src/worker-script.ts). */
@@ -264,6 +298,8 @@ export interface WorkflowScriptGlobal {
   ): Promise<unknown[]>
   phase(name: string): void
   progress(text: string): void
+  /** Persist a named checkpoint (small JSON value) onto the run record. */
+  checkpoint(name: string, value?: Json): void
   workflow(name: string, args?: Json): Promise<Json>
   sleep(ms: number): Promise<void>
   console: { log(...args: unknown[]): void }
@@ -374,6 +410,8 @@ export interface Registry {
   addAgent(runID: string, init: Omit<AgentRecord, "id">): AgentRecord | undefined
   updateAgent(runID: string, agentID: string, patch: Partial<AgentRecord>): void
   getAgent(runID: string, agentID: string): AgentRecord | undefined
+  /** Append a phase-boundary checkpoint (bounded — oldest dropped). */
+  addCheckpoint(runID: string, name: string, value?: Json): void
   /** Record final result + totals. */
   finish(runID: string, outcome: {
     status: RunStatus
@@ -480,13 +518,13 @@ export interface Supervisor {
    * Execute a resolved run. Resolves only after all children are settled
    * (success, failure, stop, or timeout) — never while agents are live.
    */
-  start(input: { script: string; meta?: WorkflowMeta; args?: Json; name?: string; workflowName?: string }, parent: ParentContext): Promise<RunOutcome>
+  start(input: { script: string; meta?: WorkflowMeta; args?: Json; name?: string; workflowName?: string; resumeFrom?: string }, parent: ParentContext): Promise<RunOutcome>
   /**
    * Same spawn path as start(), but returns the runID immediately. `done`
    * settles with the envelope (never rejects after the run is created).
    */
   startDetached(
-    input: { script: string; meta?: WorkflowMeta; args?: Json; name?: string; workflowName?: string },
+    input: { script: string; meta?: WorkflowMeta; args?: Json; name?: string; workflowName?: string; resumeFrom?: string },
     parent: ParentContext,
   ): { runID: string; done: Promise<RunOutcome> }
   /** Replace next-run defaults. In-flight runs keep their startDetached snapshot. */

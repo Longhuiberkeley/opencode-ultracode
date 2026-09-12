@@ -4,7 +4,7 @@
  */
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { RegistryImpl } from "../src/registry.ts"
+import { MAX_CHECKPOINTS, RegistryImpl } from "../src/registry.ts"
 import type { AgentRecord, RunRecord, TokenUsage } from "../src/types.ts"
 import { emptyTokens, isActiveRunStatus } from "../src/types.ts"
 
@@ -398,4 +398,24 @@ test("reconcileOrphans never overwrites live in-memory runs", () => {
   assert.equal(flipped, 0)
   assert.equal(registry.get(live.id)?.script, "live")
   assert.equal(registry.get(live.id)?.status, "running")
+})
+
+test("addCheckpoint: appended in order, bounded at MAX_CHECKPOINTS (oldest dropped)", () => {
+  const { registry } = makeRegistry()
+  const run = registry.create({ parentSessionID: "ses_p", script: "return 1" })
+  for (let i = 0; i < 60; i++) registry.addCheckpoint(run.id, `cp${i}`, { i })
+  const cps = registry.get(run.id)!.checkpoints!
+  assert.equal(cps.length, MAX_CHECKPOINTS)
+  assert.equal(cps[0]!.name, "cp10", "oldest dropped past the cap")
+  assert.equal(cps[MAX_CHECKPOINTS - 1]!.name, "cp59")
+  assert.deepEqual(cps[0]!.value, { i: 10 })
+})
+
+test("addCheckpoint: unknown run and blank names are ignored", () => {
+  const { registry } = makeRegistry()
+  registry.addCheckpoint("run_nope", "x")
+  const run = registry.create({ parentSessionID: "ses_p", script: "return 1" })
+  registry.addCheckpoint(run.id, "   ")
+  registry.addCheckpoint(run.id, "ok")
+  assert.equal(registry.get(run.id)!.checkpoints!.length, 1)
 })

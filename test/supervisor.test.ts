@@ -645,3 +645,81 @@ test("startDetached persists effective snapshot so a settings query after reload
   assert.equal(outcome.envelope.status, "succeeded")
   await supervisor.dispose()
 })
+
+// ---------------------------------------------------------------------------
+// checkpoint() + keyed warm replay (resumeFrom)
+// ---------------------------------------------------------------------------
+
+test("supervisor: checkpoint(name, value) persists onto the run record and reports", async () => {
+  const ctx = makeSupervisor()
+  const outcome = await ctx.supervisor.start(
+    { script: 'checkpoint("scout-done", { files: 2 })\ncheckpoint("bare")\nreturn "ok"' },
+    ctx.parent,
+  )
+  assert.equal(outcome.envelope.status, "succeeded")
+  const run = ctx.registry.get(outcome.envelope.runID)!
+  assert.equal(run.checkpoints?.length, 2)
+  assert.equal(run.checkpoints![0]!.name, "scout-done")
+  assert.deepEqual(run.checkpoints![0]!.value, { files: 2 })
+  assert.equal(run.checkpoints![1]!.name, "bare")
+  assert.ok(run.checkpoints![1]!.value == null, "bare checkpoint carries no value (sanitized to null)")
+  assert.ok(ctx.reports.some((r) => r.includes("checkpoint: scout-done")))
+})
+
+test("supervisor: resumeFrom replays keyed succeeded agents without spawning; envelope carries resumedFrom", async () => {
+  const ctx = makeSupervisor()
+  ctx.sessions.push({
+    text: "WORK_DONE",
+    agent: "general",
+    tokens: { input: 10, output: 3, reasoning: 0, cache: { read: 0, write: 0 } },
+  })
+  const script = 'const r = await agent("do work", { key: "work", label: "worker" })\nreturn { said: r.text }'
+  const first = await ctx.supervisor.start({ script }, ctx.parent)
+  assert.equal(first.envelope.status, "succeeded")
+  assert.equal(first.envelope.agents.total, 1)
+  const sessionsAfterFirst = ctx.sessions.sessions.size
+  const sourceID = first.envelope.runID
+  assert.equal(ctx.registry.get(sourceID)!.agents[0]!.key, "work")
+
+  // Warm rerun: same script + same args shape — the keyed call replays.
+  const second = await ctx.supervisor.start({ script, resumeFrom: sourceID }, ctx.parent)
+  assert.equal(second.envelope.status, "succeeded")
+  assert.equal(second.envelope.resumedFrom, sourceID)
+  const result = second.envelope.result as { [key: string]: Json | undefined } | undefined
+  assert.equal(result?.said, "WORK_DONE", "replayed text comes from the cache")
+  assert.equal(second.envelope.agents.total, 1)
+  assert.equal(second.envelope.agents.succeeded, 1)
+  const warmRun = ctx.registry.get(second.envelope.runID)!
+  assert.equal(warmRun.agents[0]!.cached, true)
+  assert.equal(warmRun.agents[0]!.key, "work")
+  assert.equal(warmRun.resumedFrom, sourceID)
+  assert.equal(ctx.sessions.sessions.size, sessionsAfterFirst, "warm replay spawned no new session")
+  assert.deepEqual(second.envelope.tokens, { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } })
+})
+
+test("supervisor: resumeFrom with a changed prompt spawns fresh (digest mismatch)", async () => {
+  const ctx = makeSupervisor()
+  ctx.sessions.push({
+    text: "FIRST",
+    agent: "general",
+    tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
+  })
+  ctx.sessions.push({
+    text: "SECOND",
+    agent: "general",
+    tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
+  })
+  const first = await ctx.supervisor.start(
+    { script: 'const r = await agent("original prompt", { key: "k" })\nreturn r.text' },
+    ctx.parent,
+  )
+  assert.equal(first.envelope.status, "succeeded")
+  const second = await ctx.supervisor.start(
+    { script: 'const r = await agent("CHANGED prompt", { key: "k" })\nreturn r.text', resumeFrom: first.envelope.runID },
+    ctx.parent,
+  )
+  assert.equal(second.envelope.status, "succeeded")
+  assert.equal(second.envelope.result, "SECOND", "digest mismatch spawned a real child")
+  const warmRun = ctx.registry.get(second.envelope.runID)!
+  assert.equal(warmRun.agents[0]!.cached, undefined)
+})

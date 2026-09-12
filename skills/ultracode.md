@@ -5,9 +5,11 @@ worker. Every `agent(...)` call spawns a REAL subagent session with its own cont
 own model. The script returns a small JSON value; only that value plus a compact run envelope
 re-enters your session. Child transcripts never touch your context.
 
-Invoke the `ultracode_run` tool with `{ script, name?, meta?, args?, background? }` for an inline run, or
-`{ workflow: "name", args?, background? }` to run a saved workflow. `meta` and `args` are injected into the
-script as globals. Runs are background by default: the tool returns immediately after admission
+Invoke the `ultracode_run` tool with `{ script, name?, meta?, args?, background?, resumeFrom? }` for an inline
+run, or `{ workflow: "name", args?, background?, resumeFrom? }` to run a saved workflow. `meta` and `args` are injected
+into the script as globals. `resumeFrom` (a prior runID) warm-starts: keyed succeeded agents replay
+from cache, so an interrupted long run costs only its unfinished tail. Runs are background by
+default: the tool returns immediately after admission
 so the parent chat stays available; pass `background: false` only when you need the envelope
 in-call. Progress and status are scoped to that run
 (`ultracode_status`, inspect, `/ultracode status`). When the run settles, a one-line notice lands
@@ -83,11 +85,12 @@ rejected. Injected globals, nothing else:
 
 | Global | Call | Semantics |
 | --- | --- | --- |
-| `agent` | `agent(prompt, opts?)` | Spawns one subagent and waits. Resolves `{ text, sessionID, agent, model, tokens, data? }`. `opts`: `agent` (agent id), `label`, `phase`, `schema`. With `opts.schema`, extracted JSON lands in `.data`, validated and repaired once. |
+| `agent` | `agent(prompt, opts?)` | Spawns one subagent and waits. Resolves `{ text, sessionID, agent, model, tokens, data?, cachedFrom? }`. `opts`: `agent` (agent id), `label`, `phase`, `schema`, `key`. With `opts.schema`, extracted JSON lands in `.data`, validated and repaired once. `opts.key` (stable id, e.g. `"lane:3"`) marks the call replayable: on a warm rerun (`resumeFrom` tool input, or `/ultracode rerun <runID> --warm`) a succeeded call with the same key AND the same prompt+schema+agent digest returns from cache — no session, no cap hit. Key every deterministic call in long runs. |
 | `parallel` | `parallel(thunks)` | Barrier over thunks. A thunk that throws resolves as `null`; siblings still run. |
 | `pipeline` | `pipeline(items, ...stages)` | Runs every item through the stages in order. A failing item becomes `null`; other items are unaffected. |
 | `phase` | `phase(name)` | Sets the ambient phase label for progress grouping. |
 | `progress` | `progress(text)` | Emits a progress line into the run log. |
+| `checkpoint` | `checkpoint(name, value?)` | Persists a named phase-boundary snapshot (small JSON) onto the run record — visible in `/ultracode show` and `ultracode_status` (`checkpoints`). Call it after each expensive phase with the merged intermediate (`checkpoint("survey-done", { signals: merged.length })`); it survives interruption and marks where a warm rerun can resume from. |
 | `workflow` | `workflow(name, args?)` | Runs a SAVED workflow, resolves its JSON return. Depth 1 only: it may not compose another. |
 | `sleep` | `sleep(ms)` | Pause, capped at 60000 ms per call. |
 | `console` | `console.log(x)` | Buffered into the run log. |
@@ -128,6 +131,11 @@ run legitimately needs it.
 11. **Verify before you trust.** Generators fan out, independent verifiers check, a skeptic pass
     overturns weak survivals. If the verifier shares the generator's failure modes, the workflow
     is theater.
+12. **Gate expensive phases; checkpoint the merge.** Between a cheap phase and an expensive one,
+    run ONE small reviewer (`{ pass, issues, action }` schema) over the merged intermediate and
+    abort or retry on failure — a bad merge must not fund a synthesis fan-out. Then
+    `checkpoint(name, value)` so the boundary survives interruption. Key the calls you would not
+    want to pay for twice.
 
 ## Patterns
 
@@ -284,6 +292,27 @@ for (let pass = 1; pass <= 5 && open.length > 0; pass++) {
 }
 return { fixed: issues.length - open.length, open }
 ```
+
+### Gate + checkpoint between phases (cheap QC; resumable boundaries)
+
+```
+// after an expensive phase produces the merged intermediate `merged`:
+const GATE = { type: "object", required: ["pass", "action"], properties: {
+  pass: { type: "boolean" }, action: { type: "string", enum: ["continue", "retry", "abort"] },
+  issues: { type: "array", items: { type: "string" } } } }
+const gate = await agent("QC this batch of findings. pass=false only for concrete defects " +
+  "(empty, duplicated, off-scope).\n" + JSON.stringify(merged.slice(0, 10)),
+  { agent: "explore", phase: "gate", schema: GATE })
+if (gate && gate.data && gate.data.pass === false && gate.data.action === "abort") {
+  throw new Error("gate rejected the merge: " + JSON.stringify(gate.data.issues || []))
+}
+checkpoint("merge-done", { count: merged.length })
+// downstream agents get opts.key so a warm rerun never pays for them twice:
+const out = await agent("Synthesize...", { agent: "general", phase: "synthesize", key: "synthesize:v1" })
+```
+
+One small reviewer per boundary — never a gate fan-out (wall clock is the binding constraint).
+`checkpoint` values are capped (50 kept) and visible in `/ultracode show` + `ultracode_status`.
 
 ### Compose a saved workflow (depth 1)
 

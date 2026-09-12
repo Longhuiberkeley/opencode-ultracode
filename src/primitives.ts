@@ -12,6 +12,7 @@ import type {
   AgentResult,
   Json,
   Registry,
+  RunRecord,
   SavedWorkflow,
   Storage,
   WorkflowMeta,
@@ -20,8 +21,63 @@ import { clampConcurrency } from "./types.ts"
 import type { SessionDriver } from "./sessions.ts"
 import { AgentCallError } from "./sessions.ts"
 import { validateScriptSource } from "./worker-script.ts"
+import { createHash } from "node:crypto"
 
 export const PROGRESS_THROTTLE_MS = 500
+
+// ---------------------------------------------------------------------------
+// Keyed warm replay (resumeFrom / rerun --warm)
+// ---------------------------------------------------------------------------
+
+/** A succeeded keyed agent result replayable on a warm rerun. */
+export interface WarmCacheEntry {
+  /** sha256 digest the caller's prompt+schema+agent must match to replay. */
+  digest: string
+  sourceRunID: string
+  result: AgentResult
+}
+
+/**
+ * Warm-cache identity: prompt + schema + resolved agent. Everything that
+ * changes what the child would produce must change the digest.
+ */
+export function agentCacheKey(prompt: string, opts: AgentOpts, defaultAgent: string): string {
+  return `${prompt}\u0000${JSON.stringify(opts.schema ?? null)}\u0000${opts.agent ?? defaultAgent}`
+}
+
+/** Digest used for keyed replay matching (sha256 hex). */
+export function agentCacheDigest(prompt: string, opts: AgentOpts, defaultAgent: string): string {
+  return createHash("sha256").update(agentCacheKey(prompt, opts, defaultAgent), "utf8").digest("hex")
+}
+
+/**
+ * Build a warm cache from a source run's persisted record: every SUCCEEDED
+ * keyed agent with a stored digest and a stored payload (data or text).
+ * Later duplicates of the same key win (latest success). Pending-write
+ * semantics: failed/interrupted children are never replayed.
+ */
+export function buildWarmCache(source: RunRecord | undefined): Map<string, WarmCacheEntry> {
+  const cache = new Map<string, WarmCacheEntry>()
+  if (!source) return cache
+  for (const a of source.agents as AgentRecord[]) {
+    if (a.status !== "succeeded" || !a.key || !a.promptDigest) continue
+    if (a.data === undefined && a.resultText === undefined) continue
+    cache.set(a.key, {
+      digest: a.promptDigest,
+      sourceRunID: source.id,
+      result: {
+        text: typeof a.resultText === "string" ? a.resultText : "",
+        sessionID: typeof a.sessionID === "string" ? a.sessionID : "",
+        ...(a.effectiveAgent !== undefined ? { agent: a.effectiveAgent } : {}),
+        ...(a.effectiveModel !== undefined ? { model: a.effectiveModel } : {}),
+        ...(a.tokens !== undefined ? { tokens: a.tokens } : {}),
+        ...(a.data !== undefined ? { data: a.data } : {}),
+        cachedFrom: source.id,
+      },
+    })
+  }
+  return cache
+}
 
 // ---------------------------------------------------------------------------
 // FIFO semaphore (abortable)
@@ -117,6 +173,10 @@ export interface AgentRunnerOptions {
   pinForAgent?: (agentId: string) => Promise<{ providerID: string; id: string; variant?: string } | undefined>
   /** Run-wide abort signal: rejects queued semaphore waits + aborts in-flight sessions. */
   signal?: AbortSignal
+  /** Warm cache for keyed replay (resumeFrom); a hit spawns no session. */
+  warmCache?: ReadonlyMap<string, WarmCacheEntry>
+  /** Digest for keyed replay identity (defaults to sha256-based agentCacheDigest). */
+  digest?: (prompt: string, opts: AgentOpts) => string
   /** Clock injection for throttle tests. */
   now?: () => number
 }
@@ -141,6 +201,8 @@ export class AgentRunner {
     | ((agentId: string) => Promise<{ providerID: string; id: string; variant?: string } | undefined>)
     | undefined
   private readonly signal?: AbortSignal
+  private readonly warmCache: ReadonlyMap<string, WarmCacheEntry> | undefined
+  private readonly digestFn: (prompt: string, opts: AgentOpts) => string
   private readonly now: () => number
   private started = 0
   private lastReportAt = 0
@@ -157,6 +219,9 @@ export class AgentRunner {
     this.ambientPhase = options.ambientPhase
     this.pinForAgent = options.pinForAgent
     this.signal = options.signal
+    this.warmCache = options.warmCache
+    this.digestFn =
+      options.digest ?? ((prompt, opts) => agentCacheDigest(prompt, opts, this.defaultAgent))
     this.now = options.now ?? Date.now
   }
 
@@ -173,6 +238,38 @@ export class AgentRunner {
   }
 
   async call(prompt: string, opts: AgentOpts = {}): Promise<AgentResult> {
+    const key = typeof opts.key === "string" ? opts.key.trim() : ""
+    const digest = key ? this.digestFn(prompt, opts) : undefined
+
+    // Keyed warm replay: a succeeded agent with the same key AND the same
+    // prompt digest returns from the source run — no session spawned, no cap
+    // consumed. The replay is recorded (cached: true) so this run can itself
+    // be warm-restarted later.
+    if (key && digest && this.warmCache) {
+      const entry = this.warmCache.get(key)
+      if (entry && entry.digest === digest) {
+        const phase = opts.phase ?? this.ambientPhase() ?? "workflow"
+        this.registry.addAgent(this.runID, {
+          label: opts.label,
+          phase,
+          requestedAgent: opts.agent ?? this.defaultAgent,
+          status: "succeeded",
+          startedAt: Date.now(),
+          endedAt: Date.now(),
+          key,
+          promptDigest: digest,
+          cached: true,
+          sessionID: entry.result.sessionID || undefined,
+          effectiveAgent: entry.result.agent,
+          effectiveModel: entry.result.model ?? undefined,
+          data: entry.result.data,
+          resultText: entry.result.text,
+        })
+        this.maybeReport()
+        return { ...entry.result }
+      }
+    }
+
     if (this.started >= this.maxAgents) {
       throw new Error(`agent cap reached (${this.maxAgents})`)
     }
@@ -240,6 +337,9 @@ export class AgentRunner {
         tokens: result.tokens,
         data: result.data,
         endedAt: Date.now(),
+        // Keyed calls persist replay identity (and the text a future warm
+        // rerun needs) so resumeFrom can skip this child next time.
+        ...(key && digest ? { key, promptDigest: digest, resultText: result.text } : {}),
       })
       this.maybeReport()
       return result

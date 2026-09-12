@@ -433,6 +433,13 @@ export class FakeRegistry implements Registry {
     return this.runs.get(runID)?.agents.find((a) => a.id === agentID)
   }
 
+  addCheckpoint(runID: string, name: string, value?: Json): void {
+    const run = this.runs.get(runID)
+    if (!run) return
+    run.checkpoints = run.checkpoints ?? []
+    run.checkpoints.push({ name, at: Date.now(), ...(value !== undefined ? { value } : {}) })
+  }
+
   finish(runID: string, outcome: {
     status: RunStatus
     result?: Json

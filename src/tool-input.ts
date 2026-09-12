@@ -108,6 +108,23 @@ export function resolveBackground(input: { background?: boolean }): boolean {
   return input.background !== false
 }
 
+/** runIDs look like "run_" + 12 base32 chars — loose shape check for resumeFrom. */
+const RUN_ID_RE = /^run_[a-z0-9]{4,32}$/i
+
+function validateResumeFrom(
+  raw: Record<string, unknown>,
+): { ok: true; resumeFrom?: string } | { ok: false; error: string } {
+  if (!has(raw, "resumeFrom")) return { ok: true }
+  const value = raw["resumeFrom"]
+  if (typeof value !== "string" || !RUN_ID_RE.test(value.trim())) {
+    return {
+      ok: false,
+      error: `"resumeFrom" must be a run id like "run_ab12cd34ef56", got ${typeof value === "string" ? JSON.stringify(value) : typeOf(value)}`,
+    }
+  }
+  return { ok: true, resumeFrom: value.trim() }
+}
+
 export function validateToolInput(raw: unknown): ToolInputResult {
   if (!isObj(raw)) {
     return { ok: false, error: `input must be an object, got ${typeOf(raw)}` }
@@ -122,7 +139,7 @@ export function validateToolInput(raw: unknown): ToolInputResult {
 
   if (hasWorkflow) {
     // ---- saved-workflow shape ----
-    const extra = rejectExtras(raw, new Set(["workflow", "args", "background"]))
+    const extra = rejectExtras(raw, new Set(["workflow", "args", "background", "resumeFrom"]))
     if (extra) return { ok: false, error: extra }
 
     const workflow = raw["workflow"]
@@ -141,16 +158,19 @@ export function validateToolInput(raw: unknown): ToolInputResult {
 
     const background = validateBackground(raw)
     if (!background.ok) return { ok: false, error: background.error }
+    const resume = validateResumeFrom(raw)
+    if (!resume.ok) return { ok: false, error: resume.error }
 
     const input: SavedRunInput = { workflow }
     if (raw["args"] !== undefined) input.args = args.args
     if (background.background !== undefined) input.background = background.background
+    if (resume.resumeFrom !== undefined) input.resumeFrom = resume.resumeFrom
     return { ok: true, input }
   }
 
   if (hasScript) {
     // ---- inline-script shape ----
-    const extra = rejectExtras(raw, new Set(["script", "name", "meta", "args", "background"]))
+    const extra = rejectExtras(raw, new Set(["script", "name", "meta", "args", "background", "resumeFrom"]))
     if (extra) return { ok: false, error: extra }
 
     const script = raw["script"]
@@ -191,12 +211,15 @@ export function validateToolInput(raw: unknown): ToolInputResult {
 
     const background = validateBackground(raw)
     if (!background.ok) return { ok: false, error: background.error }
+    const resume = validateResumeFrom(raw)
+    if (!resume.ok) return { ok: false, error: resume.error }
 
     const input: InlineRunInput = { script }
     if (name !== undefined) input.name = name as string
     if (meta !== undefined) input.meta = meta
     if (raw["args"] !== undefined) input.args = args.args
     if (background.background !== undefined) input.background = background.background
+    if (resume.resumeFrom !== undefined) input.resumeFrom = resume.resumeFrom
     return { ok: true, input }
   }
 

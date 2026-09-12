@@ -677,7 +677,7 @@ export default Plugin.define({
                 const background = resolveBackground(input)
                 return await executeWorkflowLaunch(
                   supervisor,
-                  { script, meta, args, name, workflowName },
+                  { script, meta, args, name, workflowName, resumeFrom: input.resumeFrom },
                   parent,
                   background,
                   background

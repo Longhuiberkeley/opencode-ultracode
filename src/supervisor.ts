@@ -30,8 +30,8 @@ import { freezeEffective, panelSettingsFrom, remainingTimeoutMs } from "./settin
 import { buildEnvelope, resultFits } from "./serialize.ts"
 import { createSessionDriver } from "./sessions.ts"
 import type { SessionDriver } from "./sessions.ts"
-import { AgentRunner, getWorkflowComposer, storageWorkflowLoader } from "./primitives.ts"
-import type { WorkflowLoader } from "./primitives.ts"
+import { AgentRunner, buildWarmCache, getWorkflowComposer, storageWorkflowLoader } from "./primitives.ts"
+import type { WarmCacheEntry, WorkflowLoader } from "./primitives.ts"
 import { validateScriptSource } from "./worker-script.ts"
 import { spawnWorker } from "./worker-host.ts"
 import type { WorkerHandle, WorkerResult } from "./worker-host.ts"
@@ -170,7 +170,7 @@ export class SupervisorImpl implements Supervisor {
   // -------------------------------------------------------------------------
 
   async start(
-    input: { script: string; meta?: WorkflowMeta; args?: Json; name?: string; workflowName?: string },
+    input: { script: string; meta?: WorkflowMeta; args?: Json; name?: string; workflowName?: string; resumeFrom?: string },
     parent: ParentContext,
   ): Promise<RunOutcome> {
     const { done } = this.startDetached(input, parent)
@@ -178,7 +178,7 @@ export class SupervisorImpl implements Supervisor {
   }
 
   startDetached(
-    input: { script: string; meta?: WorkflowMeta; args?: Json; name?: string; workflowName?: string },
+    input: { script: string; meta?: WorkflowMeta; args?: Json; name?: string; workflowName?: string; resumeFrom?: string },
     parent: ParentContext,
   ): { runID: string; done: Promise<RunOutcome> } {
     if (this.disposed) throw new Error("supervisor disposed")
@@ -203,6 +203,7 @@ export class SupervisorImpl implements Supervisor {
       workflowName: input.workflowName,
     })
     const runID = record.id
+    if (input.resumeFrom) record.resumedFrom = input.resumeFrom
     const effective = freezeEffective(this.options)
     record.effective = panelSettingsFrom(effective)
     this.registry.persistNow(runID)
@@ -218,7 +219,7 @@ export class SupervisorImpl implements Supervisor {
 
   private async executeRun(
     record: RunRecord,
-    input: { script: string; meta?: WorkflowMeta; args?: Json; name?: string; workflowName?: string },
+    input: { script: string; meta?: WorkflowMeta; args?: Json; name?: string; workflowName?: string; resumeFrom?: string },
     parent: ParentContext,
     state: RunState,
   ): Promise<RunOutcome> {
@@ -232,6 +233,23 @@ export class SupervisorImpl implements Supervisor {
         if (scriptPath) record.scriptPath = scriptPath
       } catch {
         // artifact persistence is best-effort
+      }
+
+      // Warm start (resumeFrom): replay keyed succeeded agents from the
+      // source run instead of respawning them.
+      let warmCache: ReadonlyMap<string, WarmCacheEntry> | undefined
+      if (input.resumeFrom) {
+        const source =
+          this.registry.get(input.resumeFrom) ??
+          (() => {
+            try {
+              return this.storage.loadRuns().find((r) => r.id === input.resumeFrom)
+            } catch {
+              return undefined
+            }
+          })()
+        warmCache = buildWarmCache(source)
+        this.safeParentReport(state, `warm start from ${input.resumeFrom}: ${warmCache.size} keyed result(s) replayable`)
       }
 
       // 3.-4. AgentRunner over a driver wrapper that tracks child sessions,
@@ -293,6 +311,7 @@ export class SupervisorImpl implements Supervisor {
         ambientPhase: () => state.ambientPhase,
         ...(this.pinForAgent ? { pinForAgent: this.pinForAgent } : {}),
         signal: state.controller.signal,
+        ...(warmCache ? { warmCache } : {}),
       })
 
       // 5. Spawn the worker with bridge dispatch.
@@ -511,6 +530,10 @@ export class SupervisorImpl implements Supervisor {
     if (typeof o.label === "string") opts.label = o.label
     if (typeof o.phase === "string") opts.phase = o.phase
     if (o.schema !== undefined) opts.schema = o.schema
+    if (typeof o.key === "string") {
+      const key = o.key.trim().slice(0, 128)
+      if (key) opts.key = key
+    }
     return opts
   }
 
@@ -549,6 +572,22 @@ export class SupervisorImpl implements Supervisor {
         parent.report(typeof data === "string" ? data : String(data ?? ""))
       } catch {
         // reporting must never break a run
+      }
+      return
+    }
+    if (kind === "checkpoint") {
+      const o =
+        data !== null && typeof data === "object" && !Array.isArray(data)
+          ? (data as { name?: Json; value?: Json })
+          : {}
+      const name = typeof o.name === "string" ? o.name : ""
+      if (name) {
+        this.registry.addCheckpoint(state.runID, name, o.value)
+        try {
+          parent.report(`checkpoint: ${name}`)
+        } catch {
+          // reporting must never break a run
+        }
       }
       return
     }

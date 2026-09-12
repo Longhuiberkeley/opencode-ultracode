@@ -261,3 +261,19 @@ test("result tool input: runID required; offset/maxLength validated; extras reje
   assert.equal(extra.ok, false)
   if (!extra.ok) assert.match(extra.error, /unexpected key "nope"/)
 })
+
+test("resumeFrom: valid run id accepted on both union branches; junk rejected", () => {
+  const saved = validateToolInput({ workflow: "deep-research", resumeFrom: "run_4uqmzwttnxcm" })
+  assert.equal(saved.ok, true)
+  if (saved.ok) assert.equal(saved.input.resumeFrom, "run_4uqmzwttnxcm")
+
+  const inline = validateToolInput({ script: "return 1", resumeFrom: "run_abc123def456" })
+  assert.equal(inline.ok, true)
+  if (inline.ok) assert.equal(inline.input.resumeFrom, "run_abc123def456")
+
+  for (const bad of ["nope", "run_", "run_XX!", 42, null]) {
+    const check = validateToolInput({ script: "return 1", resumeFrom: bad })
+    assert.equal(check.ok, false, `resumeFrom=${JSON.stringify(bad)} must be rejected`)
+    if (!check.ok) assert.match(check.error, /resumeFrom/)
+  }
+})

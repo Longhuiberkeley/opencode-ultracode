@@ -13,7 +13,7 @@ import type { Json } from "../src/types.ts"
 // ---------------------------------------------------------------------------
 
 interface WorkerEvent {
-  kind: "progress" | "phase" | "log"
+  kind: "progress" | "phase" | "log" | "checkpoint"
   data: Json
 }
 
@@ -393,4 +393,64 @@ test("worker: uncloneable bridge arg rejects agent() promptly (no hang)", async 
   assert.equal(result.ok, true)
   assert.match(String(result.value), /ultracode: bridge call could not be delivered/)
   assert.ok(Date.now() - started < 2000, "rejected promptly — no hang")
+})
+
+// ---------------------------------------------------------------------------
+// checkpoint() global
+// ---------------------------------------------------------------------------
+
+test("worker: checkpoint(name, value) posts a checkpoint event with sanitized value", async () => {
+  const result = await runInWorker(`
+    checkpoint("after-scout", { files: 3, nested: { ok: true } })
+    checkpoint("empty")
+    checkpoint("bad-value", function () {})
+    return "done"
+  `)
+  assert.equal(result.ok, true)
+  const checkpoints = result.events.filter((e) => e.kind === "checkpoint")
+  assert.equal(checkpoints.length, 3)
+  assert.deepEqual(checkpoints[0]!.data, { name: "after-scout", value: { files: 3, nested: { ok: true } } })
+  assert.deepEqual(checkpoints[1]!.data, { name: "empty", value: null })
+  // functions sanitize to null payloads, not a crash
+  assert.deepEqual(checkpoints[2]!.data, { name: "bad-value", value: null })
+})
+
+// ---------------------------------------------------------------------------
+// validateScriptSource: unterminated strings + regex literals
+// ---------------------------------------------------------------------------
+
+test("validation: unterminated single/double-quoted string is rejected with a line number", () => {
+  const bad = 'const a = "starts here\nconst b = 2\nreturn b'
+  const check = validateScriptSource(bad)
+  assert.equal(check.ok, false)
+  if (!check.ok) {
+    assert.match(check.error, /unterminated string literal starting at line 1/)
+    assert.match(check.error, /cannot span lines/)
+  }
+  const badLate = 'const ok = "fine"\nconst broken = \'oops\nreturn ok'
+  const check2 = validateScriptSource(badLate)
+  assert.equal(check2.ok, false)
+  if (!check2.ok) assert.match(check2.error, /line 2/)
+})
+
+test("validation: template literals may span lines", () => {
+  assert.equal(validateScriptSource("const s = `line one\nline two`; return s").ok, true)
+})
+
+test("validation: regex literals with quotes inside are fine (regex vs division heuristic)", () => {
+  // quote inside a char class — must NOT be read as a string start
+  assert.equal(validateScriptSource('const clean = s.replace(/["\']/g, ""); return clean').ok, true)
+  // division after values stays division; regex after = stays regex
+  assert.equal(validateScriptSource("const half = total / 2; return half / count;").ok, true)
+  assert.equal(validateScriptSource('const hit = /a[b/ ]c/g.test("x"); return hit').ok, true)
+  // regex after return keyword
+  assert.equal(validateScriptSource("function f(x) { return /re/.test(x) }\nreturn f").ok, true)
+  // number-adjacent division
+  assert.equal(validateScriptSource("const m = 10 / 5 / 2; return m").ok, true)
+})
+
+test("validation: quote right after value position still diagnosed as unterminated when it spans lines", () => {
+  // `dont` identifier then an apostrophe opening a "string" that hits EOL
+  const check = validateScriptSource("const dont = 1\nconst s = dont't\n")
+  assert.equal(check.ok, false)
 })

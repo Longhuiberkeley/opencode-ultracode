@@ -3,6 +3,7 @@
  * and session.tool.* → toolCalls wiring. Plugin-free so unit tests cover it.
  */
 import { agentCells, compactCount, compactElapsed, compactTokens, runHeaderCells } from "./run-format.ts"
+import { MAX_CHECKPOINTS } from "./registry.ts"
 import { compactStringify, safeSlice } from "./serialize.ts"
 import { reduceToolEvent, toolCallsFor, type ToolEvent, type ToolEventState } from "./run-events.ts"
 import { normalizePath, sha256 } from "./storage.ts"
@@ -84,7 +85,7 @@ export const NESTED_RUN_REFUSED =
   "cannot start a run from inside an active workflow session — use /ultracode from the parent"
 
 /** Plugin package version shown on the bare /ultracode dashboard. */
-export const PLUGIN_VERSION = "0.6.1"
+export const PLUGIN_VERSION = "0.7.0"
 /** Oldest OpenCode binary build the inspect TUI is gated on (A7 / D7). */
 export const MIN_SUPPORTED_BUILD = 19271
 
@@ -242,7 +243,7 @@ export function resolveRunStatus(
  */
 export async function executeWorkflowLaunch(
   supervisor: Pick<Supervisor, "start" | "startDetached">,
-  input: { script: string; meta?: WorkflowMeta; args?: Json; name?: string; workflowName?: string },
+  input: { script: string; meta?: WorkflowMeta; args?: Json; name?: string; workflowName?: string; resumeFrom?: string },
   parent: ParentContext,
   background: boolean,
   onSettled?: (outcome: RunOutcome) => void,
@@ -282,6 +283,8 @@ export type StatusChildView = {
   tokens?: { input: number; output: number; reasoning: number }
   /** Unique tool calls this child made, when known. */
   toolCalls?: number
+  /** True when this child was replayed from a prior run's warm cache. */
+  cached?: boolean
 }
 
 /**
@@ -301,6 +304,9 @@ export function enrichStatusPayload(
   children: StatusChildView[]
   childrenTruncated?: boolean
   childrenOmitted?: number
+  /** Phase-boundary checkpoints (name + timestamp only; values stay in the record). */
+  checkpoints?: Array<{ name: string; at: number }>
+  resumedFrom?: string
   result?: Json
   resultPreview?: string
   /** True when THIS payload does not contain the complete result. */
@@ -316,6 +322,7 @@ export function enrichStatusPayload(
   const out: Record<string, unknown> = { ...payload }
   if (run.name) out["name"] = run.name
   if (run.workflowName) out["workflowName"] = run.workflowName
+  if (run.resumedFrom) out["resumedFrom"] = run.resumedFrom
   out["elapsedMs"] = Math.max(0, (run.endedAt ?? now) - run.startedAt)
   const children: StatusChildView[] = run.agents.slice(0, STATUS_CHILDREN_LIMIT).map((a) => {
     const child: StatusChildView = { agentID: a.id, status: a.status }
@@ -326,12 +333,16 @@ export function enrichStatusPayload(
       child.tokens = { input: a.tokens.input, output: a.tokens.output, reasoning: a.tokens.reasoning }
     }
     if (typeof a.toolCalls === "number") child.toolCalls = a.toolCalls
+    if (a.cached) child.cached = true
     return child
   })
   out["children"] = children
   if (run.agents.length > STATUS_CHILDREN_LIMIT) {
     out["childrenTruncated"] = true
     out["childrenOmitted"] = run.agents.length - STATUS_CHILDREN_LIMIT
+  }
+  if (run.checkpoints && run.checkpoints.length > 0) {
+    out["checkpoints"] = run.checkpoints.map((cp) => ({ name: cp.name, at: cp.at }))
   }
   if (!isActiveRunStatus(run.status) && run.result !== undefined) {
     // Compact length decides delivery — NOT the persisted resultTruncated flag
@@ -511,6 +522,7 @@ export function formatShowRun(run: RunRecord, extra?: { pending?: readonly strin
     )
   }
   if (run.scriptPath) lines.push(`- script artifact: ${run.scriptPath}`)
+  if (run.resumedFrom) lines.push(`- warm start from: \`${run.resumedFrom}\``)
   if (run.resultTruncated && run.resultArtifactKey) {
     lines.push(
       `- result truncated — full result: /ultracode result \`${run.id}\` (artifact key \`${run.resultArtifactKey}\`)`,
@@ -538,6 +550,19 @@ export function formatShowRun(run: RunRecord, extra?: { pending?: readonly strin
     lines.push("")
     lines.push("**Waiting for permission**")
     lines.push(...extra.pending)
+  }
+  if (run.checkpoints && run.checkpoints.length > 0) {
+    lines.push("")
+    lines.push(`### Checkpoints (${run.checkpoints.length}${run.checkpoints.length >= MAX_CHECKPOINTS ? ", capped" : ""})`)
+    lines.push("")
+    for (const cp of run.checkpoints) {
+      const value =
+        cp.value === undefined
+          ? ""
+          : ` — ${JSON.stringify(cp.value).slice(0, 120)}${JSON.stringify(cp.value).length > 120 ? "…" : ""}`
+      const at = new Date(cp.at).toISOString().slice(11, 19)
+      lines.push(`- \`${cp.name}\` (${at} UTC)${value}`)
+    }
   }
   if (run.result !== undefined && !run.resultTruncated) {
     lines.push("")
@@ -1091,7 +1116,11 @@ async function resumeRun(deps: CommandDeps, sessionID: string, runID: string): P
 }
 
 async function rerunRun(deps: CommandDeps, sessionID: string, rest: string): Promise<void> {
-  const trimmed = rest.trim()
+  // --warm: warm-start keyed replay — succeeded keyed agents from the source
+  // run return from cache instead of respawning.
+  const warm = /(^|\s)--warm(?=\s|$)/.test(rest)
+  const stripped = warm ? rest.replace(/(^|\s)--warm(?=\s|$)/g, " ") : rest
+  const trimmed = stripped.trim()
   let source: RunRecord | undefined
   let argsJSON: string | undefined
   if (trimmed) {
@@ -1177,6 +1206,7 @@ async function rerunRun(deps: CommandDeps, sessionID: string, rest: string): Pro
         args,
         name: source.name,
         workflowName: source.workflowName,
+        ...(warm ? { resumeFrom: source.id } : {}),
       },
       { sessionID, report: () => {}, availableAgents: prep.availableAgents },
     )
@@ -1187,7 +1217,12 @@ async function rerunRun(deps: CommandDeps, sessionID: string, rest: string): Pro
 
   const newRunID = launched.runID
   const oldRunID = source.id
-  await deps.say(sessionID, `rerun started: ${newRunID} (from ${oldRunID})`)
+  await deps.say(
+    sessionID,
+    warm
+      ? `warm rerun started: ${newRunID} (from ${oldRunID}; keyed succeeded agents replay from cache)`
+      : `rerun started: ${newRunID} (from ${oldRunID})`,
+  )
   launched.done
     .then((outcome) => {
       const envelope: RunEnvelope | unknown = outcome?.envelope ?? outcome

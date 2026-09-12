@@ -168,6 +168,12 @@ function makeGlobals(depth, args, meta) {
     progress: function (text) {
       post({ type: "event", kind: "progress", data: String(text) });
     },
+    checkpoint: function (name, value) {
+      post({ type: "event", kind: "checkpoint", data: {
+        name: String(name),
+        value: sanitize(value === undefined ? null : value, new WeakSet()),
+      } });
+    },
     workflow: function (name, wfArgs) {
       return callHost("workflow", [name, wfArgs === undefined ? null : wfArgs, depth]).then(function (composed) {
         if (!composed || typeof composed.script !== "string") {
@@ -264,7 +270,25 @@ function isIdentPart(c: string): boolean {
   return isIdentStart(c) || (c >= "0" && c <= "9")
 }
 
-function skipJsString(src: string, start: number, quote: string): number {
+/** Keywords after which a `/` starts a regex literal, not division. */
+const KEYWORDS_BEFORE_REGEX = new Set([
+  "return",
+  "case",
+  "typeof",
+  "instanceof",
+  "void",
+  "delete",
+  "in",
+  "of",
+  "new",
+  "throw",
+  "do",
+  "else",
+  "yield",
+  "await",
+])
+
+function skipJsString(src: string, start: number, quote: string): { end: number; closed: boolean } {
   let i = start + 1
   while (i < src.length) {
     const c = src[i]
@@ -272,8 +296,47 @@ function skipJsString(src: string, start: number, quote: string): number {
       i += 2
       continue
     }
-    if (c === quote) return i + 1
-    if (quote !== "`" && c === "\n") return i // unterminated line string
+    if (c === quote) return { end: i + 1, closed: true }
+    // ' and " literals cannot span lines — a newline (or EOF) means the
+    // string is unterminated (template literals may; quote !== "`" here).
+    if (quote !== "`" && c === "\n") return { end: i, closed: false }
+    i++
+  }
+  return { end: i, closed: false }
+}
+
+function lineOf(src: string, index: number): number {
+  let line = 1
+  for (let i = 0; i < index && i < src.length; i++) {
+    if (src[i] === "\n") line++
+  }
+  return line
+}
+
+/**
+ * Skip a regex literal starting at src[start] === "/" (caller has already
+ * decided it is a regex, not division). Respects escapes and character
+ * classes; a newline before the closing "/" ends the skip (let the real
+ * parser diagnose it). Returns the index after the literal + flags.
+ */
+function skipRegexLiteral(src: string, start: number): number {
+  let i = start + 1
+  let inClass = false
+  while (i < src.length) {
+    const c = src[i]
+    if (c === "\\") {
+      i += 2
+      continue
+    }
+    if (c === "[") inClass = true
+    else if (c === "]") inClass = false
+    else if (c === "/" && !inClass) {
+      i++
+      while (i < src.length && isIdentPart(src[i]!)) i++ // flags: /re/gi
+      return i
+    } else if (c === "\n") {
+      return i
+    }
     i++
   }
   return i
@@ -332,6 +395,9 @@ export function validateScriptSource(src: string): ScriptCheck {
   const n = src.length
   // "" = start of script, ";" / "}" = statement-terminating token, else "x"
   let prev = ""
+  // True when the previous token is a VALUE (identifier, literal, `)`/`]`) —
+  // a following `/` is division, not a regex start.
+  let prevValue = false
 
   while (i < n) {
     const c = src[i]
@@ -348,8 +414,34 @@ export function validateScriptSource(src: string): ScriptCheck {
       continue
     }
     if (c === '"' || c === "'" || c === "`") {
-      i = skipJsString(src, i, c)
+      const str = skipJsString(src, i, c)
+      if (!str.closed && c !== "`") {
+        return {
+          ok: false,
+          error:
+            `unterminated string literal starting at line ${lineOf(src, i)} — ` +
+            `single- and double-quoted strings cannot span lines in a workflow script ` +
+            `(use \\n escapes or a template literal)`,
+        }
+      }
+      i = str.end
       prev = "x"
+      prevValue = true
+      continue
+    }
+    if (c >= "0" && c <= "9") {
+      // Number literal: digits, separators, hex/binary prefixes, exponents.
+      while (i < n && (isIdentPart(src[i]!) || src[i] === ".")) i++
+      prev = "x"
+      prevValue = true
+      continue
+    }
+    if (c === "/" && !prevValue) {
+      // Regex-literal position: skip it so a quote inside /[...]/ cannot be
+      // mistaken for a string start.
+      i = skipRegexLiteral(src, i)
+      prev = "x"
+      prevValue = true
       continue
     }
     if (isIdentStart(c)) {
@@ -367,10 +459,12 @@ export function validateScriptSource(src: string): ScriptCheck {
         return { ok: false, error: "import/export statements are not allowed — a workflow script is an async function body (plain JS, no ESM)" }
       }
       prev = "x"
+      prevValue = !KEYWORDS_BEFORE_REGEX.has(word)
       i = j
       continue
     }
     prev = c === ";" || c === "}" ? c : "x"
+    prevValue = c === ")" || c === "]"
     i++
   }
   return { ok: true }

@@ -5,7 +5,7 @@
  */
 import test from "node:test"
 import assert from "node:assert/strict"
-import { AgentRunner, Semaphore, getWorkflowComposer, parallelHelper, pipelineHelper, storageWorkflowLoader } from "../src/primitives.ts"
+import { AgentRunner, Semaphore, getWorkflowComposer, parallelHelper, pipelineHelper, storageWorkflowLoader, buildWarmCache, agentCacheDigest } from "../src/primitives.ts"
 import type { AgentRunnerOptions } from "../src/primitives.ts"
 import type { AgentResult } from "../src/types.ts"
 import type { SavedWorkflow, Storage } from "../src/types.ts"
@@ -454,4 +454,107 @@ test("pipelineHelper: stages receive (value, index)", async () => {
     ],
   )
   assert.deepEqual(seen, [["a", 0]])
+})
+
+// ---------------------------------------------------------------------------
+// Keyed warm replay (resumeFrom / rerun --warm)
+// ---------------------------------------------------------------------------
+
+function makeSourceRun() {
+  const registry = new FakeRegistry()
+  const run = registry.create({ parentSessionID: "ses_old", script: "return 1" })
+  registry.addAgent(run.id, {
+    status: "succeeded",
+    requestedAgent: "general",
+    key: "scout",
+    promptDigest: agentCacheDigest("scout the repo", {}, "general"),
+    sessionID: "ses_old_scout",
+    effectiveAgent: "general",
+    resultText: "scout findings",
+    data: { files: 3 },
+  })
+  registry.addAgent(run.id, {
+    status: "failed", // failed children are NEVER replayed
+    requestedAgent: "general",
+    key: "broken",
+    promptDigest: agentCacheDigest("broken step", {}, "general"),
+  })
+  registry.addAgent(run.id, {
+    status: "succeeded", // unkeyed: not replayable
+    requestedAgent: "general",
+  })
+  return run
+}
+
+test("buildWarmCache: only succeeded keyed agents with payloads are replayable", () => {
+  const cache = buildWarmCache(makeSourceRun())
+  assert.equal(cache.size, 1)
+  const entry = cache.get("scout")!
+  assert.equal(entry.sourceRunID, "run_fake1")
+  assert.equal(entry.result.text, "scout findings")
+  assert.equal(entry.result.cachedFrom, "run_fake1")
+  assert.deepEqual(entry.result.data, { files: 3 })
+  assert.equal(buildWarmCache(undefined).size, 0)
+})
+
+test("AgentRunner warm cache: digest-matched key replays without spawning", async () => {
+  const source = makeSourceRun()
+  const { registry, run, calls, runner } = makeRunner({ warmCache: buildWarmCache(source) })
+  const res = await runner.call("scout the repo", { key: "scout", phase: "scout" })
+  assert.equal(calls.length, 0, "no session spawned on a warm hit")
+  assert.equal(res.text, "scout findings")
+  assert.equal(res.cachedFrom, source.id)
+  const rec = registry.getAgent(run.id, "a1")!
+  assert.equal(rec.status, "succeeded")
+  assert.equal(rec.cached, true)
+  assert.equal(rec.key, "scout")
+  assert.equal(rec.phase, "scout")
+  assert.equal(rec.sessionID, "ses_old_scout")
+})
+
+test("AgentRunner warm cache: same key + different prompt (digest mismatch) spawns", async () => {
+  const source = makeSourceRun()
+  const { registry, run, calls, runner } = makeRunner({ warmCache: buildWarmCache(source) })
+  const pending = runner.call("a DIFFERENT prompt", { key: "scout" })
+  await tick()
+  assert.equal(calls.length, 1, "digest mismatch falls through to a real spawn")
+  calls[0]!.resolve(okResult("ses_new"))
+  const res = await pending
+  assert.equal(res.cachedFrom, undefined)
+  const rec = registry.getAgent(run.id, "a1")!
+  assert.equal(rec.cached, undefined)
+  assert.equal(rec.key, "scout")
+  assert.equal(rec.promptDigest, agentCacheDigest("a DIFFERENT prompt", {}, "general"))
+  assert.equal(rec.resultText, "done")
+})
+
+test("AgentRunner: keyed real-path success persists replay identity; unkeyed does not", async () => {
+  const { registry, run, calls, runner } = makeRunner()
+  const p1 = runner.call("step one", { key: "lane1" })
+  await tick()
+  calls[0]!.resolve(okResult("ses_1"))
+  await p1
+  const keyed = registry.getAgent(run.id, "a1")!
+  assert.equal(keyed.key, "lane1")
+  assert.equal(keyed.promptDigest, agentCacheDigest("step one", {}, "general"))
+  assert.equal(keyed.resultText, "done")
+
+  const p2 = runner.call("step two", {})
+  await tick()
+  calls[1]!.resolve(okResult("ses_2"))
+  await p2
+  const unkeyed = registry.getAgent(run.id, "a2")!
+  assert.equal(unkeyed.key, undefined)
+  assert.equal(unkeyed.resultText, undefined)
+})
+
+test("AgentRunner warm cache: schema or agent changes flip the digest (no stale replay)", async () => {
+  const source = makeSourceRun()
+  const schema = { type: "object", required: ["x"], properties: { x: { type: "number" } } }
+  const { calls, runner } = makeRunner({ warmCache: buildWarmCache(source) })
+  const pending = runner.call("scout the repo", { key: "scout", schema, agent: "explore" })
+  await tick()
+  assert.equal(calls.length, 1, "same prompt but different schema/agent must spawn")
+  calls[0]!.resolve(okResult("ses_schema"))
+  await pending
 })

@@ -26,6 +26,9 @@ export interface RegistryInit {
 }
 
 const FINAL_STATUSES: ReadonlySet<string> = new Set(["succeeded", "failed", "stopped", "interrupted"])
+
+/** Run record keeps at most this many checkpoints (oldest dropped). */
+export const MAX_CHECKPOINTS = 50
 // A timestamp is not proof of a live supervisor. Only a registered runtime owner
 // may keep a persisted active record alive across same-process location loads.
 const runtimeOwners = new Map<string, RegistryImpl>()
@@ -159,6 +162,19 @@ export class RegistryImpl implements Registry {
 
   getAgent(runID: string, agentID: string): AgentRecord | undefined {
     return this.runs.get(runID)?.agents.find((a) => a.id === agentID)
+  }
+
+  addCheckpoint(runID: string, name: string, value?: Json): void {
+    const run = this.runs.get(runID)
+    if (!run) return
+    const trimmed = name.trim().slice(0, 128)
+    if (!trimmed) return
+    run.checkpoints = run.checkpoints ?? []
+    run.checkpoints.push({ name: trimmed, at: this.now(), ...(value !== undefined ? { value } : {}) })
+    if (run.checkpoints.length > MAX_CHECKPOINTS) {
+      run.checkpoints.splice(0, run.checkpoints.length - MAX_CHECKPOINTS)
+    }
+    this.requestPersist(runID)
   }
 
   finish(
