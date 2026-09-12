@@ -457,3 +457,83 @@ test("graph: compiled header is name-independent, so a rename cannot move the tr
   assert.match(base, new RegExp(`graph v${GRAPH_SPEC_VERSION}`))
   assert.match(base, /do not hand-edit/)
 })
+
+// ---------------------------------------------------------------------------
+// Template-only data edges (regression: waves scheduled on refs alone put the
+// reader beside its producer, and the interpolation silently degraded to the
+// literal "{{node}}" inside a child prompt)
+// ---------------------------------------------------------------------------
+
+test("graph: a prompt template is a data edge — waves order after the node it reads", () => {
+  const spec: GraphSpec = {
+    nodes: [
+      { id: "a", kind: "agent", prompt: "First pass over {{args.topic}}." },
+      { id: "b", kind: "agent", prompt: "Second pass. First said: {{a}}" },
+    ],
+  }
+  assert.equal(validateGraphSpec(spec).ok, true)
+  assert.deepEqual(
+    graphLevels(spec).map((w) => w.map((n) => n.id)),
+    [["a"], ["b"]],
+    "b reads a's value, so it cannot share a's wave",
+  )
+  const { script } = compileGraphSpec(spec)
+  assert.doesNotMatch(script, /"\{\{a\}\}"/, "the interpolation must not degrade to a literal placeholder")
+  assert.match(script, /G_str\(v_a\)/)
+  assert.match(graphToMermaid(spec), /a --> b/, "the rendered DAG shows template edges too")
+})
+
+test("graph e2e: a template-only dependency delivers the real value to the later child", async () => {
+  const spec: GraphSpec = {
+    nodes: [
+      { id: "first", kind: "agent", prompt: "Summarize {{args.topic}} in one line." },
+      { id: "second", kind: "agent", prompt: "Critique this summary: {{first}}" },
+    ],
+    returns: { critique: "$second" },
+  }
+  const { script } = compileGraphSpec(spec)
+  const prompts: string[] = []
+  const result = await runInWorker(script, { topic: "agent evals" }, async (_fn, callArgs) => {
+    const prompt = String(callArgs[0] ?? "")
+    prompts.push(prompt)
+    return {
+      text: prompts.length === 1 ? "SUMMARY-TEXT" : "CRITIQUE",
+      sessionID: `ses_${prompts.length}`,
+      agent: "general",
+    } as unknown as Json
+  })
+  assert.equal(result.ok, true, result.error ?? "run failed")
+  assert.equal(prompts.length, 2, "one child per node, in dependency order")
+  assert.match(prompts[0]!, /Summarize "agent evals"/)
+  assert.match(prompts[1]!, /Critique this summary: "SUMMARY-TEXT"/, "the second child sees the first child's output")
+  assert.doesNotMatch(prompts[1]!, /\{\{first\}\}/)
+  assert.deepEqual(result.value, { critique: "CRITIQUE" })
+})
+
+test("graph: a backward-but-acyclic template reference is reordered by data flow, not rejected", () => {
+  // Spec order says a reads b; validateGraphSpec rejects that (templates resolve
+  // against nodes defined EARLIER), but the compiler schedules by data flow, so
+  // compiling anyway still produces a correct, interpolated script.
+  const spec = {
+    nodes: [
+      { id: "a", kind: "agent", prompt: "Use {{b}} please." },
+      { id: "b", kind: "agent", prompt: "Plain prompt." },
+    ],
+  } as unknown as GraphSpec
+  assert.equal(validateGraphSpec(spec).ok, false)
+  const { script } = compileGraphSpec(spec)
+  assert.doesNotMatch(script, /"\{\{b\}\}"/)
+  assert.match(script, /G_str\(v_b\)/)
+  assert.ok(script.indexOf("v_b =") < script.indexOf("G_str(v_b)"), "b is emitted before a reads it")
+})
+
+test("graph: a cyclic template dependency fails loudly instead of emitting placeholders", () => {
+  const spec = {
+    nodes: [
+      { id: "a", kind: "agent", prompt: "Use {{b}} please." },
+      { id: "b", kind: "agent", prompt: "Use {{a}} please." },
+    ],
+  } as unknown as GraphSpec
+  assert.equal(validateGraphSpec(spec).ok, false, "cycles are rejected up front")
+  assert.throws(() => compileGraphSpec(spec), /graph compiler invariant: node "a" interpolates \{\{b\}\}/)
+})

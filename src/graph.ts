@@ -214,6 +214,39 @@ function nodeDeps(node: GraphNode): string[] {
   return deps
 }
 
+/** Template vars that are loop/context bindings, not node references. */
+const TEMPLATE_NON_NODES: ReadonlySet<string> = new Set(["args", "item", "index", "items"])
+
+/** Node ids a prompt template interpolates (`{{report}}`, `{{verify.verdicts}}`). */
+function nodeTemplateDeps(node: GraphNode): string[] {
+  if (typeof node.prompt !== "string") return []
+  const heads: string[] = []
+  TEMPLATE_VAR_RE.lastIndex = 0
+  let m: RegExpExecArray | null
+  while ((m = TEMPLATE_VAR_RE.exec(node.prompt)) !== null) {
+    const head = m[1]!.split(".").map((s) => s.trim()).filter(Boolean)[0]
+    if (head !== undefined && !TEMPLATE_NON_NODES.has(head)) heads.push(head)
+  }
+  return heads
+}
+
+/**
+ * Every data-flow edge into a node: ref fields AND prompt templates. A
+ * `{{report}}` interpolation reads that node's value exactly like `from:
+ * "$report"` does, so wave scheduling and the rendered DAG must both see it —
+ * scheduling on refs alone puts the reader in the same wave as (or before) the
+ * producer, where the interpolation silently degrades to the literal `{{report}}`.
+ *
+ * Heads are returned unfiltered: callers decide whether an unknown head is a
+ * validation error (validateGraphSpec, via nodeDeps + template resolution) or
+ * simply never satisfiable (graphLevels leaves the node in the trailing bucket).
+ */
+export function nodeDataDeps(node: GraphNode): string[] {
+  const deps = nodeDeps(node)
+  for (const head of nodeTemplateDeps(node)) if (!deps.includes(head)) deps.push(head)
+  return deps
+}
+
 /** Validate structure, refs, templates, and rough budget. Never throws. */
 export function validateGraphSpec(spec: unknown): GraphCheck {
   const errors: string[] = []
@@ -354,15 +387,16 @@ export function validateGraphSpec(spec: unknown): GraphCheck {
 
 /**
  * Spec order IS the topological order (validated forward-only). Levels group
- * nodes whose dependencies are all satisfied by the previous levels; a level
- * with >1 agent-ish node compiles to one parallel() wave.
+ * nodes whose dependencies — ref fields AND prompt templates — are all
+ * satisfied by the previous levels; a level with >1 agent-ish node compiles to
+ * one parallel() wave.
  */
 export function graphLevels(spec: GraphSpec): GraphNode[][] {
   const defined = new Set<string>()
   const levels: GraphNode[][] = []
   let remaining = [...spec.nodes]
   while (remaining.length > 0) {
-    const wave = remaining.filter((n) => nodeDeps(n).every((d) => defined.has(d)))
+    const wave = remaining.filter((n) => nodeDataDeps(n).every((d) => defined.has(d)))
     if (wave.length === 0) break // unreachable after validation; defensive
     for (const n of wave) defined.add(n.id)
     levels.push(wave)
@@ -443,6 +477,7 @@ function parallelCallExpr(node: GraphNode, defined: ReadonlySet<string>, refExpr
  */
 export function compileGraphSpec(spec: GraphSpec): CompiledGraph {
   const defined = new Set<string>()
+  const allIds = new Set(spec.nodes.map((n) => n.id))
   const lines: string[] = []
   lines.push(
     // Stable on purpose: the compiled script is the TRUST digest basis for saved
@@ -466,8 +501,27 @@ export function compileGraphSpec(spec: GraphSpec): CompiledGraph {
     }
   }
 
+  /**
+   * Invariant: a prompt template may only interpolate a node that has already
+   * been emitted. graphLevels schedules on the same edges, so a validated spec
+   * cannot trip this — it fires for a spec compiled without validation, where
+   * the alternative is silently emitting the literal `{{node}}` into a child's
+   * prompt (a confidently wrong run, not an error).
+   */
+  const assertTemplateDepsEmitted = (node: GraphNode): void => {
+    for (const dep of nodeTemplateDeps(node)) {
+      if (allIds.has(dep) && !defined.has(dep)) {
+        throw new Error(
+          `graph compiler invariant: node "${node.id}" interpolates {{${dep}}} but "${dep}" is not defined yet — ` +
+            `run validateGraphSpec first (edges must flow forward in spec order)`,
+        )
+      }
+    }
+  }
+
   /** The call line only — `mode: "thunk"` emits a bare arrow for a parallel wave. */
   const emitNode = (node: GraphNode, mode: "await" | "thunk"): void => {
+    assertTemplateDepsEmitted(node)
     if (node.agent !== undefined) requires.add(node.agent)
 
     if (node.kind === "workflow") {
@@ -595,8 +649,7 @@ export function compileGraphSpec(spec: GraphSpec): CompiledGraph {
     }
   })
 
-  // Return assembly
-  const allIds = new Set(spec.nodes.map((n) => n.id))
+  // Return assembly (allIds is hoisted: the template invariant check needs it)
   const lastNode = spec.nodes[spec.nodes.length - 1]
   const returns = spec.returns ?? (lastNode ? { result: `$${lastNode.id}` } : {})
   const entries = Object.entries(returns).map(
@@ -619,7 +672,7 @@ export function compileGraphSpec(spec: GraphSpec): CompiledGraph {
 // Rendering (pure; `/ultracode graph` in command.ts consumes both)
 // ---------------------------------------------------------------------------
 
-/** Mermaid flowchart of the DAG (data-flow edges only). */
+/** Mermaid flowchart of the DAG (data-flow edges: refs and prompt templates). */
 export function graphToMermaid(spec: GraphSpec): string {
   const rows: string[] = ["graph TD"]
   for (const n of spec.nodes) {
@@ -627,7 +680,7 @@ export function graphToMermaid(spec: GraphSpec): string {
     rows.push(`  ${n.id}["${label.replace(/"/g, "'")}"]`)
   }
   for (const n of spec.nodes) {
-    for (const dep of nodeDeps(n)) {
+    for (const dep of nodeDataDeps(n)) {
       rows.push(`  ${dep} --> ${n.id}`)
     }
   }
@@ -694,4 +747,38 @@ export function graphNodeIds(spec: unknown): string[] {
     }
   }
   return ids
+}
+
+/**
+ * The `args` names a spec actually reads: `{{args.x}}` in prompt templates and
+ * `$args.x` in refs (from, over, value, argsFrom, returns). Sorted and unique.
+ * Types are not inferable from a template, so callers get names only.
+ */
+export function graphParamNames(spec: unknown): string[] {
+  const names = new Set<string>()
+  const addPath = (path: string): void => {
+    const segs = path.split(".").map((s) => s.trim()).filter(Boolean)
+    if (segs[0] === "args" && segs.length > 1 && ID_RE.test(segs[1]!)) names.add(segs[1]!)
+  }
+  const addRef = (ref: unknown): void => {
+    if (typeof ref === "string" && ref.startsWith("$")) addPath(ref.slice(1))
+  }
+  if (spec === null || typeof spec !== "object" || Array.isArray(spec)) return []
+  const g = spec as { nodes?: unknown; returns?: unknown }
+  if (Array.isArray(g.nodes)) {
+    for (const raw of g.nodes) {
+      if (raw === null || typeof raw !== "object" || Array.isArray(raw)) continue
+      const n = raw as Record<string, unknown>
+      for (const key of ["from", "over", "value", "argsFrom"]) addRef(n[key])
+      if (typeof n["prompt"] === "string") {
+        TEMPLATE_VAR_RE.lastIndex = 0
+        let m: RegExpExecArray | null
+        while ((m = TEMPLATE_VAR_RE.exec(n["prompt"])) !== null) addPath(m[1]!)
+      }
+    }
+  }
+  if (g.returns !== null && typeof g.returns === "object" && !Array.isArray(g.returns)) {
+    for (const ref of Object.values(g.returns as Record<string, unknown>)) addRef(ref)
+  }
+  return [...names].sort()
 }
