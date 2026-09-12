@@ -18,11 +18,12 @@ worker. Every \`agent(...)\` call spawns a REAL subagent session with its own co
 own model. The script returns a small JSON value; only that value plus a compact run envelope
 re-enters your session. Child transcripts never touch your context.
 
-Invoke the \`ultracode_run\` tool with \`{ script, name?, meta?, args?, background?, resumeFrom? }\` for an inline
-run, or \`{ workflow: "name", args?, background?, resumeFrom? }\` to run a saved workflow. \`meta\` and \`args\` are injected
-into the script as globals. \`resumeFrom\` (a prior runID) warm-starts: keyed succeeded agents replay
-from cache, so an interrupted long run costs only its unfinished tail. Runs are background by
-default: the tool returns immediately after admission
+Invoke \`ultracode_run\` with \`{ graph, args? }\` (graph-authored — preferred for standard shapes),
+\`{ script, name?, meta?, args? }\` (hand-written inline), or \`{ workflow: "name", args? }\` (saved);
+every form also takes \`background\` and \`resumeFrom\` — a prior runID that warm-starts the run so
+keyed succeeded agents replay from cache and an interrupted long run costs only its unfinished
+tail. \`meta\` and \`args\` are injected into the script as globals. Runs are background by default:
+the tool returns immediately after admission
 so the parent chat stays available; pass \`background: false\` only when you need the envelope
 in-call. Progress and status are scoped to that run
 (\`ultracode_status\`, inspect, \`/ultracode status\`). When the run settles, a one-line notice lands
@@ -50,9 +51,8 @@ agent calls, in-flight children interrupted — and is recorded as the run's sto
 Never paste a workflow script into a generic JS/execute sandbox — \`agent\`, \`parallel\`, \`pipeline\`, \`phase\`, \`progress\`, \`workflow\`, \`sleep\`, \`args\`, and \`meta\` exist only inside \`ultracode_run\`; anywhere else they are undefined.
 
 This skill auto-attaches when \`ultracode\` appears as a standalone keyword anywhere in the prompt
-— for example \`ultracode: audit the auth module\`, \`please ultracode this\`, or \`ultracode do X\`.
-Paths like \`opencode-ultracode\` do not match. Plain "use a workflow" does not auto-attach; the
-host may still select this skill from its description.
+(\`ultracode: audit the auth module\`, \`please ultracode this\`). Paths like \`opencode-ultracode\` do
+not match; plain "use a workflow" does not auto-attach — the host may still select this skill.
 
 ## Coexistence with other skills
 
@@ -90,6 +90,16 @@ Author in Plan mode; run by name from Build mode. Do not call \`ultracode_run\` 
 3. \`/ultracode trust <name>\` (digest-bound; editing the script invalidates trust until re-approved).
 4. Build: \`ultracode_run\` with \`{ workflow: "name", args? }\`. Do not mix native subagent fan-out
    with a workflow in the same task.
+
+## Graph mode (author structure, not plumbing)
+
+For standard shapes — scout → partition → fan-out → gate → merge — pass \`{ graph, args }\` instead
+of writing JS: a JSON DAG the runtime VALIDATES (refs, forward edges, prompts, budget) and COMPILES
+for you. Nodes: \`agent\` / \`fanout\` (\`over\`, \`{{item}}\`, \`max\`) / \`partition\` (budgeted lanes) /
+\`merge\` (batched) / \`gate\` (one QC reviewer, abort on fail) / \`checkpoint\` / \`workflow\`; refs like
+\`"$scout.items"\`; templates \`{{args.x}}\` and \`{{node.path}}\`. The compiler adds null-handling,
+batching, phase and label bookkeeping, \`parallel()\` waves, and an auto \`key\` on every call. Invalid
+graphs fail before any token is spent; write JS only when nodes cannot express the orchestration.
 
 ## Script API (exact)
 
@@ -144,11 +154,9 @@ run legitimately needs it.
 11. **Verify before you trust.** Generators fan out, independent verifiers check, a skeptic pass
     overturns weak survivals. If the verifier shares the generator's failure modes, the workflow
     is theater.
-12. **Gate expensive phases; checkpoint the merge.** Between a cheap phase and an expensive one,
-    run ONE small reviewer (\`{ pass, issues, action }\` schema) over the merged intermediate and
-    abort or retry on failure — a bad merge must not fund a synthesis fan-out. Then
-    \`checkpoint(name, value)\` so the boundary survives interruption. Key the calls you would not
-    want to pay for twice.
+12. **Gate expensive phases; checkpoint the merge.** Between a cheap and an expensive phase, run
+    ONE small reviewer (\`{ pass, action, issues }\` schema) over the merged intermediate and abort on
+    failure; then \`checkpoint(name, value)\`. Key the calls you would not want to pay for twice.
 
 ## Patterns
 
@@ -309,23 +317,20 @@ return { fixed: issues.length - open.length, open }
 ### Gate + checkpoint between phases (cheap QC; resumable boundaries)
 
 \`\`\`
-// after an expensive phase produces the merged intermediate \`merged\`:
-const GATE = { type: "object", required: ["pass", "action"], properties: {
-  pass: { type: "boolean" }, action: { type: "string", enum: ["continue", "retry", "abort"] },
-  issues: { type: "array", items: { type: "string" } } } }
-const gate = await agent("QC this batch of findings. pass=false only for concrete defects " +
-  "(empty, duplicated, off-scope).\\n" + JSON.stringify(merged.slice(0, 10)),
-  { agent: "explore", phase: "gate", schema: GATE })
+const gate = await agent("QC this batch. pass=false only for concrete defects (empty, " +
+  "duplicated, off-scope).\\n" + JSON.stringify(merged.slice(0, 10)),
+  { agent: "explore", phase: "gate", schema: { type: "object", required: ["pass", "action"],
+    properties: { pass: { type: "boolean" }, action: { type: "string", enum: ["continue", "abort"] },
+      issues: { type: "array", items: { type: "string" } } } } })
 if (gate && gate.data && gate.data.pass === false && gate.data.action === "abort") {
   throw new Error("gate rejected the merge: " + JSON.stringify(gate.data.issues || []))
 }
 checkpoint("merge-done", { count: merged.length })
-// downstream agents get opts.key so a warm rerun never pays for them twice:
-const out = await agent("Synthesize...", { agent: "general", phase: "synthesize", key: "synthesize:v1" })
+const out = await agent("Synthesize...", { agent: "general", phase: "synthesize", key: "synth:v1" })
 \`\`\`
 
-One small reviewer per boundary — never a gate fan-out (wall clock is the binding constraint).
-\`checkpoint\` values are capped (50 kept) and visible in \`/ultracode show\` + \`ultracode_status\`.
+One small reviewer per boundary — never a gate fan-out (wall clock binds); values capped at 50.
+The graph-mode \`gate\` node is this pattern pre-built.
 
 ### Compose a saved workflow (depth 1)
 

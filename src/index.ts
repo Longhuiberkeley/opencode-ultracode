@@ -55,6 +55,8 @@ import { lookupAgentPin, parseModelPin } from "./agent-pins.ts"
 import { RegistryImpl } from "./registry.ts"
 import { emptyToolEventState } from "./run-events.ts"
 import { EMPTY_CATALOG, SKILL_CONTENT, SKILL_DESCRIPTION, SKILL_NAME, buildSkillContent } from "./skill-content.ts"
+import { compileGraphSpec, validateGraphSpec } from "./graph.ts"
+import type { GraphSpec } from "./graph.ts"
 import { StorageImpl, normalizePath, resolveContainedPath, sha256 } from "./storage.ts"
 import { resolveBackground, validateControlToolInput, validateResultToolInput, validateStatusToolInput, validateToolInput } from "./tool-input.ts"
 import type {
@@ -169,6 +171,29 @@ const WORKFLOW_TOOL_INPUT_SCHEMA: Record<string, unknown> = {
           type: "boolean",
           description:
             "Default true: return immediately after admission with { runID, status: \"running\", hint }. Pass false to block until the envelope. On completion a one-line settle notice lands in the parent session and wakes the calling agent; poll ultracode_status for detail.",
+        },
+      },
+    },
+    {
+      type: "object",
+      additionalProperties: false,
+      required: ["graph"],
+      properties: {
+        graph: {
+          type: "object",
+          description:
+            "Graph-authored workflow DAG (preferred for standard shapes — cheaper and safer than hand-writing JS). " +
+            "{ nodes: [{ id, kind, ... }], returns?: { key: \"$node.path\" } }. Kinds: agent (one child: prompt template with {{args.x}}/{{nodeId}}), " +
+            "fanout (over: \"$ref\", one child per item, {{item}}/{{index}}, max caps items), partition (from: \"$scout.files\", token-budgeted lanes), " +
+            "merge (from: \"$fanout\", batched join), gate (one QC reviewer, aborts on fail), checkpoint, workflow (compose by name). " +
+            "Node ids are phases; every call is auto-keyed for warm rerun. The runtime validates the DAG (refs, cycles, budgets) and compiles it — zero tokens spent on invalid graphs.",
+        },
+        name: { type: "string", description: "Optional run name shown in /ultracode summaries." },
+        args: { description: "JSON value exposed to templates as {{args.x}} and to the compiled script as `args`." },
+        background: {
+          type: "boolean",
+          description:
+            "Default true: return immediately after admission. Pass false to block until the envelope.",
         },
       },
     },
@@ -610,7 +635,31 @@ export default Plugin.define({
                 let workflowName: string | undefined
                 let args: Json | undefined
 
-                if ("workflow" in input) {
+                if ("graph" in input) {
+                  // Graph-authored run: validate the DAG, compile to a plain
+                  // async-body script, then proceed down the inline path.
+                  const graphCheck = validateGraphSpec(input.graph)
+                  if (!graphCheck.ok) {
+                    return {
+                      content:
+                        `error: invalid graph spec — ${graphCheck.errors.slice(0, 5).join("; ")}` +
+                        (graphCheck.errors.length > 5 ? ` (+${graphCheck.errors.length - 5} more)` : ""),
+                    }
+                  }
+                  const compiled = compileGraphSpec(input.graph as unknown as GraphSpec)
+                  script = compiled.script
+                  workflowName = undefined
+                  name = input.name ?? compiled.meta.name
+                  meta = {
+                    ...(name !== undefined ? { name } : {}),
+                    ...(compiled.meta.description !== undefined
+                      ? { description: compiled.meta.description }
+                      : {}),
+                    phases: compiled.meta.phases,
+                    requires: compiled.meta.requires,
+                  }
+                  args = input.args
+                } else if ("workflow" in input) {
                   // Fresh disk scan so edits made while the server runs are seen.
                   await storage.refreshWorkflows()
                   await runsReconciled

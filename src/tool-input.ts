@@ -9,7 +9,7 @@
  * keys, wrong types and oversized inputs with precise messages.
  */
 import { CONTROL_ACTIONS, type ControlAction } from "./control.ts"
-import type { InlineRunInput, Json, SavedRunInput, WorkflowMeta, WorkflowToolInput } from "./types.ts"
+import type { GraphRunInput, InlineRunInput, Json, SavedRunInput, WorkflowMeta, WorkflowToolInput } from "./types.ts"
 
 export type ToolInputResult =
   | { ok: true; input: WorkflowToolInput }
@@ -135,6 +135,51 @@ export function validateToolInput(raw: unknown): ToolInputResult {
 
   if (hasScript && hasWorkflow) {
     return { ok: false, error: `input cannot specify both "script" and "workflow" — choose one` }
+  }
+
+  const hasGraph = has(raw, "graph")
+  if ((hasScript || hasWorkflow) && hasGraph) {
+    return { ok: false, error: `input cannot combine "graph" with "script"/"workflow" — choose one` }
+  }
+
+  if (hasGraph) {
+    // ---- graph-spec shape (deep validation happens in validateGraphSpec) ----
+    const extra = rejectExtras(raw, new Set(["graph", "name", "args", "background", "resumeFrom"]))
+    if (extra) return { ok: false, error: extra }
+
+    const graph = raw["graph"]
+    if (typeof graph !== "object" || graph === null || Array.isArray(graph)) {
+      return { ok: false, error: `"graph" must be an object (the DAG spec: { nodes: [...] }), got ${typeOf(graph)}` }
+    }
+    if (!Array.isArray((graph as { nodes?: unknown }).nodes)) {
+      return { ok: false, error: `"graph".nodes must be an array of node objects` }
+    }
+
+    const name = raw["name"]
+    if (name !== undefined && (typeof name !== "string" || name.trim() === "")) {
+      return { ok: false, error: `"name" must be a non-empty string, got ${typeof name === "string" ? "empty string" : typeOf(name)}` }
+    }
+
+    const args = validateArgs(raw["args"])
+    if (!args.ok) return { ok: false, error: args.error }
+    if (args.serializedBytes > MAX_ARGS_BYTES) {
+      return {
+        ok: false,
+        error: `"args" is too large: ${args.serializedBytes} bytes serialized (max ${MAX_ARGS_BYTES}). Pass large data via a saved workflow or trim the payload`,
+      }
+    }
+
+    const background = validateBackground(raw)
+    if (!background.ok) return { ok: false, error: background.error }
+    const resume = validateResumeFrom(raw)
+    if (!resume.ok) return { ok: false, error: resume.error }
+
+    const input: GraphRunInput = { graph: graph as Record<string, unknown> }
+    if (name !== undefined) input.name = name as string
+    if (raw["args"] !== undefined) input.args = args.args
+    if (background.background !== undefined) input.background = background.background
+    if (resume.resumeFrom !== undefined) input.resumeFrom = resume.resumeFrom
+    return { ok: true, input }
   }
 
   if (hasWorkflow) {

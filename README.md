@@ -67,8 +67,9 @@ The rest of this README covers security, internals, and the full command surface
    `please ultracode this`, or `ultracode do X and verify it`). The `Ultracode` skill auto-attaches
    and teaches the model the script API. Natural-language requests ("use a workflow to ...") do
    not auto-attach — the model can still choose to author one from the skill description.
-2. The model invokes the **`ultracode_run`** tool with `{ script, name?, meta?, args? }` for an
-   inline run, or `{ workflow: "name", args? }` for a saved workflow.
+2. The model invokes the **`ultracode_run`** tool with `{ graph, args? }` for a graph-authored run
+   (a JSON DAG — validated and compiled server-side; preferred for standard shapes), `{ script, name?, meta?, args? }`
+   for an inline run, or `{ workflow: "name", args? }` for a saved workflow.
 3. The runtime validates the script (plain JS async-function body — no module syntax), preflights
    the agents declared in `meta.requires`, then executes it in a worker thread with injected
    globals: `agent`, `parallel`, `pipeline`, `phase`, `progress`, `workflow`, `sleep`, `console`,
@@ -622,6 +623,11 @@ list of available agents and guidance instead of spawning a broken run.
 
 ## Roadmap
 
+- **Graph authoring layer (partial, v0.8.0)** — inline `{ graph }` runs land: a JSON DAG spec
+  (agent / fanout / partition / merge / gate / checkpoint / workflow nodes) validated before any
+  token is spent and compiled to the plain script runtime, with auto-keyed calls (warm rerun free)
+  and automatic `parallel()` waves. Still future: saved graph workflows by name, `/ultracode graph`
+  rendering, and the catalog tool.
 - **Dialog-key overlay** — blocked on the host: `ui.dialog.show` owns the keymap (G1 NO-GO on
   beta-19271). Inspect stays panel-hosted until a host API delivers keys inside a dialog
   without leaking to the prompt.

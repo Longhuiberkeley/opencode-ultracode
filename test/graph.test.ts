@@ -1,0 +1,416 @@
+/**
+ * Graph layer tests: validator, compiler determinism, emitted-script validity,
+ * end-to-end execution of compiled graphs in a REAL worker with a mock bridge,
+ * and renderers.
+ */
+import test from "node:test"
+import assert from "node:assert/strict"
+import { Worker } from "node:worker_threads"
+import type { Json } from "../src/types.ts"
+import { WORKER_SOURCE, validateScriptSource } from "../src/worker-script.ts"
+import {
+  DEFAULT_FANOUT_MAX,
+  compileGraphSpec,
+  graphToAscii,
+  graphToMermaid,
+  graphLevels,
+  validateGraphSpec,
+  type GraphSpec,
+} from "../src/graph.ts"
+
+// ---------------------------------------------------------------------------
+// Spec fixtures
+// ---------------------------------------------------------------------------
+
+const INVENTORY_SCHEMA = {
+  type: "object",
+  required: ["items"],
+  properties: {
+    items: {
+      type: "array",
+      items: {
+        type: "object",
+        required: ["name", "lines"],
+        properties: { name: { type: "string" }, lines: { type: "number" } },
+      },
+    },
+  },
+}
+
+const SUMMARY_SCHEMA = {
+  type: "object",
+  required: ["summary"],
+  properties: { summary: { type: "string" } },
+}
+
+const CANONICAL: GraphSpec = {
+  name: "partitioned-review",
+  description: "scout, partition, review lanes, gate, merge",
+  nodes: [
+    {
+      id: "scout",
+      kind: "agent",
+      agent: "explore",
+      prompt: "Inventory {{args.area}}. Per file: name + line count. Do not read contents.",
+      schema: INVENTORY_SCHEMA,
+    },
+    { id: "lanes", kind: "partition", from: "$scout.items", budgetTokens: 100, tokensPerLine: 10 },
+    {
+      id: "review",
+      kind: "fanout",
+      over: "$lanes",
+      agent: "explore",
+      max: 8,
+      prompt: "Review exactly these files (ranged reads only):\n{{item}}\nReturn a summary.",
+      schema: SUMMARY_SCHEMA,
+    },
+    { id: "qc", kind: "gate", from: "$review", onFail: "abort" },
+    {
+      id: "report",
+      kind: "merge",
+      from: "$review",
+      prompt: "Merge these lane reports into one report. Reports only:\n{{item}}",
+      batches: 2,
+    },
+  ],
+  returns: { report: "$report", laneCount: "$lanes.length" },
+}
+
+// ---------------------------------------------------------------------------
+// Mock worker harness (same protocol as test/worker-script.test.ts)
+// ---------------------------------------------------------------------------
+
+type WorkerEvent = { kind: string; data: Json }
+type MockCall = { fn: string; args: Json[] }
+type MockHandler = (fn: string, args: Json[]) => Promise<Json>
+
+function runInWorker(script: string, args: Json | undefined, onCall: MockHandler): Promise<{
+  ok: boolean
+  value?: Json
+  error?: string
+  events: WorkerEvent[]
+  calls: MockCall[]
+}> {
+  const worker = new Worker(WORKER_SOURCE, { eval: true })
+  const events: WorkerEvent[] = []
+  const calls: MockCall[] = []
+  return new Promise((resolve, reject) => {
+    worker.on("message", (msg: unknown) => {
+      const m = msg as { type?: string; [k: string]: unknown }
+      if (m.type === "call") {
+        const callArgs = (Array.isArray(m.args) ? m.args : []) as Json[]
+        calls.push({ fn: String(m.fn), args: callArgs })
+        void Promise.resolve()
+          .then(() => onCall(String(m.fn), callArgs))
+          .then(
+            (value) => worker.postMessage({ type: "result", id: Number(m.id), ok: true, value: value ?? null }),
+            (err: unknown) =>
+              worker.postMessage({
+                type: "result",
+                id: Number(m.id),
+                ok: false,
+                error: String((err as Error)?.message ?? err),
+              }),
+          )
+        return
+      }
+      if (m.type === "event") {
+        events.push({ kind: String(m.kind), data: (m.data ?? null) as Json })
+        return
+      }
+      if (m.type === "done") {
+        const result = {
+          ok: m.ok === true,
+          value: (m.value ?? undefined) as Json | undefined,
+          error: typeof m.error === "string" ? m.error : undefined,
+          events,
+          calls,
+        }
+        void worker.terminate()
+        resolve(result)
+      }
+    })
+    worker.on("error", (err: Error) => {
+      void worker.terminate()
+      reject(err)
+    })
+    worker.postMessage({ type: "init", script, args, meta: {} })
+  })
+}
+
+/** Mock bridge: schema-driven canned replies. */
+function makeMockAgent(gatePass: boolean): MockHandler {
+  return async (fn, callArgs) => {
+    if (fn === "workflow") {
+      // the worker EXECUTES the composed script with the workflow args —
+      // return a runnable one that echoes them back
+      return { script: "return { composed: true, topic: args && args.topic }", meta: {} } as unknown as Json
+    }
+    const prompt = String(callArgs[0] ?? "")
+    const opts = (callArgs[1] ?? {}) as { schema?: Json; key?: string }
+    const sessionID = "ses_" + String(opts.key ?? Math.random()).replace(/[^a-z0-9]/gi, "")
+    if (opts.schema && (opts.schema as { properties?: Record<string, unknown> }).properties?.["pass"]) {
+      // gate schema
+      return {
+        text: JSON.stringify({ pass: gatePass, action: gatePass ? "continue" : "abort", issues: gatePass ? [] : ["empty output"] }),
+        sessionID,
+        agent: "general",
+        data: { pass: gatePass, action: gatePass ? "continue" : "abort", issues: gatePass ? [] : ["empty output"] },
+      }
+    }
+    if (opts.schema && (opts.schema as { properties?: Record<string, unknown> }).properties?.["items"]) {
+      return {
+        text: "inventory",
+        sessionID,
+        agent: "explore",
+        data: {
+          items: [
+            { name: "a.ts", lines: 10 },
+            { name: "b.ts", lines: 8 },
+            { name: "c.ts", lines: 12 },
+          ],
+        },
+      }
+    }
+    if (opts.schema && (opts.schema as { properties?: Record<string, unknown> }).properties?.["topic"]) {
+      return { text: "prep", sessionID, agent: "general", data: { topic: "agent evals" } }
+    }
+    if (opts.schema) {
+      return { text: "summary", sessionID, agent: "explore", data: { summary: "lane-ok:" + prompt.slice(0, 12) } }
+    }
+    void prompt
+    return { text: "merged-text", sessionID, agent: "general" }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Validator
+// ---------------------------------------------------------------------------
+
+test("graph: canonical spec validates (warnings only)", () => {
+  const check = validateGraphSpec(CANONICAL)
+  assert.equal(check.ok, true)
+  assert.deepEqual(check.ok && check.warnings, [])
+})
+
+test("graph: forward-only refs enforced (cycle-equivalent)", () => {
+  const check = validateGraphSpec({
+    nodes: [
+      { id: "b", kind: "merge", from: "$a", prompt: "m {{item}}" },
+      { id: "a", kind: "agent", prompt: "x" },
+    ],
+  })
+  assert.equal(check.ok, false)
+  if (!check.ok) assert.match(check.errors.join("; "), /does not match any node defined earlier/)
+})
+
+test("graph: unknown kind, duplicate id, missing prompt, bad keys", () => {
+  const check = validateGraphSpec({
+    nodes: [
+      { id: "t", kind: "teleport" },
+      { id: "a", kind: "agent", prompt: "p" },
+      { id: "a", kind: "agent", prompt: "p" },
+      { id: "ok", kind: "agent", prompt: "p", bogus: 1 },
+    ],
+  })
+  assert.equal(check.ok, false)
+  if (!check.ok) {
+    const all = check.errors.join("; ")
+    assert.match(all, /unknown kind/)
+    assert.match(all, /duplicate id/)
+    assert.match(all, /unexpected key "bogus"/)
+  }
+})
+
+test("graph: missing prompt is an error", () => {
+  const check = validateGraphSpec({ nodes: [{ id: "a", kind: "agent" }] })
+  assert.equal(check.ok, false)
+  if (!check.ok) assert.match(check.errors.join("; "), /prompt is required/)
+})
+
+test("graph: unresolved template vars and bad returns refs are errors", () => {
+  const check = validateGraphSpec({
+    nodes: [
+      { id: "a", kind: "agent", prompt: "hello {{nosuch}} and {{args.x}}" },
+      { id: "f", kind: "fanout", over: "$a", prompt: "{{item}} at {{index}}" },
+    ],
+    returns: { out: "$missing.text" },
+  })
+  assert.equal(check.ok, false)
+  if (!check.ok) {
+    const all = check.errors.join("; ")
+    assert.match(all, /\{\{nosuch\}\}/)
+    assert.match(all, /returns\.out/)
+  }
+})
+
+test("graph: fanout without max warns; reserved ids rejected", () => {
+  const check = validateGraphSpec({
+    nodes: [
+      { id: "args", kind: "agent", prompt: "p" },
+      { id: "f", kind: "fanout", over: "$args2", prompt: "{{item}}" },
+      { id: "args2", kind: "agent", prompt: "p" },
+    ],
+  })
+  assert.equal(check.ok, false)
+  if (!check.ok) {
+    assert.match(check.errors.join("; "), /reserved/)
+  }
+  const check2 = validateGraphSpec({
+    nodes: [
+      { id: "src", kind: "agent", prompt: "p", schema: { type: "object", required: ["items"], properties: { items: { type: "array", items: { type: "string" } } } } },
+      { id: "f", kind: "fanout", over: "$src", prompt: "{{item}}" },
+    ],
+  })
+  assert.equal(check2.ok, true)
+  if (check2.ok) {
+    assert.ok(check2.warnings.some((w) => w.includes(`default cap ${DEFAULT_FANOUT_MAX}`)))
+  }
+})
+
+// ---------------------------------------------------------------------------
+// Compiler
+// ---------------------------------------------------------------------------
+
+test("graph: compiled script passes script validation and is deterministic", () => {
+  const first = compileGraphSpec(CANONICAL)
+  const second = compileGraphSpec(CANONICAL)
+  assert.equal(first.script, second.script)
+  assert.deepEqual(validateScriptSource(first.script), { ok: true })
+  const meta = first.meta
+  assert.equal(meta.name, "partitioned-review")
+  assert.deepEqual(meta.phases, ["scout", "review", "qc", "report"])
+  assert.deepEqual(meta.requires, ["explore"])
+})
+
+test("graph: compiled script carries keys, phases, partition, gate checkpoint, batches", () => {
+  const { script } = compileGraphSpec(CANONICAL)
+  assert.match(script, /key: "scout"/)
+  assert.match(script, /key: "review:" \+ index/)
+  assert.match(script, /key: "report:b" \+ index/)
+  assert.match(script, /phase: "review"/)
+  assert.match(script, /G_est_lanes/) // partition estimate
+  assert.match(script, /checkpoint\("qc"/) // gate auto-checkpoint
+  assert.match(script, /gate qc rejected/) // abort branch
+  assert.match(script, /G_batches_report/)
+  assert.match(script, /v_lanes\.length/) // returns ref
+})
+
+test("graph: levels group independent nodes into parallel waves", () => {
+  const spec: GraphSpec = {
+    nodes: [
+      { id: "a", kind: "agent", prompt: "a" },
+      { id: "b", kind: "agent", prompt: "b" },
+      { id: "c", kind: "merge", from: "$a", prompt: "m {{item}}" },
+    ],
+  }
+  const levels = graphLevels(spec)
+  assert.deepEqual(
+    levels.map((l) => l.map((n) => n.id)),
+    [["a", "b"], ["c"]],
+  )
+  const { script } = compileGraphSpec(spec)
+  assert.match(script, /const \[r_a, r_b\] = await parallel\(\[/)
+})
+
+// ---------------------------------------------------------------------------
+// End-to-end execution in a real worker
+// ---------------------------------------------------------------------------
+
+test("graph e2e: canonical spec executes — partition, fanout, gate, merge, returns", async () => {
+  const compiled = compileGraphSpec(CANONICAL)
+  const result = await runInWorker(compiled.script, { area: "src/util" }, makeMockAgent(true))
+  assert.equal(result.ok, true, result.error ?? "run failed")
+  const value = result.value as { report?: string; laneCount?: number }
+  // 3 files, budget 100 tokens, 10 tokens/line: a(100) | b(80) | c(120) → 3 lanes
+  assert.equal(value.laneCount, 3)
+  assert.equal(value.report, "merged-text\n---\nmerged-text")
+
+  // agent calls: 1 scout + 3 lanes + 1 gate + 2 merge batches = 7
+  const agentCalls = result.calls.filter((c) => c.fn === "agent")
+  assert.equal(agentCalls.length, 7)
+  const keys = agentCalls.map((c) => String(((c.args[1] ?? {}) as { key?: string }).key))
+  assert.deepEqual(keys.sort(), ["qc", "report:b0", "report:b1", "review:0", "review:1", "review:2", "scout"])
+
+  // the scout prompt interpolated args.area
+  assert.match(String(agentCalls[0]!.args[0]), /src\/util/)
+  // the fanout prompt interpolated the lane item JSON
+  assert.match(String(agentCalls[1]!.args[0]), /a\.ts/)
+
+  // gate checkpoint event landed
+  const cp = result.events.find((e) => e.kind === "checkpoint")
+  assert.ok(cp, "gate emitted a checkpoint")
+  assert.deepEqual(cp!.data, { name: "qc", value: { pass: true, issues: [] } })
+})
+
+test("graph e2e: failed gate aborts the run with the issues", async () => {
+  const compiled = compileGraphSpec(CANONICAL)
+  const result = await runInWorker(compiled.script, { area: "x" }, makeMockAgent(false))
+  assert.equal(result.ok, false)
+  assert.match(result.error ?? "", /gate qc rejected the batch/)
+  assert.match(result.error ?? "", /empty output/)
+})
+
+test("graph e2e: workflow node composes a saved workflow with args from a ref", async () => {
+  const spec: GraphSpec = {
+    nodes: [
+      { id: "prep", kind: "agent", prompt: "prepare {{args.topic}}", schema: { type: "object", required: ["topic"], properties: { topic: { type: "string" } } } },
+      { id: "deep", kind: "workflow", name: "deep-research", argsFrom: "$prep" },
+    ],
+    returns: { deep: "$deep" },
+  }
+  const check = validateGraphSpec(spec)
+  assert.equal(check.ok, true, JSON.stringify(check))
+  const compiled = compileGraphSpec(spec)
+  const result = await runInWorker(compiled.script, { topic: "agent evals" }, makeMockAgent(true))
+  assert.equal(result.ok, true, result.error ?? "run failed")
+  const wfCall = result.calls.find((c) => c.fn === "workflow")
+  assert.ok(wfCall, "workflow bridge called")
+  assert.equal(wfCall!.args[0], "deep-research")
+  assert.deepEqual(wfCall!.args[1], { topic: "agent evals" })
+  const value = result.value as { deep?: { composed?: boolean; topic?: string } }
+  assert.equal(value.deep?.composed, true)
+  assert.equal(value.deep?.topic, "agent evals")
+})
+
+test("graph e2e: checkpoint node persists refs; parallel wave tolerates one failure", async () => {
+  const spec: GraphSpec = {
+    nodes: [
+      { id: "a", kind: "agent", prompt: "a" },
+      { id: "b", kind: "agent", prompt: "b" },
+      { id: "mark", kind: "checkpoint", value: "$a" },
+    ],
+    returns: { a: "$a", b: "$b" },
+  }
+  const compiled = compileGraphSpec(spec)
+  let n = 0
+  const handler: MockHandler = async (fn) => {
+    void fn
+    n += 1
+    if (n === 2) throw new Error("child b exploded")
+    return { text: "A", sessionID: "ses_a" }
+  }
+  const result = await runInWorker(compiled.script, undefined, handler)
+  assert.equal(result.ok, true, result.error ?? "run failed")
+  const value = result.value as { a?: string; b?: string | null }
+  assert.equal(value.a, "A")
+  assert.equal(value.b, null, "a failed sibling nulls, tolerated")
+  const cp = result.events.find((e) => e.kind === "checkpoint")
+  assert.deepEqual(cp!.data, { name: "mark", value: "A" })
+})
+
+// ---------------------------------------------------------------------------
+// Renderers
+// ---------------------------------------------------------------------------
+
+test("graph: mermaid + ascii renders", () => {
+  const mermaid = graphToMermaid(CANONICAL)
+  assert.match(mermaid, /graph TD/)
+  assert.match(mermaid, /scout --> lanes/)
+  assert.match(mermaid, /review --> qc/)
+  assert.match(mermaid, /review --> report/)
+  const ascii = graphToAscii(CANONICAL)
+  assert.match(ascii, /wave 1: scout\(agent\)/)
+  assert.match(ascii, /wave 3: review\(fanout\)/)
+  assert.match(ascii, /wave 4 \[parallel\]: qc\(gate\)\s+\+\s+report\(merge\)/)
+})

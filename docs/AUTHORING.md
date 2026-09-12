@@ -73,6 +73,55 @@ nest: an `ultracode_run` call from a session owned by a
 running workflow is rejected. Pass `background: false` to block until the run finishes
 (success, failure, stop, or timeout) — never while agents are live.
 
+### Graph-authored runs (preferred for standard shapes)
+
+Instead of hand-writing JS, describe the workflow as a **DAG** and let the compiler emit the
+script — cheaper to author, validated before any token is spent, and every call is auto-keyed
+for warm reruns:
+
+```json
+{
+  "graph": {
+    "name": "partitioned-review",
+    "nodes": [
+      { "id": "scout", "kind": "agent", "agent": "explore",
+        "prompt": "Inventory {{args.area}}. Per file: name + line count. Do not read contents.",
+        "schema": { "...": "items: [{name, lines}]" } },
+      { "id": "lanes", "kind": "partition", "from": "$scout.items", "budgetTokens": 35000 },
+      { "id": "review", "kind": "fanout", "over": "$lanes", "agent": "explore", "max": 16,
+        "prompt": "Review exactly these files (ranged reads only):\n{{item}}\nReturn a summary." },
+      { "id": "qc", "kind": "gate", "from": "$review" },
+      { "id": "report", "kind": "merge", "from": "$review", "batches": 8,
+        "prompt": "Merge these lane reports. Reports only:\n{{item}}" }
+    ],
+    "returns": { "report": "$report", "laneCount": "$lanes.length" }
+  },
+  "args": { "area": "src/api" }
+}
+```
+
+- **Node kinds:** `agent` (one child), `fanout` (`over` a ref — one child per item, `{{item}}` /
+  `{{index}}` in the prompt, hard `max` cap default 64), `partition` (token-budgeted lanes from an
+  inventory, no agent), `merge` (batched join of a list, `batches` default 8), `gate` (one QC
+  reviewer with the `{pass, action, issues}` verdict schema; auto-checkpoints and aborts on fail —
+  `onFail: "continue"` to tolerate), `checkpoint` (persist a ref), `workflow` (compose a saved
+  workflow, `argsFrom` ref).
+- **Refs:** `"$scout.items"`, `"$args.angles"`, `"$lanes.length"` — a node's *primary value* is
+  its `.data` when a schema was given, else its `.text`; fanout/merge primaries are arrays / joined
+  text. Refs must flow forward (spec order is the topological order); back-references are
+  validation errors, so cycles are impossible by construction.
+- **Templates:** prompt strings interpolate `{{args.x}}`, `{{nodeId.path}}`, and (fanout/merge)
+  `{{item}}` / `{{index}}`, JSON-stringified.
+- **What the compiler does for you:** null-checking and total-failure aborts per fanout/merge,
+  batching, lane partitioning with coverage by construction, `phase`/`label` bookkeeping (node ids
+  are phases), auto `key` on every call (`scout`, `review:3`, `report:b1`) so warm reruns replay
+  finished children, and independent nodes grouped into `parallel()` waves automatically.
+- **Validation before spawn:** unknown kinds/keys, duplicate or reserved ids, missing prompts,
+  unresolvable refs and templates, fanouts without `max` (warning), budget warnings — an invalid
+  graph costs zero tokens.
+- JS scripts remain the escape hatch for anything the node kinds don't cover; both run through the
+  same runtime, caps, inspector, and resume machinery.
+
 ### Plan → Build (no prior run)
 
 OpenCode plan/build is a host agent mode. Handoff is file + trust + named run:

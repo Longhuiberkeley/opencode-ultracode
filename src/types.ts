@@ -100,7 +100,22 @@ export interface SavedRunInput {
   resumeFrom?: string
 }
 
-export type WorkflowToolInput = InlineRunInput | SavedRunInput
+/**
+ * Run a graph-authored workflow (inline DAG spec — validated and compiled by
+ * src/graph.ts into a plain async-body script). Kept as a plain object here to
+ * avoid a types <-> graph import cycle; deep validation lives in graph.ts.
+ */
+export interface GraphRunInput {
+  graph: Record<string, unknown>
+  name?: string
+  args?: Json
+  /** Default true: return after admission. Explicit false blocks until the envelope. */
+  background?: boolean
+  /** Warm-start from a prior run: keyed succeeded agents replay from cache. */
+  resumeFrom?: string
+}
+
+export type WorkflowToolInput = InlineRunInput | SavedRunInput | GraphRunInput
 
 // ---------------------------------------------------------------------------
 // Run + agent records (registry domain)
