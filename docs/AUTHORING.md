@@ -152,6 +152,40 @@ A graph can be a named, trusted, shareable artifact exactly like a script:
 - **Composition:** a graph node of `kind: "workflow"` can compose a saved graph workflow (depth 1),
   because the loader compiles fresh on every call.
 
+### Discovery: `ultracode_catalog` and declared params
+
+The live catalog appended to the authoring skill is built once per plugin instance, from inside
+the `ultracode_run` executor — so before the first run of a server session the attached skill
+carries an empty catalog and the model cannot see which saved workflows exist. `ultracode_catalog`
+is the fresh, read-only path:
+
+```json
+{}                                    // agents, saved workflows, template summaries, caps
+{ "workflow": "code-audit" }          // one workflow: params as data, graph spec or script head
+{ "template": "research-verify" }     // one complete graph template to adapt
+{ "templates": true }                 // every template spec
+```
+
+- **Workflows** are listed with `kind`, description, `params`, `phases`, `requires`, `trusted`,
+  `source`, node count for graphs, a `broken` reason when a spec will not load, and — from runs
+  **owned by the calling conversation only** — a run count plus the latest run's status, duration,
+  agent counts and tokens. Run history is per-session provenance, so the tool executor filters it
+  before the builder ever sees it.
+- **Params** (`manifest.params`) are derived at save time when not authored: a `// Tool input:`
+  header (names, `?` optionality, example types) beats code references (`args.x`, `args?.x`,
+  `args["x"]`, the `const input = args && …` alias, destructuring), a graph contributes its
+  `{{args.x}}` templates and `$args.x` refs, and saving a run contributes that run's real `args`
+  keys with their JSON types. Explicit params win field by field; derived names fill the gaps.
+  Derivation is best-effort by design — a missed name costs a documentation gap, never a wrong
+  run, because `args` are not enforced.
+- **Templates** (`src/graph-templates.ts`) are the anti-blank-page answer: `partitioned-review`,
+  `research-verify` and `draft-fact-check`, each test-asserted to validate, compile, route only
+  through stock agents, cap every fan-out, and interpolate its item (a fan-out child that never
+  reads `{{item}}` does identical work per lane — the classic wasted-budget bug).
+- **Bounds:** 40 workflows per listing (overflow reported as `moreWorkflows`), descriptions sliced
+  to 200 chars, a script detail view limited to a 1200-char head (where the args contract lives),
+  templates only on request. A catalog is a menu, not a dump.
+
 ### Plan → Build (no prior run)
 
 OpenCode plan/build is a host agent mode. Handoff is file + trust + named run:

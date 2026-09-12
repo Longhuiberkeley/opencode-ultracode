@@ -5,8 +5,10 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 import {
   MAX_ARGS_BYTES,
+  MAX_CATALOG_NAME_CHARS,
   MAX_SCRIPT_BYTES,
   resolveBackground,
+  validateCatalogToolInput,
   validateResultToolInput,
   validateStatusToolInput,
   validateToolInput,
@@ -275,5 +277,66 @@ test("resumeFrom: valid run id accepted on both union branches; junk rejected", 
     const check = validateToolInput({ script: "return 1", resumeFrom: bad })
     assert.equal(check.ok, false, `resumeFrom=${JSON.stringify(bad)} must be rejected`)
     if (!check.ok) assert.match(check.error, /resumeFrom/)
+  }
+})
+
+// ---------------------------------------------------------------------------
+// ultracode_catalog input (workstream C)
+// ---------------------------------------------------------------------------
+
+test("catalog input: no input, or one view, is accepted", () => {
+  for (const raw of [undefined, null, {}]) {
+    const parsed = validateCatalogToolInput(raw)
+    assert.equal(parsed.ok, true, `expected ok for ${JSON.stringify(raw)}`)
+    if (parsed.ok) {
+      assert.equal(parsed.workflow, undefined)
+      assert.equal(parsed.template, undefined)
+      assert.equal(parsed.templates, undefined)
+    }
+  }
+  const detail = validateCatalogToolInput({ workflow: " lane-review " })
+  assert.equal(detail.ok, true)
+  if (detail.ok) assert.equal(detail.workflow, "lane-review", "names are trimmed")
+  const one = validateCatalogToolInput({ template: "research-verify" })
+  assert.equal(one.ok, true)
+  if (one.ok) assert.equal(one.template, "research-verify")
+  const all = validateCatalogToolInput({ templates: true })
+  assert.equal(all.ok, true)
+  if (all.ok) assert.equal(all.templates, true)
+  const off = validateCatalogToolInput({ templates: false })
+  assert.equal(off.ok, true)
+  if (off.ok) assert.equal(off.templates, false)
+})
+
+test("catalog input: exactly one view per call", () => {
+  for (const raw of [
+    { workflow: "a", template: "b" },
+    { workflow: "a", templates: true },
+  ]) {
+    const parsed = validateCatalogToolInput(raw)
+    assert.equal(parsed.ok, false, `expected rejection for ${JSON.stringify(raw)}`)
+    if (!parsed.ok) assert.match(parsed.error, /choose ONE view per call/)
+  }
+  // template + templates is redundant but unambiguous (the named one wins)
+  const both = validateCatalogToolInput({ template: "a", templates: true })
+  assert.equal(both.ok, true)
+})
+
+test("catalog input: bad names, bad flags and unknown keys are rejected precisely", () => {
+  const cases: Array<[unknown, RegExp]> = [
+    [{ workflow: "" }, /"workflow" must be a non-empty name/],
+    [{ workflow: "   " }, /"workflow" must be a non-empty name/],
+    [{ workflow: 42 }, /"workflow" must be a non-empty name, got number/],
+    [{ template: null }, /"template" must be a non-empty name, got null/],
+    [{ workflow: "x".repeat(MAX_CATALOG_NAME_CHARS + 1) }, /too long/],
+    [{ templates: "yes" }, /"templates" must be a boolean, got string/],
+    [{ bogus: 1 }, /unexpected key "bogus"/],
+    ["nope", /input must be an object, got string/],
+    [[], /input must be an object, got array/],
+  ]
+  for (const [raw, pattern] of cases) {
+    const parsed = validateCatalogToolInput(raw)
+    assert.equal(parsed.ok, false, `expected rejection for ${JSON.stringify(raw)}`)
+    if (!parsed.ok) assert.match(parsed.error, pattern)
   }
 })

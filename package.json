@@ -1,6 +1,6 @@
 {
   "name": "opencode-ultracode",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "description": "Claude Code-style dynamic workflows (ultracode) for OpenCode v2",
   "type": "module",
   "license": "MIT",

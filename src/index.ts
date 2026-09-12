@@ -33,6 +33,7 @@ import {
   type StatusChildView,
 } from "./command.ts"
 import { loadOptions } from "./config.ts"
+import { buildCatalog } from "./catalog.ts"
 import { controlToolContent } from "./control.ts"
 import {
   applyOverlay,
@@ -58,7 +59,7 @@ import { EMPTY_CATALOG, SKILL_CONTENT, SKILL_DESCRIPTION, SKILL_NAME, buildSkill
 import { compileGraphSpec, validateGraphSpec } from "./graph.ts"
 import type { GraphSpec } from "./graph.ts"
 import { StorageImpl, normalizePath, resolveContainedPath, sha256 } from "./storage.ts"
-import { resolveBackground, validateControlToolInput, validateResultToolInput, validateStatusToolInput, validateToolInput } from "./tool-input.ts"
+import { resolveBackground, validateCatalogToolInput, validateControlToolInput, validateResultToolInput, validateStatusToolInput, validateToolInput } from "./tool-input.ts"
 import type {
   FsLike,
   Json,
@@ -245,6 +246,26 @@ const RESULT_TOOL_INPUT_SCHEMA: Record<string, unknown> = {
       minimum: 2,
       maximum: 131072,
       description: "Max chars for this chunk (min 2 — one UTF-16 unit can be half a surrogate pair; default 24000, max 131072). Chunks concatenate; parse after the complete chunk.",
+    },
+  },
+}
+
+const CATALOG_TOOL_INPUT_SCHEMA: Record<string, unknown> = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    workflow: {
+      type: "string",
+      description:
+        "One saved workflow name → detail view: params (names, JSON types, optional markers), phases, required agents, trust state, the full graph spec (graph kind) or the script head (script kind), and last-run stats from this conversation.",
+    },
+    template: {
+      type: "string",
+      description: "One graph template name → its complete spec, ready to adapt (edit prompts, caps, schemas).",
+    },
+    templates: {
+      type: "boolean",
+      description: "true → every graph template's complete spec. Larger payload; prefer `template` for one.",
     },
   },
 }
@@ -851,6 +872,46 @@ export default Plugin.define({
         } catch (err) {
           warn("failed to register the ultracode_result tool", err)
         }
+        editor.add({
+          name: "catalog",
+          options: { namespace: "ultracode" },
+          description:
+            "Read-only discovery of what this project can run: saved workflows (kind, params with JSON types, phases, required agents, trust state, last-run stats from THIS conversation), the available agent ids, and graph templates to adapt. Call it BEFORE choosing a saved workflow or authoring a graph — cheaper than reading workflow files, and it executes nothing. Input { workflow? | template? | templates? }: no input returns the whole bounded catalog; one view per call. A workflow listed as trusted can be run immediately; an untrusted one needs the user's /ultracode trust first (relay that, never work around it).",
+          input: CATALOG_TOOL_INPUT_SCHEMA,
+          execute: async (rawInput: unknown, tool) => {
+            try {
+              const parsed = validateCatalogToolInput(rawInput)
+              if (!parsed.ok) return { content: `error: ${parsed.error}` }
+              // Fresh scans: workflows may have been saved or edited while the
+              // server ran, and persisted runs may predate this process.
+              await runsReconciled
+              await storage.refreshWorkflows()
+              const listed = await listAgents()
+              // Ownership: run history is per-conversation provenance, so stats
+              // never leak another session's runs (same rule as status/result).
+              const runs = registry.listRecent(50).filter((r) => r.parentSessionID === tool.sessionID)
+              const catalog = buildCatalog({
+                ...(listed.ok ? { agents: listed.agents } : { agentsUnavailable: listed.error }),
+                workflows: storage.listWorkflows().map((workflow) => ({
+                  workflow,
+                  trusted: storage.workflowTrustState(workflow.manifest.name) === "trusted",
+                })),
+                runs,
+                caps: {
+                  concurrency: options.concurrency,
+                  maxAgents: options.maxAgents,
+                  timeoutMs: options.timeoutMs,
+                },
+                ...(parsed.templates !== undefined ? { templates: parsed.templates } : {}),
+                ...(parsed.template !== undefined ? { template: parsed.template } : {}),
+                ...(parsed.workflow !== undefined ? { workflow: parsed.workflow } : {}),
+              })
+              return { content: JSON.stringify(catalog) }
+            } catch (err) {
+              return { content: `error: ${describeError(err)}` }
+            }
+          },
+        })
         editor.add({
           name: "control",
           options: { namespace: "ultracode" },

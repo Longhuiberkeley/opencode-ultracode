@@ -1,58 +1,35 @@
 # Ultracode workflows
 
-You are about to author a workflow: a plain JavaScript async-body script that runs in an isolated
-worker. Every `agent(...)` call spawns a REAL subagent session with its own context window and its
-own model. The script returns a small JSON value; only that value plus a compact run envelope
-re-enters your session. Child transcripts never touch your context.
+You are about to author a workflow that orchestrates REAL subagent sessions from an isolated
+worker. Every `agent(...)` call spawns a child with its own context window and its own model.
+The run returns a small JSON value; only that value plus a compact envelope re-enters your
+session. Child transcripts never touch your context.
 
-Invoke `ultracode_run` with `{ graph, args? }` (graph-authored — preferred for standard shapes),
-`{ script, name?, meta?, args? }` (hand-written inline), or `{ workflow: "name", args? }` (saved);
-every form also takes `background` and `resumeFrom` — a prior runID that warm-starts the run so
-keyed succeeded agents replay from cache and an interrupted long run costs only its unfinished
-tail. `meta` and `args` are injected into the script as globals. Runs are background by default:
-the tool returns immediately after admission
-so the parent chat stays available; pass `background: false` only when you need the envelope
-in-call. Progress and status are scoped to that run
-(`ultracode_status`, inspect, `/ultracode status`). When the run settles, a one-line notice lands
-in the parent session and wakes the calling agent (status, agents, result brief, stop reason). If
-the result exceeds the size cap, the notice and `ultracode_status` carry a preview and the total
-size — fetch the full value with `ultracode_result { runID, offset, maxLength }`; chunks are
-substrings of the compact JSON, so concatenate from offset 0 following `nextOffset`, then parse once.
+Two ways to author, and the order matters:
 
-For long interactive tasks, background is the default so the user can keep chatting.
-When the user changes requirements, use `ultracode_steer` with `{ runID, agentID?, text }`
-to deliver the adjustment to one running child without stopping the workflow. If several
-children are active, choose the relevant agentID from status; do not broadcast edits blindly.
-Status includes active child IDs and permission waits. In Ctrl+G, review permissions with y or n;
-never treat a blocked child as completed work.
+1. **Graph** — a JSON DAG. The runtime validates it (refs, forward edges, prompts, budget),
+   schedules the parallel waves and compiles the plumbing. Preferred: an invalid graph costs
+   zero tokens, every call is auto-keyed for warm replay, and the structure stays reviewable.
+2. **Script** — a plain-JS async function body. The escape hatch for what nodes cannot express:
+   bounded loops, retries, conditional re-planning, arithmetic over intermediates.
 
-Control your own runs: `ultracode_status { runID? }` returns per-child detail (id, session, label,
-phase, status) and, once the run settles, the result itself — inline when it fits the size cap,
-else a bounded preview with the total size; `ultracode_result` `{ runID, offset?, maxLength? }`
-pages the FULL settled result when it was truncated; `ultracode_control` with
-`{ action: "stop" | "pause" | "resume", runID? }` stops, pauses, or resumes a run this
-conversation owns (implicit target only when exactly one is active). Stop is graceful — no new
-agent calls, in-flight children interrupted — and is recorded as the run's stop reason
-(`/ultracode show` displays it). Pause and resume are not persisted log lines.
+Invoke `ultracode_run` with `{ graph, args? }`, `{ script, name?, meta?, args? }`, or
+`{ workflow: "name", args? }` (saved). Every form also takes `background` and `resumeFrom` — a
+prior runID that warm-starts the run so keyed succeeded agents replay from cache and an
+interrupted long run costs only its unfinished tail. `meta` and `args` are injected as globals.
 
-Never paste a workflow script into a generic JS/execute sandbox — `agent`, `parallel`, `pipeline`, `phase`, `progress`, `workflow`, `sleep`, `args`, and `meta` exist only inside `ultracode_run`; anywhere else they are undefined.
+## Discovery first: ultracode_catalog
 
-This skill auto-attaches when `ultracode` appears as a standalone keyword anywhere in the prompt
-(`ultracode: audit the auth module`, `please ultracode this`). Paths like `opencode-ultracode` do
-not match; plain "use a workflow" does not auto-attach — the host may still select this skill.
+`ultracode_catalog` is read-only, cheap, and fresher than anything in this skill. Call it before
+choosing a saved workflow or authoring a graph from a blank page. With no input it returns the
+agent roster, every saved workflow (kind, description, **params with JSON types**, phases,
+required agents, trust state, last-run stats) and the graph template summaries. Drill in with
+`{ workflow: "name" }` for one workflow's full spec (graph) or script head, `{ template: "name" }`
+for one ready-made spec, or `{ templates: true }` for all of them.
 
-## Coexistence with other skills
-
-Other attached skills carry the domain: methodology, evidence standards, consent rules, reporting
-format. Ultracode carries only the execution mechanism: orchestrating many agents from one script.
-Two rules keep the layers from fighting:
-
-1. Use ONE orchestration mechanism per task. Do not fan out through native subagents AND a
-   workflow in the same task; if a workflow is running, it owns all delegation.
-2. Child sessions do NOT inherit skills attached to your session: a child sees only its prompt.
-   When domain skills impose requirements (consent, provider rules, output format), restate them
-   inside the workflow prompts for that domain work — e.g. the bailian consent and provider rules
-   when the user relies on them.
+Two things it tells you that guessing cannot: what `args` a saved workflow actually takes, and
+whether the user has trusted it. An untrusted workflow needs the user's `/ultracode trust <name>` —
+relay that and wait; never work around it by inlining an equivalent script.
 
 ## Decide: answer, delegate, or workflow
 
@@ -61,46 +38,100 @@ Two rules keep the layers from fighting:
 | One reply answers it | Answer directly. Spawn nothing. |
 | One focused subtask (explore one corner, review one file) | Delegate to a single subagent. |
 | Task outgrows one context window: many files, many sources, broad research | Workflow: fan out, merge. |
-| Verification must be structural: independent verifiers, skeptics, judges | Workflow with a verify phase. |
+| The shape is standard: scout → partition → fan out → gate → merge | Workflow as a **graph**, from a template. |
+| Verification must be structural: independent verifiers, skeptics, judges | Workflow with a verify phase and a gate. |
 | You will rerun, share, or compose the orchestration | Workflow, saved under a name. |
+| You need loops, retries or conditional re-planning | Workflow as a **script**. |
 
 Rule of thumb: a workflow earns its cost when you can name BOTH the fan-out AND the verifier.
 Name neither? Answer or delegate instead.
+
+## Graph mode (author structure, not plumbing)
+
+A graph is `{ nodes: [...], returns?: { key: "$node.path" } }`. Node ids are the phases; refs
+like `"$scout.items"` are the edges and must flow forward, so cycles are impossible by
+construction. Prompt templates interpolate `{{args.x}}`, `{{nodeId.path}}` and, inside a fanout
+or merge, `{{item}}` and `{{index}}` — each JSON-stringified. A template that names another node
+IS a dependency: the scheduler orders it, so a reader never runs beside its producer.
+
+| Kind | What it does | Key fields |
+| --- | --- | --- |
+| `agent` | one child | `prompt`, `agent?`, `schema?`, `label?` |
+| `fanout` | one child per item of `over` | `over`, `prompt` with `{{item}}`, `max` (always set it) |
+| `partition` | split an inventory into token-budgeted lanes, no agent | `from`, `budgetTokens`, `tokensPerLine` |
+| `merge` | batched merge children over `from`, joined text | `from`, `prompt`, `batches` |
+| `gate` | ONE QC reviewer; auto-checkpoints, aborts the run on a failed verdict | `from`, `onFail` |
+| `checkpoint` | persist a named snapshot, no agent | `from` or `value` |
+| `workflow` | compose a saved workflow, depth 1 | `name`, `argsFrom?` |
+
+What the compiler does for you: null-checking and a total-failure abort per fanout or merge,
+batching, lane partitioning with coverage by construction, `phase` and `label` bookkeeping,
+independent nodes grouped into `parallel()` waves, and an auto `key` on every call (`scout`,
+`review:3`, `report:b1`) so a warm rerun replays finished children instead of paying twice.
+
+Start from a template (`ultracode_catalog { template: "partitioned-review" }`) and edit prompts,
+caps and schemas — that is cheaper and safer than inventing structure. Templates ship for
+partitioned review, research with independent verification, and draft fact-checking.
+
+## Complete graph example (runs as-is)
+
+Material-budgeted review of a repo area: scout → partition → one reviewer per lane → QC gate →
+batched merge of reports only.
+
+```
+{
+  "graph": {
+    "name": "partitioned-review",
+    "nodes": [
+      { "id": "scout", "kind": "agent", "agent": "explore",
+        "prompt": "Inventory {{args.area}} for review. Use glob, grep and line counts only — do NOT read file contents. Return every file with path and line count.",
+        "schema": { "type": "object", "required": ["files"], "properties": { "files": { "type": "array",
+          "items": { "type": "object", "required": ["path", "lines"],
+            "properties": { "path": { "type": "string" }, "lines": { "type": "number" } } } } } } },
+      { "id": "lanes", "kind": "partition", "from": "$scout.files", "budgetTokens": 35000 },
+      { "id": "review", "kind": "fanout", "over": "$lanes", "agent": "explore", "max": 12,
+        "prompt": "Review exactly the files in this lane: {{item}}\nRead-discipline: grep and ranged reads only, never whole-read a file over ~500 lines, never echo contents back.\nReport concrete defects with file and line; list what you covered and put anything unread in overflow.",
+        "schema": { "type": "object", "required": ["summary", "covered", "overflow"], "properties": {
+          "summary": { "type": "string" }, "covered": { "type": "array", "items": { "type": "string" } },
+          "overflow": { "type": "array", "items": { "type": "string" } } } } },
+      { "id": "qc", "kind": "gate", "from": "$review" },
+      { "id": "report", "kind": "merge", "from": "$review", "agent": "general", "batches": 8,
+        "prompt": "Merge these lane reports into one review ordered by severity. Reports only — do NOT read source files.\n{{item}}" }
+    ],
+    "returns": { "report": "$report", "lanes": "$lanes.length", "qc": "$qc" }
+  },
+  "args": { "area": "the directory to review" }
+}
+```
 
 ## Plan → Build (named workflow, no prior run)
 
 Author in Plan mode; run by name from Build mode. Do not call `ultracode_run` inline from Plan.
 
-1. Write only `<name>.js` in the project workflows directory (async-function body, no module syntax).
-   Name: lowercase alphanumerics, `-`/`_`, max 64 chars.
-2. `/ultracode save <name>` (one-token file save). After a run, `/ultracode save <runID> <name>` still works.
-3. `/ultracode trust <name>` (digest-bound; editing the script invalidates trust until re-approved).
+1. Write ONE artifact into the project workflows directory: `<name>.graph.json` (a graph — pure
+   JSON, no escaping hazards) or `<name>.js` (a script, async-function body, no module syntax).
+   Name: lowercase alphanumerics, `-` or `_`, max 64 chars.
+2. `/ultracode save <name>` (one-token file save). After a run, `/ultracode save <runID> <name>`
+   still works — a graph run saves its spec, not the compiled script.
+3. Review a graph with `/ultracode graph <name>` (waves, node table, mermaid — works before
+   trust, which is the point), then `/ultracode trust <name>` (digest-bound; editing the artifact
+   invalidates trust until it is re-approved).
 4. Build: `ultracode_run` with `{ workflow: "name", args? }`. Do not mix native subagent fan-out
    with a workflow in the same task.
 
-## Graph mode (author structure, not plumbing)
-
-For standard shapes — scout → partition → fan-out → gate → merge — pass `{ graph, args }` instead
-of writing JS: a JSON DAG the runtime VALIDATES (refs, forward edges, prompts, budget) and COMPILES
-for you. Nodes: `agent` / `fanout` (`over`, `{{item}}`, `max`) / `partition` (budgeted lanes) /
-`merge` (batched) / `gate` (one QC reviewer, abort on fail) / `checkpoint` / `workflow`; refs like
-`"$scout.items"`; templates `{{args.x}}` and `{{node.path}}`. The compiler adds null-handling,
-batching, phase and label bookkeeping, `parallel()` waves, and an auto `key` on every call. Invalid
-graphs fail before any token is spent; write JS only when nodes cannot express the orchestration.
-
-## Script API (exact)
+## Script mode (the escape hatch)
 
 The script is an async function body: top-level `await` and `return` are legal, module syntax is
 rejected. Injected globals, nothing else:
 
 | Global | Call | Semantics |
 | --- | --- | --- |
-| `agent` | `agent(prompt, opts?)` | Spawns one subagent and waits. Resolves `{ text, sessionID, agent, model, tokens, data?, cachedFrom? }`. `opts`: `agent` (agent id), `label`, `phase`, `schema`, `key`. With `opts.schema`, extracted JSON lands in `.data`, validated and repaired once. `opts.key` (stable id, e.g. `"lane:3"`) marks the call replayable: on a warm rerun (`resumeFrom` tool input, or `/ultracode rerun <runID> --warm`) a succeeded call with the same key AND the same prompt+schema+agent digest returns from cache — no session, no cap hit. Key every deterministic call in long runs. |
+| `agent` | `agent(prompt, opts?)` | Spawns one subagent and waits. Resolves `{ text, sessionID, agent, model, tokens, data?, cachedFrom? }`. `opts`: `agent` (agent id), `label`, `phase`, `schema`, `key`. With `opts.schema`, extracted JSON lands in `.data`, validated and repaired once. `opts.key` (stable id, e.g. `"lane:3"`) marks the call replayable: on a warm rerun (`resumeFrom`, or `/ultracode rerun <runID> --warm`) a succeeded call with the same key AND the same prompt+schema+agent digest returns from cache — no session, no cap hit. Key every deterministic call in a long run. |
 | `parallel` | `parallel(thunks)` | Barrier over thunks. A thunk that throws resolves as `null`; siblings still run. |
 | `pipeline` | `pipeline(items, ...stages)` | Runs every item through the stages in order. A failing item becomes `null`; other items are unaffected. |
 | `phase` | `phase(name)` | Sets the ambient phase label for progress grouping. |
 | `progress` | `progress(text)` | Emits a progress line into the run log. |
-| `checkpoint` | `checkpoint(name, value?)` | Persists a named phase-boundary snapshot (small JSON) onto the run record — visible in `/ultracode show` and `ultracode_status` (`checkpoints`). Call it after each expensive phase with the merged intermediate (`checkpoint("survey-done", { signals: merged.length })`); it survives interruption and marks where a warm rerun can resume from. |
+| `checkpoint` | `checkpoint(name, value?)` | Persists a named phase-boundary snapshot (small JSON) onto the run record — visible in `/ultracode show` and `ultracode_status`. Call it after each expensive phase; it survives interruption and marks where a warm rerun resumes from. |
 | `workflow` | `workflow(name, args?)` | Runs a SAVED workflow, resolves its JSON return. Depth 1 only: it may not compose another. |
 | `sleep` | `sleep(ms)` | Pause, capped at 60000 ms per call. |
 | `console` | `console.log(x)` | Buffered into the run log. |
@@ -115,123 +146,58 @@ run legitimately needs it.
 
 ## Hard rules
 
-1. **Async function body ONLY.** `import`, `export`, and `require` are rejected before the run
-   starts. There are no file, network, or process APIs in the worker; all real work goes through
-   `agent`.
-2. **Return small JSON.** A few keys: a report string, counts, verdicts. Bigger values come back
+1. **Graph first, script when you must.** If nodes express the shape, use them: validation is
+   free, keys are automatic, and the structure stays reviewable. Write JS for loops and retries.
+2. **Async function body ONLY** in a script. `import`, `export` and `require` are rejected before
+   the run starts. There are no file, network or process APIs in the worker; all real work goes
+   through `agent`.
+3. **Return small JSON.** A few keys: a report string, counts, verdicts. Bigger values come back
    as a truncated preview — recover the full value with `ultracode_result` (offset paging), never
    by guessing past the cut.
-3. **Route by agent, never by model.** No provider or model ids anywhere. Pass an agent id in
+4. **Route by agent, never by model.** No provider or model ids anywhere. Pass an agent id in
    `opts.agent`; the user's own agent config decides which model runs.
-4. **Prompts are the entire world.** A child agent sees ONLY its prompt string, zero conversation
+5. **Prompts are the entire world.** A child agent sees ONLY its prompt string, zero conversation
    context. Make every prompt self-contained: paths, pasted snippets, criteria, output format.
-5. **Serialize write agents.** A clean context is NOT filesystem isolation: two write agents
+6. **Serialize write agents.** A clean context is NOT filesystem isolation: two write agents
    racing in one worktree corrupt it. One write agent at a time; parallelize read-only agents.
-6. **Prefer explicit `opts.phase`.** The ambient `phase()` label races across parallel branches;
-   an explicit `opts.phase` on every `agent` call always wins.
-7. **Use `opts.schema` for anything you merge or branch on.** `.data` is validated JSON; `.text`
-   is unvalidated prose.
-8. **`parallel` swallows failures as `null`.** Null-check every result before merging, then
-   decide: skip, retry, or abort.
-9. **Bound everything.** Cap items, claims, and retry iterations. A runaway fan-out hits the
-   200-agent cap and fails the whole run; a wide one dies on the 60-minute wall clock — budget
-   waves × stages × ~5-10 min per child before you write the first `agent()` call.
-10. **`meta` and `args` come from tool input**, never from inside the script. Declare every
+7. **Prefer explicit `opts.phase`.** The ambient `phase()` label races across parallel branches;
+   an explicit `opts.phase` on every `agent` call always wins. (Graph nodes set it for you.)
+8. **Use `opts.schema` for anything you merge or branch on.** `.data` is validated JSON; `.text`
+   is unvalidated prose. (A graph node's `schema` does the same.)
+9. **`parallel` swallows failures as `null`.** Null-check every result before merging, then
+   decide: skip, retry, or abort. Compiled graphs null-check and abort on total failure for you.
+10. **Bound everything.** Cap items, claims and retry iterations. A runaway fan-out hits the
+    200-agent cap and fails the whole run; a wide one dies on the 60-minute wall clock. Set `max`
+    on every fanout node and `slice(0, n)` in every script loop.
+11. **`meta` and `args` come from tool input**, never from inside the script. Declare every
     non-stock agent in `meta.requires` so the preflight fails fast with the available-agents list.
-11. **Verify before you trust.** Generators fan out, independent verifiers check, a skeptic pass
+12. **Verify before you trust.** Generators fan out, independent verifiers check, a skeptic pass
     overturns weak survivals. If the verifier shares the generator's failure modes, the workflow
-    is theater.
-12. **Gate expensive phases; checkpoint the merge.** Between a cheap and an expensive phase, run
-    ONE small reviewer (`{ pass, action, issues }` schema) over the merged intermediate and abort on
-    failure; then `checkpoint(name, value)`. Key the calls you would not want to pay for twice.
+    is theater. A `gate` node between an expensive phase and the next one is this, pre-built.
 
-## Patterns
-
-Skeletons assume SCHEMA constants are JSON Schema objects you define inline (see the complete
-example below).
-
-### Sizing: partition, budget, merge (read this before any wide fan-out)
+## Sizing: partition, budget, merge (read this before any wide fan-out)
 
 A 300k-token child is a lane that was too wide, not a model problem. Budget **input material**
 (files, line counts), not context tokens — reasoning models inflate their own numbers, so material
 is the only unit comparable across the user's model rotation.
 
 1. **Scout before you fan out** — one cheap `explore` child returns an inventory (paths + line
-   counts). The script, not the children, partitions it into lanes.
-2. **~30-40k tokens of source per lane** (≈3-4k lines at ~10 tokens per line — the
-   scout reports lines, the script converts), keyed to the smallest window that
-   might run it.
-3. **Arithmetic coverage assertion** — every inventoried file lands in ≥1 lane; assert it in the
-   script. Coverage comes from the map, not from each child reading everything.
-4. **Every lane schema carries `overflow`** (paths not read within budget); the script subdivides
-   overflow into new lanes instead of silently under-covering.
-5. **Merge reads REPORTS only, in batches of ~8** (hierarchical for more). One mega-merge child
+   counts). The orchestration, not the children, partitions it into lanes. A `partition` node
+   does this at ~35000 estimated tokens per lane (≈3-4k lines at ~10 tokens per line).
+2. **Arithmetic coverage assertion** — every inventoried file lands in ≥1 lane. Coverage comes
+   from the map, not from each child reading everything.
+3. **Every lane schema carries `overflow`** (paths not read within budget) so the next pass can
+   subdivide them instead of silently under-covering.
+4. **Merge reads REPORTS only, in batches of ~8** (hierarchical for more). One mega-merge child
    recreates the exact blowup fan-out exists to avoid.
-6. **One cross-cutting lane** greps the cross-file question's symbols repo-wide, so
+5. **One cross-cutting lane** greps the cross-file question's symbols repo-wide, so
    partition-by-file seams have an owner.
-7. **Wall clock beats the agent cap**: waves (ceil(agents / concurrency)) × stages × ~5-10 min per
-   child must fit 60 min. Prefer wide-not-deep; raise per project via `/ultracode set timeoutMs`.
-8. **Read-discipline in every child prompt**: grep + ranged reads, no whole-file reads of large
+6. **Read-discipline in every child prompt**: grep + ranged reads, no whole-file reads of large
    files, never echo file contents back; output = the schema JSON only.
 
-### Scout → partition → fan-out (material-budgeted, coverage-checked)
+## Script-only patterns
 
-```
-const LANE_BUDGET = 35000 // ESTIMATED TOKENS of source; scout reports lines
-const TOKENS_PER_LINE = 10
-const SCOUT = { type: "object", required: ["files"], properties: { files: { type: "array",
-  items: { type: "object", required: ["path", "lines"], properties: { path: { type: "string" },
-  lines: { type: "number" } } } } } }
-const REPORT = { type: "object", required: ["summary", "covered", "overflow"], properties: {
-  summary: { type: "string" }, covered: { type: "array", items: { type: "string" } },
-  overflow: { type: "array", items: { type: "string" } } } }
-
-phase("scout")
-const scout = await agent("Inventory the repo area " + area + ". Per file: path, line count. " +
-  "Use glob, grep, wc — do NOT read file contents.", { agent: "explore", phase: "scout", schema: SCOUT })
-const files = (scout && scout.data && scout.data.files) || []
-
-// Script-side partition under the token budget (lines × ~10), then assert coverage.
-const est = (f) => Math.max(1, Math.round((f.lines || 0) * TOKENS_PER_LINE))
-const lanes = []
-let cur = { files: [], lines: 0 }
-for (const f of files) {
-  if (cur.files.length > 0 && cur.lines + est(f) > LANE_BUDGET) { lanes.push(cur); cur = { files: [], lines: 0 } }
-  cur.files.push(f); cur.lines += est(f)
-}
-if (cur.files.length) lanes.push(cur)
-const assigned = new Set(lanes.flatMap((l) => l.files.map((f) => f.path)))
-const unassigned = files.filter((f) => !assigned.has(f.path)).map((f) => f.path)
-if (unassigned.length) throw new Error("coverage assertion failed: " + unassigned.join(", "))
-
-phase("lanes")
-const reports = await parallel(lanes.map((lane, i) => () =>
-  agent("Review exactly these files (grep + ranged reads only; never whole-read files over ~500 " +
-    "lines; never echo contents back):\n" + JSON.stringify(lane.files) +
-    "\nReturn summary, covered paths, overflow = paths you could not review within budget.",
-    { agent: "explore", phase: "lanes", label: "lane" + (i + 1), schema: REPORT })))
-// overflow paths → subdivide and re-run (bounded gap-fill, same partition helper)
-```
-
-### Fan-out and synthesize (batched merge; merge reads reports only)
-
-```
-phase("research")
-const parts = await parallel(["api", "storage", "ui"].map((area) => () =>
-  agent("Summarize the " + area + " layer of this repo. Read the code; be concrete.",
-    { agent: "explore", phase: "research", schema: SUMMARY })))
-const good = parts.filter(Boolean)
-// Batched merge: reports only, ~8 per merge child (one mega-merge recreates
-// the context blowup fan-out exists to avoid).
-const batches = []
-for (let i = 0; i < good.length; i += 8) batches.push(good.slice(i, i + 8))
-const drafts = await parallel(batches.map((batch, bi) => () =>
-  agent("Merge these lane reports into one section list. Reports only — do not read source files.\n" +
-    JSON.stringify(batch.map((p) => p.data)), { agent: "general", phase: "synthesize", label: "merge" + (bi + 1) })))
-const report = await agent("Combine these merged sections into one report:\n" +
-  drafts.filter(Boolean).map((d) => d.text).join("\n---\n"), { agent: "general", phase: "synthesize" })
-return { report: report.text, sections: good.length }
-```
+Skeletons assume SCHEMA constants are JSON Schema objects you define inline.
 
 ### Adversarial verification (verifier, then skeptic)
 
@@ -239,12 +205,12 @@ return { report: report.text, sections: good.length }
 phase("verify")
 const verdicts = await parallel(claims.map((c) => () =>
   agent("Verify this claim. Try to refute it before accepting it.\nClaim: " + c,
-    { agent: "general", phase: "verify", schema: VERDICT })))
+    { agent: "general", phase: "verify", schema: VERDICT, key: "verify:" + c.slice(0, 24) })))
 const supported = verdicts.flatMap((v, i) =>
   v && v.data && v.data.verdict === "supported" ? [claims[i]] : [])
 phase("skeptic")
 const skeptic = await agent("Overturn any of these resting on weak evidence:\n" +
-  JSON.stringify(supported), { agent: "general", phase: "skeptic", schema: OVERTURNED })
+  JSON.stringify(supported), { agent: "general", phase: "skeptic", key: "skeptic:v1" })
 ```
 
 ### Pipeline per item (a stage failure isolates to one item)
@@ -252,38 +218,9 @@ const skeptic = await agent("Overturn any of these resting on weak evidence:\n" 
 ```
 const rated = await pipeline(files,
   (f) => agent("Skim this file and list risks.\nFile: " + f,
-    { agent: "explore", phase: "skim", schema: RISKS }),
+    { agent: "explore", phase: "skim", schema: RISKS, key: "skim:" + f }),
   (r, i) => agent("Rate the severity of these risks:\n" + JSON.stringify(r.data) +
-    "\nFile: " + files[i], { agent: "general", phase: "rate", schema: SEVERITY }))
-```
-
-### Generate and filter
-
-```
-phase("draft")
-const drafts = await parallel(Array.from({ length: 6 }, (_, i) => () =>
-  agent("Propose solution " + (i + 1) + " for this task. One paragraph each.\nTask: " + task,
-    { agent: "general", phase: "draft" })))
-phase("filter")
-const best = await agent("Rank these drafts. Keep the top 2 with reasons.\n" +
-  drafts.filter(Boolean).map((d) => d.text).join("\n---\n"),
-  { agent: "general", phase: "filter", schema: TOP2 })
-```
-
-### Tournament (pairwise judges, bounded rounds)
-
-```
-let pool = options.slice()
-for (let round = 0; round < 3 && pool.length > 1; round++) {
-  const pairs = []
-  for (let i = 0; i + 1 < pool.length; i += 2) pairs.push([pool[i], pool[i + 1]])
-  const picks = await parallel(pairs.map((pair) => () =>
-    agent("Judge this pair; pick exactly one winner.\nA: " + pair[0] + "\nB: " + pair[1],
-      { agent: "general", phase: "judge", schema: PICK })))
-  pool = picks.flatMap((p, i) =>
-    p && p.data && p.data.winner === "B" ? [pairs[i][1]] : [pairs[i][0]])
-}
-return { winner: pool[0] }
+    "\nFile: " + files[i], { agent: "general", phase: "rate", schema: SEVERITY, key: "rate:" + files[i] }))
 ```
 
 ### Loop until done (bounded; the write agent stays sequential)
@@ -293,31 +230,30 @@ let open = issues
 for (let pass = 1; pass <= 5 && open.length > 0; pass++) {
   progress("pass " + pass + ": " + open.length + " open")
   await agent("Fix exactly these issues. Change no unrelated code.\n" + JSON.stringify(open),
-    { agent: "general", phase: "fix", label: "fix" + pass })   // write agent: one at a time
+    { agent: "general", phase: "fix", label: "fix" + pass, key: "fix:" + pass })
   const recheck = await agent("Check whether these issues still exist. List survivors only.\n" +
-    JSON.stringify(open), { agent: "explore", phase: "recheck", schema: ISSUES })
+    JSON.stringify(open), { agent: "explore", phase: "recheck", schema: ISSUES, key: "recheck:" + pass })
   open = (recheck && recheck.data && recheck.data.issues) || []
+  checkpoint("fix-pass-" + pass, { open: open.length })
 }
 return { fixed: issues.length - open.length, open }
 ```
 
-### Gate + checkpoint between phases (cheap QC; resumable boundaries)
+### Tournament (pairwise judges, bounded rounds)
 
 ```
-const gate = await agent("QC this batch. pass=false only for concrete defects (empty, " +
-  "duplicated, off-scope).\n" + JSON.stringify(merged.slice(0, 10)),
-  { agent: "explore", phase: "gate", schema: { type: "object", required: ["pass", "action"],
-    properties: { pass: { type: "boolean" }, action: { type: "string", enum: ["continue", "abort"] },
-      issues: { type: "array", items: { type: "string" } } } } })
-if (gate && gate.data && gate.data.pass === false && gate.data.action === "abort") {
-  throw new Error("gate rejected the merge: " + JSON.stringify(gate.data.issues || []))
+let pool = options.slice()
+for (let round = 0; round < 3 && pool.length > 1; round++) {
+  const pairs = []
+  for (let i = 0; i + 1 < pool.length; i += 2) pairs.push([pool[i], pool[i + 1]])
+  const picks = await parallel(pairs.map((pair, i) => () =>
+    agent("Judge this pair; pick exactly one winner.\nA: " + pair[0] + "\nB: " + pair[1],
+      { agent: "general", phase: "judge", schema: PICK, key: "judge:" + round + ":" + i })))
+  pool = picks.flatMap((p, i) =>
+    p && p.data && p.data.winner === "B" ? [pairs[i][1]] : [pairs[i][0]])
 }
-checkpoint("merge-done", { count: merged.length })
-const out = await agent("Synthesize...", { agent: "general", phase: "synthesize", key: "synth:v1" })
+return { winner: pool[0] }
 ```
-
-One small reviewer per boundary — never a gate fan-out (wall clock binds); values capped at 50.
-The graph-mode `gate` node is this pattern pre-built.
 
 ### Compose a saved workflow (depth 1)
 
@@ -328,11 +264,11 @@ return { research: research.stats, audit: audit.stats }
 ```
 
 Saved workflows (samples included) run only after the user approves them once via
-`/ultracode trust <name>`; editing the script later invalidates that approval. An unapproved
+`/ultracode trust <name>`; editing the artifact later invalidates that approval. An unapproved
 call fails fast with that instruction — relay it to the user instead of retrying. Plan-authored
-`.js` files use the same gate after `/ultracode save <name>`.
+files use the same gate after `/ultracode save <name>`.
 
-## Complete example
+## Complete script example
 
 Research fan-out with structural verification. Runs as-is:
 
@@ -344,36 +280,79 @@ const CLAIMS = { type: "object", required: ["claims"], properties: { claims: { t
 const VERDICT = { type: "object", required: ["verdict"], properties: { verdict: { type: "string",
   enum: ["supported", "refuted", "unverifiable"] }, evidence: { type: "string" } } }
 phase("research")
-const found = await parallel(["how it works", "who relies on it", "known failures"].map((a) => () =>
+const found = await parallel(["how it works", "who relies on it", "known failures"].map((a, i) => () =>
   agent("Collect 3 to 5 checkable factual claims about: " + topic + "\nAngle: " + a +
-    "\nOne source hint per claim.", { agent: "explore", phase: "research", schema: CLAIMS })))
+    "\nOne source hint per claim.", { agent: "explore", phase: "research", schema: CLAIMS, key: "angle:" + i })))
 const claims = []
 for (const part of found) for (const c of (part && part.data && part.data.claims) || []) claims.push(c.claim)
 phase("verify")
-const verdicts = await parallel(claims.slice(0, 12).map((c) => () =>
+const verdicts = await parallel(claims.slice(0, 12).map((c, i) => () =>
   agent("Verify against primary sources; refute it if you can.\nClaim: " + c,
-    { agent: "general", phase: "verify", schema: VERDICT })))
+    { agent: "general", phase: "verify", schema: VERDICT, key: "verify:" + i })))
 const kept = []
 verdicts.forEach((v, i) => { if (v && v.data && v.data.verdict === "supported")
   kept.push({ claim: claims[i], evidence: v.data.evidence || "" }) })
+checkpoint("verified", { kept: kept.length, examined: claims.length })
 phase("report")
 const report = await agent("Write a 300-word briefing on: " + topic +
   "\nUse ONLY these verified claims:\n" + JSON.stringify(kept, null, 1),
-  { agent: "general", phase: "report" })
+  { agent: "general", phase: "report", key: "report:v1" })
 return { brief: report.text, verified: kept.length, examined: claims.length }
 ```
+
+## Running, steering and stopping a run
+
+Runs are background by default so the user can keep chatting. When the run settles, a one-line
+notice lands in the parent session and wakes the calling agent (status, agents, result brief,
+stop reason). If the result exceeds the size cap, the notice and `ultracode_status` carry a
+preview and the total size — fetch the full value with `ultracode_result { runID, offset,
+maxLength }`; chunks are substrings of the compact JSON, so concatenate from offset 0 following
+`nextOffset`, then parse once.
+
+- `ultracode_status { runID? }` — per-child detail (id, session, label, phase, status, tokens,
+  tool calls, permission waits) and, once settled, the result itself or a bounded preview.
+- `ultracode_control { action: "stop" | "pause" | "resume", runID? }` — your own runs only. Stop
+  is graceful (no new agent calls, in-flight children interrupted) and is recorded as the run's
+  stop reason; pause closes admission of new `agent()` calls.
+- `ultracode_steer { runID, agentID?, text }` — deliver a user adjustment to ONE running child
+  without stopping the workflow. If several children are active, pick the relevant agentID from
+  status; do not broadcast edits blindly. It does not restart completed children.
+
+Status includes active child ids and permission waits. In Ctrl+G, review permissions with y or n;
+never treat a blocked child as completed work.
+
+Never paste a workflow script into a generic JS or execute sandbox — `agent`, `parallel`,
+`pipeline`, `phase`, `progress`, `checkpoint`, `workflow`, `sleep`, `args` and `meta` exist only
+inside `ultracode_run`; anywhere else they are undefined.
+
+This skill auto-attaches when `ultracode` appears as a standalone keyword anywhere in the prompt
+(`ultracode: audit the auth module`, `please ultracode this`). Paths like `opencode-ultracode` do
+not match; plain "use a workflow" does not auto-attach — the host may still select this skill.
+
+## Coexistence with other skills
+
+Other attached skills carry the domain: methodology, evidence standards, consent rules, reporting
+format. Ultracode carries only the execution mechanism: orchestrating many agents from one run.
+Two rules keep the layers from fighting:
+
+1. Use ONE orchestration mechanism per task. Do not fan out through native subagents AND a
+   workflow in the same task; if a workflow is running, it owns all delegation.
+2. Child sessions do NOT inherit skills attached to your session: a child sees only its prompt.
+   When domain skills impose requirements (consent, provider rules, output format), restate them
+   inside the workflow prompts for that domain work.
 
 ## Agent routing
 
 - Every install has `general` (general-purpose subagent) and `explore` (fast codebase
-  exploration). Omitting `opts.agent` means `general`.
+  exploration). Omitting `opts.agent` means `general`. `ultracode_catalog` lists the real roster.
 - If this user has specialists (reviewer, deep-researcher, critic, planner), prefer them: pass the
-  id via `opts.agent` AND declare it in `meta.requires`. The preflight then fails fast with the
-  list of available agents instead of the run dying midway.
+  id via `opts.agent` AND declare it in `meta.requires` (a graph node's `agent` is collected into
+  `requires` for you). The preflight then fails fast with the list of available agents instead of
+  the run dying midway.
 - Cost shape: extraction and search go to the cheap agent; judgment and synthesis go to the strong
   one. The user pins which model each agent runs. You never name models, ever.
 - `model` on results is informational (what actually ran). Do not branch on it.
 
-Before writing the script, answer two questions: what is the fan-out? who verifies? If both
-answers exist, write the script: self-contained prompts, explicit phases, bounded loops, a schema
-for everything you merge on, and a small JSON return.
+Before authoring, answer two questions: what is the fan-out? who verifies? If both answers exist,
+build it — graph first, script when the shape needs loops — with self-contained prompts, explicit
+phases, bounded fan-out, a schema for everything you merge on, and a small JSON return.

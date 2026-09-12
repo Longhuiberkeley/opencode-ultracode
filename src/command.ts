@@ -9,6 +9,7 @@ import { MAX_CHECKPOINTS } from "./registry.ts"
 import { compactStringify, safeSlice } from "./serialize.ts"
 import { reduceToolEvent, toolCallsFor, type ToolEvent, type ToolEventState } from "./run-events.ts"
 import { GRAPH_ARTIFACT_SUFFIX, normalizePath, sha256 } from "./storage.ts"
+import { paramsFromArgs, paramsValue } from "./params.ts"
 import type {
   Json,
   ParentContext,
@@ -91,7 +92,7 @@ export const NESTED_RUN_REFUSED =
   "cannot start a run from inside an active workflow session — use /ultracode from the parent"
 
 /** Plugin package version shown on the bare /ultracode dashboard. */
-export const PLUGIN_VERSION = "0.9.0"
+export const PLUGIN_VERSION = "0.10.0"
 /** Oldest OpenCode binary build the inspect TUI is gated on (A7 / D7). */
 export const MIN_SUPPORTED_BUILD = 19271
 
@@ -1440,6 +1441,9 @@ async function saveRun(deps: CommandDeps, sessionID: string, rest: string): Prom
         requires: run.meta?.requires,
         savedFromRunID: run.id,
         source: "project",
+        // The run's real args are the most accurate params evidence available;
+        // storage merges them over what the artifact itself declares.
+        params: paramsValue(paramsFromArgs(run.args)),
       }
       // A graph run saves its SPEC. Saving run.script instead would launder
       // generated plumbing into a hand-editable `.js` pair and lose validation,

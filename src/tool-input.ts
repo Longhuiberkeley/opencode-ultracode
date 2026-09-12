@@ -353,3 +353,64 @@ export function validateResultToolInput(
   if (maxLength !== undefined) out.maxLength = maxLength
   return out
 }
+
+/** Max length of a catalog lookup name (workflow / template). */
+export const MAX_CATALOG_NAME_CHARS = 64
+
+export type CatalogToolInput = {
+  ok: true
+  workflow?: string
+  template?: string
+  templates?: boolean
+}
+
+/**
+ * Input for the read-only `ultracode_catalog` tool. Three mutually exclusive
+ * views: the whole catalog (no args), one saved workflow (`workflow`), or graph
+ * template specs (`template` / `templates`) — one view per call keeps the
+ * payload bounded and the intent unambiguous.
+ */
+export function validateCatalogToolInput(raw: unknown): CatalogToolInput | { ok: false; error: string } {
+  if (raw === undefined || raw === null) return { ok: true }
+  if (!isObj(raw)) return { ok: false, error: `input must be an object, got ${typeOf(raw)}` }
+  const extra = rejectExtras(raw, new Set(["workflow", "template", "templates"]))
+  if (extra) return { ok: false, error: extra }
+
+  const names: string[] = []
+  for (const key of ["workflow", "template"] as const) {
+    if (!has(raw, key)) continue
+    const value = raw[key]
+    if (typeof value !== "string" || value.trim() === "") {
+      return {
+        ok: false,
+        error: `"${key}" must be a non-empty name, got ${typeof value === "string" ? "empty string" : typeOf(value)}`,
+      }
+    }
+    if (value.trim().length > MAX_CATALOG_NAME_CHARS) {
+      return { ok: false, error: `"${key}" is too long (${value.trim().length} chars, max ${MAX_CATALOG_NAME_CHARS})` }
+    }
+    names.push(key)
+  }
+  const wantsAllTemplates = has(raw, "templates")
+  if (names.length > 1 || (names.length === 1 && wantsAllTemplates && names[0] !== "template")) {
+    return {
+      ok: false,
+      error: `choose ONE view per call: { workflow }, { template }, { templates } or no input for the whole catalog`,
+    }
+  }
+
+  let templates: boolean | undefined
+  if (wantsAllTemplates) {
+    const value = raw["templates"]
+    if (typeof value !== "boolean") {
+      return { ok: false, error: `"templates" must be a boolean, got ${typeOf(value)}` }
+    }
+    templates = value
+  }
+
+  const out: CatalogToolInput = { ok: true }
+  if (has(raw, "workflow")) out.workflow = (raw["workflow"] as string).trim()
+  if (has(raw, "template")) out.template = (raw["template"] as string).trim()
+  if (templates !== undefined) out.templates = templates
+  return out
+}

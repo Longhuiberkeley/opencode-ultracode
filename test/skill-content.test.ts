@@ -79,6 +79,39 @@ test("skill content teaches Plan to Build named-workflow handoff", () => {
   assert.doesNotMatch(SKILL_CONTENT, /ultracode-skill\.md/)
 })
 
+test("skill content is graph-first: structure before plumbing", () => {
+  const graph = SKILL_CONTENT.indexOf("## Graph mode")
+  const script = SKILL_CONTENT.indexOf("## Script mode")
+  assert.ok(graph > -1, "graph mode must have its own section")
+  assert.ok(script > -1, "script mode must remain documented as the escape hatch")
+  assert.ok(graph < script, "graph mode must come first — order teaches priority")
+  assert.match(SKILL_CONTENT, /Graph first, script when you must/, "hard rule 1 states the preference")
+  // Every node kind the compiler understands is named, so the model can reach
+  // for partition and gate instead of hand-rolling them in JS.
+  for (const kind of ["agent", "fanout", "partition", "merge", "gate", "checkpoint", "workflow"]) {
+    assert.match(SKILL_CONTENT, new RegExp(`\`${kind}\``), `node kind \`${kind}\` must be documented`)
+  }
+  assert.match(SKILL_CONTENT, /\{\{\s*item\s*\}\}|\{\{item\}\}/, "fanout templates must be shown")
+  assert.match(SKILL_CONTENT, /auto `key` on every call/, "auto-keying is the warm-rerun story")
+})
+
+test("skill content teaches the catalog tool and graph templates", () => {
+  assert.ok(SKILL_CONTENT.includes("ultracode_catalog"), "discovery tool must be named")
+  assert.match(SKILL_CONTENT, /Discovery first/, "catalog comes before authoring")
+  assert.match(SKILL_CONTENT, /params with JSON types/, "the catalog answers 'what args does it take'")
+  assert.match(SKILL_CONTENT, /\{ workflow: "name" \}/, "detail drill-down")
+  assert.match(SKILL_CONTENT, /\{ template: "name" \}/, "single-template drill-down")
+  assert.match(SKILL_CONTENT, /template/, "templates are the anti-blank-page answer")
+  assert.match(SKILL_CONTENT, /never work around it by inlining an equivalent script/, "trust is user-only")
+})
+
+test("skill content teaches graph review, saving and the graph handoff", () => {
+  assert.match(SKILL_CONTENT, /\/ultracode graph <name>/, "render before trusting")
+  assert.match(SKILL_CONTENT, /works before\s+trust/, "review is not trust-gated")
+  assert.match(SKILL_CONTENT, /<name>\.graph\.json/, "the plan-mode graph artifact")
+  assert.match(SKILL_CONTENT, /a graph run saves its spec, not the compiled script/, "no laundering")
+})
+
 test("skill content teaches coexistence with domain skills", () => {
   assert.ok(SKILL_CONTENT.includes("execution mechanism"), "must position the skill as mechanism-only")
   assert.ok(SKILL_CONTENT.includes("ONE orchestration mechanism"), "must forbid double fan-out")
@@ -177,6 +210,10 @@ const MANIFEST_KEYS = new Set([
   "source",
   "savedAt",
   "savedFromRunID",
+  // v0.9.0 (graph workflows) and v0.10.0 (params) — the shipped samples do not
+  // use them yet, but a hand-authored pair may.
+  "kind",
+  "params",
 ])
 
 for (const name of SAMPLE_NAMES) {

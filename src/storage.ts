@@ -41,6 +41,7 @@
 import { createHash } from "node:crypto"
 import { compileGraphSpec, validateGraphSpec } from "./graph.ts"
 import type { GraphSpec } from "./graph.ts"
+import { mergeParams, paramsFromGraph, paramsFromScript } from "./params.ts"
 import type {
   FsLike,
   Json,
@@ -569,7 +570,10 @@ export class StorageImpl implements Storage {
     if (typeof manifest.savedFromRunID === "string" && manifest.savedFromRunID.length > 0) {
       full.savedFromRunID = manifest.savedFromRunID
     }
-    if (manifest.params !== undefined) full.params = manifest.params
+    // Params: caller-supplied wins field-by-field; the rest is derived from the
+    // artifact, so `ultracode_catalog` can serve it without reading any code.
+    const scriptParams = mergeParams(manifest.params, paramsFromScript(script))
+    if (scriptParams !== undefined) full.params = scriptParams
     await this.assertNoShadowingArtifact(name, source, dir, "script")
     const scriptPath = joinInside(dir, `${name}.js`, "workflow script")
     const manifestPath = joinInside(dir, `${name}.json`, "workflow manifest")
@@ -631,7 +635,8 @@ export class StorageImpl implements Storage {
     if (typeof manifest.savedFromRunID === "string" && manifest.savedFromRunID.length > 0) {
       full.savedFromRunID = manifest.savedFromRunID
     }
-    if (manifest.params !== undefined) full.params = manifest.params
+    const graphParams = mergeParams(manifest.params, paramsFromGraph(body.spec))
+    if (graphParams !== undefined) full.params = graphParams
     await this.assertNoShadowingArtifact(name, source, dir, "graph")
     const specPath = joinInside(dir, `${name}${GRAPH_ARTIFACT_SUFFIX}`, "workflow graph spec")
     const manifestPath = joinInside(dir, `${name}.json`, "workflow manifest")

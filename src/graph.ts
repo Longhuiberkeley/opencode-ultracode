@@ -751,7 +751,8 @@ export function graphNodeIds(spec: unknown): string[] {
 
 /**
  * The `args` names a spec actually reads: `{{args.x}}` in prompt templates and
- * `$args.x` in refs (from, over, value, argsFrom, returns). Sorted and unique.
+ * `$args.x` in refs (from, over, value, argsFrom, returns). Unique, in
+ * first-appearance order (a spec reads its args in a meaningful order).
  * Types are not inferable from a template, so callers get names only.
  */
 export function graphParamNames(spec: unknown): string[] {
@@ -780,5 +781,5 @@ export function graphParamNames(spec: unknown): string[] {
   if (g.returns !== null && typeof g.returns === "object" && !Array.isArray(g.returns)) {
     for (const ref of Object.values(g.returns as Record<string, unknown>)) addRef(ref)
   }
-  return [...names].sort()
+  return [...names]
 }

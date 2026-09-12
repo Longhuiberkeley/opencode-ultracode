@@ -342,6 +342,7 @@ global (registered from the always-mounted chip component).
 | `/ultracode status [runID]` | Compact run state: runID, status, agents done/total, elapsed. Same implicit-target rule as `show`. | — |
 | `ultracode_status` tool | Read-only `{ runID? }` → `{ runID, status, agents: { done, total, failed }, startedAt, elapsedMs, checkpoints?: [{name, at}], resumedFrom?, children: [{ agentID, sessionID?, label?, phase?, status, cached?, waitingForPermission? }] }`; settled runs carry the result inline when it fits the cap, else `resultPreview` + `resultTruncated` + `resultChars` + `resultHint`. | — |
 | `ultracode_result` tool | `{ runID, offset?, maxLength? }` → one page of a settled run's FULL result: `{ source, totalChars, offset, chunk, complete, nextOffset }`. Chunks are substrings of the compact JSON — concatenate from offset 0 following `nextOffset`, then parse. | — |
+| `ultracode_catalog` tool | Read-only discovery, and the only fresh source of it: `{}` → agents, every saved workflow (`kind`, description, **params with JSON types**, phases, requires, trust, last-run stats from this conversation) and graph-template summaries; `{ workflow }` → one workflow's full graph spec or script head; `{ template }` / `{ templates: true }` → complete specs to adapt. Executes nothing; bounded (40 workflows, sliced strings). | — |
 | `ultracode_control` tool | Orchestrator control of **owned** runs: `{ action: "stop" \| "pause" \| "resume", runID? }`. Implicit target only when exactly one active owned run. Stop is recorded as the run's stop reason (`/ultracode show` displays it). | same verbs via panel keys |
 | `/ultracode result [runID]` | Print the **full** result of a run (artifact first, run-record fallback — serves truncated and background runs alike). | — |
 | `/ultracode graph <name\|runID>` | Render a graph workflow's DAG: execution waves, a node table (kind, agent, source ref, bounds), returns, and a mermaid flowchart. **Not trust-gated** — rendering is how you review a graph before approving it. Works for a saved `<name>.graph.json` workflow or any graph-authored run. | — |
@@ -575,6 +576,13 @@ Workflows multiply tokens. Controls, in order of leverage:
   script or the spec refuses the run until you re-trust, and so does upgrading the plugin when the
   compiler output changes (fail closed, by design). A spec that fails to parse, validate or compile
   can never be trusted or run: it is listed with its validator errors instead of disappearing.
+- **Params are declared, not guessed.** Each manifest can carry `params` — `{ args: [{ name,
+  type?, required?, description? }] }` — and it is **derived at save time** when you do not write
+  it: from a `// Tool input:` header comment (which declares optional markers and example types),
+  from every `args.x` reference in the code (including the `const input = args && …` alias idiom),
+  from a graph spec's `{{args.x}}` templates and `$args.x` refs, and from the real `args` of the
+  run being saved. An explicit `params` always wins, field by field. `ultracode_catalog` serves it,
+  so a caller learns a workflow's contract without reading its code.
 - **Reviewing a graph before approving it:** `/ultracode graph <name>` renders the DAG (execution
   waves, node table, mermaid) and is deliberately **not** trust-gated — seeing the structure is
   how you decide. `/ultracode graph <runID>` renders the spec a run was launched from.
@@ -638,14 +646,15 @@ list of available agents and guidance instead of spawning a broken run.
 
 ## Roadmap
 
-- **Graph authoring layer (v0.8.0 inline, v0.9.0 saved)** — a JSON DAG spec
-  (agent / fanout / partition / merge / gate / checkpoint / workflow nodes) validated before any
-  token is spent and compiled to the plain script runtime, with auto-keyed calls (warm rerun free)
-  and automatic `parallel()` waves. v0.9.0 makes graphs first-class citizens: they save as
+- **Graph authoring layer (v0.8.0 inline → v0.9.0 saved → v0.10.0 discoverable)** — a JSON DAG
+  spec (agent / fanout / partition / merge / gate / checkpoint / workflow nodes) validated before
+  any token is spent and compiled to the plain script runtime, with auto-keyed calls (warm rerun
+  free) and automatic `parallel()` waves. v0.9.0 made graphs first-class citizens: they save as
   `<name>.graph.json` pairs (compiled fresh on load, trust bound to the compiled output), a graph
   run keeps its spec on the run record so `save`/`rerun`/`show` work from the source of truth, and
-  `/ultracode graph <name|runID>` renders the DAG. Still future: the catalog tool (saved-workflow
-  params + graph templates) and a graph-first skill rewrite.
+  `/ultracode graph <name|runID>` renders the DAG. v0.10.0 made them discoverable: the
+  `ultracode_catalog` tool serves saved workflows with their derived `params`, plus three
+  ready-to-adapt graph templates, and the authoring skill is graph-first.
 - **Dialog-key overlay** — blocked on the host: `ui.dialog.show` owns the keymap (G1 NO-GO on
   beta-19271). Inspect stays panel-hosted until a host API delivers keys inside a dialog
   without leaking to the prompt.

@@ -8,6 +8,7 @@ import assert from "node:assert/strict"
 import { Worker } from "node:worker_threads"
 import type { Json } from "../src/types.ts"
 import { WORKER_SOURCE, validateScriptSource } from "../src/worker-script.ts"
+import { GRAPH_TEMPLATES } from "../src/graph-templates.ts"
 import {
   DEFAULT_FANOUT_MAX,
   GRAPH_SPEC_VERSION,
@@ -536,4 +537,61 @@ test("graph: a cyclic template dependency fails loudly instead of emitting place
   } as unknown as GraphSpec
   assert.equal(validateGraphSpec(spec).ok, false, "cycles are rejected up front")
   assert.throws(() => compileGraphSpec(spec), /graph compiler invariant: node "a" interpolates \{\{b\}\}/)
+})
+
+// ---------------------------------------------------------------------------
+// Template e2e: a shipped template must actually run, not merely validate
+// ---------------------------------------------------------------------------
+
+test("graph e2e: the partitioned-review template runs end to end (partition, fanout, gate, merge)", async () => {
+  const template = GRAPH_TEMPLATES.find((t) => t.name === "partitioned-review")
+  assert.ok(template, "template missing")
+  const { script } = compileGraphSpec(template.graph)
+  const prompts: string[] = []
+  const result = await runInWorker(script, { area: "src/api" }, async (_fn, callArgs) => {
+    const prompt = String(callArgs[0] ?? "")
+    prompts.push(prompt)
+    const opts = (callArgs[1] ?? {}) as { schema?: Json; key?: string }
+    const schema = (opts.schema ?? {}) as { properties?: Record<string, unknown> }
+    const sessionID = `ses_${String(opts.key ?? prompts.length).replace(/[^a-z0-9]/gi, "")}`
+    if (schema.properties?.["files"]) {
+      return {
+        text: "inventory",
+        sessionID,
+        agent: "explore",
+        data: { files: [{ path: "src/api/a.ts", lines: 1200 }, { path: "src/api/b.ts", lines: 300 }] },
+      } as unknown as Json
+    }
+    if (schema.properties?.["pass"]) {
+      return {
+        text: '{"pass":true}',
+        sessionID,
+        agent: "general",
+        data: { pass: true, action: "continue", issues: [] },
+      } as unknown as Json
+    }
+    if (schema.properties?.["summary"]) {
+      return {
+        text: "lane report",
+        sessionID,
+        agent: "explore",
+        data: { summary: "no defects", covered: ["src/api/a.ts", "src/api/b.ts"], overflow: [] },
+      } as unknown as Json
+    }
+    return { text: "MERGED-REPORT", sessionID, agent: "general" } as unknown as Json
+  })
+  assert.equal(result.ok, true, result.error ?? "template run failed")
+  const value = result.value as { report?: string; lanes?: number }
+  assert.equal(value.lanes, 1, "1500 estimated tokens over a 35000 budget is one lane")
+  assert.equal(value.report, "MERGED-REPORT")
+  assert.match(prompts[0]!, /Inventory "src\/api"/, "the scout prompt interpolated args.area")
+  assert.ok(
+    prompts.some((p) => p.includes("src/api/a.ts") && p.includes("src/api/b.ts")),
+    "the lane child received its file list, not a placeholder",
+  )
+  assert.ok(!prompts.some((p) => p.includes("{{")), "no unresolved template reached a child")
+  assert.ok(
+    result.events.some((e) => e.kind === "checkpoint"),
+    "the gate auto-checkpointed",
+  )
 })
