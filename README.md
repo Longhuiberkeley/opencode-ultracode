@@ -170,6 +170,12 @@ the source checkout is moved or deleted (assumes a plain `npm install` tree — 
 | `--repo PATH` | Plugin repo root (default: parent of the script) |
 
 Reruns are idempotent (same files, never duplicate config). No network. An existing v1 install
+
+> **Never reinstall while a run is in flight.** The host hot-reloads the plugin when its files
+> change, and a reload finalizes in-flight runs with `stopReason: "plugin unload"` — children
+> are interrupted mid-phase. Check `/ultracode status` (or the Ctrl+G inspector) for active
+> runs before running `install.sh`; a warm `/ultracode rerun <id>` afterwards recovers the
+> succeeded agents from cache.
 (absolute-path re-export shims) is migrated automatically to the new layout. Platform status:
 **macOS verified** end-to-end (live TUI); Linux runs in CI (unit + installer tests); Windows
 untested.
