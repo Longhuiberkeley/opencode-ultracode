@@ -425,6 +425,15 @@ test("supervisor: startDetached returns runID before finalize; done settles with
   assert.equal(outcome.envelope.result, 7)
 })
 
+test("supervisor: run record keeps permissionStallMs for the stall watchdog", async () => {
+  const ctx = makeSupervisor()
+  const { runID, done } = ctx.supervisor.startDetached({ script: `return 1;` }, ctx.parent)
+  const effective = ctx.registry.get(runID)?.effective
+  assert.equal(effective?.permissions, DEFAULT_OPTIONS.permissions)
+  assert.equal(effective?.permissionStallMs, DEFAULT_OPTIONS.permissionStallMs, "panelSettingsFrom must not drop it")
+  await done
+})
+
 test("supervisor: graphSpec on the launch input lands on the run record (and is persisted)", async () => {
   const ctx = makeSupervisor()
   const spec = { nodes: [{ id: "a", kind: "agent", prompt: "say hi" }] } as Json

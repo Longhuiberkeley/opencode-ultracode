@@ -208,7 +208,9 @@ export class SupervisorImpl implements Supervisor {
       input.timeoutMs !== undefined ? { ...this.options, timeoutMs: input.timeoutMs } : this.options,
     )
     if (input.timeoutMs !== undefined) record.timeoutOverrideMs = input.timeoutMs
-    record.effective = panelSettingsFrom(effective)
+    // panelSettingsFrom alone drops permissionStallMs (panel shows 4 keys),
+    // but the permission stall watchdog reads it off this record — keep it.
+    record.effective = { ...panelSettingsFrom(effective), permissionStallMs: effective.permissionStallMs }
     this.registry.persistNow(runID)
     const state = this.makeState(runID, parent, effective)
     this.runs.set(runID, state)
