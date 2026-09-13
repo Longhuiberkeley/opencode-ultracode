@@ -984,6 +984,13 @@ test("enrichStatusPayload: running run carries identity, elapsed, children detai
   assert.equal("resultPreview" in out, false)
 })
 
+test("enrichStatusPayload: an explicit per-run timeout override is surfaced, absent otherwise", () => {
+  const withOverride = baseRun({ timeoutOverrideMs: 7_200_000 })
+  assert.equal(enrichStatusPayload(payloadOf(withOverride), withOverride, 3_000).timeoutOverrideMs, 7_200_000)
+  const without = baseRun({})
+  assert.equal("timeoutOverrideMs" in enrichStatusPayload(payloadOf(without), without, 3_000), false)
+})
+
 test("enrichStatusPayload: children carry per-lane tokens and tool counts (budget feedback loop)", () => {
   const run = baseRun({
     agents: [

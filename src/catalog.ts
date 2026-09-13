@@ -20,6 +20,12 @@
 import { graphNodeCount, graphNodeIds } from "./graph.ts"
 import { GRAPH_TEMPLATES, graphTemplate, graphTemplateSummaries } from "./graph-templates.ts"
 import { paramsLine, parseParams } from "./params.ts"
+import {
+  MAX_SCRIPT_TEMPLATE_CHARS,
+  SCRIPT_TEMPLATES,
+  scriptTemplate,
+  scriptTemplateSummaries,
+} from "./script-templates.ts"
 import { safeSlice, compactStringify } from "./serialize.ts"
 import type { Json, RunRecord, SavedWorkflow, WorkflowKind } from "./types.ts"
 import { countAgents } from "./types.ts"
@@ -73,6 +79,10 @@ export interface CatalogInput {
   templates?: boolean
   /** One template by name (full spec). */
   template?: string
+  /** Full script-template bodies instead of summaries. */
+  scriptTemplates?: boolean
+  /** One script template by name (full body). */
+  scriptTemplate?: string
   /** One workflow by name (detail view). */
   workflow?: string
 }
@@ -261,11 +271,38 @@ export function buildCatalog(input: CatalogInput): Json {
     out["templates"] = graphTemplateSummaries()
   }
 
+  // ---- script templates ----
+  if (input.scriptTemplate !== undefined) {
+    const found = scriptTemplate(input.scriptTemplate)
+    if (found && found.script.length <= MAX_SCRIPT_TEMPLATE_CHARS) {
+      out["scriptTemplate"] = { name: found.name, description: found.description, args: found.args, script: found.script } as unknown as Json
+    } else if (found) {
+      out["scriptTemplateError"] = `body is ${found.script.length} chars, over the ${MAX_SCRIPT_TEMPLATE_CHARS} serving cap — read src/script-templates.ts`
+    } else {
+      out["scriptTemplateError"] = `no script template named ${JSON.stringify(input.scriptTemplate)}`
+      out["scriptTemplates"] = scriptTemplateSummaries()
+    }
+  } else if (input.scriptTemplates === true) {
+    out["scriptTemplates"] = SCRIPT_TEMPLATES.map((t) => ({
+      name: t.name,
+      description: t.description,
+      args: t.args,
+      // Same serving cap as the single view — a body that cannot be served
+      // alone must not sneak through the bulk view.
+      ...(t.script.length <= MAX_SCRIPT_TEMPLATE_CHARS
+        ? { script: t.script }
+        : { scriptChars: t.script.length, scriptOmitted: `over the ${MAX_SCRIPT_TEMPLATE_CHARS} serving cap` }),
+    })) as unknown as Json
+  } else {
+    out["scriptTemplates"] = scriptTemplateSummaries()
+  }
+
   // ---- caps + how to drill in ----
   if (input.caps) out["caps"] = { ...input.caps }
   out["hint"] =
     "drill in with { workflow: \"<name>\" } for one workflow's params, spec or script head; " +
-    "{ templates: true } returns complete graph specs to adapt; { template: \"<name>\" } returns one. " +
-    "Nothing here executes — a saved workflow still needs a user's /ultracode trust before it can run."
+    "{ templates: true } returns complete graph specs to adapt; { template: \"<name>\" } returns one; " +
+    "{ scriptTemplate: \"<name>\" } returns a ready-to-adapt script body (staged delivery, bounded fix loop) " +
+    "for shapes graphs cannot express. Nothing here executes — a saved workflow still needs a user's /ultracode trust before it can run."
   return out as Json
 }

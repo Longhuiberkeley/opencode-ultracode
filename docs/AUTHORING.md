@@ -447,7 +447,9 @@ context caps:
 - **One cross-cutting lane** greps the cross-file question's symbols repo-wide so
   partition-by-file seams have an owner.
 - **Wall clock beats the agent cap** — waves × stages × ~5-10 min per child must fit `timeoutMs`
-  (default 60 min). Prefer wide-not-deep; raise per project with `/ultracode set timeoutMs <ms>`.
+  (default 60 min). Prefer wide-not-deep; a single run that legitimately needs longer takes
+  `timeoutMs` in its `ultracode_run` input (that run only), and a project that always needs longer
+  should raise the default with `/ultracode set timeoutMs <ms>`.
 - **Read-discipline in every child prompt**: grep + ranged reads, no whole-file reads of large
   files, never echo file contents back; the child's output is the schema JSON only.
 
@@ -631,6 +633,16 @@ const reports = await parallel(lanes.map((lane, i) => () =>
 *When:* the orchestration already exists as a saved workflow. See
 [`workflow()`](#workflowname-args--promisejson). Depth 1, shared budget — compose for reuse, not
 for depth.
+
+### 9b. Staged delivery with verify-fix gates (served template)
+
+*When:* sequential write stages (story-by-story, layer-by-layer) each gated by an independent
+verifier with bounded fix rounds. This is the script-mode twin of the QC gate: a stage that
+cannot pass stops the run with a partial report instead of poisoning the next stage. Do not
+hand-roll it — `ultracode_catalog { scriptTemplate: "staged-delivery" }` returns a ready-to-adapt
+body (stage list, schemas, keyed verify/fix rounds, checkpoints, wall-clock budget note); edit
+prompts and args, run inline or save it. `verify-fix` is the same idea reduced to a bare bounded
+fix loop (pattern 6, also served).
 
 ### 10. Write-safe serialization (the meta-pattern)
 
@@ -835,8 +847,10 @@ round) + merges + synthesizes should keep `items x stages + overhead` comfortabl
 The wall clock is usually the binding constraint before `maxAgents` is: `waves
 (ceil(agents / concurrency)) x dependent stages x ~5-10 min per child` must fit `timeoutMs`.
 A production run died at 63 min with 7/8 agents done and the fix loop never reached (2026-09-12) —
-budget time before you write the first `agent()` call, prefer wide-not-deep, and raise
-`timeoutMs` per project when a wide run legitimately needs it.
+budget time before you write the first `agent()` call, prefer wide-not-deep, and pass `timeoutMs`
+in the run input when one run legitimately needs it (10 s–24 h; that run only, recorded on the
+run and echoed in the admission ack). Raise the project default via `/ultracode set timeoutMs`
+when it should stick.
 
 ## Testing your workflows
 

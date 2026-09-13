@@ -3,7 +3,7 @@
  * Host-free: command/TUI/supervisor/tests share this module.
  */
 import type { PermissionMode, UltracodeOptions } from "./types.ts"
-import { CONCURRENCY_CAP, DEFAULT_OPTIONS, clampConcurrency } from "./types.ts"
+import { CONCURRENCY_CAP, DEFAULT_OPTIONS, MAX_RUN_TIMEOUT_MS, MIN_RUN_TIMEOUT_MS, clampConcurrency } from "./types.ts"
 
 export type PanelSettings = {
   concurrency: number
@@ -91,7 +91,7 @@ export function parseSettingsOverlay(raw: unknown): SettingsOverlay {
   if (concurrency !== undefined) overlay.concurrency = concurrency
   const maxAgents = intInRange(record.maxAgents, MAX_AGENTS_MIN, MAX_AGENTS_MAX)
   if (maxAgents !== undefined) overlay.maxAgents = maxAgents
-  const timeoutMs = intInRange(record.timeoutMs, 10_000, 86_400_000)
+  const timeoutMs = intInRange(record.timeoutMs, MIN_RUN_TIMEOUT_MS, MAX_RUN_TIMEOUT_MS)
   if (timeoutMs !== undefined) overlay.timeoutMs = timeoutMs
   const permissions = record.permissions
   if (typeof permissions === "string" && PERMISSION_MODES.has(permissions)) {
@@ -132,7 +132,7 @@ export function applySetValue(current: PanelSettings, key: string, raw: string):
   if (key === "timeoutms" || key === "timeoutMs") {
     const n = parseSetNumber(raw)
     if (n === undefined) return "ignored"
-    if (n < 10_000 || n > 86_400_000) return "ignored"
+    if (n < MIN_RUN_TIMEOUT_MS || n > MAX_RUN_TIMEOUT_MS) return "ignored"
     return { ...current, timeoutMs: n }
   }
   if (key === "permissions") {
@@ -226,7 +226,7 @@ export function parsePanelSettings(raw: unknown): PanelSettings | undefined {
   const rec = raw as Record<string, unknown>
   const concurrency = intInRange(rec.concurrency, 1, CONCURRENCY_CAP) ?? intInRange(rec.concurrency, 1, 64)
   const maxAgents = intInRange(rec.maxAgents, MAX_AGENTS_MIN, MAX_AGENTS_MAX)
-  const timeoutMs = intInRange(rec.timeoutMs, 10_000, 86_400_000)
+  const timeoutMs = intInRange(rec.timeoutMs, MIN_RUN_TIMEOUT_MS, MAX_RUN_TIMEOUT_MS)
   const permissions = rec.permissions
   if (concurrency === undefined || maxAgents === undefined || timeoutMs === undefined) return undefined
   if (typeof permissions !== "string" || !PERMISSION_MODES.has(permissions)) return undefined

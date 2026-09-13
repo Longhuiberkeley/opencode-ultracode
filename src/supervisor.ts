@@ -200,7 +200,14 @@ export class SupervisorImpl implements Supervisor {
     })
     const runID = record.id
     if (input.resumeFrom) record.resumedFrom = input.resumeFrom
-    const effective = freezeEffective(this.options)
+    // Per-run wall-clock override from the run tool input: this run only. The
+    // supervisor defaults (user overlay included) are left untouched, and the
+    // override is captured in record.effective for status/panel display and
+    // record.timeoutOverrideMs so a warm rerun reproduces the run's clock.
+    const effective = freezeEffective(
+      input.timeoutMs !== undefined ? { ...this.options, timeoutMs: input.timeoutMs } : this.options,
+    )
+    if (input.timeoutMs !== undefined) record.timeoutOverrideMs = input.timeoutMs
     record.effective = panelSettingsFrom(effective)
     this.registry.persistNow(runID)
     const state = this.makeState(runID, parent, effective)

@@ -5,7 +5,7 @@
  * and collect a human-readable warning. Never throws.
  */
 import type { PermissionMode, UltracodeOptions } from "./types.ts"
-import { DEFAULT_OPTIONS } from "./types.ts"
+import { DEFAULT_OPTIONS, MAX_RUN_TIMEOUT_MS, MIN_RUN_TIMEOUT_MS } from "./types.ts"
 
 export interface LoadedOptions {
   options: Required<UltracodeOptions>
@@ -21,7 +21,8 @@ interface NumRange {
 const RANGES: Record<"concurrency" | "maxAgents" | "timeoutMs" | "maxResultChars", NumRange> = {
   concurrency: { min: 1, max: 64 },
   maxAgents: { min: 1, max: 10_000 },
-  timeoutMs: { min: 10_000, max: 86_400_000 },
+  // Shared with the per-run override and /ultracode set (src/types.ts).
+  timeoutMs: { min: MIN_RUN_TIMEOUT_MS, max: MAX_RUN_TIMEOUT_MS },
   maxResultChars: { min: 1_000, max: 1_000_000 },
 }
 

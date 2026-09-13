@@ -92,7 +92,7 @@ export const NESTED_RUN_REFUSED =
   "cannot start a run from inside an active workflow session — use /ultracode from the parent"
 
 /** Plugin package version shown on the bare /ultracode dashboard. */
-export const PLUGIN_VERSION = "0.10.1"
+export const PLUGIN_VERSION = "0.11.0"
 /** Oldest OpenCode binary build the inspect TUI is gated on (A7 / D7). */
 export const MIN_SUPPORTED_BUILD = 19271
 
@@ -160,9 +160,9 @@ export const TOOL_DESCRIPTION: string = [
   "- Partition before you fan out. A cheap scout pass inventories the material (paths + line counts); the script then assigns each lane an EXPLICIT slice. Budget ~30-40k tokens of source per lane (≈3-4k lines — convert line counts at ~10 tokens/line) so any model in the user's rotation can run it.",
   "- Read-discipline in every child prompt: grep + ranged reads, never whole-file reads of large files, never echo file contents back; the child's output is the schema JSON only.",
   "- Merge reads REPORTS only — never source material — in batches of ~8 (hierarchical merge for more); one mega-merge child recreates the very context blowup fan-out exists to avoid.",
-  "- Budget the wall clock: waves (ceil(agents / concurrency)) × stages × ~5-10 min per child must fit the cap. Prefer wide-not-deep; a project can raise the ceiling with /ultracode set timeoutMs <ms>.",
+  "- Budget the wall clock: waves (ceil(agents / concurrency)) × stages × ~5-10 min per child must fit the cap. Prefer wide-not-deep.",
   "",
-  "Caps: 8 concurrent agents (default), 200 agent() calls per run, 60 minutes wall clock, 512 KB max script, results truncated after 64 KB.",
+  "Caps are project settings — ultracode_catalog reports the live concurrency, agent cap and timeout under `caps`. Defaults: 8 concurrent agents, 200 agent() calls per run, 60 minutes wall clock (scripts are hard-capped at 512 KB, results truncate after 64 KB). A run that legitimately needs longer than the configured timeout takes an optional timeoutMs in its input (10 s-24 h; that run only, recorded on the run).",
   "Default / background: runs are background by default — the tool returns immediately after admission with { runID, status: \"running\", hint } (inspect panel via ctrl+g, or /ultracode status / ultracode_status). A late tool result cannot be delivered after execute returns; instead a settle notice lands in the parent session on completion and wakes the calling agent.",
   "background: false (opt-in) blocks until every agent settles, then returns { runID, status, agents, tokens, result | preview }.",
   "Orchestrator tools: ultracode_status { runID? } (per-child detail, elapsed, settled result — full when it fits), ultracode_result { runID, offset?, maxLength? } (full settled result, page-by-page), ultracode_control { action: stop|pause|resume, runID? } (owned runs only), ultracode_steer { runID, agentID?, text } (running child).",
@@ -271,7 +271,11 @@ export async function executeWorkflowLaunch(
       .catch((err: unknown) => {
         console.error(`ultracode background run ${runID} failed: ${describeError(err)}`)
       })
-    return { content: JSON.stringify({ runID, status: "running", hint: BACKGROUND_RUN_HINT }) }
+    // A non-default clock is echoed so an override is visible in-conversation,
+    // not only on the run record (status/panel).
+    const ack: Record<string, unknown> = { runID, status: "running", hint: BACKGROUND_RUN_HINT }
+    if (input.timeoutMs !== undefined) ack["timeoutMs"] = input.timeoutMs
+    return { content: JSON.stringify(ack) }
   }
   const outcome = await supervisor.start(input, parent)
   return { content: JSON.stringify(outcome.envelope, null, 1) }
@@ -317,6 +321,8 @@ export function enrichStatusPayload(
   /** Phase-boundary checkpoints (name + timestamp only; values stay in the record). */
   checkpoints?: Array<{ name: string; at: number }>
   resumedFrom?: string
+  /** Explicit per-run wall-clock override from the run input, when present. */
+  timeoutOverrideMs?: number
   result?: Json
   resultPreview?: string
   /** True when THIS payload does not contain the complete result. */
@@ -333,6 +339,7 @@ export function enrichStatusPayload(
   if (run.name) out["name"] = run.name
   if (run.workflowName) out["workflowName"] = run.workflowName
   if (run.resumedFrom) out["resumedFrom"] = run.resumedFrom
+  if (run.timeoutOverrideMs !== undefined) out["timeoutOverrideMs"] = run.timeoutOverrideMs
   out["elapsedMs"] = Math.max(0, (run.endedAt ?? now) - run.startedAt)
   const children: StatusChildView[] = run.agents.slice(0, STATUS_CHILDREN_LIMIT).map((a) => {
     const child: StatusChildView = { agentID: a.id, status: a.status }
@@ -1419,6 +1426,10 @@ async function rerunRun(deps: CommandDeps, sessionID: string, rest: string): Pro
         // script-authored, and `/ultracode save <newRunID> <name>` would write
         // the compiled JS instead of the graph.
         graphSpec: source.graphSpec,
+        // Reproduce an explicit per-run clock: a run launched with timeoutMs
+        // reruns at the same timeout (warm reruns of long runs must not die
+        // at the project default). Absent when the original used the default.
+        ...(source.timeoutOverrideMs !== undefined ? { timeoutMs: source.timeoutOverrideMs } : {}),
         ...(warm ? { resumeFrom: source.id } : {}),
       },
       { sessionID, report: () => {}, availableAgents: prep.availableAgents },

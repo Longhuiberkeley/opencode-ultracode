@@ -51,6 +51,13 @@ export const DEFAULT_OPTIONS: Required<UltracodeOptions> = {
 /** Local admission clamp (this repo default). Not a host API. */
 export const CONCURRENCY_CAP = DEFAULT_OPTIONS.concurrency
 
+/**
+ * Wall-clock bounds shared by every timeoutMs source (options, `/ultracode set`,
+ * panel overlay, per-run run input): 10 s .. 24 h.
+ */
+export const MIN_RUN_TIMEOUT_MS = 10_000
+export const MAX_RUN_TIMEOUT_MS = 86_400_000
+
 /** Clamp concurrency at the admission point (not in loadOptions). */
 export function clampConcurrency(value: number): number {
   if (typeof value !== "number" || !Number.isFinite(value)) return CONCURRENCY_CAP
@@ -88,6 +95,8 @@ export interface InlineRunInput {
   background?: boolean
   /** Warm-start from a prior run: keyed succeeded agents replay from cache. */
   resumeFrom?: string
+  /** Per-run wall-clock override (ms, MIN_RUN_TIMEOUT_MS..MAX_RUN_TIMEOUT_MS). This run only. */
+  timeoutMs?: number
 }
 
 /** Run a saved workflow by name (project dir beats personal dir). */
@@ -98,6 +107,8 @@ export interface SavedRunInput {
   background?: boolean
   /** Warm-start from a prior run: keyed succeeded agents replay from cache. */
   resumeFrom?: string
+  /** Per-run wall-clock override (ms, MIN_RUN_TIMEOUT_MS..MAX_RUN_TIMEOUT_MS). This run only. */
+  timeoutMs?: number
 }
 
 /**
@@ -113,6 +124,8 @@ export interface GraphRunInput {
   background?: boolean
   /** Warm-start from a prior run: keyed succeeded agents replay from cache. */
   resumeFrom?: string
+  /** Per-run wall-clock override (ms, MIN_RUN_TIMEOUT_MS..MAX_RUN_TIMEOUT_MS). This run only. */
+  timeoutMs?: number
 }
 
 export type WorkflowToolInput = InlineRunInput | SavedRunInput | GraphRunInput
@@ -131,6 +144,11 @@ export interface RunLaunchInput {
   resumeFrom?: string
   /** Originating DAG spec for graph-authored runs (persisted on the RunRecord). */
   graphSpec?: Json
+  /**
+   * Per-run wall-clock override from the run tool input. Applied only to this
+   * run's frozen effective options — never persisted into the settings overlay.
+   */
+  timeoutMs?: number
 }
 
 // ---------------------------------------------------------------------------
@@ -240,6 +258,13 @@ export interface RunRecord {
   checkpoints?: CheckpointRecord[]
   /** Source runID when this run was started warm (resumeFrom / rerun --warm). */
   resumedFrom?: string
+  /**
+   * Explicit per-run wall-clock override from the run tool input (additive).
+   * Distinct from `effective` (the frozen settings): present ONLY when the
+   * caller passed timeoutMs, so a warm rerun can reproduce the run's clock
+   * without overriding a user's freshly configured default.
+   */
+  timeoutOverrideMs?: number
   /**
    * Process ownership for orphan reconciliation. Optional/additive: records
    * without owner keep the legacy "flip on restart" behavior.

@@ -750,3 +750,22 @@ test("supervisor: resumeFrom with a changed prompt spawns fresh (digest mismatch
   const warmRun = ctx.registry.get(second.envelope.runID)!
   assert.equal(warmRun.agents[0]!.cached, undefined)
 })
+
+test("supervisor: per-run timeoutMs overrides effective for that run only", async () => {
+  const ctx = makeSupervisor({ timeoutMs: 5_000 })
+  ctx.sessions.push({ text: "ok", agent: "general" })
+  const outcome = await ctx.supervisor.start(
+    { script: 'const r = await agent("say ok", { label: "t" })\nreturn r.text', timeoutMs: 7_200_000 },
+    ctx.parent,
+  )
+  assert.equal(outcome.envelope.status, "succeeded")
+  const run = ctx.registry.get(outcome.envelope.runID)!
+  assert.equal(run.effective?.timeoutMs, 7_200_000, "the override is captured on the run record")
+  assert.equal(run.timeoutOverrideMs, 7_200_000, "the explicit override is recorded distinctly for warm reruns")
+  // The next run keeps the supervisor default — the override never leaks.
+  ctx.sessions.push({ text: "ok", agent: "general" })
+  const next = await ctx.supervisor.start({ script: "return 1" }, ctx.parent)
+  const nextRun = ctx.registry.get(next.envelope.runID)!
+  assert.equal(nextRun.effective?.timeoutMs, 5_000)
+  assert.equal(nextRun.timeoutOverrideMs, undefined)
+})

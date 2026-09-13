@@ -9,7 +9,15 @@
  * keys, wrong types and oversized inputs with precise messages.
  */
 import { CONTROL_ACTIONS, type ControlAction } from "./control.ts"
-import type { GraphRunInput, InlineRunInput, Json, SavedRunInput, WorkflowMeta, WorkflowToolInput } from "./types.ts"
+import type {
+  GraphRunInput,
+  InlineRunInput,
+  Json,
+  SavedRunInput,
+  WorkflowMeta,
+  WorkflowToolInput,
+} from "./types.ts"
+import { MAX_RUN_TIMEOUT_MS, MIN_RUN_TIMEOUT_MS } from "./types.ts"
 
 export type ToolInputResult =
   | { ok: true; input: WorkflowToolInput }
@@ -125,6 +133,27 @@ function validateResumeFrom(
   return { ok: true, resumeFrom: value.trim() }
 }
 
+/**
+ * Per-run wall-clock override. Same bounds as `/ultracode set timeoutMs`, but
+ * applies to this run only — the settings overlay is never touched.
+ */
+function validateTimeoutMs(
+  raw: Record<string, unknown>,
+): { ok: true; timeoutMs?: number } | { ok: false; error: string } {
+  if (!has(raw, "timeoutMs")) return { ok: true }
+  const value = raw["timeoutMs"]
+  if (typeof value !== "number" || !Number.isInteger(value)) {
+    return { ok: false, error: `"timeoutMs" must be an integer of milliseconds, got ${typeOf(value) === "number" ? value : typeOf(value)}` }
+  }
+  if (value < MIN_RUN_TIMEOUT_MS || value > MAX_RUN_TIMEOUT_MS) {
+    return {
+      ok: false,
+      error: `"timeoutMs" must be between ${MIN_RUN_TIMEOUT_MS} and ${MAX_RUN_TIMEOUT_MS} ms (same bounds as /ultracode set timeoutMs), got ${value}`,
+    }
+  }
+  return { ok: true, timeoutMs: value }
+}
+
 export function validateToolInput(raw: unknown): ToolInputResult {
   if (!isObj(raw)) {
     return { ok: false, error: `input must be an object, got ${typeOf(raw)}` }
@@ -144,7 +173,7 @@ export function validateToolInput(raw: unknown): ToolInputResult {
 
   if (hasGraph) {
     // ---- graph-spec shape (deep validation happens in validateGraphSpec) ----
-    const extra = rejectExtras(raw, new Set(["graph", "name", "args", "background", "resumeFrom"]))
+    const extra = rejectExtras(raw, new Set(["graph", "name", "args", "background", "resumeFrom", "timeoutMs"]))
     if (extra) return { ok: false, error: extra }
 
     const graph = raw["graph"]
@@ -173,18 +202,21 @@ export function validateToolInput(raw: unknown): ToolInputResult {
     if (!background.ok) return { ok: false, error: background.error }
     const resume = validateResumeFrom(raw)
     if (!resume.ok) return { ok: false, error: resume.error }
+    const timeout = validateTimeoutMs(raw)
+    if (!timeout.ok) return { ok: false, error: timeout.error }
 
     const input: GraphRunInput = { graph: graph as Record<string, unknown> }
     if (name !== undefined) input.name = name as string
     if (raw["args"] !== undefined) input.args = args.args
     if (background.background !== undefined) input.background = background.background
     if (resume.resumeFrom !== undefined) input.resumeFrom = resume.resumeFrom
+    if (timeout.timeoutMs !== undefined) input.timeoutMs = timeout.timeoutMs
     return { ok: true, input }
   }
 
   if (hasWorkflow) {
     // ---- saved-workflow shape ----
-    const extra = rejectExtras(raw, new Set(["workflow", "args", "background", "resumeFrom"]))
+    const extra = rejectExtras(raw, new Set(["workflow", "args", "background", "resumeFrom", "timeoutMs"]))
     if (extra) return { ok: false, error: extra }
 
     const workflow = raw["workflow"]
@@ -205,17 +237,20 @@ export function validateToolInput(raw: unknown): ToolInputResult {
     if (!background.ok) return { ok: false, error: background.error }
     const resume = validateResumeFrom(raw)
     if (!resume.ok) return { ok: false, error: resume.error }
+    const timeout = validateTimeoutMs(raw)
+    if (!timeout.ok) return { ok: false, error: timeout.error }
 
     const input: SavedRunInput = { workflow }
     if (raw["args"] !== undefined) input.args = args.args
     if (background.background !== undefined) input.background = background.background
     if (resume.resumeFrom !== undefined) input.resumeFrom = resume.resumeFrom
+    if (timeout.timeoutMs !== undefined) input.timeoutMs = timeout.timeoutMs
     return { ok: true, input }
   }
 
   if (hasScript) {
     // ---- inline-script shape ----
-    const extra = rejectExtras(raw, new Set(["script", "name", "meta", "args", "background", "resumeFrom"]))
+    const extra = rejectExtras(raw, new Set(["script", "name", "meta", "args", "background", "resumeFrom", "timeoutMs"]))
     if (extra) return { ok: false, error: extra }
 
     const script = raw["script"]
@@ -258,6 +293,8 @@ export function validateToolInput(raw: unknown): ToolInputResult {
     if (!background.ok) return { ok: false, error: background.error }
     const resume = validateResumeFrom(raw)
     if (!resume.ok) return { ok: false, error: resume.error }
+    const timeout = validateTimeoutMs(raw)
+    if (!timeout.ok) return { ok: false, error: timeout.error }
 
     const input: InlineRunInput = { script }
     if (name !== undefined) input.name = name as string
@@ -265,6 +302,7 @@ export function validateToolInput(raw: unknown): ToolInputResult {
     if (raw["args"] !== undefined) input.args = args.args
     if (background.background !== undefined) input.background = background.background
     if (resume.resumeFrom !== undefined) input.resumeFrom = resume.resumeFrom
+    if (timeout.timeoutMs !== undefined) input.timeoutMs = timeout.timeoutMs
     return { ok: true, input }
   }
 
@@ -354,7 +392,7 @@ export function validateResultToolInput(
   return out
 }
 
-/** Max length of a catalog lookup name (workflow / template). */
+/** Max length of a catalog lookup name (workflow / template / script template). */
 export const MAX_CATALOG_NAME_CHARS = 64
 
 export type CatalogToolInput = {
@@ -362,22 +400,25 @@ export type CatalogToolInput = {
   workflow?: string
   template?: string
   templates?: boolean
+  scriptTemplate?: string
+  scriptTemplates?: boolean
 }
 
 /**
- * Input for the read-only `ultracode_catalog` tool. Three mutually exclusive
- * views: the whole catalog (no args), one saved workflow (`workflow`), or graph
- * template specs (`template` / `templates`) — one view per call keeps the
+ * Input for the read-only `ultracode_catalog` tool. Mutually exclusive
+ * views: the whole catalog (no args), one saved workflow (`workflow`), graph
+ * template specs (`template` / `templates`), or script template bodies
+ * (`scriptTemplate` / `scriptTemplates`) — one view per call keeps the
  * payload bounded and the intent unambiguous.
  */
 export function validateCatalogToolInput(raw: unknown): CatalogToolInput | { ok: false; error: string } {
   if (raw === undefined || raw === null) return { ok: true }
   if (!isObj(raw)) return { ok: false, error: `input must be an object, got ${typeOf(raw)}` }
-  const extra = rejectExtras(raw, new Set(["workflow", "template", "templates"]))
+  const extra = rejectExtras(raw, new Set(["workflow", "template", "templates", "scriptTemplate", "scriptTemplates"]))
   if (extra) return { ok: false, error: extra }
 
   const names: string[] = []
-  for (const key of ["workflow", "template"] as const) {
+  for (const key of ["workflow", "template", "scriptTemplate"] as const) {
     if (!has(raw, key)) continue
     const value = raw[key]
     if (typeof value !== "string" || value.trim() === "") {
@@ -393,10 +434,12 @@ export function validateCatalogToolInput(raw: unknown): CatalogToolInput | { ok:
   }
   const wantsAllTemplates = has(raw, "templates")
   if (wantsAllTemplates) names.push("templates")
+  const wantsAllScriptTemplates = has(raw, "scriptTemplates")
+  if (wantsAllScriptTemplates) names.push("scriptTemplates")
   if (names.length > 1) {
     return {
       ok: false,
-      error: `choose ONE view per call: { workflow }, { template }, { templates } or no input for the whole catalog (got ${names.join(" + ")})`,
+      error: `choose ONE view per call: { workflow }, { template }, { templates }, { scriptTemplate }, { scriptTemplates } or no input for the whole catalog (got ${names.join(" + ")})`,
     }
   }
 
@@ -408,10 +451,20 @@ export function validateCatalogToolInput(raw: unknown): CatalogToolInput | { ok:
     }
     templates = value
   }
+  let scriptTemplates: boolean | undefined
+  if (wantsAllScriptTemplates) {
+    const value = raw["scriptTemplates"]
+    if (typeof value !== "boolean") {
+      return { ok: false, error: `"scriptTemplates" must be a boolean, got ${typeOf(value)}` }
+    }
+    scriptTemplates = value
+  }
 
   const out: CatalogToolInput = { ok: true }
   if (has(raw, "workflow")) out.workflow = (raw["workflow"] as string).trim()
   if (has(raw, "template")) out.template = (raw["template"] as string).trim()
+  if (has(raw, "scriptTemplate")) out.scriptTemplate = (raw["scriptTemplate"] as string).trim()
   if (templates !== undefined) out.templates = templates
+  if (scriptTemplates !== undefined) out.scriptTemplates = scriptTemplates
   return out
 }

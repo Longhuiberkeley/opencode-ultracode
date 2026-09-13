@@ -136,8 +136,14 @@ in your final report) is the single source of truth. Import shared types from `.
 - B does NOT import `@opencode/plugin`; everything arrives via narrow interfaces
   (`SessionCtx`, `Registry`, `Storage`, options) — constructible from fakes in tests.
 
-### Builder C — authoring surface & tests (`src/skill-content.ts`, `workflows/samples/*`, `test/*.test.ts`, `README.md`, `docs/AUTHORING.md`)
+### Builder C — authoring surface & tests (`src/skill-content.ts`, `src/graph-templates.ts`, `src/script-templates.ts`, `src/catalog.ts`, `workflows/samples/*`, `test/*.test.ts`, `README.md`, `docs/AUTHORING.md`)
 
+- `src/script-templates.ts`: pure module, twin of `graph-templates.ts` for script-mode shapes —
+  `SCRIPT_TEMPLATES: readonly ScriptTemplate[]` (`{ name, description, args, script }`), lookup and
+  summary helpers. Every body must pass `validateScriptSource`, fail fast on degenerate args, keep
+  write agents sequential, cap every loop/slice, and carry stable `opts.key`s (enforced by
+  `test/script-templates.test.ts`, including end-to-end supervisor runs). Served read-only by
+  `ultracode_catalog` via `{ scriptTemplate }` / `{ scriptTemplates }` — the catalog never executes.
 - `src/skill-content.ts`: `export const SKILL_NAME = "Ultracode"`; `export const SKILL_DESCRIPTION`
   (one dense sentence, trigger conditions); `export const SKILL_CONTENT: string` — the authoring
   skill markdown (mirrors Claude Code's workflow docs, adapted):

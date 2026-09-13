@@ -69,7 +69,7 @@ import type {
   Supervisor,
   WorkflowMeta,
 } from "./types.ts"
-import { isActiveRunStatus } from "./types.ts"
+import { isActiveRunStatus, MAX_RUN_TIMEOUT_MS, MIN_RUN_TIMEOUT_MS } from "./types.ts"
 
 /** Minimal shape of a plugin hook/transform registration (for cleanup). */
 interface RegistrationLike {
@@ -122,6 +122,15 @@ function unwrapList(result: unknown): unknown[] {
   return []
 }
 
+/** Shared per-run wall-clock override property (all three run forms). */
+const RUN_TIMEOUT_MS_PROPERTY: Record<string, unknown> = {
+  type: "integer",
+  minimum: MIN_RUN_TIMEOUT_MS,
+  maximum: MAX_RUN_TIMEOUT_MS,
+  description:
+    "Optional wall-clock limit for THIS run in ms (10 s–24 h, same bounds as /ultracode set timeoutMs). Pass it when your budgeted waves × stages exceed the configured default — it applies to this run only, never changes the project default, and is recorded on the run and shown in ultracode_status.",
+}
+
 /** JSON Schema for the workflow tool input union (inline script vs saved workflow). */
 const WORKFLOW_TOOL_INPUT_SCHEMA: Record<string, unknown> = {
   anyOf: [
@@ -161,6 +170,7 @@ const WORKFLOW_TOOL_INPUT_SCHEMA: Record<string, unknown> = {
           description:
             "Warm-start from a prior run id (run_…): keyed succeeded agents replay from that run's cache instead of respawning, so an interrupted long run costs only its unfinished tail.",
         },
+        timeoutMs: RUN_TIMEOUT_MS_PROPERTY,
       },
     },
     {
@@ -183,6 +193,7 @@ const WORKFLOW_TOOL_INPUT_SCHEMA: Record<string, unknown> = {
           description:
             "Warm-start from a prior run id (run_…): keyed succeeded agents replay from that run's cache instead of respawning, so an interrupted long run costs only its unfinished tail.",
         },
+        timeoutMs: RUN_TIMEOUT_MS_PROPERTY,
       },
     },
     {
@@ -211,6 +222,7 @@ const WORKFLOW_TOOL_INPUT_SCHEMA: Record<string, unknown> = {
           description:
             "Warm-start from a prior run id (run_…). Graph calls are auto-keyed per node, so every finished child replays from cache and only the unfinished tail respawns.",
         },
+        timeoutMs: RUN_TIMEOUT_MS_PROPERTY,
       },
     },
   ],
@@ -266,6 +278,15 @@ const CATALOG_TOOL_INPUT_SCHEMA: Record<string, unknown> = {
     templates: {
       type: "boolean",
       description: "true → every graph template's complete spec. Larger payload; prefer `template` for one.",
+    },
+    scriptTemplate: {
+      type: "string",
+      description:
+        "One script template name → its complete body, ready to adapt (edit prompts, args, caps) and run as { script }. For shapes graphs cannot express: staged-delivery (sequential write stages with verify-fix gates), verify-fix (bounded fix loop).",
+    },
+    scriptTemplates: {
+      type: "boolean",
+      description: "true → every script template's complete body. Larger payload; prefer `scriptTemplate` for one.",
     },
   },
 }
@@ -770,7 +791,7 @@ export default Plugin.define({
                 const background = resolveBackground(input)
                 return await executeWorkflowLaunch(
                   supervisor,
-                  { script, meta, args, name, workflowName, graphSpec, resumeFrom: input.resumeFrom },
+                  { script, meta, args, name, workflowName, graphSpec, resumeFrom: input.resumeFrom, timeoutMs: input.timeoutMs },
                   parent,
                   background,
                   background
@@ -876,7 +897,7 @@ export default Plugin.define({
           name: "catalog",
           options: { namespace: "ultracode" },
           description:
-            "Read-only discovery of what this project can run: saved workflows (kind, params (names always; JSON types only when declared — explicit params, a // Tool input: header, or a saved run's real args; graph-derived params are names only), phases, required agents, trust state, last-run stats from THIS conversation), the available agent ids, and graph templates to adapt. Call it BEFORE choosing a saved workflow or authoring a graph — cheaper than reading workflow files, and it executes nothing. Input { workflow? | template? | templates? }: no input returns the whole bounded catalog; one view per call. A workflow listed as trusted can be run immediately; an untrusted one needs the user's /ultracode trust first (relay that, never work around it).",
+            "Read-only discovery of what this project can run: saved workflows (kind, params (names always; JSON types only when declared — explicit params, a // Tool input: header, or a saved run's real args; graph-derived params are names only), phases, required agents, trust state, last-run stats from THIS conversation), the available agent ids, the live caps (concurrency, maxAgents, timeoutMs), graph templates to adapt, and script templates (staged-delivery, verify-fix) for loop-shaped work graphs cannot express. Call it BEFORE choosing a saved workflow or authoring from a blank page — cheaper than reading workflow files, and it executes nothing. Input { workflow? | template? | templates? | scriptTemplate? | scriptTemplates? }: no input returns the whole bounded catalog; one view per call. A workflow listed as trusted can be run immediately; an untrusted one needs the user's /ultracode trust first (relay that, never work around it).",
           input: CATALOG_TOOL_INPUT_SCHEMA,
           execute: async (rawInput: unknown, tool) => {
             try {
@@ -909,6 +930,8 @@ export default Plugin.define({
                 },
                 ...(parsed.templates !== undefined ? { templates: parsed.templates } : {}),
                 ...(parsed.template !== undefined ? { template: parsed.template } : {}),
+                ...(parsed.scriptTemplates !== undefined ? { scriptTemplates: parsed.scriptTemplates } : {}),
+                ...(parsed.scriptTemplate !== undefined ? { scriptTemplate: parsed.scriptTemplate } : {}),
                 ...(parsed.workflow !== undefined ? { workflow: parsed.workflow } : {}),
               })
               return { content: JSON.stringify(catalog) }

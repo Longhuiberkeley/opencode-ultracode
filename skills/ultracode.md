@@ -24,13 +24,17 @@ interrupted long run costs only its unfinished tail. `meta` and `args` are injec
 choosing a saved workflow or authoring a graph from a blank page. With no input it returns the
 agent roster, every saved workflow (kind, description, **params (names always; JSON types only when declared —
 explicit params, a // Tool input: header, or a saved run's real args; graph-derived params are names only)**, phases,
-required agents, trust state, last-run stats) and the graph template summaries. Drill in with
-`{ workflow: "name" }` for one workflow's full spec (graph) or script head, `{ template: "name" }`
-for one ready-made spec, or `{ templates: true }` for all of them.
+required agents, trust state, last-run stats), the graph template summaries and the script template summaries, and
+the live `caps`. Drill in with `{ workflow: "name" }` for one workflow's full spec (graph) or script head,
+`{ template: "name" }` for one ready-made graph spec, `{ templates: true }` for all of them, or
+`{ scriptTemplate: "name" }` for a ready-to-adapt script body (staged-delivery, verify-fix).
 
 Two things it tells you that guessing cannot: what `args` a saved workflow actually takes, and
-whether the user has trusted it. An untrusted workflow needs the user's `/ultracode trust <name>` —
-relay that and wait; never work around it by inlining an equivalent script.
+whether the user has trusted it. Trust gates SAVED workflows only: running by name requires the user's
+one-time `/ultracode trust <name>` — relay that and wait. An inline `{ script }` you author now runs
+without saving or trusting (there is no digest check against saved files); save when you will rerun or
+share the orchestration. Never dodge an untrusted saved workflow by inlining its content — that bypasses
+the user's pending approval; ask them to trust it.
 
 ## Decide: answer, delegate, or workflow
 
@@ -42,7 +46,7 @@ relay that and wait; never work around it by inlining an equivalent script.
 | The shape is standard: scout → partition → fan out → gate → merge | Workflow as a **graph**, from a template. |
 | Verification must be structural: independent verifiers, skeptics, judges | Workflow with a verify phase and a gate. |
 | You will rerun, share, or compose the orchestration | Workflow, saved under a name. |
-| You need loops, retries or conditional re-planning | Workflow as a **script**. |
+| You need loops, retries or conditional re-planning | Workflow as a **script** — start from `staged-delivery` if it is sequential write stages with verification. |
 
 Rule of thumb: a workflow earns its cost when you can name BOTH the fan-out AND the verifier.
 Name neither? Answer or delegate instead.
@@ -123,7 +127,10 @@ Author in Plan mode; run by name from Build mode. Do not call `ultracode_run` in
 ## Script mode (the escape hatch)
 
 The script is an async function body: top-level `await` and `return` are legal, module syntax is
-rejected. Injected globals, nothing else:
+rejected. Two script shapes recur enough to ship as served templates — sequential write stages with
+verify-fix gates (`staged-delivery`) and a bounded fix loop (`verify-fix`). Get one with
+`ultracode_catalog { scriptTemplate: "staged-delivery" }`, edit prompts and args, then run it
+inline or save it. Injected globals, nothing else:
 
 | Global | Call | Semantics |
 | --- | --- | --- |
@@ -139,11 +146,14 @@ rejected. Injected globals, nothing else:
 | `args` | `args` | Your tool-input arguments, a JSON value. |
 | `meta` | `meta` | Your tool-input metadata: name, description, phases, requires. |
 
-Caps: 8 concurrent agents (default), 200 agent calls per run, 60 minutes wall clock, 512 KB max
-script size, results truncated after 64 KB by default. Budget the wall clock before anything else:
-waves (ceil(agents / concurrency)) × dependent stages × ~5-10 minutes per child must fit — prefer
-wide-not-deep, and raise the ceiling per project with `/ultracode set timeoutMs <ms>` when a wide
-run legitimately needs it.
+Caps are project settings, not constants: `ultracode_catalog` reports the live concurrency, agent
+cap and timeout under `caps` (defaults: 8 concurrent agents, 200 agent calls per run, 60 minutes
+wall clock; separately, scripts are hard-capped at 512 KB and results truncate after 64 KB by
+default). Budget the wall clock before anything else — waves
+(ceil(agents / concurrency)) × dependent stages × ~5-10 minutes per child must fit; prefer wide-not-deep.
+When a run legitimately needs longer than the configured timeout, pass `timeoutMs` in the run call
+(10 s to 24 h; applies to that run only and is recorded on the run). Ask the user to raise the default
+with `/ultracode set timeoutMs <ms>` when it should stick.
 
 ## Hard rules
 

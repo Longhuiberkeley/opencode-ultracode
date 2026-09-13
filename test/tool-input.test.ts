@@ -342,3 +342,65 @@ test("catalog input: bad names, bad flags and unknown keys are rejected precisel
     if (!parsed.ok) assert.match(parsed.error, pattern)
   }
 })
+
+// ---------------------------------------------------------------------------
+// Script template views
+// ---------------------------------------------------------------------------
+
+test("catalog input: scriptTemplate and scriptTemplates views validate like their graph twins", () => {
+  const one = validateCatalogToolInput({ scriptTemplate: "staged-delivery" })
+  assert.equal(one.ok, true)
+  if (one.ok) assert.equal(one.scriptTemplate, "staged-delivery")
+  const all = validateCatalogToolInput({ scriptTemplates: true })
+  assert.equal(all.ok, true)
+  if (all.ok) assert.equal(all.scriptTemplates, true)
+
+  const cases: Array<[unknown, RegExp]> = [
+    [{ scriptTemplate: "" }, /"scriptTemplate" must be a non-empty name/],
+    [{ scriptTemplate: 7 }, /"scriptTemplate" must be a non-empty name, got number/],
+    [{ scriptTemplates: "yes" }, /"scriptTemplates" must be a boolean, got string/],
+  ]
+  for (const [raw, pattern] of cases) {
+    const parsed = validateCatalogToolInput(raw)
+    assert.equal(parsed.ok, false, `expected rejection for ${JSON.stringify(raw)}`)
+    if (!parsed.ok) assert.match(parsed.error, pattern)
+  }
+})
+
+test("catalog input: script template views join the one-view-per-call rule", () => {
+  for (const raw of [
+    { scriptTemplate: "a", template: "b" },
+    { scriptTemplate: "a", scriptTemplates: true },
+    { scriptTemplates: true, templates: true },
+    { workflow: "a", scriptTemplate: "b" },
+  ]) {
+    const parsed = validateCatalogToolInput(raw)
+    assert.equal(parsed.ok, false, `expected rejection for ${JSON.stringify(raw)}`)
+    if (!parsed.ok) assert.match(parsed.error, /choose ONE view per call/)
+  }
+})
+
+// ---------------------------------------------------------------------------
+// Per-run timeoutMs
+// ---------------------------------------------------------------------------
+
+test("timeoutMs is accepted on all three run forms and carried through", () => {
+  const inline = ok({ script: "s", timeoutMs: 90 * 60_000 })
+  assert.equal(inline.input.timeoutMs, 90 * 60_000)
+  const saved = ok({ workflow: "w", timeoutMs: 90 * 60_000 })
+  assert.equal(saved.input.timeoutMs, 90 * 60_000)
+  const graph = ok({ graph: { nodes: [] }, timeoutMs: 90 * 60_000 })
+  assert.equal(graph.input.timeoutMs, 90 * 60_000)
+  const none = ok({ script: "s" })
+  assert.equal(none.input.timeoutMs, undefined)
+})
+
+test("timeoutMs bounds match /ultracode set: 10 s to 24 h, integers only", () => {
+  bad({ script: "s", timeoutMs: 9_999 }, /"timeoutMs" must be between 10000 and 86400000/)
+  bad({ script: "s", timeoutMs: 86_400_001 }, /"timeoutMs" must be between/)
+  bad({ script: "s", timeoutMs: 60_000.5 }, /"timeoutMs" must be an integer/)
+  bad({ script: "s", timeoutMs: "60000" }, /"timeoutMs" must be an integer/)
+  bad({ workflow: "w", timeoutMs: 1 }, /"timeoutMs" must be between/)
+  ok({ script: "s", timeoutMs: 10_000 })
+  ok({ script: "s", timeoutMs: 86_400_000 })
+})

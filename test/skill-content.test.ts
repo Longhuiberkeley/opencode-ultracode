@@ -103,7 +103,11 @@ test("skill content teaches the catalog tool and graph templates", () => {
   assert.match(SKILL_CONTENT, /\{ workflow: "name" \}/, "detail drill-down")
   assert.match(SKILL_CONTENT, /\{ template: "name" \}/, "single-template drill-down")
   assert.match(SKILL_CONTENT, /template/, "templates are the anti-blank-page answer")
-  assert.match(SKILL_CONTENT, /never work around it by inlining an equivalent script/, "trust is user-only")
+  assert.match(SKILL_CONTENT, /\{ scriptTemplate: "name" \}/, "script-template drill-down")
+  assert.match(SKILL_CONTENT, /Trust gates SAVED workflows only/, "the trust boundary is precise")
+  assert.match(SKILL_CONTENT, /relay that and wait/, "trust is user-only")
+  assert.match(SKILL_CONTENT, /runs\s+without saving or trusting/, "inline scripts are not trust-gated — no agonizing over it")
+  assert.match(SKILL_CONTENT, /Never dodge an untrusted saved workflow by inlining its content/, "the anti-bypass guard stands")
 })
 
 test("skill content teaches graph review, saving and the graph handoff", () => {
