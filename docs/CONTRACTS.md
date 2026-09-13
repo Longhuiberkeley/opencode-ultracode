@@ -79,6 +79,9 @@ in your final report) is the single source of truth. Import shared types from `.
     `ctx.permission.reply({ reply: "reject" })`; other modes reject after
     `effective.permissionStallMs` (0 disables). `permission.replied` clears the timer;
     dispose clears all timers. A hidden prompt never hangs a run until `timeoutMs`.
+  - question tool: `action: "question"` on an owned-active child => `effect: "deny"` in every
+    mode (dialog only renders inside the child session — invisible hang). Children must
+    decide autonomously; authors give decision rules instead.
   - cleanup return: `supervisor.dispose()`, abort event subscriptions.
 - A also wires NO direct session calls inside setup (deadlock rule) — commands do session calls
   inside their executors (allowed).

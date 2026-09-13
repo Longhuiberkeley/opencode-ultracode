@@ -125,7 +125,10 @@ The rest of this README covers security, internals, and the full command surface
   `permission.asked` events: in `noEditTools` mode pending requests are rejected immediately;
   in other modes they are rejected after `permissionStallMs` (default 5 min; `0` disables). A
   rejection is visible in the child transcript (denied tool call) and the agent adapts — check
-  `/ultracode status` for `waitingForPermission` while a run is in flight.
+  `/ultracode status` for `waitingForPermission` while a run is in flight. The interactive
+  `question` tool is likewise **denied for owned children in every mode** (its dialog only
+  renders inside the child session — an invisible hang): children must decide autonomously and
+  report the decision. Give children decision rules in the prompt instead of letting them ask.
 - **Isolation caveat for authors:** a "clean context" is NOT filesystem isolation. Two agents
   that write files concurrently will race on the same worktree. Orchestration scripts must
   serialize write agents (see `docs/AUTHORING.md`).

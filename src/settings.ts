@@ -260,6 +260,16 @@ export const NO_EDIT_TOOLS_MESSAGE = "workflow run is in noEditTools mode"
 export const NO_SHELL_WRITE_MESSAGE =
   "workflow run is in noEditTools mode — this shell command looks like a file write (best-effort detection)"
 
+/**
+ * The interactive question tool: its dialog only renders inside the focused
+ * session (Ctrl+G). A workflow child asking one is an invisible hang — the
+ * user is never notified. Denied for owned children in every mode.
+ */
+export const QUESTION_ACTIONS: ReadonlySet<string> = new Set(["question"])
+
+export const CHILD_QUESTION_MESSAGE =
+  "workflow child agents run unattended — the user cannot see or answer this question. Decide autonomously and state the decision in your result."
+
 /** Host action names for shell command execution across builds. */
 export const SHELL_ACTIONS: ReadonlySet<string> = new Set(["shell", "bash"])
 
@@ -421,6 +431,13 @@ export function evaluateOwnedPermission(
   if (typeof sessionID !== "string" || !lookup.isOwnedActive(sessionID)) return "skip"
   const action = event.action
   if (typeof action !== "string") return "skip"
+  // Children are unattended: a question dialog only renders inside the child
+  // session, so asking one is an invisible hang. Deny in every mode.
+  if (QUESTION_ACTIONS.has(action)) {
+    event.effect = "deny"
+    event.message = CHILD_QUESTION_MESSAGE
+    return "deny"
+  }
   const mode = lookup.runForActiveSession(sessionID)?.effective?.permissions
   // noEditTools: the edit-tool deny alone leaks shell-mediated writes
   // (`sed -i`, `tee`, redirections, `git commit`, `sh -c '… > f'`).

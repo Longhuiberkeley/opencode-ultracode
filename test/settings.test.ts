@@ -277,6 +277,26 @@ test("permissionStallAction: noEditTools rejects now; other modes honor the stal
   assert.equal(permissionStallAction(undefined, undefined), "wait")
 })
 
+test("evaluateOwnedPermission: question tool denied for owned children in every mode", () => {
+  const registry = new FakeRegistry()
+  for (const mode of ["ask", "autoEditsWorkflow", "noEditTools", undefined] as const) {
+    const run = registry.create({ parentSessionID: "ses_p", script: "return 1" })
+    if (mode) run.effective = { concurrency: 8, maxAgents: 200, timeoutMs: 3_600_000, permissions: mode }
+    const sid = `ses_q_${mode ?? "none"}`
+    registry.markOwned(run.id, sid)
+    const ev: { sessionID: string; action: string; resources?: ReadonlyArray<unknown>; effect?: string; message?: string } = {
+      sessionID: sid,
+      action: "question",
+    }
+    assert.equal(evaluateOwnedPermission(ev, registry), "deny", `mode=${String(mode)}`)
+    assert.equal(ev.effect, "deny", `mode=${String(mode)}`)
+    assert.match(ev.message ?? "", /unattended/)
+  }
+  const unowned: { sessionID: string; action: string; effect?: string } = { sessionID: "ses_other", action: "question" }
+  assert.equal(evaluateOwnedPermission(unowned, registry), "skip")
+  assert.equal(unowned.effect, undefined)
+})
+
 test("freezeEffective snapshots permissionStallMs", () => {
   const snap = freezeEffective({ ...DEFAULT_OPTIONS, permissionStallMs: 0 })
   assert.equal(snap.permissionStallMs, 0)
