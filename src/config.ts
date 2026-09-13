@@ -18,12 +18,14 @@ interface NumRange {
 }
 
 /** Verified ranges — see CONTRACTS.md Builder A. */
-const RANGES: Record<"concurrency" | "maxAgents" | "timeoutMs" | "maxResultChars", NumRange> = {
+const RANGES: Record<"concurrency" | "maxAgents" | "timeoutMs" | "maxResultChars" | "permissionStallMs", NumRange> = {
   concurrency: { min: 1, max: 64 },
   maxAgents: { min: 1, max: 10_000 },
   // Shared with the per-run override and /ultracode set (src/types.ts).
   timeoutMs: { min: MIN_RUN_TIMEOUT_MS, max: MAX_RUN_TIMEOUT_MS },
   maxResultChars: { min: 1_000, max: 1_000_000 },
+  // 0 disables the stall watchdog (noEditTools rejects immediately anyway).
+  permissionStallMs: { min: 0, max: 3_600_000 },
 }
 
 const PERMISSION_MODES: ReadonlySet<string> = new Set(["ask", "autoEditsWorkflow", "noEditTools"])

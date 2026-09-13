@@ -66,11 +66,19 @@ in your final report) is the single source of truth. Import shared types from `.
   - skill transform (try/catch!): register skill id `ultracode` with content imported from
     `../skill-content.ts` (Builder C) and `location` pointing at `<projectRoot>/.opencode/workflows/ultracode-skill.md`
     — **also write that file at setup** (storage fs helper) so the path exists; guard all failures.
-  - permission hook ONLY when `options.permissions !== "ask"`: `ctx.permission.hook("evaluate", ...)`.
-    `autoEditsWorkflow`: if `registry.isOwnedActive(event.sessionID)` and action in configurable
-    set (default `["edit", "write"]`) and every resource path is inside the project root =>
-    `event.effect = "allow"`. `noEditTools`: same ownership check + action set => `effect: "deny"`,
-    message "workflow run is in noEditTools mode". Otherwise untouched.
+  - permission hook ALWAYS registered (ask delegates to the host): `ctx.permission.hook("evaluate", ...)`,
+    logic in `src/settings.ts` `evaluateOwnedPermission` (pure, tested). Owned-active child only.
+    `ask`/missing mode => untouched (delegate). `autoEditsWorkflow`: action in `["edit", "write"]`
+    and every resource path inside the project root (symlink-aware, fail-closed) =>
+    `event.effect = "allow"`. `noEditTools`: edit-class actions => `effect: "deny"`;
+    shell actions (`shell`/`bash`) with any write-shaped resource (`isShellWriteCommand`:
+    redirects, `sed -i`, `tee`, mutating git, `sh -c`, …) => `deny` with the shell-write
+    message. Otherwise untouched.
+  - permission stall watchdog (same event subscription as tool-call counting): on
+    `permission.asked` for an owned-active child, `noEditTools` rejects immediately via
+    `ctx.permission.reply({ reply: "reject" })`; other modes reject after
+    `effective.permissionStallMs` (0 disables). `permission.replied` clears the timer;
+    dispose clears all timers. A hidden prompt never hangs a run until `timeoutMs`.
   - cleanup return: `supervisor.dispose()`, abort event subscriptions.
 - A also wires NO direct session calls inside setup (deadlock rule) — commands do session calls
   inside their executors (allowed).

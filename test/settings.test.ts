@@ -11,9 +11,11 @@ import {
   applySetValue,
   evaluateOwnedPermission,
   freezeEffective,
+  isShellWriteCommand,
   parseSetArgs,
   parseSettingsOverlay,
   permissionHookDecision,
+  permissionStallAction,
   remainingTimeoutMs,
   stepPanelSetting,
   panelSettingsFrom,
@@ -144,4 +146,139 @@ test("permission hook is registered even when setup-time mode is ask", () => {
   assert.match(src, /permission\.hook\("evaluate"/)
   assert.equal(/if\s*\(\s*options\.permissions\s*!==\s*"ask"\s*\)/.test(src), false)
   assert.match(src, /evaluateOwnedPermission/)
+})
+
+test("isShellWriteCommand: write-shaped commands are detected (best-effort)", () => {
+  const writes = [
+    "echo hi > out.txt",
+    "cat a >> b",
+    "ls foo 2> err.txt",
+    "cmd >&file",
+    "tee out.txt",
+    "tee -a log",
+    "sed -i s/a/b/ f",
+    "sed -i.bak s/a/b/ f",
+    "sed --in-place s/a/b/ f",
+    "perl -pi -e 's/a/b/' f",
+    "awk -i inplace '{print}' f",
+    "rm -rf build",
+    "mv a b",
+    "cp a b",
+    "touch x",
+    "mkdir d",
+    "chmod +x s",
+    "rsync -a a/ b/",
+    "install -m 644 a b",
+    "truncate -s 0 f",
+    "patch -p1 < diff",
+    "git commit -m x",
+    "git -C /repo push",
+    "git checkout -b branch",
+    "FOO=1 rm x",
+    "env rm x",
+    "bash -c 'echo x'",
+    "sh -c 'ls'",
+    "dd if=a of=b",
+    "find . -name x -delete",
+    "find . -exec rm {} ;",
+    "sort -o out list",
+    "sort list --output=out",
+    "xargs rm",
+    "xargs git commit",
+  ]
+  for (const cmd of writes) assert.equal(isShellWriteCommand(cmd), true, cmd)
+})
+
+test("isShellWriteCommand: read-only commands and benign redirects pass", () => {
+  const reads = [
+    "ls -la",
+    "cat a b",
+    "grep pattern file",
+    "rg pattern .",
+    "echo hello",
+    "echo 'a > b'",
+    "grep '>' file",
+    "sed s/a/b/ f",
+    "sed -n p f",
+    "perl -ne 'print' f",
+    "awk '{print}' f",
+    "git status",
+    "git diff HEAD~1",
+    "git show HEAD:file",
+    "git log --oneline",
+    "git -C /repo log",
+    "ls foo 2>/dev/null",
+    "cmd > /dev/null 2>&1",
+    "sort list",
+    "find . -name x",
+    "head -5 f",
+    "wc -l f",
+    "",
+  ]
+  for (const cmd of reads) assert.equal(isShellWriteCommand(cmd), false, cmd)
+})
+
+test("evaluateOwnedPermission: noEditTools denies write-shaped shell commands, ignores read-only ones", () => {
+  const registry = new FakeRegistry()
+  const run = registry.create({ parentSessionID: "ses_p", script: "return 1" })
+  run.effective = { concurrency: 8, maxAgents: 200, timeoutMs: 3_600_000, permissions: "noEditTools" }
+  registry.markOwned(run.id, "ses_shell_child")
+
+  const denyEvent: { sessionID: string; action: string; resources?: ReadonlyArray<unknown>; effect?: string; message?: string } = {
+    sessionID: "ses_shell_child",
+    action: "shell",
+    resources: ["sed -i s/a/b/ f"],
+  }
+  assert.equal(evaluateOwnedPermission(denyEvent, registry), "deny")
+  assert.equal(denyEvent.effect, "deny")
+  assert.match(denyEvent.message ?? "", /noEditTools/)
+
+  const readEvent: { sessionID: string; action: string; resources?: ReadonlyArray<unknown>; effect?: string; message?: string } = {
+    sessionID: "ses_shell_child",
+    action: "shell",
+    resources: ["rg pattern ."],
+  }
+  assert.equal(evaluateOwnedPermission(readEvent, registry), "ignore")
+  assert.equal(readEvent.effect, undefined)
+})
+
+test("evaluateOwnedPermission: shell writes delegate under ask, ignore under autoEditsWorkflow", () => {
+  const registry = new FakeRegistry()
+  const askRun = registry.create({ parentSessionID: "ses_p", script: "return 1" })
+  askRun.effective = { concurrency: 8, maxAgents: 200, timeoutMs: 3_600_000, permissions: "ask" }
+  registry.markOwned(askRun.id, "ses_ask_shell")
+  const askEvent: { sessionID: string; action: string; resources?: ReadonlyArray<unknown>; effect?: string; message?: string } = {
+    sessionID: "ses_ask_shell",
+    action: "bash",
+    resources: ["tee f"],
+  }
+  assert.equal(evaluateOwnedPermission(askEvent, registry), "delegate")
+  assert.equal(askEvent.effect, undefined)
+
+  const autoRun = registry.create({ parentSessionID: "ses_p", script: "return 1" })
+  autoRun.effective = { concurrency: 8, maxAgents: 200, timeoutMs: 3_600_000, permissions: "autoEditsWorkflow" }
+  registry.markOwned(autoRun.id, "ses_auto_shell")
+  const autoEvent: { sessionID: string; action: string; resources?: ReadonlyArray<unknown>; effect?: string; message?: string } = {
+    sessionID: "ses_auto_shell",
+    action: "bash",
+    resources: ["tee f"],
+  }
+  assert.equal(evaluateOwnedPermission(autoEvent, registry), "ignore")
+  assert.equal(autoEvent.effect, undefined)
+})
+
+test("permissionStallAction: noEditTools rejects now; other modes honor the stall window", () => {
+  assert.equal(permissionStallAction("noEditTools", 0), "reject-now")
+  assert.equal(permissionStallAction("noEditTools", undefined), "reject-now")
+  assert.equal(permissionStallAction("ask", 300_000), "reject-after-stall")
+  assert.equal(permissionStallAction("autoEditsWorkflow", 300_000), "reject-after-stall")
+  assert.equal(permissionStallAction(undefined, 300_000), "reject-after-stall")
+  assert.equal(permissionStallAction("ask", 0), "wait")
+  assert.equal(permissionStallAction(undefined, undefined), "wait")
+})
+
+test("freezeEffective snapshots permissionStallMs", () => {
+  const snap = freezeEffective({ ...DEFAULT_OPTIONS, permissionStallMs: 0 })
+  assert.equal(snap.permissionStallMs, 0)
+  assert.equal(Object.isFrozen(snap), true)
 })

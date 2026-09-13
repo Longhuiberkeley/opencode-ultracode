@@ -35,6 +35,14 @@ export interface UltracodeOptions {
   timeoutMs?: number
   /** Permission handling for child sessions. Default "ask". */
   permissions?: PermissionMode
+  /**
+   * Auto-reject a workflow child's pending permission request after this many
+   * ms, so runs fail visibly instead of hanging on prompts the user cannot
+   * see (child sessions never surface a host permission dialog). 0 disables.
+   * `noEditTools` mode rejects immediately regardless of this value.
+   * Default 300_000 (5 min).
+   */
+  permissionStallMs?: number
   /** Max serialized result size returned to the session. Default 65_536 chars. */
   maxResultChars?: number
 }
@@ -45,6 +53,7 @@ export const DEFAULT_OPTIONS: Required<UltracodeOptions> = {
   maxAgents: 200,
   timeoutMs: 3_600_000,
   permissions: "ask",
+  permissionStallMs: 300_000,
   maxResultChars: 65_536,
 }
 
@@ -70,6 +79,8 @@ export type CapturedSettings = {
   maxAgents: number
   timeoutMs: number
   permissions: PermissionMode
+  /** Copied into the frozen snapshot for the permission stall watchdog. */
+  permissionStallMs?: number
 }
 
 // ---------------------------------------------------------------------------

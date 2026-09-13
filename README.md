@@ -117,8 +117,15 @@ The rest of this README covers security, internals, and the full command surface
 - **Child sessions are real agents.** They inherit your config. The default permission mode
   `"ask"` keeps edit approval manual for workflow children. `autoEditsWorkflow` auto-approves
   edit-class actions for active run children scoped to the project root; `noEditTools` denies
-  edit-class tools for active run children outright. See [Options](#options) and
-  [Known limitations](#known-limitations).
+  edit-class tools **and best-effort write-shaped shell commands** (`sed -i`, `tee`,
+  redirections, `git commit`, opaque `sh -c …`) for active run children outright. See
+  [Options](#options) and [Known limitations](#known-limitations).
+- **Hidden prompts never hang a run.** Run children never surface a host permission dialog, so
+  an unanswered "ask" would silently block until `timeoutMs`. The plugin watches
+  `permission.asked` events: in `noEditTools` mode pending requests are rejected immediately;
+  in other modes they are rejected after `permissionStallMs` (default 5 min; `0` disables). A
+  rejection is visible in the child transcript (denied tool call) and the agent adapts — check
+  `/ultracode status` for `waitingForPermission` while a run is in flight.
 - **Isolation caveat for authors:** a "clean context" is NOT filesystem isolation. Two agents
   that write files concurrently will race on the same worktree. Orchestration scripts must
   serialize write agents (see `docs/AUTHORING.md`).
@@ -234,7 +241,8 @@ back to defaults.
 | `concurrency` | number | `8` | Parsed 1–64 in config; **effective max 8** at admission (local clamp to this repo default, not a host API). Extra `agent()` calls queue FIFO. |
 | `maxAgents` | number | `200` | Max total `agent()` calls per run (panel `+/-` steps by 10 within 1–10000). A runaway fan-out fails the run instead of burning tokens forever. |
 | `timeoutMs` | number | `3600000` | Wall-clock limit per run (60 min). Panel cycles presets `600000` / `1800000` / `3600000`. On timeout: children interrupted, worker terminated, run finalized. |
-| `permissions` | string | `"ask"` | `ask` (host user prompt for children — recommended), `autoEditsWorkflow` (auto-approve edit-class actions for active run children inside the project root), `noEditTools` (deny edit-class tools for active run children). Panel cycles these three. |
+| `permissions` | string | `"ask"` | `ask` (host user prompt for children — recommended), `autoEditsWorkflow` (auto-approve edit-class actions for active run children inside the project root), `noEditTools` (deny edit-class tools **and best-effort write-shaped shell commands** — `sed -i`, `tee`, redirections, `git commit`, `sh -c …` — for active run children; `/dev/null` and `2>&1`-style redirects pass). Panel cycles these three. |
+| `permissionStallMs` | number | `300000` | Auto-reject a child's pending permission request after this many ms unanswered, so runs fail visibly instead of hanging on prompts the user cannot see. `0` disables. `noEditTools` rejects immediately regardless. Not a panel setting. |
 | `maxResultChars` | number | `65536` | Max serialized result returned to the session; larger results come back as a compact `preview` + `truncated: true` + `resultChars`, full value retrievable page-by-page via the `ultracode_result` tool (or `/ultracode result <runID>` for humans). |
 
 Panel settings (`h`/`l` to the settings pane, `+/-` to edit) persist a project-scoped KV overlay and refresh next-run defaults. Changes apply to the **next** run only — in-flight runs keep the snapshot captured at `startDetached`.
@@ -252,6 +260,7 @@ Panel settings (`h`/`l` to the settings pane, `+/-` to edit) persist a project-s
         "maxAgents": 200,
         "timeoutMs": 3600000,
         "permissions": "ask",
+        "permissionStallMs": 300000,
         "maxResultChars": 65536
       }
     }
@@ -390,7 +399,10 @@ newest 50 runs (RPC limit up to 100); `/ultracode show <id>` remains available f
 
 Permissions from owned children appear in this inspector: `y` opens a full-request
 confirmation for **allow once**, `n` reviews rejection, and Enter navigates to the
-blocked child. No permission is automatically approved. Full selected task labels
+blocked child. No permission is automatically approved — but pending requests on
+owned children may be **auto-rejected** (immediately in `noEditTools`, after
+`permissionStallMs` otherwise) so an unseen prompt never hangs the run. Full
+selected task labels
 wrap in the detail pane; `h/l` selects panes and up/down scrolls detail text. Press
 `f` for the host's full-screen presentation when supported. Stop/pause actions are
 disabled for finished runs.
@@ -627,6 +639,13 @@ list of available agents and guidance instead of spawning a broken run.
   allows some actions this plugin's children request, but another plugin's hooks may still deny
   or ask; combined effects are not guaranteed to be stricter-than-ask in every configuration.
   `"ask"` is the recommended default.
+- **`noEditTools` shell-write detection is best-effort, not a sandbox.** Write-shaped commands
+  are denied by token/redirect analysis of each parsed command string (`sed -i`, `tee`, `>`
+  redirections, `rm`/`mv`/`cp`, mutating git subcommands, `sh -c …`). Constructs it cannot
+  inspect fail closed, but determined code can still reach interpreters whose flags it does not
+  model (`python -c`, `node -e`, package managers). Read-only guards at the agent level
+  (allowlist frontmatter) remain the stronger boundary; the mode is defense-in-depth for the
+  default agent.
 - **Scripts are trusted code** (see Security) — the worker is an availability boundary, not a
   sandbox; memory is unbounded.
 

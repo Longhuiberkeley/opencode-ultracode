@@ -40,6 +40,8 @@ import {
   capturedFromRecord,
   panelSettingsFrom,
   evaluateOwnedPermission,
+  NO_EDIT_TOOLS_MESSAGE,
+  permissionStallAction,
   type SettingsOverlay,
 } from "./settings.ts"
 import { ULTRACODE_RPC } from "./rpc-definition.ts"
@@ -1218,6 +1220,77 @@ export default Plugin.define({
       warn("skill registration failed — keyword skill attach will not resolve", err)
     }
 
+    // ---- permission stall watchdog (owned children never hang on hidden prompts) ----
+    /**
+     * Run children never surface a host permission dialog: the user cannot see
+     * (or answer) an "ask" a child triggered, so the run would silently block
+     * until timeoutMs. When a `permission.asked` event arrives for a session
+     * owned by an ACTIVE run we therefore:
+     *   - noEditTools: reject immediately (mode contract: children never block)
+     *   - other modes: reject after effective.permissionStallMs (0 = never)
+     * A rejection is visible in the child transcript (denied tool call) and the
+     * agent adapts — instead of the whole run hanging invisibly.
+     */
+    const stallTimers = new Map<string, ReturnType<typeof setTimeout>>()
+    const replyReject = (ctx.permission as { reply?: unknown } | undefined)?.reply as unknown as
+      | ((input: { sessionID: string; requestID: string; reply: "reject"; message?: string }) => Promise<void>)
+      | undefined
+    const rejectPending = async (sessionID: string, requestID: string, why: string) => {
+      if (typeof replyReject !== "function") return
+      try {
+        await replyReject({
+          sessionID,
+          requestID,
+          reply: "reject",
+          message: `ultracode auto-reject: ${why}`,
+        })
+      } catch {
+        // already answered or gone — nothing to do
+      }
+    }
+    const handlePermissionAsked = (data: unknown) => {
+      try {
+        const d = data as { id?: string; sessionID?: string }
+        if (typeof d?.id !== "string" || typeof d?.sessionID !== "string") return
+        const requestID = d.id
+        const sessionID = d.sessionID
+        if (!registry.isOwnedActive(sessionID)) return
+        const effective = registry.runForActiveSession(sessionID)?.effective
+        const action = permissionStallAction(effective?.permissions, effective?.permissionStallMs)
+        if (action === "wait") return
+        if (action === "reject-now") {
+          warn(`auto-rejecting permission request ${requestID} on owned child ${sessionID} (noEditTools)`)
+          void rejectPending(sessionID, requestID, "workflow run is in noEditTools mode")
+          return
+        }
+        const delay = effective?.permissionStallMs ?? 0
+        if (delay <= 0 || stallTimers.has(requestID)) return
+        const timer = setTimeout(() => {
+          stallTimers.delete(requestID)
+          // Only reject while the run still owns the session.
+          if (!registry.isOwnedActive(sessionID)) return
+          warn(`permission stall: auto-rejecting request ${requestID} on owned child ${sessionID} after ${delay}ms unanswered`)
+          void rejectPending(sessionID, requestID, `permission prompt unanswered for ${delay}ms (permissionStallMs)`)
+        }, delay)
+        stallTimers.set(requestID, timer)
+      } catch {
+        // never throw from the event loop
+      }
+    }
+    const handlePermissionReplied = (data: unknown) => {
+      try {
+        const d = data as { requestID?: string }
+        if (typeof d?.requestID !== "string") return
+        const timer = stallTimers.get(d.requestID)
+        if (timer) {
+          clearTimeout(timer)
+          stallTimers.delete(d.requestID)
+        }
+      } catch {
+        // never throw from the event loop
+      }
+    }
+
     // ---- session.tool.* event stream → AgentRecord.toolCalls (D6/A2) ----
     try {
       const subscribe = (ctx.event as { subscribe?: (opts?: { signal?: AbortSignal }) => AsyncIterable<unknown> })
@@ -1233,6 +1306,8 @@ export default Plugin.define({
               if (controller.signal.aborted) break
               const ev = raw as { type?: string; created?: number; data?: { sessionID?: string; id?: string } }
               if (typeof ev?.type !== "string") continue
+              if (ev.type === "permission.asked") handlePermissionAsked(ev.data)
+              else if (ev.type === "permission.replied") handlePermissionReplied(ev.data)
               state = feedToolEvent(
                 state,
                 { type: ev.type, created: ev.created, data: ev.data },
@@ -1298,8 +1373,10 @@ export default Plugin.define({
             return
           }
           // noEditTools: workflow children never edit, regardless of path.
+          // (evaluateOwnedPermission may already have set a more specific
+          // message, e.g. the shell-write one — don't clobber it.)
           ev.effect = "deny"
-          ev.message = "workflow run is in noEditTools mode"
+          if (!ev.message) ev.message = NO_EDIT_TOOLS_MESSAGE
         } catch {
           // never throw from a permission hook
         }
@@ -1314,6 +1391,8 @@ export default Plugin.define({
       disposed = true
       skillInstalled = false
       controller.abort()
+      for (const timer of stallTimers.values()) clearTimeout(timer)
+      stallTimers.clear()
       for (const reg of registrations) {
         try {
           void reg.dispose()

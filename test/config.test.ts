@@ -31,6 +31,7 @@ test("loadOptions: empty object gives all defaults", () => {
     maxAgents: 200,
     timeoutMs: 3_600_000,
     permissions: "ask",
+    permissionStallMs: 300_000,
     maxResultChars: 65_536,
   })
   assert.deepEqual(warnings, [])
@@ -43,11 +44,27 @@ test("loadOptions: fully valid options round-trip", () => {
     maxAgents: 1000,
     timeoutMs: 600_000,
     permissions: "noEditTools",
+    permissionStallMs: 60_000,
     maxResultChars: 10_000,
   }
   const { options, warnings } = loadOptions(raw)
   assert.deepEqual(options, raw)
   assert.deepEqual(warnings, [])
+})
+
+test("loadOptions: permissionStallMs accepts 0 (disabled) and rejects out-of-range", () => {
+  const off = loadOptions({ permissionStallMs: 0 })
+  assert.equal(off.options.permissionStallMs, 0)
+  assert.deepEqual(off.warnings, [])
+  const hi = loadOptions({ permissionStallMs: 3_600_000 })
+  assert.equal(hi.options.permissionStallMs, 3_600_000)
+  assert.deepEqual(hi.warnings, [])
+  for (const bad of [-1, 3_600_001, 1.5, "soon"]) {
+    const { options, warnings } = loadOptions({ permissionStallMs: bad })
+    assert.equal(options.permissionStallMs, DEFAULT_OPTIONS.permissionStallMs)
+    assert.equal(warnings.length, 1)
+    assert.match(warnings[0]!, /permissionStallMs/)
+  }
 })
 
 test("loadOptions: numeric ranges reject out-of-range values with default fallback", () => {
