@@ -200,7 +200,8 @@ const summary = await loop({
   the next iteration without bloating state.
 - `unit: { name, args(state) }` runs a TRUSTED saved workflow per iteration instead of a local
   iterate (preflighted before iteration 1); nesting is capped (`maxLoopDepth`, default 2) and the
-  budget ledger is shared across nested loops.
+  budget ledger is shared across nested loops. A unit cannot run inside a composed workflow (depth
+  1) and its script must return `{ state, result? }` like any iterate.
 - Structural failures (bad spec, depth cap, unit trust) fail loud; per-iteration failures follow
   `onIterationError: retry | record | abort`.
 - Served loop templates: `kanban` (ticket worklist) and `kaggle-ml` (metric-targeted refinement).
@@ -240,9 +241,9 @@ const summary = await loop({
     overturns weak survivals. If the verifier shares the generator's failure modes, the workflow
     is theater. A `gate` node between an expensive phase and the next one is this, pre-built.
 13. **Iterate through `loop()`, not a hand-rolled `while`.** The engine owns budgets, auto-keys,
-    checkpoints, stall detection and the skeptics behind terminating verdicts; a raw loop forfeits
-    all of it (and its un-keyed children cannot warm-replay). Graph first, `loop()` for iteration,
-    raw scripts only when neither shape fits.
+    checkpoints, stall detection and the skeptics behind terminating verdicts; a raw wait-loop
+    forfeits all of it (and its un-keyed children cannot warm-replay). Graph first, `loop()` for
+    refinement until a condition, raw scripts for bounded one-shot shapes (tournaments, fan-out).
 
 ## Sizing: partition, budget, merge (read this before any wide fan-out)
 
@@ -292,20 +293,20 @@ const rated = await pipeline(files,
     "\nFile: " + files[i], { agent: "general", phase: "rate", schema: SEVERITY, key: "rate:" + files[i] }))
 ```
 
-### Loop until done (bounded; the write agent stays sequential)
+### Loop until done (engine-owned; the write agent stays sequential per iteration)
 
 ```
-let open = issues
-for (let pass = 1; pass <= 5 && open.length > 0; pass++) {
-  progress("pass " + pass + ": " + open.length + " open")
-  await agent("Fix exactly these issues. Change no unrelated code.\n" + JSON.stringify(open),
-    { agent: "general", phase: "fix", label: "fix" + pass, key: "fix:" + pass })
+const summary = await loop({
+  key: "fix", goal: "issues resolved", state: { open: issues },
+  budget: { iterations: 5, agentsPerIteration: 4 }, stop: { predicate: (v) => v.state.open.length === 0 && "queue-empty", stallK: 2 },
+}, async (c) => {
+  await agent("Fix exactly these issues. Change no unrelated code.\n" + JSON.stringify(c.state.open),
+    { agent: "general", phase: "fix", label: "fix" + c.i, key: "fix:" + c.i })
   const recheck = await agent("Check whether these issues still exist. List survivors only.\n" +
-    JSON.stringify(open), { agent: "explore", phase: "recheck", schema: ISSUES, key: "recheck:" + pass })
-  open = (recheck && recheck.data && recheck.data.issues) || []
-  checkpoint("fix-pass-" + pass, { open: open.length })
-}
-return { fixed: issues.length - open.length, open }
+    JSON.stringify(c.state.open), { agent: "explore", phase: "recheck", schema: ISSUES, key: "recheck:" + c.i })
+  return { state: { open: (recheck && recheck.data && recheck.data.issues) || [] } }
+})
+return { fixed: issues.length - summary.state.open.length, open: summary.state.open }
 ```
 
 ### Tournament (pairwise judges, bounded rounds)

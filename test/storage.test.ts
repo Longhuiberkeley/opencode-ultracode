@@ -1239,3 +1239,13 @@ test("modelsUsed survives a reload (refreshWorkflows reads it back from disk)", 
   const relisted = fresh.listWorkflows().find((w) => w.manifest.name === "reloadme")
   assert.deepEqual(relisted?.manifest.modelsUsed, ["openai/gpt-6"], "fresh instance sees it too")
 })
+
+test("runDirFor: run scaffold dir for loop artifacts, rejects path-shaped ids", () => {
+  const { storage } = makeStorage()
+  const dir = storage.runDirFor("run_0123456789abcdef")
+  assert.ok(dir, "valid run id returns a dir")
+  assert.match(dir!, /workflows[\\/]runs[\\/]run_0123456789abcdef$/)
+  assert.equal(storage.runDirFor("../escape"), undefined)
+  assert.equal(storage.runDirFor("a/b"), undefined)
+  assert.equal(storage.runDirFor(""), undefined)
+})

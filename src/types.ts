@@ -514,6 +514,10 @@ export interface QueueSizes {
   blocked: number
   done: number
   ready: number
+  /** Open items whose (present) dependencies are not all done yet. */
+  unready: number
+  /** Open items referencing a dep id that is not in the queue — never become ready. */
+  missingDeps: number
 }
 
 /** Pure serializable worklist returned by the queue() global. */
@@ -558,9 +562,9 @@ export interface LoopIterationCtx {
   artifactsDir: string | null
   /** Stable run-level directory for cross-iteration artifacts. */
   runDir: string | null
-  /** Bounded compact log of prior iterations (status/digest/error). */
-  history: Array<{ i: number; status: string; digest?: string; error?: string }>
-  /** Previous iteration's verdict data (schema-validated), when declared. */
+  /** Bounded compact log of prior iterations (status/digest/error/skeptic). */
+  history: Array<{ i: number; status: string; digest?: string; error?: string; skeptic?: string; skepticReason?: string }>
+  /** Previous iteration's verdict data (schema-validated; null when its termination was refuted). */
   lastVerdict: Json | null
 }
 
@@ -573,8 +577,12 @@ export interface LoopVerdictInput {
   agent?: string
   /** JSON Schema for the judge's structured output (evidence-shaped recommended). */
   schema?: Json
-  /** Prompt builder (string or function of the iteration); the judge is told to cite evidence. */
-  prompt?: string | ((ctx: LoopIterationCtx) => string)
+  /**
+   * Prompt builder: a string or a function of the iteration outcome (i, goal,
+   * state, result). The judge is told to cite evidence; a `done`/`target`
+   * status must survive one skeptic re-derivation before the loop may stop.
+   */
+  prompt?: string | ((ctx: { i: number; goal: string; state: Json; result: Json | null }) => string)
   /** Default true: a terminating verdict must survive one independent skeptic re-derivation. */
   skeptic?: boolean
 }
@@ -587,7 +595,11 @@ export interface LoopSpec {
   state?: Json
   budget?: LoopBudgetInput
   stop?: {
-    /** Truthy stops the loop (a string names the stop reason) until-conditions. */
+    /**
+     * Truthy stops the loop (a string names the stop reason). Never invoked
+     * for an iteration whose terminating verdict was refuted — the claim is
+     * void, so state resting on it must not stop the loop either.
+     */
     predicate?: (input: {
       i: number
       state: Json

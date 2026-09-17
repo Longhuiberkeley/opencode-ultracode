@@ -961,3 +961,30 @@ test("model override: graph node model flows end-to-end through the worker", asy
   )
   assert.deepEqual(out2.run.modelOverride, { providerID: "openai", id: "gpt-6" })
 })
+
+test("supervisor: loop auto-keys replay on a warm rerun (resumeFrom)", async () => {
+  const ctx = makeSupervisor()
+  ctx.sessions.push({ text: "A", agent: "general" }).push({ text: "B", agent: "general" })
+  const script = `
+const summary = await loop({ key: "warmloop", budget: { iterations: 2, agentsPerIteration: 2 }, stop: { stallK: 9 } },
+  async (c) => {
+    await agent("step " + c.i)
+    return { state: { n: c.i + 1 } }
+  })
+return { iterations: summary.iterations, stopReason: summary.stopReason }`
+  const first = await ctx.supervisor.start({ script }, ctx.parent)
+  assert.equal(first.envelope.status, "succeeded", first.envelope.error ?? "run failed")
+  assert.equal(first.envelope.agents.total, 2)
+  const sessionsAfterFirst = ctx.sessions.sessions.size
+
+  const second = await ctx.supervisor.start({ script, resumeFrom: first.envelope.runID }, ctx.parent)
+  assert.equal(second.envelope.status, "succeeded", second.envelope.error ?? "warm run failed")
+  const warm = ctx.registry.get(second.envelope.runID)!
+  assert.deepEqual(
+    warm.agents.map((a) => a.key),
+    ["warmloop:i0:a1", "warmloop:i1:a1"],
+    "auto-keys are deterministic across runs",
+  )
+  assert.deepEqual(warm.agents.map((a) => a.cached), [true, true], "both iterations replay from the source run")
+  assert.equal(ctx.sessions.sessions.size, sessionsAfterFirst, "warm loop replay spawned no new sessions")
+})

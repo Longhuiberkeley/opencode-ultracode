@@ -177,7 +177,7 @@ const KANBAN = `// kanban — worklist loop: pull ONE ticket at a time and run i
 // tickets; the queue drains or budgets stop the run. One writer per iteration.
 // Seed note: tickets can come from any tracker — a first explore agent can
 // parse a markdown/CSV board into args.tickets; the engine never reads files.
-// Tool input: { args: { goal: "what done means", tickets: [{ text: "ticket", id: "T-1", deps: ["T-0"], tags: ["ui"] }], maxIterations: 12, agentsPerIteration: 6, reviewer: "general" } }
+// Tool input: { args: { goal: "what done means", tickets: [{ text: "ticket", id: "T-1", deps: [], tags: ["ui"] }], maxIterations: 12, agentsPerIteration: 6, reviewer: "general" } }
 if (!args || !Array.isArray(args.tickets) || args.tickets.length === 0) {
   throw new Error("kanban: args.tickets must be a non-empty array of { text }")
 }
@@ -191,6 +191,24 @@ const agentsPerIteration = Math.max(
   Math.min(Number.isFinite(Number(args.agentsPerIteration)) ? Math.floor(Number(args.agentsPerIteration)) : 6, 12)
 )
 const reviewer = typeof args.reviewer === "string" && args.reviewer.trim() ? args.reviewer.trim() : "general"
+
+// Build the seed queue once and reject dangling dependencies up front: a dep
+// on an unknown id can never become ready, and the loop would otherwise sit
+// idle until the stall stop with nothing actionable to report.
+const seedQueue = queue(args.tickets, { id: "id" })
+const seedItems = seedQueue.items()
+const seedIds = {}
+for (let svi = 0; svi < seedItems.length; svi++) seedIds[seedItems[svi].id] = true
+const dangling = []
+for (let sdi = 0; sdi < seedItems.length; sdi++) {
+  const depList = seedItems[sdi].deps || []
+  for (let sdj = 0; sdj < depList.length; sdj++) {
+    if (!seedIds[depList[sdj]]) dangling.push(seedItems[sdi].id + " -> " + depList[sdj])
+  }
+}
+if (dangling.length > 0) {
+  throw new Error("kanban: tickets depend on unknown ids (would never become ready): " + dangling.slice(0, 5).join(", "))
+}
 
 const KPLAN = { type: "object", required: ["approach", "steps"], properties: {
   approach: { type: "string" },
@@ -208,7 +226,7 @@ const KREVIEW = { type: "object", required: ["pass", "issues"], properties: {
 const summary = await loop({
   key: "kanban",
   goal: goal || "process the ticket queue",
-  state: { tickets: args.tickets, processed: [], followUps: 0 },
+  state: { tickets: seedItems, processed: [], followUps: 0 },
   budget: { iterations: maxIterations, agentsPerIteration: agentsPerIteration },
   stop: { predicate: function (v) {
     const open = (v.state.tickets || []).filter(function (t) { return t.status !== "done" && t.status !== "blocked" })
@@ -217,7 +235,7 @@ const summary = await loop({
 }, async function (ctx) {
   const q = queue(ctx.state.tickets, { id: "id" })
   const ticket = q.pop()
-  if (!ticket) return { state: ctx.state }
+  if (!ticket) return { state: ctx.state, result: { idle: true, queue: q.sizes() } }
   const tid = ticket.id.slice(0, 22)
   progress("ticket: " + String(ticket.text).slice(0, 100))
   const ticketJson = JSON.stringify({ id: ticket.id, text: ticket.text })
@@ -279,10 +297,9 @@ return {
 }`
 
 const KAGGLE_ML = `// kaggle-ml — refinement loop for ML/quant work: reflect on the plan, propose
-// per-component variations, SELECT a shortlist of full pipeline configurations
-// (never the cross product), run each in its own artifacts dir, judge metrics
-// from verbatim evidence, keep the best. Agentic honing, not grid search: the
-// selector sees the trial history and carries the incumbent forward.
+// per-component variations, SELECT <=3 full pipeline configurations (never the
+// cross product), run each in its own artifacts dir, judge metrics from
+// verbatim evidence, keep the best. Agentic honing, not grid search.
 // Tool input: { args: { goal: "best CV score", components: ["data", "features", "model"], metric: "cv", target: 0.9, evalCommand: "python eval.py", dataRoot: "/data", judge: "general", deadline: "2026-09-18T08:00:00", maxIterations: 8, agentsPerIteration: 12 } }
 if (!args || typeof args.goal !== "string" || args.goal.trim() === "") {
   throw new Error("kaggle-ml: args.goal is required (what to optimize)")
@@ -307,35 +324,11 @@ const agentsPerIteration = Math.max(
   Math.min(Number.isFinite(Number(args.agentsPerIteration)) ? Math.floor(Number(args.agentsPerIteration)) : 12, 20)
 )
 
-const MPLAN = { type: "object", required: ["strategy", "components"], properties: {
-  strategy: { type: "string" },
-  components: { type: "array", items: { type: "object", required: ["id", "focus"], properties: {
-    id: { type: "string" }, focus: { type: "string" }, status: { type: "string", enum: ["active", "dropped", "new"] } } } } } }
-const MIDEA = { type: "object", required: ["variations"], properties: {
-  variations: { type: "array", items: { type: "object", required: ["idea", "rationale"], properties: {
-    idea: { type: "string" }, rationale: { type: "string" }, expectedDelta: { type: "number" } } } } } }
-const MSELECT = { type: "object", required: ["configs"], properties: {
-  configs: { type: "array", items: { type: "object", required: ["id", "chosen", "why"], properties: {
-    id: { type: "string" },
-    chosen: { type: "array", items: { type: "object", required: ["componentId", "variationId"], properties: {
-      componentId: { type: "string" }, variationId: { type: "string" } } } },
-    why: { type: "string" } } } },
-  rationale: { type: "string" } } }
-const MBUILD = { type: "object", required: ["candidateId", "metrics", "evidence"], properties: {
-  candidateId: { type: "string" },
-  metrics: { type: "object" },
-  evidence: { type: "object", required: ["command", "outputQuote"], properties: {
-    command: { type: "string" }, exitCode: { type: "number" }, outputQuote: { type: "string" } } },
-  artifactsRef: { type: "string" } } }
-const MVERDICT = { type: "object", required: ["status", "metrics", "evidence"], properties: {
-  status: { type: "string", enum: ["improve", "done", "blocked"] },
-  metrics: { type: "object" },
-  insight: { type: "object", properties: {
-    componentDelta: { type: "array", items: { type: "object", properties: {
-      component: { type: "string" }, variation: { type: "string" }, kept: { type: "boolean" }, why: { type: "string" } } } },
-    nextHints: { type: "array", items: { type: "string" } } } },
-  evidence: { type: "object", required: ["command", "outputQuote"], properties: {
-    command: { type: "string" }, exitCode: { type: "number" }, outputQuote: { type: "string" } } } } }
+const MPLAN = { type: "object", required: ["strategy", "components"], properties: { strategy: { type: "string" }, components: { type: "array", items: { type: "object", required: ["id", "focus"], properties: { id: { type: "string" }, focus: { type: "string" }, status: { type: "string", enum: ["active", "dropped", "new"] } } } } } }
+const MIDEA = { type: "object", required: ["variations"], properties: { variations: { type: "array", items: { type: "object", required: ["idea", "rationale"], properties: { idea: { type: "string" }, rationale: { type: "string" } } } } } }
+const MSELECT = { type: "object", required: ["configs"], properties: { configs: { type: "array", items: { type: "object", required: ["id", "chosen", "why"], properties: { id: { type: "string" }, chosen: { type: "array", items: { type: "object", required: ["componentId", "variationId"], properties: { componentId: { type: "string" }, variationId: { type: "string" } } } }, why: { type: "string" } } } } } }
+const MBUILD = { type: "object", required: ["candidateId", "metrics", "evidence"], properties: { candidateId: { type: "string" }, metrics: { type: "object" }, evidence: { type: "object", required: ["command", "outputQuote"], properties: { command: { type: "string" }, exitCode: { type: "number" }, outputQuote: { type: "string" } } }, artifactsRef: { type: "string" } } }
+const MVERDICT = { type: "object", required: ["status", "metrics", "evidence"], properties: { status: { type: "string", enum: ["improve", "done", "blocked"] }, metrics: { type: "object" }, candidateId: { type: "string" }, evidence: { type: "object", required: ["command", "outputQuote"], properties: { command: { type: "string" }, exitCode: { type: "number" }, outputQuote: { type: "string" } } } } }
 
 const summary = await loop({
   key: "kaggle-ml",
@@ -358,23 +351,37 @@ const summary = await loop({
       return "Judge ML round " + c.i + " for: " + goal +
         ".\\nMetric: " + metric + (hasTarget ? " (target >= " + target + ")" : "") +
         ".\\nRound result: " + JSON.stringify(c.result) +
-        ".\\nState best metrics: " + JSON.stringify(c.state.best && c.state.best.metrics ? c.state.best.metrics : null) +
-        ".\\nRE-DERIVE the best candidate's metric yourself: run the evaluation, then quote the exact command and the output line with the number. status=done ONLY when the target is actually met by your own re-derivation." +
-        ".\\ninsight: which variation helped or hurt per component (componentDelta) and what to try next."
+        ".\\nBest metrics: " + JSON.stringify(c.state.best && c.state.best.metrics ? c.state.best.metrics : null) +
+        ".\\nRE-DERIVE the best candidate's metric: run the evaluation, quote the command and the number. status=done ONLY if your own re-derivation meets the target." +
+        ".\\nSet candidateId to that runner candidate's note; metrics = YOUR numbers."
     },
   },
 }, async function (ctx) {
   const state = ctx.state || {}
-  const trials = state.trials || []
+  const trials = (state.trials || []).slice()
+  // Fold judge re-derivation into the trials (judge metrics win).
+  if (
+    ctx.lastVerdict && ctx.lastVerdict.metrics && typeof ctx.lastVerdict.metrics[metric] === "number" &&
+    typeof ctx.lastVerdict.candidateId === "string"
+  ) {
+    for (let fti = 0; fti < trials.length; fti++) {
+      if (trials[fti].note === ctx.lastVerdict.candidateId) {
+        trials[fti] = Object.assign({}, trials[fti], {
+          metrics: Object.assign({}, trials[fti].metrics, ctx.lastVerdict.metrics),
+          metricsSource: "judge",
+        })
+      }
+    }
+  }
   const recent = trials.slice(-5).map(function (t) {
-    return { config: t.config, metric: t.metrics ? t.metrics[metric] : null, note: t.note }
+    return { config: t.config, metric: t.metrics ? t.metrics[metric] : null, source: t.metricsSource || "runner", note: t.note }
   })
   const plan = (await agent(
     "You are improving: " + goal + ".\\nMetric: " + metric + (hasTarget ? " (target >= " + target + ")" : "") +
     ".\\nKnown best: " + JSON.stringify(state.best && state.best.metrics ? state.best.metrics : null) +
     ".\\nRecent trials: " + JSON.stringify(recent) +
     ".\\nCurrent plan: " + JSON.stringify(state.plan) +
-    ".\\nRevise the plan from the evidence (drop/add components, refocus); keep it if it is working. Respond JSON: strategy, components [{id, focus, status}].",
+    ".\\nRevise it from the evidence. Respond JSON: strategy, components [{id, focus, status}].",
     { schema: MPLAN, key: "kaggle-ml:i" + ctx.i + ":reflect", label: "reflect", phase: "kaggle-ml" }
   )).data || { strategy: "", components: components.map(function (id) { return { id: id, focus: "", status: "active" } }) }
 
@@ -382,16 +389,15 @@ const summary = await loop({
   const variations = {}
   for (let vi = 0; vi < active.length; vi++) {
     const comp = active[vi]
-    progress("variations: " + comp.id)
     try {
       const idea = (await agent(
         "Propose 2-3 concrete variations for the '" + comp.id + "' component.\\nGoal: " + goal +
         ".\\nComponent focus: " + String(comp.focus || "") +
-        ".\\nHistory (do not repeat failed ideas; exploit what helped): " + JSON.stringify(recent) +
-        ".\\nRespond JSON: variations [{idea, rationale, expectedDelta}].",
+        ".\\nHistory (do not repeat failures; exploit what helped): " + JSON.stringify(recent) +
+        ".\\nRespond JSON: variations [{idea, rationale}].",
         { schema: MIDEA, key: "kaggle-ml:i" + ctx.i + ":var:" + String(comp.id).slice(0, 20), label: "variations:" + comp.id, phase: "kaggle-ml" }
       )).data
-      variations[comp.id] = idea && Array.isArray(idea.variations) ? idea.variations.slice(0, 3) : []
+      variations[comp.id] = idea && Array.isArray(idea.variations) ? idea.variations.slice(0, 3).map(function (v, idx) { return { id: String(comp.id) + "-v" + (idx + 1), idea: v.idea, rationale: v.rationale } }) : []
     } catch (e) {
       variations[comp.id] = []
     }
@@ -402,28 +408,59 @@ const summary = await loop({
     ".\\nPlan: " + JSON.stringify(plan) +
     ".\\nVariations per component: " + JSON.stringify(variations) +
     ".\\nIncumbent best config: " + JSON.stringify(state.best ? state.best.config : null) +
-    ".\\nRules: NEVER enumerate combinations (no grid search). Carry the incumbent forward as one config, changing at most one component. Use the rest of the budget on the most promising single variations. " +
-    "Respond JSON: configs [{id, chosen: [{componentId, variationId}], why}] (<=3), rationale.",
+    ".\\nRules: NEVER enumerate combinations (no grid search). Carry the incumbent forward as one config, changing at most one component. " +
+    "Respond JSON: configs [{id, chosen: [{componentId, variationId}], why}] (<=3).",
     { schema: MSELECT, key: "kaggle-ml:i" + ctx.i + ":select", label: "select", phase: "kaggle-ml" }
   )).data || { configs: [] }
-  const configs = Array.isArray(select.configs) ? select.configs.slice(0, 3) : []
+  // Dedupe by chosen-variation signature (no double-running the same config).
+  const seenSig = {}
+  const configs = []
+  const rawConfigs = Array.isArray(select.configs) ? select.configs : []
+  for (let sci = 0; sci < rawConfigs.length && configs.length < 3; sci++) {
+    const cfg = rawConfigs[sci]
+    const sig = JSON.stringify((Array.isArray(cfg.chosen) ? cfg.chosen : []).map(function (c) { return String(c && c.componentId) + "=" + String(c && c.variationId) }).sort())
+    if (seenSig[sig]) continue
+    seenSig[sig] = true
+    configs.push(cfg)
+  }
 
+  const baseDir = ctx.artifactsDir || ctx.runDir
+  if (!baseDir) {
+    const noDir = new Error("kaggle-ml: no run artifacts dir (storage.runDirFor unavailable)")
+    noDir.__ucStructural = true
+    throw noDir
+  }
+  const sanitizeId = function (raw, fallback) {
+    const cleaned = String(raw === undefined || raw === null ? "" : raw).replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 32)
+    return cleaned || fallback
+  }
   const nextTrials = trials.slice()
   for (let ci = 0; ci < configs.length; ci++) {
     const cfg = configs[ci]
-    const dir = String(ctx.artifactsDir || ctx.runDir || ".") + "/cand-" + String(cfg.id || ci).slice(0, 16)
-    progress("run: " + String(cfg.id))
+    const cfgId = sanitizeId(cfg.id, "c" + ctx.i + "-" + (ci + 1))
+    const dir = baseDir + "/cand-" + cfgId
+    // Resolve the selector's variation ids to actual ideas (the runner must know WHAT to build).
+    const resolved = []
+    const chosen = Array.isArray(cfg.chosen) ? cfg.chosen : []
+    for (let ri = 0; ri < chosen.length; ri++) {
+      const pick = chosen[ri] || {}
+      const pool = variations[String(pick.componentId)] || []
+      let match = null
+      for (let pi = 0; pi < pool.length; pi++) if (pool[pi].id === pick.variationId) match = pool[pi]
+      resolved.push({ componentId: String(pick.componentId), variationId: String(pick.variationId), idea: match ? match.idea : "(no matching proposal)", rationale: match ? match.rationale : "" })
+    }
     const build = (await agent(
-      "Run this ML configuration end-to-end.\\nGoal: " + goal +
+      "Run this ML configuration.\\nGoal: " + goal +
       ".\\nConfig: " + JSON.stringify(cfg) +
+      ".\\nResolved variations (what each chosen component must implement): " + JSON.stringify(resolved) +
       ".\\nWork ONLY inside this directory (create it): " + dir +
       (dataRoot ? ". Read data read-only from: " + dataRoot : "") +
       (evalCommand ? ".\\nThen run exactly: " + evalCommand : ".\\nUse your own evaluation and cite the exact command you ran") +
-      ".\\nRespond JSON: candidateId, metrics (numbers keyed by name, include '" + metric + "'), evidence {command, exitCode, outputQuote (the line with the metric)}, artifactsRef.",
-      { schema: MBUILD, key: "kaggle-ml:i" + ctx.i + ":run:" + String(cfg.id || ci).slice(0, 20), label: "run:" + cfg.id, phase: "kaggle-ml" }
+      ".\\nRespond JSON: candidateId (exactly " + JSON.stringify(cfgId) + "), metrics (numbers keyed by name, include '" + metric + "'), evidence {command, exitCode, outputQuote (the line with the metric)}, artifactsRef.",
+      { schema: MBUILD, key: "kaggle-ml:i" + ctx.i + ":run:" + cfgId, label: "run:" + cfgId, phase: "kaggle-ml" }
     )).data
     if (build) {
-      nextTrials.push({ round: ctx.i, config: cfg, metrics: build.metrics || {}, evidence: build.evidence || null, artifactsRef: build.artifactsRef || dir, note: build.candidateId })
+      nextTrials.push({ round: ctx.i, config: cfg, metrics: build.metrics || {}, evidence: build.evidence || null, artifactsRef: build.artifactsRef || dir, note: build.candidateId || cfgId, metricsSource: "runner" })
     }
   }
 

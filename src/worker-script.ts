@@ -23,7 +23,6 @@ const LOOP_RUNTIME = `
 // ---- loop engine + queue library -----------------------------------------
 var loopCaps = { maxAgents: 0, maxLoopDepth: 2, artifactsDir: null, runDir: null };
 var activeLoops = [];
-var scriptDepth = 0;
 
 function applyLoopCaps(caps) {
   if (caps === null || typeof caps !== "object") return;
@@ -47,9 +46,34 @@ function hashValue(v) {
   try {
     s = JSON.stringify(v === undefined ? null : v);
   } catch (e) {
-    s = "[unserializable]";
+    // Unstringifiable (cycles, BigInt, Map/Set): fall back to a shape tag +
+    // shallow key list (+ collection size) so distinct values do not all
+    // collapse to one constant and trip the stall detector.
+    var tag = Object.prototype.toString.call(v);
+    var shape = "";
+    try {
+      if (v !== null && typeof v === "object") {
+        var shapeKeys = Object.keys(v);
+        shapeKeys.sort();
+        shape = shapeKeys.join(",");
+        if (typeof v.size === "number") shape = shape + "|size:" + v.size;
+      }
+    } catch (e2) {
+      shape = "";
+    }
+    s = "[unserializable:" + tag + ":" + shape + "]";
   }
   return fnv1a(String(s));
+}
+
+/** Safe JSON clone for small engine-owned values handed to user callbacks. */
+function cloneJson(v) {
+  if (v === null || v === undefined) return null;
+  try {
+    return JSON.parse(JSON.stringify(v));
+  } catch (e) {
+    return v;
+  }
 }
 
 function postCheckpoint(name, value) {
@@ -87,9 +111,21 @@ function createQueue(initial, opts) {
     return { id: id, text: text, deps: deps, tags: tags, meta: meta, status: status, note: note };
   }
 
+  function identityOf(it) {
+    return JSON.stringify([it.text, it.deps, it.tags, it.meta]);
+  }
+
   function add(raw) {
     var it = normalize(raw);
-    if (index[it.id]) return index[it.id].id;
+    var existing = index[it.id];
+    if (existing) {
+      if (identityOf(existing) === identityOf(it)) return existing.id;
+      // 32-bit hash collision with DIFFERENT content: probe for a free id
+      // instead of silently swallowing the push.
+      var suffix = 2;
+      while (suffix < 1000 && index[it.id + "-" + suffix]) suffix += 1;
+      it.id = it.id + "-" + suffix;
+    }
     items.push(it);
     index[it.id] = it;
     return it.id;
@@ -166,12 +202,24 @@ function createQueue(initial, opts) {
     },
     sizes: function () {
       var done = doneMap();
-      var n = { total: items.length, open: 0, active: 0, blocked: 0, done: 0, ready: 0 };
+      var present = Object.create(null);
+      for (var pi = 0; pi < items.length; pi++) present[items[pi].id] = true;
+      var n = { total: items.length, open: 0, active: 0, blocked: 0, done: 0, ready: 0, unready: 0, missingDeps: 0 };
       for (var i = 0; i < items.length; i++) {
         var it = items[i];
         if (it.status === "open") {
           n.open += 1;
-          if (ready(it, done)) n.ready += 1;
+          if (ready(it, done)) {
+            n.ready += 1;
+          } else {
+            n.unready += 1;
+            for (var dpi = 0; dpi < it.deps.length; dpi++) {
+              if (!present[it.deps[dpi]]) {
+                n.missingDeps += 1;
+                break;
+              }
+            }
+          }
         } else if (it.status === "active") n.active += 1;
         else if (it.status === "blocked") n.blocked += 1;
         else if (it.status === "done") n.done += 1;
@@ -190,7 +238,8 @@ function createQueue(initial, opts) {
 function loopAgentCall(prompt, opts, engineCall) {
   if (activeLoops.length === 0) {
     return callHost("agent", [prompt, opts === undefined || opts === null ? {} : opts]);
-  }  var o = opts !== null && typeof opts === "object" && !Array.isArray(opts) ? opts : {};
+  }
+  var o = opts !== null && typeof opts === "object" && !Array.isArray(opts) ? opts : {};
   var top = activeLoops[activeLoops.length - 1];
   for (var li = 0; li < activeLoops.length; li++) {
     var ctx = activeLoops[li];
@@ -199,12 +248,16 @@ function loopAgentCall(prompt, opts, engineCall) {
     var limit = engineCall === true ? ctx.perIteration : ctx.perIteration - ctx.reserved;
     if (limit < 1) limit = 1;
     if (ctx.iterAgents > limit) {
-      throw new Error(
+      var budgetErr = new Error(
         "loop " + ctx.key + ": iteration " + ctx.iteration + " exceeded its agent budget (" +
           (engineCall === true ? ctx.perIteration : ctx.perIteration - ctx.reserved) +
           " calls" + (ctx.reserved > 0 && engineCall !== true ? " after verdict reservation" : "") +
           "; agentsPerIteration " + ctx.perIteration + ")"
       );
+      // Deterministic failure: re-running the same iteration cannot fit
+      // either, so the retry policy must not waste another attempt on it.
+      budgetErr.__ucBudget = true;
+      throw budgetErr;
     }
   }
   var call = {};
@@ -246,8 +299,9 @@ function normalizeLoopBudget(raw) {
   return { iterations: iterations, agentsPerIteration: per, wallMs: wallMs, tokens: tokens, deadlineAt: deadlineAt };
 }
 
-async function runLoop(spec, iterate) {
+async function runLoop(spec, iterate, ownerDepth) {
   var s = spec !== null && typeof spec === "object" && !Array.isArray(spec) ? spec : {};
+  var baseDepth = Number.isFinite(Number(ownerDepth)) ? Math.max(0, Math.floor(Number(ownerDepth))) : 0;
   var key = "";
   var goal = "";
   var state = {};
@@ -298,7 +352,7 @@ async function runLoop(spec, iterate) {
       );
     }
     if (unitName) {
-      await callHost("workflow-check", [unitName, null, scriptDepth]);
+      await callHost("workflow-check", [unitName, null, baseDepth]);
     }
   } catch (preflightErr) {
     if (preflightErr !== null && typeof preflightErr === "object" && preflightErr.__ucStructural !== true) {
@@ -372,24 +426,31 @@ async function runLoop(spec, iterate) {
         },
         artifactsDir: loopCaps.artifactsDir ? String(loopCaps.artifactsDir) + "/it-" + i : null,
         runDir: loopCaps.runDir ? String(loopCaps.runDir) : null,
-        history: history.slice(),
-        lastVerdict: lastVerdict,
-        lastResult: lastResult,
+        history: history.map(function (row) { return cloneJson(row); }),
+        lastVerdict: cloneJson(lastVerdict),
+        lastResult: cloneJson(lastResult),
       };
 
       var attempts = onError === "retry" ? 2 : 1;
       var outcome = null;
       var iterError = null;
+      var firstError = null;
       var status = "improve";
       var stopped = false;
+      var iterVerdict = null;
+      var refuted = false;
+      var skeptic = null;
       for (var attempt = 0; attempt < attempts; attempt++) {
         iterError = null;
         outcome = null;
+        iterVerdict = null;
+        refuted = false;
+        skeptic = null;
         ledger.iterCalls = 0;
         try {
           var res = iterateFn
             ? await iterateFn(ctx)
-            : await runUnit(unitName, unit, ctx);
+            : await runUnit(unitName, unit, ctx, baseDepth);
           if (res === null || typeof res !== "object" || Array.isArray(res) || res.state === undefined) {
             throw new Error("loop: iterate must return an object with { state } (got " + fmt(res) + ")");
           }
@@ -405,16 +466,14 @@ async function runLoop(spec, iterate) {
               label: key + ":verdict",
               phase: key,
             }, true);
-            lastVerdict = vres !== null && typeof vres === "object" && vres.data !== undefined ? vres.data : null;
-            if (lastVerdict !== null && typeof lastVerdict === "object" && typeof lastVerdict.status === "string") {
-              status = lastVerdict.status;
+            iterVerdict = vres !== null && typeof vres === "object" && vres.data !== undefined ? vres.data : null;
+            if (iterVerdict !== null && typeof iterVerdict === "object" && typeof iterVerdict.status === "string") {
+              status = iterVerdict.status;
             }
-          } else {
-            lastVerdict = null;
           }
           var terminating = status === "done" || status === "target";
           if (terminating && skepticOn) {
-            var claim = JSON.stringify(lastVerdict === null ? { status: status } : lastVerdict);
+            var claim = JSON.stringify(iterVerdict === null ? { status: status } : iterVerdict);
             var verified = false;
             try {
               var sk = await loopAgentCall(
@@ -429,21 +488,38 @@ async function runLoop(spec, iterate) {
                 true
               );
               verified = sk !== null && typeof sk === "object" && sk.data !== undefined && sk.data !== null && sk.data.verified === true;
+              if (!verified) {
+                var reason = sk !== null && typeof sk === "object" && sk.data !== null && typeof sk.data === "object" && typeof sk.data.reason === "string" ? sk.data.reason.slice(0, 120) : "";
+                skeptic = { outcome: "refuted", reason: reason };
+              } else {
+                skeptic = { outcome: "verified", reason: "" };
+              }
             } catch (skErr) {
-              verified = false;
-              postHistoryRow({ i: i, status: "skeptic-error", error: errMsg(skErr).slice(0, 160) });
+              skeptic = { outcome: "error", reason: errMsg(skErr).slice(0, 120) };
             }
-            if (!verified) status = "improve";
+            if (skeptic === null || skeptic.outcome !== "verified") {
+              // A refuted (or unverifiable) termination is void: the loop
+              // continues, and this iteration's claim never reaches the stop
+              // predicate nor the next ctx as a trustworthy verdict.
+              refuted = true;
+              status = "improve";
+            }
           }
           if (status === "blocked") {
             stopReason = "blocked";
             stopped = true;
-          } else if ((status === "done" || status === "target") && !(terminating && skepticOn && status === "improve")) {
+          } else if (terminating && !refuted) {
             stopReason = "target";
             stopped = true;
           }
-          if (!stopped && predicate) {
-            var pv = predicate({ i: i, state: outcome.state, result: outcome.result, verdict: lastVerdict, goal: goal });
+          if (!stopped && predicate && !refuted) {
+            var pv = predicate({
+              i: i,
+              state: outcome.state,
+              result: outcome.result,
+              verdict: iterVerdict,
+              goal: goal,
+            });
             if (pv) {
               stopReason = typeof pv === "string" && pv ? pv.slice(0, 40) : "target";
               stopped = true;
@@ -457,6 +533,14 @@ async function runLoop(spec, iterate) {
           iterError = e;
           outcome = null;
           stopped = false;
+          // A per-iteration budget trip is deterministic: attempt 2 would
+          // re-issue the same calls and trip again. Skip the retry and prefer
+          // the first attempt's (real) error when one exists.
+          if (e !== null && typeof e === "object" && e.__ucBudget === true) {
+            if (firstError !== null) iterError = firstError;
+            break;
+          }
+          if (attempt === 0) firstError = e;
           if (attempt + 1 < attempts) continue;
         }
         break;
@@ -464,7 +548,11 @@ async function runLoop(spec, iterate) {
 
       if (iterError !== null) {
         errors += 1;
-        postHistoryRow({ i: i, status: "error", error: errMsg(iterError).slice(0, 160) });
+        var errText = errMsg(iterError).slice(0, 160);
+        if (firstError !== null && firstError !== iterError) {
+          errText = (errText + " [first attempt: " + errMsg(firstError).slice(0, 120) + "]").slice(0, 300);
+        }
+        postHistoryRow({ i: i, status: "error", error: errText });
         postCheckpoint("loop:" + key.slice(0, 24) + ":i" + i, { status: "error" });
         if (onError === "abort") {
           stopReason = "error";
@@ -480,6 +568,10 @@ async function runLoop(spec, iterate) {
 
       state = outcome.state;
       lastResult = outcome.result;
+      // A refuted termination never becomes the loop's official verdict:
+      // ctx, the summary and downstream predicates only ever see claims that
+      // survived the skeptic (the history row records the refutation).
+      lastVerdict = refuted ? null : iterVerdict;
       completed = i + 1;
       var digest = hashValue(state);
       if (!stopped) {
@@ -494,13 +586,20 @@ async function runLoop(spec, iterate) {
         }
       }
       lastDigest = digest;
-      postHistoryRow({ i: i, status: status, digest: digest.slice(0, 12) });
-      postCheckpoint("loop:" + key.slice(0, 24) + ":i" + i, {
+      var row = { i: i, status: status, digest: digest.slice(0, 12) };
+      if (skeptic !== null && skeptic.outcome !== "verified") {
+        row.skeptic = skeptic.outcome;
+        if (skeptic.reason) row.skepticReason = skeptic.reason;
+      }
+      postHistoryRow(row);
+      var checkpointValue = {
         status: status,
         digest: digest.slice(0, 12),
         agents: ledger.iterAgents,
         tokens: ledger.tokens,
-      });
+      };
+      if (refuted) checkpointValue.refuted = true;
+      postCheckpoint("loop:" + key.slice(0, 24) + ":i" + i, checkpointValue);
       if (stopped) break;
     }
   } finally {
@@ -520,14 +619,14 @@ async function runLoop(spec, iterate) {
   };
 }
 
-async function runUnit(name, unit, ctx) {
+async function runUnit(name, unit, ctx, baseDepth) {
   var ua = typeof unit.args === "function" ? unit.args(ctx) : (unit.args === undefined ? null : unit.args);
   if (ua !== null && typeof ua === "object" && typeof ua.then === "function") ua = await ua;
-  var composed = await callHost("workflow", [name, ua === undefined ? null : ua, scriptDepth]);
+  var composed = await callHost("workflow", [name, ua === undefined ? null : ua, baseDepth]);
   if (!composed || typeof composed.script !== "string") {
     throw new Error("workflow bridge returned no script");
   }
-  return await runScript(composed.script, composed.meta || {}, ua, scriptDepth + 1);
+  return await runScript(composed.script, composed.meta || {}, ua, baseDepth + 1);
 }
 `
 
@@ -658,7 +757,6 @@ function unavailableStub(name) {
 ${LOOP_RUNTIME}
 
 function makeGlobals(depth, args, meta) {
-  scriptDepth = depth;
   return {
     agent: function (prompt, opts) {
       return loopAgentCall(prompt, opts);
@@ -708,7 +806,7 @@ function makeGlobals(depth, args, meta) {
       });
     },
     loop: function (spec, iterate) {
-      return runLoop(spec, iterate);
+      return runLoop(spec, iterate, depth);
     },
     queue: function (initial, opts) {
       return createQueue(initial, opts);

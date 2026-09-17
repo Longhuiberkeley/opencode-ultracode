@@ -462,3 +462,63 @@ test("kaggle-ml: one round meeting the target stops with target after skeptic ve
     "kaggle-ml:i0:skeptic",
   ])
 })
+
+test("kanban: fails fast (no spawns) when tickets depend on unknown ids", async () => {
+  const ctx = makeSupervisor()
+  const outcome = await ctx.supervisor.start(
+    {
+      script: scriptTemplate("kanban")!.script,
+      args: { tickets: [{ text: "first", id: "A", deps: ["B"] }, { text: "second", id: "C" }] } as never,
+    },
+    ctx.parent,
+  )
+  assert.equal(outcome.envelope.status, "failed", "dangling deps are structural")
+  assert.match(String(outcome.envelope.error), /unknown ids/)
+  assert.equal(ctx.sessions.createdModels.length, 0, "nothing spawns before the validation")
+})
+
+test("kanban: explicit deps gate readiness across tickets", async () => {
+  const ctx = makeSupervisor()
+  ctx.sessions
+    .push(KPLAN_REPLY("first"))
+    .push(KWORK_REPLY("did first"))
+    .push(KREVIEW_REPLY(true))
+    .push(KPLAN_REPLY("second"))
+    .push(KWORK_REPLY("did second"))
+    .push(KREVIEW_REPLY(true))
+  const outcome = await ctx.supervisor.start(
+    {
+      script: scriptTemplate("kanban")!.script,
+      args: { tickets: [{ text: "first", id: "A" }, { text: "second", id: "B", deps: ["A"] }] } as never,
+    },
+    ctx.parent,
+  )
+  assert.equal(outcome.envelope.status, "succeeded", outcome.envelope.error ?? "run failed")
+  const result = outcome.envelope.result as { stopReason: string; processed: number }
+  assert.equal(result.stopReason, "queue-empty")
+  assert.equal(result.processed, 2)
+})
+
+test("kaggle-ml: a round with zero selected configs still judges and continues", async () => {
+  const ctx = makeSupervisor()
+  const reflect = { text: JSON.stringify({ strategy: "explore", components: [{ id: "data", focus: "clean", status: "active" }, { id: "model", focus: "gbdt", status: "active" }] }), agent: "general" }
+  const ideas = { text: JSON.stringify({ variations: [{ idea: "x", rationale: "y", expectedDelta: 0.01 }] }), agent: "general" }
+  const empty = { text: JSON.stringify({ configs: [] }), agent: "general" }
+  const judge = { text: JSON.stringify({ status: "improve", metrics: { cv: 0.8 }, insight: { componentDelta: [], nextHints: ["try more"] }, evidence: { command: "python eval.py", exitCode: 0, outputQuote: "cv=0.8" } }), agent: "general" }
+  for (let round = 0; round < 2; round++) {
+    ctx.sessions.push(reflect).push(ideas).push(ideas).push(empty).push(judge)
+  }
+  const outcome = await ctx.supervisor.start(
+    {
+      script: scriptTemplate("kaggle-ml")!.script,
+      args: { goal: "best CV", components: ["data", "model"], metric: "cv", maxIterations: 2 } as never,
+    },
+    ctx.parent,
+  )
+  assert.equal(outcome.envelope.status, "succeeded", outcome.envelope.error ?? "run failed")
+  const result = outcome.envelope.result as { stopReason: string; iterations: number; rounds: Array<{ configs: number }> }
+  assert.equal(result.stopReason, "budget")
+  assert.equal(result.iterations, 2)
+  assert.deepEqual(result.rounds.map((r) => r.configs), [0, 0])
+  assert.equal(outcome.run.agents.some((a) => a.label?.startsWith("run:")), false, "no runner spawned without configs")
+})

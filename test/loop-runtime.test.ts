@@ -452,3 +452,148 @@ return { sizes, poppedText: popped ? popped.text : null, note: q2.items()[0].not
   assert.equal(value.poppedText, "c", "the open item is the only one poppable")
   assert.equal(value.note, "shipped", "notes persist")
 })
+
+test("loop: unit lane runs EVERY iteration at the caller's depth (scriptDepth leak fix)", async () => {
+  const workflowDepths: number[] = []
+  const checkNames: string[] = []
+  const result = await runInWorker(
+    `
+const summary = await loop({ key: "unitloop", unit: { name: "unit-wf" }, budget: { iterations: 2 } })
+return { summary }
+`,
+    {
+      caps: GENERAL_AGENT_CAPS,
+      onCall: async (fn, args) => {
+        if (fn === "workflow-check") {
+          checkNames.push(String(args[0]))
+          return { ok: true }
+        }
+        if (fn === "workflow") {
+          workflowDepths.push(Number(args[2]))
+          return { script: "return { state: { ok: true } }", meta: {} }
+        }
+        return agentResult()
+      },
+    },
+  )
+  assert.equal(result.ok, true, result.error ?? "loop run failed")
+  assert.deepEqual(checkNames, ["unit-wf"], "preflight runs once, before iteration 1")
+  assert.deepEqual(workflowDepths, [0, 0], "composed execution must not leak its depth into iteration 2")
+  const summary = (result.value as { summary: Record<string, Json> }).summary
+  assert.equal(summary["iterations"], 2)
+  assert.equal(summary["stopReason"], "budget")
+})
+
+test("loop: workflow() then a unit loop in one script keeps depths independent", async () => {
+  const depths: Array<{ name: string; depth: number }> = []
+  const result = await runInWorker(
+    `
+const direct = await workflow("helper")
+const summary = await loop({ key: "after-wf", unit: { name: "unit-wf" }, budget: { iterations: 2 } })
+return { direct, summary }
+`,
+    {
+      caps: GENERAL_AGENT_CAPS,
+      onCall: async (fn, args) => {
+        if (fn === "workflow-check") return { ok: true }
+        if (fn === "workflow") {
+          const name = String(args[0])
+          depths.push({ name, depth: Number(args[2]) })
+          return name === "helper"
+            ? { script: "return { answer: 42 }", meta: {} }
+            : { script: "return { state: { ok: true } }", meta: {} }
+        }
+        return agentResult()
+      },
+    },
+  )
+  assert.equal(result.ok, true, result.error ?? "loop run failed")
+  const value = result.value as { direct: { answer: number }; summary: Record<string, Json> }
+  assert.equal(value.direct.answer, 42)
+  assert.equal(value.summary["iterations"], 2)
+  assert.deepEqual(
+    depths.map((d) => d.name + "@" + d.depth),
+    ["helper@0", "unit-wf@0", "unit-wf@0"],
+    "a completed composed workflow must not raise the caller's composition depth",
+  )
+})
+
+test("loop: a refuted verdict voids predicate stops for that iteration", async () => {
+  let verdicts = 0
+  const result = await runInWorker(
+    `
+const summary = await loop({
+  key: "refpred",
+  budget: { iterations: 2, agentsPerIteration: 4 },
+  verdict: {
+    schema: { type: "object", required: ["status"], properties: { status: { type: "string" }, metrics: { type: "object" } } },
+    prompt: "judge",
+  },
+  stop: { predicate: function (v) { return v.state.hit === true && "state-stop" }, stallK: 9 },
+}, async (ctx) => ({ state: { hit: true, n: ctx.i } }))
+return { summary }
+`,
+    {
+      caps: GENERAL_AGENT_CAPS,
+      onCall: async (fn, args) => {
+        if (fn !== "agent") return { ok: true }
+        const opts = args[1] as { key?: string }
+        if (opts.key?.endsWith(":verdict")) {
+          verdicts += 1
+          return agentResult({ data: { status: "done", metrics: { cv: 0.95 } } })
+        }
+        if (opts.key?.endsWith(":skeptic")) return agentResult({ data: { verified: false, reason: "cannot reproduce" } })
+        return agentResult()
+      },
+    },
+  )
+  assert.equal(result.ok, true, result.error ?? "loop run failed")
+  const summary = (result.value as { summary: Record<string, Json> }).summary
+  assert.equal(summary["stopReason"], "budget", "a refuted iteration must not stop, even on state the skeptic just voided")
+  assert.equal(summary["lastVerdict"], null, "a refuted claim is not exposed as the loop's verdict")
+  assert.equal(verdicts, 2)
+  const history = summary["history"] as Array<{ skeptic?: string }>
+  assert.equal(
+    history.filter((row) => row.skeptic === "refuted").length,
+    2,
+    "each refutation is recorded in the history row",
+  )
+})
+
+test("loop: maxLoopDepth 1 rejects any nesting", async () => {
+  const result = await runInWorker(
+    `
+let err = null
+try {
+  await loop({ key: "outer", budget: { iterations: 1 } }, async () => {
+    await loop({ key: "inner", budget: { iterations: 1 } }, async () => ({ state: {} }))
+    return { state: {} }
+  })
+} catch (e) { err = String(e && e.message ? e.message : e) }
+return { err }
+`,
+    { caps: { maxAgents: 200, maxLoopDepth: 1 }, onCall: async () => agentResult() },
+  )
+  assert.equal(result.ok, true, result.error ?? "loop run failed")
+  assert.match((result.value as { err: string | null }).err ?? "", /maxLoopDepth/)
+  assert.equal(result.calls.filter((c) => c.fn === "agent").length, 0, "no spawns before the structural rejection")
+})
+
+test("queue: same text with different deps coexists; sizes expose unready and missing deps", async () => {
+  const result = await runInWorker(
+    `
+const q = queue([{ text: "same", deps: [] }, { text: "same", deps: ["missing"] }])
+const sizes = q.sizes()
+const first = q.pop()
+return { sizes, firstText: first ? first.text : null, itemCount: q.items().length }
+`,
+    { caps: GENERAL_AGENT_CAPS, onCall: async () => agentResult() },
+  )
+  assert.equal(result.ok, true, result.error ?? "loop run failed")
+  const value = result.value as { sizes: Record<string, number>; firstText: string | null; itemCount: number }
+  assert.equal(value.itemCount, 2, "different deps make distinct ids (no false dedupe)")
+  assert.equal(value.sizes.ready, 1)
+  assert.equal(value.sizes.unready, 1)
+  assert.equal(value.sizes.missingDeps, 1)
+  assert.equal(value.firstText, "same")
+})

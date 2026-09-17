@@ -553,6 +553,11 @@ export class FakeStorage implements Storage {
     return path
   }
 
+  runDirFor(runID: string): string | undefined {
+    if (typeof runID !== "string" || runID.length === 0 || runID.includes("/") || runID.includes("..")) return undefined
+    return `/project/.opencode/workflows/runs/${runID}`
+  }
+
   saveResultArtifact(runID: string, result: Json): string | undefined {
     if (this.failSaveResultArtifact) return undefined
     const key = `results/${runID}`
