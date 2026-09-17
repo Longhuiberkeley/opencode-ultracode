@@ -62,6 +62,10 @@ export interface CatalogCaps {
   concurrency: number
   maxAgents: number
   timeoutMs: number
+  /** Current loop() nesting cap (config default; the per-run run input may set 1..16). */
+  maxLoopDepth: number
+  /** Hard per-loop iteration ceiling (200): the per-run maxLoopIterations input may tighten below any loop's budget, never raise it. */
+  maxLoopIterations: number
 }
 
 export interface CatalogInput {

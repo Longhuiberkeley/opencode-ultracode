@@ -784,6 +784,65 @@ test("supervisor: per-run timeoutMs overrides effective for that run only", asyn
   assert.equal(nextRun.timeoutOverrideMs, undefined)
 })
 
+test("supervisor: per-run maxLoopDepth unlocks a deeper design for that run only", async () => {
+  const ctx = makeSupervisor({ maxLoopDepth: 2 })
+  const nested = `
+let err = null
+try {
+  await loop({ key: "a", budget: { iterations: 1 } }, async () => {
+    await loop({ key: "b", budget: { iterations: 1 } }, async () => {
+      await loop({ key: "c", budget: { iterations: 1 } }, async () => ({ state: {} }))
+      return { state: {} }
+    })
+    return { state: {} }
+  })
+} catch (e) { err = String(e && e.message ? e.message : e) }
+return { err }
+`
+  // Without the input: the plugin default (2) structurally rejects depth 3.
+  const blocked = await ctx.supervisor.start({ script: nested }, ctx.parent)
+  assert.equal(blocked.envelope.status, "succeeded")
+  assert.match(JSON.stringify(blocked.envelope.result), /maxLoopDepth/)
+  // With the input: the same script runs, and the override is recorded.
+  const passed = await ctx.supervisor.start({ script: nested, maxLoopDepth: 3 }, ctx.parent)
+  assert.equal(passed.envelope.status, "succeeded")
+  assert.deepEqual(passed.envelope.result, { err: null })
+  const run = ctx.registry.get(passed.envelope.runID)!
+  assert.equal(run.effective?.maxLoopDepth, 3, "the enforced cap is captured on the record")
+  assert.equal(run.maxLoopDepthOverride, 3, "the explicit override is recorded for warm reruns")
+  // The next run reverts to the configured default — the override never leaks.
+  const next = await ctx.supervisor.start({ script: "return 1" }, ctx.parent)
+  const nextRun = ctx.registry.get(next.envelope.runID)!
+  assert.equal(nextRun.effective?.maxLoopDepth, 2)
+  assert.equal(nextRun.maxLoopDepthOverride, undefined)
+})
+
+test("supervisor: per-run maxLoopIterations caps an authored loop budget for that run only", async () => {
+  const ctx = makeSupervisor({})
+  const script = `
+const summary = await loop({
+  key: "count",
+  budget: { iterations: 4 },
+}, async (ctx) => ({ state: { n: (ctx.state.n || 0) + 1 } }))
+return { iterations: summary.iterations, budget: summary.budget }
+`
+  const outcome = await ctx.supervisor.start({ script, maxLoopIterations: 2 }, ctx.parent)
+  assert.equal(outcome.envelope.status, "succeeded")
+  const result = outcome.envelope.result as { iterations: number; budget: { requested: number; effective: number } }
+  assert.equal(result.iterations, 2, "the ceiling tightens the authored budget")
+  assert.deepEqual(result.budget, { requested: 4, effective: 2 })
+  const run = ctx.registry.get(outcome.envelope.runID)!
+  assert.equal(run.maxLoopIterationsOverride, 2)
+  assert.equal(run.effective?.maxLoopIterations, 2, "the ceiling is captured on the record")
+  // The next run reverts: the authored budget runs unclamped, nothing recorded.
+  const next = await ctx.supervisor.start({ script }, ctx.parent)
+  const nextResult = next.envelope.result as { iterations: number }
+  assert.equal(nextResult.iterations, 4)
+  const nextRun = ctx.registry.get(next.envelope.runID)!
+  assert.equal(nextRun.maxLoopIterationsOverride, undefined)
+  assert.equal(nextRun.effective?.maxLoopIterations, undefined)
+})
+
 // ---------------------------------------------------------------------------
 // Child-liveness watchdog (childStallMs)
 // ---------------------------------------------------------------------------

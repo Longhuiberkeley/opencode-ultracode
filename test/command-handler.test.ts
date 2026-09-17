@@ -991,6 +991,17 @@ test("enrichStatusPayload: an explicit per-run timeout override is surfaced, abs
   assert.equal("timeoutOverrideMs" in enrichStatusPayload(payloadOf(without), without, 3_000), false)
 })
 
+test("enrichStatusPayload: per-run loop-cap overrides are surfaced, absent otherwise", () => {
+  const withOverrides = baseRun({ maxLoopDepthOverride: 3, maxLoopIterationsOverride: 10 })
+  const out = enrichStatusPayload(payloadOf(withOverrides), withOverrides, 3_000)
+  assert.equal(out.maxLoopDepthOverride, 3)
+  assert.equal(out.maxLoopIterationsOverride, 10)
+  const without = baseRun({})
+  const plain = enrichStatusPayload(payloadOf(without), without, 3_000)
+  assert.equal("maxLoopDepthOverride" in plain, false)
+  assert.equal("maxLoopIterationsOverride" in plain, false)
+})
+
 test("enrichStatusPayload: children carry per-lane tokens and tool counts (budget feedback loop)", () => {
   const run = baseRun({
     agents: [
@@ -1335,6 +1346,24 @@ test("rerun reproduces the original run's model override and provider unlock", a
   assert.deepEqual(input.model, { providerID: "openai", id: "gpt-6", variant: "high" })
   assert.equal(input.allowDisabledProviders, true)
   assert.equal(input.timeoutMs, 1_200_000)
+})
+
+test("rerun reproduces the original run's per-run loop caps", async () => {
+  const registry = new FakeRegistry()
+  seed(
+    registry,
+    baseRun({
+      id: "run_loops",
+      status: "succeeded",
+      script: "return 1",
+      maxLoopDepthOverride: 3,
+      maxLoopIterationsOverride: 12,
+    }),
+  )
+  const { supervisor } = await invoke("rerun run_loops", { registry })
+  const input = supervisor.startCalls[0]!.input as RunLaunchInput
+  assert.equal(input.maxLoopDepth, 3, "the script was authored against this nesting depth")
+  assert.equal(input.maxLoopIterations, 12, "a capped rerun stays capped")
 })
 
 test("rerun of a run without overrides launches without model fields", async () => {

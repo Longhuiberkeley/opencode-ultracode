@@ -108,6 +108,23 @@ export const CONCURRENCY_CAP = DEFAULT_OPTIONS.concurrency
 export const MIN_RUN_TIMEOUT_MS = 10_000
 export const MAX_RUN_TIMEOUT_MS = 86_400_000
 
+/**
+ * `loop()` nesting-depth bounds shared by every maxLoopDepth source (config
+ * option, per-run run input, worker preflight): 1..16. The config range is the
+ * runaway guard; the per-run input may set any value inside it.
+ */
+export const MIN_LOOP_DEPTH = 1
+export const MAX_LOOP_DEPTH = 16
+
+/**
+ * Per-loop iteration bounds shared by the worker's spec clamp
+ * (`budget.iterations` silently clamps here) and the per-run
+ * `maxLoopIterations` run input (rejected outside the range at tool-input
+ * time). The run input is tighten-only: effective = min(spec budget, input).
+ */
+export const MIN_LOOP_ITERATIONS = 1
+export const MAX_LOOP_ITERATIONS = 200
+
 /** Clamp concurrency at the admission point (not in loadOptions). */
 export function clampConcurrency(value: number): number {
   if (typeof value !== "number" || !Number.isFinite(value)) return CONCURRENCY_CAP
@@ -122,6 +139,17 @@ export type CapturedSettings = {
   permissions: PermissionMode
   /** Copied into the frozen snapshot for the permission stall watchdog. */
   permissionStallMs?: number
+  /**
+   * Loop nesting cap this run enforced (config default or per-run override).
+   * Not part of the 4-key settings panel — kept on the record so a run can
+   * always answer "what cap was enforced?", override or not.
+   */
+  maxLoopDepth?: number
+  /**
+   * Per-run tighten-only iteration ceiling, present ONLY when the caller
+   * passed maxLoopIterations. Absent = each loop ran its authored budget.
+   */
+  maxLoopIterations?: number
 }
 
 /** Model reference as `session.create` expects it ({ providerID, id, variant? }). */
@@ -162,8 +190,30 @@ export interface ModelOverrideInput {
   allowDisabledProviders?: boolean
 }
 
+/**
+ * Per-run loop-cap overrides (all run variants): tighten the engine-owned
+ * loop safety caps for THIS run without editing the script or touching the
+ * project config. Mirrors the timeoutMs/model per-run override pattern.
+ */
+export interface LoopControlInput {
+  /**
+   * Per-run `loop()` nesting-depth cap (MIN_LOOP_DEPTH..MAX_LOOP_DEPTH, i.e.
+   * 1..16). This run only; the preflight error points here. The plugin option
+   * stays the global default and the range stays the runaway guard.
+   */
+  maxLoopDepth?: number
+  /**
+   * Per-run per-loop iteration ceiling (MIN_LOOP_ITERATIONS..MAX_LOOP_ITERATIONS,
+   * i.e. 1..200), TIGHTEN-ONLY: each loop's effective bound is
+   * min(budget.iterations, this) — the caller can cap a long-running template
+   * at N passes but can never raise an authored budget. Per loop, not a
+   * run-wide total; also binds loops inside composed `loop({unit})` workflows.
+   */
+  maxLoopIterations?: number
+}
+
 /** Run an inline script (async function body, plain JS — no ESM exports). */
-export interface InlineRunInput extends ModelOverrideInput {
+export interface InlineRunInput extends ModelOverrideInput, LoopControlInput {
   script: string
   name?: string
   meta?: WorkflowMeta
@@ -177,7 +227,7 @@ export interface InlineRunInput extends ModelOverrideInput {
 }
 
 /** Run a saved workflow by name (project dir beats personal dir). */
-export interface SavedRunInput extends ModelOverrideInput {
+export interface SavedRunInput extends ModelOverrideInput, LoopControlInput {
   workflow: string
   args?: Json
   /** Default true: return after admission. Explicit false blocks until the envelope. */
@@ -193,7 +243,7 @@ export interface SavedRunInput extends ModelOverrideInput {
  * src/graph.ts into a plain async-body script). Kept as a plain object here to
  * avoid a types <-> graph import cycle; deep validation lives in graph.ts.
  */
-export interface GraphRunInput extends ModelOverrideInput {
+export interface GraphRunInput extends ModelOverrideInput, LoopControlInput {
   graph: Record<string, unknown>
   name?: string
   args?: Json
@@ -214,7 +264,7 @@ export type WorkflowToolInput = InlineRunInput | SavedRunInput | GraphRunInput |
  * level equals an inline { script } — the user's own agent wrote the file
  * deliberately; the file is read at call time.
  */
-export interface PathRunInput extends ModelOverrideInput {
+export interface PathRunInput extends ModelOverrideInput, LoopControlInput {
   /** Project-root-relative POSIX path; no absolute paths, no ".." segments. */
   path: string
   args?: Json
@@ -227,7 +277,7 @@ export interface PathRunInput extends ModelOverrideInput {
 }
 
 /** Run a served script template by name (args feed its declared params). */
-export interface TemplateRunInput extends ModelOverrideInput {
+export interface TemplateRunInput extends ModelOverrideInput, LoopControlInput {
   /** Known script-template name (see ultracode_catalog scriptTemplates). */
   template: string
   args?: Json
@@ -258,6 +308,18 @@ export interface RunLaunchInput {
    * run's frozen effective options — never persisted into the settings overlay.
    */
   timeoutMs?: number
+  /**
+   * Per-run `loop()` nesting-depth cap from the run tool input (1..16).
+   * Applied only to this run's frozen effective options — the worker preflight
+   * enforces it; the plugin option stays the global default.
+   */
+  maxLoopDepth?: number
+  /**
+   * Per-run tighten-only iteration ceiling from the run tool input (1..200):
+   * each loop's effective bound is min(budget.iterations, this). Threaded to
+   * the worker caps; never persisted into any settings surface.
+   */
+  maxLoopIterations?: number
   /**
    * Explicit run-level model override (parsed from the tool input `model`
    * string): applies to every child without a per-call `opts.model`. Beats
@@ -389,6 +451,18 @@ export interface RunRecord {
    * without overriding a user's freshly configured default.
    */
   timeoutOverrideMs?: number
+  /**
+   * Explicit per-run `loop()` nesting-depth override from the run tool input
+   * (additive). Present ONLY when the caller passed maxLoopDepth, so a rerun
+   * reproduces the cap the script was authored against.
+   */
+  maxLoopDepthOverride?: number
+  /**
+   * Explicit per-run tighten-only iteration ceiling from the run tool input
+   * (additive). Present ONLY when the caller passed maxLoopIterations; reruns
+   * reproduce it so a capped rerun stays capped.
+   */
+  maxLoopIterationsOverride?: number
   /**
    * Explicit run-level model override from the run tool input (additive).
    * Persisted so `/ultracode rerun` reproduces the override; absent when the

@@ -5,7 +5,7 @@
  * and collect a human-readable warning. Never throws.
  */
 import type { AgentScope, PermissionMode, UltracodeOptions } from "./types.ts"
-import { DEFAULT_OPTIONS, MAX_RUN_TIMEOUT_MS, MIN_RUN_TIMEOUT_MS } from "./types.ts"
+import { DEFAULT_OPTIONS, MAX_LOOP_DEPTH, MAX_RUN_TIMEOUT_MS, MIN_LOOP_DEPTH, MIN_RUN_TIMEOUT_MS } from "./types.ts"
 
 export interface LoadedOptions {
   options: Required<UltracodeOptions>
@@ -41,8 +41,9 @@ const RANGES: Record<
   agentRetryBackoffMs: { min: 0, max: 120_000 },
   // 0 disables the child-liveness watchdog.
   childStallMs: { min: 0, max: 3_600_000 },
-  // loop() nesting depth inside one run (engine-owned preflight).
-  maxLoopDepth: { min: 1, max: 16 },
+  // loop() nesting depth inside one run (engine-owned preflight; shared with
+  // the per-run maxLoopDepth run input — src/types.ts).
+  maxLoopDepth: { min: MIN_LOOP_DEPTH, max: MAX_LOOP_DEPTH },
 }
 
 const PERMISSION_MODES: ReadonlySet<string> = new Set(["ask", "autoEditsWorkflow", "noEditTools"])

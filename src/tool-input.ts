@@ -21,7 +21,14 @@ import type {
   WorkflowMeta,
   WorkflowToolInput,
 } from "./types.ts"
-import { MAX_RUN_TIMEOUT_MS, MIN_RUN_TIMEOUT_MS } from "./types.ts"
+import {
+  MAX_LOOP_DEPTH,
+  MAX_LOOP_ITERATIONS,
+  MAX_RUN_TIMEOUT_MS,
+  MIN_LOOP_DEPTH,
+  MIN_LOOP_ITERATIONS,
+  MIN_RUN_TIMEOUT_MS,
+} from "./types.ts"
 
 export type ToolInputResult =
   | { ok: true; input: WorkflowToolInput }
@@ -159,6 +166,51 @@ function validateTimeoutMs(
 }
 
 /**
+ * Per-run `loop()` nesting-depth override. Same 1..16 bounds as the
+ * maxLoopDepth plugin option (the runaway guard), but applies to this run
+ * only — the settings overlay is never touched.
+ */
+function validateMaxLoopDepth(
+  raw: Record<string, unknown>,
+): { ok: true; maxLoopDepth?: number } | { ok: false; error: string } {
+  if (!has(raw, "maxLoopDepth")) return { ok: true }
+  const value = raw["maxLoopDepth"]
+  if (typeof value !== "number" || !Number.isInteger(value)) {
+    return { ok: false, error: `"maxLoopDepth" must be an integer, got ${typeof value === "number" ? value : typeOf(value)}` }
+  }
+  if (value < MIN_LOOP_DEPTH || value > MAX_LOOP_DEPTH) {
+    return {
+      ok: false,
+      error: `"maxLoopDepth" must be between ${MIN_LOOP_DEPTH} and ${MAX_LOOP_DEPTH} (same bounds as the maxLoopDepth plugin option), got ${value}`,
+    }
+  }
+  return { ok: true, maxLoopDepth: value }
+}
+
+/**
+ * Per-run per-loop iteration ceiling. Same 1..200 bounds as the engine's spec
+ * clamp; TIGHTEN-ONLY — the worker applies min(budget.iterations, this), so
+ * the input can cap a loop-shaped template at N passes but never raise an
+ * authored budget.
+ */
+function validateMaxLoopIterations(
+  raw: Record<string, unknown>,
+): { ok: true; maxLoopIterations?: number } | { ok: false; error: string } {
+  if (!has(raw, "maxLoopIterations")) return { ok: true }
+  const value = raw["maxLoopIterations"]
+  if (typeof value !== "number" || !Number.isInteger(value)) {
+    return { ok: false, error: `"maxLoopIterations" must be an integer, got ${typeof value === "number" ? value : typeOf(value)}` }
+  }
+  if (value < MIN_LOOP_ITERATIONS || value > MAX_LOOP_ITERATIONS) {
+    return {
+      ok: false,
+      error: `"maxLoopIterations" must be between ${MIN_LOOP_ITERATIONS} and ${MAX_LOOP_ITERATIONS} (tighten-only: it caps each loop's authored budget, never raises it), got ${value}`,
+    }
+  }
+  return { ok: true, maxLoopIterations: value }
+}
+
+/**
  * Explicit run-level model override (all run variants): "provider/id" or
  * "provider/id#variant" — the same shape agent-config pins use.
  */
@@ -188,7 +240,16 @@ function validateModelOverride(
 }
 
 /** Common per-run option keys every variant accepts (beyond its source key). */
-const RUN_OPTION_KEYS = ["args", "background", "resumeFrom", "timeoutMs", "model", "allowDisabledProviders"] as const
+const RUN_OPTION_KEYS = [
+  "args",
+  "background",
+  "resumeFrom",
+  "timeoutMs",
+  "maxLoopDepth",
+  "maxLoopIterations",
+  "model",
+  "allowDisabledProviders",
+] as const
 
 export function validateToolInput(raw: unknown): ToolInputResult {
   if (!isObj(raw)) {
@@ -251,6 +312,10 @@ export function validateToolInput(raw: unknown): ToolInputResult {
     if (!resume.ok) return { ok: false, error: resume.error }
     const timeout = validateTimeoutMs(raw)
     if (!timeout.ok) return { ok: false, error: timeout.error }
+    const loopDepth = validateMaxLoopDepth(raw)
+    if (!loopDepth.ok) return { ok: false, error: loopDepth.error }
+    const loopIters = validateMaxLoopIterations(raw)
+    if (!loopIters.ok) return { ok: false, error: loopIters.error }
     const override = validateModelOverride(raw)
     if (!override.ok) return { ok: false, error: override.error }
 
@@ -260,6 +325,8 @@ export function validateToolInput(raw: unknown): ToolInputResult {
     if (background.background !== undefined) input.background = background.background
     if (resume.resumeFrom !== undefined) input.resumeFrom = resume.resumeFrom
     if (timeout.timeoutMs !== undefined) input.timeoutMs = timeout.timeoutMs
+    if (loopDepth.maxLoopDepth !== undefined) input.maxLoopDepth = loopDepth.maxLoopDepth
+    if (loopIters.maxLoopIterations !== undefined) input.maxLoopIterations = loopIters.maxLoopIterations
     if (override.model !== undefined) input.model = override.model
     if (override.allowDisabledProviders !== undefined) input.allowDisabledProviders = override.allowDisabledProviders
     return { ok: true, input }
@@ -290,6 +357,10 @@ export function validateToolInput(raw: unknown): ToolInputResult {
     if (!resume.ok) return { ok: false, error: resume.error }
     const timeout = validateTimeoutMs(raw)
     if (!timeout.ok) return { ok: false, error: timeout.error }
+    const loopDepth = validateMaxLoopDepth(raw)
+    if (!loopDepth.ok) return { ok: false, error: loopDepth.error }
+    const loopIters = validateMaxLoopIterations(raw)
+    if (!loopIters.ok) return { ok: false, error: loopIters.error }
     const override = validateModelOverride(raw)
     if (!override.ok) return { ok: false, error: override.error }
 
@@ -298,6 +369,8 @@ export function validateToolInput(raw: unknown): ToolInputResult {
     if (background.background !== undefined) input.background = background.background
     if (resume.resumeFrom !== undefined) input.resumeFrom = resume.resumeFrom
     if (timeout.timeoutMs !== undefined) input.timeoutMs = timeout.timeoutMs
+    if (loopDepth.maxLoopDepth !== undefined) input.maxLoopDepth = loopDepth.maxLoopDepth
+    if (loopIters.maxLoopIterations !== undefined) input.maxLoopIterations = loopIters.maxLoopIterations
     if (override.model !== undefined) input.model = override.model
     if (override.allowDisabledProviders !== undefined) input.allowDisabledProviders = override.allowDisabledProviders
     return { ok: true, input }
@@ -340,6 +413,10 @@ export function validateToolInput(raw: unknown): ToolInputResult {
     if (!resume.ok) return { ok: false, error: resume.error }
     const timeout = validateTimeoutMs(raw)
     if (!timeout.ok) return { ok: false, error: timeout.error }
+    const loopDepth = validateMaxLoopDepth(raw)
+    if (!loopDepth.ok) return { ok: false, error: loopDepth.error }
+    const loopIters = validateMaxLoopIterations(raw)
+    if (!loopIters.ok) return { ok: false, error: loopIters.error }
     const override = validateModelOverride(raw)
     if (!override.ok) return { ok: false, error: override.error }
 
@@ -348,6 +425,8 @@ export function validateToolInput(raw: unknown): ToolInputResult {
     if (background.background !== undefined) input.background = background.background
     if (resume.resumeFrom !== undefined) input.resumeFrom = resume.resumeFrom
     if (timeout.timeoutMs !== undefined) input.timeoutMs = timeout.timeoutMs
+    if (loopDepth.maxLoopDepth !== undefined) input.maxLoopDepth = loopDepth.maxLoopDepth
+    if (loopIters.maxLoopIterations !== undefined) input.maxLoopIterations = loopIters.maxLoopIterations
     if (override.model !== undefined) input.model = override.model
     if (override.allowDisabledProviders !== undefined) input.allowDisabledProviders = override.allowDisabledProviders
     return { ok: true, input }
@@ -384,6 +463,10 @@ export function validateToolInput(raw: unknown): ToolInputResult {
     if (!resume.ok) return { ok: false, error: resume.error }
     const timeout = validateTimeoutMs(raw)
     if (!timeout.ok) return { ok: false, error: timeout.error }
+    const loopDepth = validateMaxLoopDepth(raw)
+    if (!loopDepth.ok) return { ok: false, error: loopDepth.error }
+    const loopIters = validateMaxLoopIterations(raw)
+    if (!loopIters.ok) return { ok: false, error: loopIters.error }
     const override = validateModelOverride(raw)
     if (!override.ok) return { ok: false, error: override.error }
 
@@ -392,6 +475,8 @@ export function validateToolInput(raw: unknown): ToolInputResult {
     if (background.background !== undefined) input.background = background.background
     if (resume.resumeFrom !== undefined) input.resumeFrom = resume.resumeFrom
     if (timeout.timeoutMs !== undefined) input.timeoutMs = timeout.timeoutMs
+    if (loopDepth.maxLoopDepth !== undefined) input.maxLoopDepth = loopDepth.maxLoopDepth
+    if (loopIters.maxLoopIterations !== undefined) input.maxLoopIterations = loopIters.maxLoopIterations
     if (override.model !== undefined) input.model = override.model
     if (override.allowDisabledProviders !== undefined) input.allowDisabledProviders = override.allowDisabledProviders
     return { ok: true, input }
@@ -444,6 +529,10 @@ export function validateToolInput(raw: unknown): ToolInputResult {
     if (!resume.ok) return { ok: false, error: resume.error }
     const timeout = validateTimeoutMs(raw)
     if (!timeout.ok) return { ok: false, error: timeout.error }
+    const loopDepth = validateMaxLoopDepth(raw)
+    if (!loopDepth.ok) return { ok: false, error: loopDepth.error }
+    const loopIters = validateMaxLoopIterations(raw)
+    if (!loopIters.ok) return { ok: false, error: loopIters.error }
     const override = validateModelOverride(raw)
     if (!override.ok) return { ok: false, error: override.error }
 
@@ -454,6 +543,8 @@ export function validateToolInput(raw: unknown): ToolInputResult {
     if (background.background !== undefined) input.background = background.background
     if (resume.resumeFrom !== undefined) input.resumeFrom = resume.resumeFrom
     if (timeout.timeoutMs !== undefined) input.timeoutMs = timeout.timeoutMs
+    if (loopDepth.maxLoopDepth !== undefined) input.maxLoopDepth = loopDepth.maxLoopDepth
+    if (loopIters.maxLoopIterations !== undefined) input.maxLoopIterations = loopIters.maxLoopIterations
     if (override.model !== undefined) input.model = override.model
     if (override.allowDisabledProviders !== undefined) input.allowDisabledProviders = override.allowDisabledProviders
     return { ok: true, input }

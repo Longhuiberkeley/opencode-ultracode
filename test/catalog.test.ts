@@ -192,8 +192,16 @@ test("catalog: agents are listed with sliced descriptions, or the failure is sur
 })
 
 test("catalog: caps are echoed so the model can budget the run it is about to author", () => {
-  const out = buildCatalog({ caps: { concurrency: 8, maxAgents: 200, timeoutMs: 3_600_000 } }) as Record<string, Json>
-  assert.deepEqual(out["caps"], { concurrency: 8, maxAgents: 200, timeoutMs: 3_600_000 })
+  const out = buildCatalog({
+    caps: { concurrency: 8, maxAgents: 200, timeoutMs: 3_600_000, maxLoopDepth: 2, maxLoopIterations: 200 },
+  }) as Record<string, Json>
+  assert.deepEqual(out["caps"], {
+    concurrency: 8,
+    maxAgents: 200,
+    timeoutMs: 3_600_000,
+    maxLoopDepth: 2,
+    maxLoopIterations: 200,
+  })
 })
 
 // ---------------------------------------------------------------------------

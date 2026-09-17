@@ -370,6 +370,110 @@ return { err }
   assert.match(value.err ?? "", /maxLoopDepth/)
 })
 
+test("loop: nesting depth error points the author at the per-run ultracode_run input", async () => {
+  const result = await runInWorker(
+    `
+let err = null
+try {
+  await loop({ key: "l1", budget: { iterations: 1 } }, async () => {
+    await loop({ key: "l2", budget: { iterations: 1 } }, async () => {
+      await loop({ key: "l3", budget: { iterations: 1 } }, async () => ({ state: {} }))
+      return { state: {} }
+    })
+    return { state: {} }
+  })
+} catch (e) { err = String(e && e.message ? e.message : e) }
+return { err }
+`,
+    { caps: { maxAgents: 200, maxLoopDepth: 2 }, onCall: async () => agentResult() },
+  )
+  assert.equal(result.ok, true, result.error ?? "loop run failed")
+  const value = result.value as { err: string | null }
+  assert.match(value.err ?? "", /ultracode_run input/)
+})
+
+test("loop: per-run maxLoopIterations is a tighten-only ceiling (min, never raises)", async () => {
+  const result = await runInWorker(
+    `
+const capped = await loop({
+  key: "capped",
+  budget: { iterations: 5 },
+}, async (ctx) => ({ state: { n: (ctx.state.n || 0) + 1 } }))
+const notRaised = await loop({
+  key: "small",
+  budget: { iterations: 2 },
+}, async (ctx) => ({ state: { n: (ctx.state.n || 0) + 1 } }))
+return { capped, notRaised }
+`,
+    { caps: { maxAgents: 200, maxLoopDepth: 2, maxLoopIterations: 3 }, onCall: async () => agentResult() },
+  )
+  assert.equal(result.ok, true, result.error ?? "loop run failed")
+  const value = result.value as {
+    capped: { iterations: number; stopReason: string; budget: { requested: number; effective: number } }
+    notRaised: { iterations: number; stopReason: string; budget: { requested: number; effective: number } }
+  }
+  assert.equal(value.capped.iterations, 3, "the ceiling clamps the authored budget")
+  assert.equal(value.capped.stopReason, "budget")
+  assert.deepEqual(value.capped.budget, { requested: 5, effective: 3 })
+  assert.equal(value.notRaised.iterations, 2, "a ceiling above the authored budget changes nothing")
+  assert.deepEqual(value.notRaised.budget, { requested: 2, effective: 2 })
+})
+
+test("loop: maxLoopIterations applies before the maxAgents worst-case estimate", async () => {
+  const result = await runInWorker(
+    `
+const summary = await loop({
+  key: "wide",
+  budget: { iterations: 50, agentsPerIteration: 6 },
+}, async (ctx) => ({ state: { n: (ctx.state.n || 0) + 1 } }))
+return { summary }
+`,
+    { caps: { maxAgents: 100, maxLoopDepth: 2, maxLoopIterations: 10 }, onCall: async () => agentResult() },
+  )
+  assert.equal(result.ok, true, result.error ?? "loop run failed")
+  const summary = (result.value as { summary: Record<string, Json> }).summary
+  // The AUTHORED worst case (50 x 6 = 300 > maxAgents 100) would preflight-throw;
+  // the capped worst case (10 x 6 = 60) is the one that matters — a caller who
+  // bounds the blast radius gets to run within it.
+  assert.equal(summary["iterations"], 10)
+  assert.equal((summary["budget"] as Record<string, Json>)["requested"], 50)
+  assert.equal((summary["budget"] as Record<string, Json>)["effective"], 10)
+})
+
+test("loop: a per-run maxLoopIterations ceiling also binds loops inside a composed unit workflow", async () => {
+  const result = await runInWorker(
+    `
+const outer = await loop({
+  key: "outer",
+  unit: { name: "inner-looper" },
+  budget: { iterations: 1 },
+})
+return { outer }
+`,
+    {
+      caps: { maxAgents: 200, maxLoopDepth: 2, maxLoopIterations: 2 },
+      onCall: async (fn, args) => {
+        if (fn === "workflow-check") return { ok: true }
+        if (fn === "workflow") {
+          // The composed unit itself contains a 5-iteration loop; the caller's
+          // run-wide ceiling must clamp it (caps are worker-global from init).
+          return {
+            script:
+              'const inner = await loop({ key: "inner", budget: { iterations: 5 } }, async (ctx) => ({ state: { n: (ctx.state.n || 0) + 1 } }))\nreturn { state: { inner } }',
+            meta: {},
+          }
+        }
+        return agentResult()
+      },
+    },
+  )
+  assert.equal(result.ok, true, result.error ?? "loop run failed")
+  const outer = (result.value as { outer: Record<string, Json> }).outer
+  const inner = outer["state"] as { inner: { iterations: number; budget: { requested: number; effective: number } } }
+  assert.equal(inner.inner.iterations, 2, "the unit's inner loop runs at the ceiling, not its authored 5")
+  assert.deepEqual(inner.inner.budget, { requested: 5, effective: 2 })
+})
+
 test("loop: deadline in the past stops immediately with budget", async () => {
   const result = await runInWorker(
     `

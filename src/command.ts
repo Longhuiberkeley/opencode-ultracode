@@ -275,6 +275,8 @@ export async function executeWorkflowLaunch(
     // not only on the run record (status/panel).
     const ack: Record<string, unknown> = { runID, status: "running", hint: BACKGROUND_RUN_HINT }
     if (input.timeoutMs !== undefined) ack["timeoutMs"] = input.timeoutMs
+    if (input.maxLoopDepth !== undefined) ack["maxLoopDepth"] = input.maxLoopDepth
+    if (input.maxLoopIterations !== undefined) ack["maxLoopIterations"] = input.maxLoopIterations
     return { content: JSON.stringify(ack) }
   }
   const outcome = await supervisor.start(input, parent)
@@ -323,6 +325,10 @@ export function enrichStatusPayload(
   resumedFrom?: string
   /** Explicit per-run wall-clock override from the run input, when present. */
   timeoutOverrideMs?: number
+  /** Explicit per-run loop nesting-depth override from the run input, when present. */
+  maxLoopDepthOverride?: number
+  /** Explicit per-run per-loop iteration ceiling from the run input, when present. */
+  maxLoopIterationsOverride?: number
   /** Explicit run-level model override ("provider/id"), when present. */
   modelOverride?: string
   result?: Json
@@ -342,6 +348,10 @@ export function enrichStatusPayload(
   if (run.workflowName) out["workflowName"] = run.workflowName
   if (run.resumedFrom) out["resumedFrom"] = run.resumedFrom
   if (run.timeoutOverrideMs !== undefined) out["timeoutOverrideMs"] = run.timeoutOverrideMs
+  if (run.maxLoopDepthOverride !== undefined) out["maxLoopDepthOverride"] = run.maxLoopDepthOverride
+  if (run.maxLoopIterationsOverride !== undefined) {
+    out["maxLoopIterationsOverride"] = run.maxLoopIterationsOverride
+  }
   if (run.modelOverride !== undefined) {
     out["modelOverride"] = `${run.modelOverride.providerID}/${run.modelOverride.id}${run.modelOverride.variant ? `#${run.modelOverride.variant}` : ""}`
   }
@@ -1435,6 +1445,13 @@ async function rerunRun(deps: CommandDeps, sessionID: string, rest: string): Pro
         // reruns at the same timeout (warm reruns of long runs must not die
         // at the project default). Absent when the original used the default.
         ...(source.timeoutOverrideMs !== undefined ? { timeoutMs: source.timeoutOverrideMs } : {}),
+        // Reproduce the per-run loop caps the same way — the script was
+        // authored against this nesting depth, and a capped rerun stays
+        // capped (a warm rerun dying at the default cap defeats the warm tail).
+        ...(source.maxLoopDepthOverride !== undefined ? { maxLoopDepth: source.maxLoopDepthOverride } : {}),
+        ...(source.maxLoopIterationsOverride !== undefined
+          ? { maxLoopIterations: source.maxLoopIterationsOverride }
+          : {}),
         // Reproduce the explicit run-level model override the same way —
         // without it, a rerun's unpinned children would silently fall back to
         // config pins and break warm-digest expectations.

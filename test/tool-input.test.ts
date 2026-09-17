@@ -406,6 +406,47 @@ test("timeoutMs bounds match /ultracode set: 10 s to 24 h, integers only", () =>
 })
 
 // ---------------------------------------------------------------------------
+// Per-run loop caps (maxLoopDepth / maxLoopIterations)
+// ---------------------------------------------------------------------------
+
+test("maxLoopDepth and maxLoopIterations are accepted on all five run forms and carried through", () => {
+  const forms: Array<Record<string, unknown>> = [
+    { script: "s" },
+    { workflow: "w" },
+    { graph: { nodes: [] } },
+    { path: ".opencode/workflows/a.js" },
+    { template: "verify-fix" },
+  ]
+  for (const base of forms) {
+    const parsed = ok({ ...base, maxLoopDepth: 4, maxLoopIterations: 25 })
+    assert.equal(parsed.input.maxLoopDepth, 4, `carried on the ${Object.keys(base)[0]} form`)
+    assert.equal(parsed.input.maxLoopIterations, 25)
+  }
+  const none = ok({ script: "s" })
+  assert.equal(none.input.maxLoopDepth, undefined)
+  assert.equal(none.input.maxLoopIterations, undefined)
+})
+
+test("maxLoopDepth bounds: 1..16 integers only, same range as the plugin option", () => {
+  bad({ script: "s", maxLoopDepth: 0 }, /"maxLoopDepth" must be between 1 and 16/)
+  bad({ script: "s", maxLoopDepth: 17 }, /"maxLoopDepth" must be between 1 and 16/)
+  bad({ workflow: "w", maxLoopDepth: 16.5 }, /"maxLoopDepth" must be an integer/)
+  bad({ graph: { nodes: [] }, maxLoopDepth: "3" }, /"maxLoopDepth" must be an integer/)
+  ok({ script: "s", maxLoopDepth: 1 })
+  ok({ script: "s", maxLoopDepth: 16 })
+})
+
+test("maxLoopIterations bounds: 1..200 integers only; the error states tighten-only", () => {
+  bad({ script: "s", maxLoopIterations: 0 }, /"maxLoopIterations" must be between 1 and 200/)
+  bad({ script: "s", maxLoopIterations: 201 }, /"maxLoopIterations" must be between 1 and 200/)
+  bad({ workflow: "w", maxLoopIterations: 10.5 }, /"maxLoopIterations" must be an integer/)
+  // 500 is out of range AND would be a raise attempt — the error says which semantics apply.
+  bad({ script: "s", maxLoopIterations: 500 }, /tighten-only/)
+  ok({ template: "kanban", maxLoopIterations: 1 })
+  ok({ path: ".opencode/workflows/a.js", maxLoopIterations: 200 })
+})
+
+// ---------------------------------------------------------------------------
 // path / template run inputs
 // ---------------------------------------------------------------------------
 

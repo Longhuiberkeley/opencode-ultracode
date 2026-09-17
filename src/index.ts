@@ -72,7 +72,15 @@ import type {
   Supervisor,
   WorkflowMeta,
 } from "./types.ts"
-import { isActiveRunStatus, MAX_RUN_TIMEOUT_MS, MIN_RUN_TIMEOUT_MS } from "./types.ts"
+import {
+  isActiveRunStatus,
+  MAX_LOOP_DEPTH,
+  MAX_LOOP_ITERATIONS,
+  MAX_RUN_TIMEOUT_MS,
+  MIN_LOOP_DEPTH,
+  MIN_LOOP_ITERATIONS,
+  MIN_RUN_TIMEOUT_MS,
+} from "./types.ts"
 
 /** Minimal shape of a plugin hook/transform registration (for cleanup). */
 interface RegistrationLike {
@@ -148,6 +156,24 @@ const ALLOW_DISABLED_PROVIDERS_PROPERTY: Record<string, unknown> = {
     "Default false. Pass true only when the user explicitly wants overrides to run on providers they disabled (disabled_providers) — it unlocks ALL disabled providers for THIS run only (run-wide), not just the one named in model.",
 }
 
+/** Shared per-run loop nesting-depth override property (all run forms). */
+const MAX_LOOP_DEPTH_PROPERTY: Record<string, unknown> = {
+  type: "integer",
+  minimum: MIN_LOOP_DEPTH,
+  maximum: MAX_LOOP_DEPTH,
+  description:
+    "Optional per-run cap on loop() nesting depth (1-16, same bounds as the maxLoopDepth plugin option). Pass it when an authored design legitimately nests deeper than the configured default — e.g. loop({unit}) composition shares ONE depth stack, so a trusted workflow containing loops called per-iteration can need depth 3+. This run only; recorded on the run and shown in ultracode_status. Graphs compile to flat waves (no loop nesting), so this applies to script/template/saved-workflow loops.",
+}
+
+/** Shared per-run loop iteration ceiling property (all run forms). */
+const MAX_LOOP_ITERATIONS_PROPERTY: Record<string, unknown> = {
+  type: "integer",
+  minimum: MIN_LOOP_ITERATIONS,
+  maximum: MAX_LOOP_ITERATIONS,
+  description:
+    "Optional per-run ceiling on loop() iterations (1-200, TIGHTEN-ONLY): each loop's effective bound becomes min(its budget.iterations, this value) — cap a long-running template at N passes without editing it; it can never RAISE an authored budget. Per loop, not a run-wide total (the shared agent ledger and wall clock bound totals); it also binds loops inside composed loop({unit}) workflows. Loops that stop early because of it report budget: { requested, effective } in their result. This run only; recorded on the run and shown in ultracode_status.",
+}
+
 /** JSON Schema for the workflow tool input union (inline script vs saved workflow). */
 const WORKFLOW_TOOL_INPUT_SCHEMA: Record<string, unknown> = {
   anyOf: [
@@ -188,6 +214,8 @@ const WORKFLOW_TOOL_INPUT_SCHEMA: Record<string, unknown> = {
             "Warm-start from a prior run id (run_…): keyed succeeded agents replay from that run's cache instead of respawning, so an interrupted long run costs only its unfinished tail.",
         },
         timeoutMs: RUN_TIMEOUT_MS_PROPERTY,
+        maxLoopDepth: MAX_LOOP_DEPTH_PROPERTY,
+        maxLoopIterations: MAX_LOOP_ITERATIONS_PROPERTY,
         model: MODEL_OVERRIDE_PROPERTY,
         allowDisabledProviders: ALLOW_DISABLED_PROVIDERS_PROPERTY,
       },
@@ -213,6 +241,8 @@ const WORKFLOW_TOOL_INPUT_SCHEMA: Record<string, unknown> = {
             "Warm-start from a prior run id (run_…): keyed succeeded agents replay from that run's cache instead of respawning, so an interrupted long run costs only its unfinished tail.",
         },
         timeoutMs: RUN_TIMEOUT_MS_PROPERTY,
+        maxLoopDepth: MAX_LOOP_DEPTH_PROPERTY,
+        maxLoopIterations: MAX_LOOP_ITERATIONS_PROPERTY,
         model: MODEL_OVERRIDE_PROPERTY,
         allowDisabledProviders: ALLOW_DISABLED_PROVIDERS_PROPERTY,
       },
@@ -244,6 +274,8 @@ const WORKFLOW_TOOL_INPUT_SCHEMA: Record<string, unknown> = {
             "Warm-start from a prior run id (run_…). Graph calls are auto-keyed per node, so every finished child replays from cache and only the unfinished tail respawns.",
         },
         timeoutMs: RUN_TIMEOUT_MS_PROPERTY,
+        maxLoopDepth: MAX_LOOP_DEPTH_PROPERTY,
+        maxLoopIterations: MAX_LOOP_ITERATIONS_PROPERTY,
         model: MODEL_OVERRIDE_PROPERTY,
         allowDisabledProviders: ALLOW_DISABLED_PROVIDERS_PROPERTY,
       },
@@ -269,6 +301,8 @@ const WORKFLOW_TOOL_INPUT_SCHEMA: Record<string, unknown> = {
           description: "Warm-start from a prior run id (run_…): keyed succeeded agents replay from cache.",
         },
         timeoutMs: RUN_TIMEOUT_MS_PROPERTY,
+        maxLoopDepth: MAX_LOOP_DEPTH_PROPERTY,
+        maxLoopIterations: MAX_LOOP_ITERATIONS_PROPERTY,
         model: MODEL_OVERRIDE_PROPERTY,
         allowDisabledProviders: ALLOW_DISABLED_PROVIDERS_PROPERTY,
       },
@@ -293,6 +327,8 @@ const WORKFLOW_TOOL_INPUT_SCHEMA: Record<string, unknown> = {
           description: "Warm-start from a prior run id (run_…): keyed succeeded agents replay from cache.",
         },
         timeoutMs: RUN_TIMEOUT_MS_PROPERTY,
+        maxLoopDepth: MAX_LOOP_DEPTH_PROPERTY,
+        maxLoopIterations: MAX_LOOP_ITERATIONS_PROPERTY,
         model: MODEL_OVERRIDE_PROPERTY,
         allowDisabledProviders: ALLOW_DISABLED_PROVIDERS_PROPERTY,
       },
@@ -969,6 +1005,10 @@ export default Plugin.define({
                     graphSpec,
                     resumeFrom: input.resumeFrom,
                     timeoutMs: input.timeoutMs,
+                    ...(input.maxLoopDepth !== undefined ? { maxLoopDepth: input.maxLoopDepth } : {}),
+                    ...(input.maxLoopIterations !== undefined
+                      ? { maxLoopIterations: input.maxLoopIterations }
+                      : {}),
                     ...(runModel !== undefined ? { model: runModel } : {}),
                     ...(input.allowDisabledProviders !== undefined
                       ? { allowDisabledProviders: input.allowDisabledProviders }
@@ -1079,7 +1119,7 @@ export default Plugin.define({
           name: "catalog",
           options: { namespace: "ultracode" },
           description:
-            "Read-only discovery of what this project can run: saved workflows (kind, params (names always; JSON types only when declared — explicit params, a // Tool input: header, or a saved run's real args; graph-derived params are names only), phases, required agents, trust state, last-run stats from THIS conversation), the available agent ids, the live caps (concurrency, maxAgents, timeoutMs), graph templates to adapt, and script templates (staged-delivery, verify-fix) for loop-shaped work graphs cannot express. Call it BEFORE choosing a saved workflow or authoring from a blank page — cheaper than reading workflow files, and it executes nothing. Input { workflow? | template? | templates? | scriptTemplate? | scriptTemplates? }: no input returns the whole bounded catalog; one view per call. A workflow listed as trusted can be run immediately; an untrusted one needs the user's /ultracode trust first (relay that, never work around it).",
+            "Read-only discovery of what this project can run: saved workflows (kind, params (names always; JSON types only when declared — explicit params, a // Tool input: header, or a saved run's real args; graph-derived params are names only), phases, required agents, trust state, last-run stats from THIS conversation), the available agent ids, the live caps (concurrency, maxAgents, timeoutMs, maxLoopDepth, maxLoopIterations), graph templates to adapt, and script templates (staged-delivery, verify-fix) for loop-shaped work graphs cannot express. Call it BEFORE choosing a saved workflow or authoring from a blank page — cheaper than reading workflow files, and it executes nothing. Input { workflow? | template? | templates? | scriptTemplate? | scriptTemplates? }: no input returns the whole bounded catalog; one view per call. A workflow listed as trusted can be run immediately; an untrusted one needs the user's /ultracode trust first (relay that, never work around it).",
           input: CATALOG_TOOL_INPUT_SCHEMA,
           execute: async (rawInput: unknown, tool) => {
             try {
@@ -1109,6 +1149,11 @@ export default Plugin.define({
                   concurrency: options.concurrency,
                   maxAgents: options.maxAgents,
                   timeoutMs: options.timeoutMs,
+                  // Loop caps: the current nesting default (per-run input may
+                  // set 1..16) and the per-loop iteration ceiling a per-run
+                  // input may tighten below (never raise).
+                  maxLoopDepth: options.maxLoopDepth,
+                  maxLoopIterations: MAX_LOOP_ITERATIONS,
                 },
                 ...(parsed.templates !== undefined ? { templates: parsed.templates } : {}),
                 ...(parsed.template !== undefined ? { template: parsed.template } : {}),

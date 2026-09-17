@@ -21,13 +21,14 @@
  */
 const LOOP_RUNTIME = `
 // ---- loop engine + queue library -----------------------------------------
-var loopCaps = { maxAgents: 0, maxLoopDepth: 2, artifactsDir: null, runDir: null };
+var loopCaps = { maxAgents: 0, maxLoopDepth: 2, maxLoopIterations: 0, artifactsDir: null, runDir: null };
 var activeLoops = [];
 
 function applyLoopCaps(caps) {
   if (caps === null || typeof caps !== "object") return;
   loopCaps.maxAgents = Number(caps.maxAgents) > 0 ? Math.floor(Number(caps.maxAgents)) : 0;
   loopCaps.maxLoopDepth = Number(caps.maxLoopDepth) > 0 ? Math.floor(Number(caps.maxLoopDepth)) : 2;
+  loopCaps.maxLoopIterations = Number(caps.maxLoopIterations) > 0 ? Math.floor(Number(caps.maxLoopIterations)) : 0;
   loopCaps.artifactsDir = typeof caps.artifactsDir === "string" && caps.artifactsDir ? caps.artifactsDir : null;
   loopCaps.runDir = typeof caps.runDir === "string" && caps.runDir ? caps.runDir : null;
 }
@@ -331,6 +332,15 @@ async function runLoop(spec, iterate, ownerDepth) {
     if (iterateFn && unitName) throw new Error("loop: pass iterate(ctx) or unit { name, args }, not both");
     if (!iterateFn && !unitName) throw new Error("loop: pass iterate(ctx) or unit { name, args(state) }");
     budget = normalizeLoopBudget(s.budget);
+    // Per-run tighten-only iteration ceiling (run input maxLoopIterations):
+    // effective bound = min(authored budget, ceiling). Applied BEFORE the
+    // maxAgents worst-case estimate below — once the caller has bounded the
+    // blast radius, the capped worst case IS the worst case. Never raises an
+    // authored budget; requestedIterations is reported on the loop result so
+    // a stop at the ceiling is visible as budget: { requested, effective }.
+    var requestedIterations = budget.iterations;
+    var iterCeiling = loopCaps.maxLoopIterations > 0 ? loopCaps.maxLoopIterations : 0;
+    if (iterCeiling > 0 && budget.iterations > iterCeiling) budget.iterations = iterCeiling;
     stopSpec = s.stop !== null && typeof s.stop === "object" && !Array.isArray(s.stop) ? s.stop : {};
     predicate = typeof stopSpec.predicate === "function" ? stopSpec.predicate : null;
     stallK = Number.isFinite(Number(stopSpec.stallK)) ? Math.min(10, Math.max(1, Math.floor(Number(stopSpec.stallK)))) : 3;
@@ -341,7 +351,7 @@ async function runLoop(spec, iterate, ownerDepth) {
     var depthNow = activeLoops.length;
     var maxDepth = loopCaps.maxLoopDepth > 0 ? loopCaps.maxLoopDepth : 2;
     if (depthNow + 1 > maxDepth) {
-      throw new Error("loop: nesting depth " + (depthNow + 1) + " exceeds maxLoopDepth " + maxDepth + " — flatten the loops or raise the plugin option");
+      throw new Error("loop: nesting depth " + (depthNow + 1) + " exceeds maxLoopDepth " + maxDepth + " — flatten the loops or pass a higher maxLoopDepth in the ultracode_run input (or raise the plugin option)");
     }
     var maxAgents = loopCaps.maxAgents > 0 ? loopCaps.maxAgents : 0;
     var estimated = budget.iterations * budget.agentsPerIteration;
@@ -610,6 +620,7 @@ async function runLoop(spec, iterate, ownerDepth) {
     key: key,
     goal: goal,
     iterations: completed,
+    budget: { requested: requestedIterations, effective: budget.iterations },
     stopReason: stopReason,
     state: state,
     lastVerdict: lastVerdict,

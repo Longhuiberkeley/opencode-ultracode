@@ -121,6 +121,8 @@ interface RunState {
   runModel: { providerID: string; id: string; variant?: string } | undefined
   /** Escape hatch: explicit overrides may target disabled providers. */
   allowDisabledProviders: boolean
+  /** Per-run tighten-only loop iteration ceiling (run input `maxLoopIterations`). */
+  runLoopIterations: number | undefined
 }
 
 type FinalOutcome = {
@@ -221,21 +223,34 @@ export class SupervisorImpl implements Supervisor {
     })
     const runID = record.id
     if (input.resumeFrom) record.resumedFrom = input.resumeFrom
-    // Per-run wall-clock override from the run tool input: this run only. The
-    // supervisor defaults (user overlay included) are left untouched, and the
-    // override is captured in record.effective for status/panel display and
-    // record.timeoutOverrideMs so a warm rerun reproduces the run's clock.
-    const effective = freezeEffective(
-      input.timeoutMs !== undefined ? { ...this.options, timeoutMs: input.timeoutMs } : this.options,
-    )
+    // Per-run overrides from the run tool input: this run only. The
+    // supervisor defaults (user overlay included) are left untouched, and each
+    // override is captured on the record — record.effective for status/panel
+    // display, plus the explicit *Override fields so a warm rerun reproduces
+    // the run's clock and loop caps.
+    const effective = freezeEffective({
+      ...this.options,
+      ...(input.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {}),
+      ...(input.maxLoopDepth !== undefined ? { maxLoopDepth: input.maxLoopDepth } : {}),
+    })
     if (input.timeoutMs !== undefined) record.timeoutOverrideMs = input.timeoutMs
+    if (input.maxLoopDepth !== undefined) record.maxLoopDepthOverride = input.maxLoopDepth
+    if (input.maxLoopIterations !== undefined) record.maxLoopIterationsOverride = input.maxLoopIterations
     // Persist the explicit model override for rerun reproduction (mirrors
     // timeoutOverrideMs; absent = pins/defaults only).
     if (input.model !== undefined) record.modelOverride = input.model
     if (input.allowDisabledProviders === true) record.allowDisabledProviders = true
     // panelSettingsFrom alone drops permissionStallMs (panel shows 4 keys),
     // but the permission stall watchdog reads it off this record — keep it.
-    record.effective = { ...panelSettingsFrom(effective), permissionStallMs: effective.permissionStallMs }
+    // Same for the loop caps: a run must always answer "what cap did this
+    // run enforce?" — the nesting cap even without an override, the iteration
+    // ceiling only when one was passed.
+    record.effective = {
+      ...panelSettingsFrom(effective),
+      permissionStallMs: effective.permissionStallMs,
+      maxLoopDepth: effective.maxLoopDepth,
+      ...(input.maxLoopIterations !== undefined ? { maxLoopIterations: input.maxLoopIterations } : {}),
+    }
     this.registry.persistNow(runID)
     const state = this.makeState(runID, parent, effective, input)
     this.runs.set(runID, state)
@@ -379,6 +394,7 @@ export class SupervisorImpl implements Supervisor {
         caps: {
           maxAgents: state.effective.maxAgents,
           maxLoopDepth: state.effective.maxLoopDepth,
+          ...(state.runLoopIterations !== undefined ? { maxLoopIterations: state.runLoopIterations } : {}),
           artifactsDir: runDir ?? null,
           runDir: runDir ?? null,
         },
@@ -569,6 +585,7 @@ export class SupervisorImpl implements Supervisor {
       effective,
       runModel: input.model,
       allowDisabledProviders: input.allowDisabledProviders === true,
+      runLoopIterations: input.maxLoopIterations,
     }
   }
 

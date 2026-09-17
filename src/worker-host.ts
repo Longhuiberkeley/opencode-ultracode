@@ -27,13 +27,15 @@ export interface SpawnWorkerInput {
   args?: Json
   meta?: WorkflowMeta
   /**
-   * Engine caps for the loop runtime (maxAgents / maxLoopDepth caps +
-   * artifact dirs). Advisory worker-side preflight; the host remains the
-   * hard enforcer of maxAgents and the run wall clock.
+   * Engine caps for the loop runtime (maxAgents / maxLoopDepth /
+   * maxLoopIterations caps + artifact dirs). Advisory worker-side preflight;
+   * the host remains the hard enforcer of maxAgents and the run wall clock.
    */
   caps?: {
     maxAgents?: number
     maxLoopDepth?: number
+    /** Tighten-only per-loop iteration ceiling (0/unset = no ceiling). */
+    maxLoopIterations?: number
     artifactsDir?: string | null
     runDir?: string | null
   }

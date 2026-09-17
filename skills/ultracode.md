@@ -161,8 +161,10 @@ cap and timeout under `caps` (defaults: 8 concurrent agents, 200 agent calls per
 wall clock; separately, scripts are hard-capped at 512 KB and results truncate after 64 KB by
 default). Budget the wall clock before anything else — waves × dependent stages × ~5-10 min per child
 must fit; prefer wide-not-deep. When a run legitimately needs longer, pass `timeoutMs` in the run
-call (10 s to 24 h; this run only, recorded on the run). Ask the user to raise the default with
-`/ultracode set timeoutMs <ms>` when it should stick.
+call (10 s to 24 h; this run only, recorded on the run; ask the user to `/ultracode set timeoutMs`
+when it should stick). Loop caps are per-run inputs on the same pattern: `maxLoopDepth` (1..16,
+when a design legitimately nests deeper) and `maxLoopIterations` (1..200, TIGHTEN-ONLY —
+effective = min(loop budget, input); cap a template, never raise a budget).
 
 ## Loop mode (engine-owned iteration)
 
@@ -188,24 +190,31 @@ const summary = await loop({
 
 - `iterate(ctx)` must return `{ state, result? }`; `result` feeds prompts and the verdict.
 - Budgets are engine-owned: iterations / agentsPerIteration / wallMs / tokens / deadline checked
-  every iteration; preflight rejects a worst case beyond the run caps; `ctx.budgetLeft` shows what
+  every iteration; preflight rejects the worst case (iterations × agentsPerIteration, after any
+  per-run `maxLoopIterations` ceiling is applied) beyond the run caps; `ctx.budgetLeft` shows what
   remains (agentsPerIteration already excludes the verdict+skeptic reservation).
 - `verdict`: an independent judge (different agent than the workers) with a schema; a terminating
   `done` must survive ONE skeptic re-derivation before the loop stops (`skeptic: false` opts out);
   a refuted termination continues the loop. Evidence-shaped schemas (command / exitCode / outputQuote
   / metrics) keep "done" falsifiable.
 - Stop reasons (returned + checkpointed): `target | queue-empty | stall | budget | blocked | error`.
+  The summary's `budget: { requested, effective }` makes a stop at a per-run ceiling visible.
 - `ctx.artifactsDir` (`<run artifacts>/it-<i>`) and `ctx.runDir` are where iterations put files;
   checkpoints store refs, not contents. `ctx.history` / `ctx.lastVerdict` / `ctx.lastResult` feed
   the next iteration without bloating state.
 - `unit: { name, args(state) }` runs a TRUSTED saved workflow per iteration instead of a local
-  iterate (preflighted before iteration 1); nesting is capped (`maxLoopDepth`, default 2) and the
-  budget ledger is shared across nested loops. A unit cannot run inside a composed workflow (depth
-  1) and its script must return `{ state, result? }` like any iterate.
+  iterate (preflighted before iteration 1); nesting is capped (`maxLoopDepth`, default 2 — but a
+  unit whose workflow contains loops legitimately needs depth 3+: pass the per-run `maxLoopDepth`
+  input). The budget ledger is shared across nested loops; a per-run `maxLoopIterations` ceiling
+  binds unit loops too. A unit cannot run inside a composed workflow (depth 1) and its script must
+  return `{ state, result? }` like any iterate.
 - Structural failures (bad spec, depth cap, unit trust) fail loud; per-iteration failures follow
   `onIterationError: retry | record | abort`.
 - Served loop templates: `kanban` (ticket worklist) and `kaggle-ml` (metric-targeted refinement).
   Inspect with `ultracode_catalog { scriptTemplate: "kanban" }`.
+- Leftover work is a result shape, not a mechanism: loop templates return `remaining` — continue
+  it in a follow-up run in the SAME conversation by passing it as the next run's `tickets`/`open`
+  args. Cross-conversation campaign memory is deliberately unbuilt (docs/DESIGN-NOTES/reduce.md).
 
 ## Hard rules
 
