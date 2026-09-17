@@ -54,13 +54,14 @@ import {
   runStateTransition,
   settingsPayload,
 } from "./run-status.ts"
-import { lookupAgentPin, parseModelPin } from "./agent-pins.ts"
+import { agentUsable, lookupAgentPin, parseModelPin, readDisabledProviders } from "./agent-pins.ts"
 import { RegistryImpl } from "./registry.ts"
 import { emptyToolEventState } from "./run-events.ts"
 import { EMPTY_CATALOG, SKILL_CONTENT, SKILL_DESCRIPTION, SKILL_NAME, buildSkillContent } from "./skill-content.ts"
 import { compileGraphSpec, validateGraphSpec } from "./graph.ts"
 import type { GraphSpec } from "./graph.ts"
-import { StorageImpl, normalizePath, resolveContainedPath, sha256 } from "./storage.ts"
+import { SCRIPT_TEMPLATES, scriptTemplate } from "./script-templates.ts"
+import { StorageImpl, normalizePath, readProjectWorkflowFile, resolveContainedPath, sha256 } from "./storage.ts"
 import { resolveBackground, validateCatalogToolInput, validateControlToolInput, validateResultToolInput, validateStatusToolInput, validateToolInput } from "./tool-input.ts"
 import type {
   FsLike,
@@ -223,6 +224,51 @@ const WORKFLOW_TOOL_INPUT_SCHEMA: Record<string, unknown> = {
           type: "string",
           description:
             "Warm-start from a prior run id (run_…). Graph calls are auto-keyed per node, so every finished child replays from cache and only the unfinished tail respawns.",
+        },
+        timeoutMs: RUN_TIMEOUT_MS_PROPERTY,
+      },
+    },
+    {
+      type: "object",
+      additionalProperties: false,
+      required: ["path"],
+      properties: {
+        path: {
+          type: "string",
+          description:
+            "Project-root-relative workflow file (e.g. \".opencode/workflows/audit.js\"). PREFERRED for scripts longer than ~30 lines: author the file with your file-write tool, then run it by path — never embed long scripts as strings in tool input (generic execute sandboxes mangle escapes). Read at call time; trust level equals an inline { script }.",
+        },
+        args: { description: "JSON value exposed to the script as `args` (max 64 KB serialized)." },
+        background: {
+          type: "boolean",
+          description:
+            "Default true: return immediately after admission with { runID, status: \"running\", hint }. Pass false to block until the envelope.",
+        },
+        resumeFrom: {
+          type: "string",
+          description: "Warm-start from a prior run id (run_…): keyed succeeded agents replay from cache.",
+        },
+        timeoutMs: RUN_TIMEOUT_MS_PROPERTY,
+      },
+    },
+    {
+      type: "object",
+      additionalProperties: false,
+      required: ["template"],
+      properties: {
+        template: {
+          type: "string",
+          description:
+            "Served script-template name (staged-delivery, verify-fix — see ultracode_catalog { scriptTemplates: true }): run it directly without copying the body.",
+        },
+        args: { description: "JSON value feeding the template's declared params (see ultracode_catalog for each template's args)." },
+        background: {
+          type: "boolean",
+          description: "Default true: return immediately after admission. Pass false to block until the envelope.",
+        },
+        resumeFrom: {
+          type: "string",
+          description: "Warm-start from a prior run id (run_…): keyed succeeded agents replay from cache.",
         },
         timeoutMs: RUN_TIMEOUT_MS_PROPERTY,
       },
@@ -556,6 +602,30 @@ export default Plugin.define({
                 : undefined
           agents.push(desc ? { id, description: desc } : { id })
         }
+        // agentScope "configured": only agents the user actually manages
+        // (agents/*.md in project or global config — the subagent-config
+        // set), not disabled, and not pinned to a provider the user took
+        // offline. Shipped file-less agents (build, plan, …) are excluded
+        // until the user creates their file; filter failures fail open to
+        // the host list.
+        if (options.agentScope === "configured") {
+          const home = process.env["HOME"] ?? homedir()
+          let disabledProviders: ReadonlySet<string> = new Set()
+          try {
+            disabledProviders = await readDisabledProviders(fs, projectRoot, home)
+          } catch {
+            // best-effort — empty set fails open
+          }
+          const filtered: typeof agents = []
+          for (const a of agents) {
+            try {
+              if (await agentUsable(fs, projectRoot, home, a.id, disabledProviders)) filtered.push(a)
+            } catch {
+              filtered.push(a)
+            }
+          }
+          return { ok: true, agents: filtered }
+        }
         return { ok: true, agents }
       } catch (err) {
         return { ok: false, error: describeError(err) }
@@ -626,8 +696,21 @@ export default Plugin.define({
         // config the client reads and apply it at create time. Per-call, so
         // re-pinning applies to the next spawned child.
         pinForAgent: async (agentId: string) => {
-          const pin = await lookupAgentPin(fs, projectRoot, process.env["HOME"] ?? homedir(), agentId)
-          return pin !== undefined ? parseModelPin(pin) : undefined
+          const home = process.env["HOME"] ?? homedir()
+          const pin = await lookupAgentPin(fs, projectRoot, home, agentId)
+          if (pin === undefined) return undefined
+          const parsed = parseModelPin(pin)
+          if (parsed === undefined) return undefined
+          // Offline provider (subagent-config provider off): skip the pin —
+          // AgentRunner falls back to the default agent's pin (also guarded
+          // here) rather than spawning on a provider the user turned off.
+          try {
+            const disabled = await readDisabledProviders(fs, projectRoot, home)
+            if (disabled.has(parsed.providerID)) return undefined
+          } catch {
+            // best-effort check — fail open
+          }
+          return parsed
         },
       })
     } catch (err) {
@@ -765,6 +848,39 @@ export default Plugin.define({
                     phases: saved.manifest.phases,
                     requires: saved.manifest.requires,
                   }
+                  args = input.args
+                } else if ("path" in input) {
+                  // Project-file run: the authoring agent writes the file with
+                  // its file tool, then runs it by path — no string embedding.
+                  // Trust equals an inline { script }: the user's own agent
+                  // wrote the file deliberately. Read at call time (edits
+                  // apply on the next run) through the SAME fail-closed,
+                  // symlink-aware containment every other workflow-file access
+                  // uses — a link escaping the project root is refused.
+                  const read = await readProjectWorkflowFile(fs, projectRoot, input.path)
+                  if (!read.ok) {
+                    return {
+                      content:
+                        `error: ${read.error}. ` +
+                        'Write it first (e.g. .opencode/workflows/<name>.js), then run { path: ".opencode/workflows/<name>.js" }.',
+                    }
+                  }
+                  script = read.content
+                  name = read.name
+                  meta = { name: read.name }
+                  args = input.args
+                } else if ("template" in input) {
+                  const t = scriptTemplate(input.template)
+                  if (!t) {
+                    return {
+                      content:
+                        `error: unknown script template "${input.template}" — known: ${SCRIPT_TEMPLATES.map((x) => x.name).join(", ")}. ` +
+                        "Inspect one with ultracode_catalog { scriptTemplate: \"<name>\" }.",
+                    }
+                  }
+                  script = t.script
+                  name = t.name
+                  meta = { name: t.name, description: t.description }
                   args = input.args
                 } else {
                   script = input.script
@@ -1306,6 +1422,19 @@ export default Plugin.define({
               if (controller.signal.aborted) break
               const ev = raw as { type?: string; created?: number; data?: { sessionID?: string; id?: string } }
               if (typeof ev?.type !== "string") continue
+              // Child-liveness feed FIRST: any event carrying a child
+              // sessionID — including permission.asked, so a child legitimately
+              // waiting on a user-visible ask never accrues stall time — bumps
+              // its last-activity timestamp (childStallMs watchdog consumes
+              // it; non-children are a cheap map miss).
+              const sid = (ev.data as { sessionID?: string } | undefined)?.sessionID
+              if (typeof sid === "string" && supervisor) {
+                try {
+                  supervisor.noteChildActivity(sid)
+                } catch {
+                  // never throw from the event loop
+                }
+              }
               if (ev.type === "permission.asked") handlePermissionAsked(ev.data)
               else if (ev.type === "permission.replied") handlePermissionReplied(ev.data)
               state = feedToolEvent(

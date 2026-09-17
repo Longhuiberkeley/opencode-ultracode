@@ -65,7 +65,9 @@ test("skill content teaches routing + preflight + structure knobs", () => {
 })
 
 test("skill content contains no provider or model ids", () => {
-  const modelRef = SKILL_CONTENT.match(/[a-z-]+\/[a-z0-9.:-]+/)
+  // Dot-relative paths (.opencode/workflows/…) are config paths, not pins.
+  const stripped = SKILL_CONTENT.replace(/\S*opencode\S*/g, " ")
+  const modelRef = stripped.match(/[a-z-]+\/[a-z0-9.:-]+/)
   assert.equal(modelRef, null, `provider/model-looking ref in skill: ${modelRef?.[0]}`)
   assert.doesNotMatch(SKILL_CONTENT, /\b(opus|sonnet)\b|\b(gpt|claude)-/i, "model family name in skill")
 })

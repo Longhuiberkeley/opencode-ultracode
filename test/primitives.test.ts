@@ -5,7 +5,7 @@
  */
 import test from "node:test"
 import assert from "node:assert/strict"
-import { AgentRunner, Semaphore, getWorkflowComposer, parallelHelper, pipelineHelper, storageWorkflowLoader, buildWarmCache, agentCacheDigest } from "../src/primitives.ts"
+import { AgentRunner, Semaphore, getWorkflowComposer, parallelHelper, pipelineHelper, storageWorkflowLoader, buildWarmCache, agentCacheDigest, clampRetryAttempts, clampRetryBackoffMs, delayAbortable } from "../src/primitives.ts"
 import { compileGraphSpec } from "../src/graph.ts"
 import type { GraphSpec } from "../src/graph.ts"
 import type { AgentRunnerOptions } from "../src/primitives.ts"
@@ -580,4 +580,107 @@ test("AgentRunner warm cache: schema or agent changes flip the digest (no stale 
   assert.equal(calls.length, 1, "same prompt but different schema/agent must spawn")
   calls[0]!.resolve(okResult("ses_schema"))
   await pending
+})
+
+// ---------------------------------------------------------------------------
+// Outcome-failure retry with backoff (agentRetryAttempts / opts.retry)
+// ---------------------------------------------------------------------------
+
+test("AgentRunner retry: outcome failure retried, same record, success after retry", async () => {
+  const { registry, run, calls, runner, reports } = makeRunner({ retryAttempts: 1, retryBackoffMs: 0 })
+  const pending = runner.call("do work", { label: "w1" })
+  await tick()
+  assert.equal(calls.length, 1)
+  calls[0]!.reject(new AgentCallError("outcome", 'agent session outcome "failed"'))
+  await tick()
+  assert.equal(calls.length, 2, "outcome failure must be retried once")
+  calls[1]!.resolve(okResult("ses_retry"))
+  assert.equal((await pending).sessionID, "ses_retry")
+  const rec = registry.getAgent(run.id, "a1")!
+  assert.equal(rec.status, "succeeded")
+  assert.ok(reports.some((r) => r.includes("retry 1/1")), `expected retry report, got: ${reports.join(" / ")}`)
+})
+
+test("AgentRunner retry: abort and schema errors are never retried", async () => {
+  const { registry, run, calls, runner } = makeRunner({ retryAttempts: 2, retryBackoffMs: 0 })
+  const p1 = runner.call("a", {})
+  await tick()
+  calls[0]!.reject(new AgentCallError("abort", "agent aborted: run stopping"))
+  await assert.rejects(p1)
+  const p2 = runner.call("b", {})
+  await tick()
+  calls[1]!.reject(new AgentCallError("schema", "structured output still invalid after repair"))
+  await assert.rejects(p2)
+  assert.equal(calls.length, 2, "no retries for abort/schema errors")
+  assert.equal(registry.getAgent(run.id, "a1")!.status, "interrupted")
+  assert.equal(registry.getAgent(run.id, "a2")!.status, "failed")
+})
+
+test("AgentRunner retry: attempts exhausted -> failure surfaces", async () => {
+  const { registry, run, calls, runner } = makeRunner({ retryAttempts: 1, retryBackoffMs: 0 })
+  const pending = runner.call("c", {})
+  await tick()
+  calls[0]!.reject(new AgentCallError("outcome", 'agent session outcome "failed"'))
+  await tick()
+  calls[1]!.reject(new AgentCallError("outcome", 'agent session outcome "failed"'))
+  await assert.rejects(pending, /outcome "failed"/)
+  assert.equal(registry.getAgent(run.id, "a1")!.status, "failed")
+})
+
+test("AgentRunner retry: per-call opts.retry overrides plugin default", async () => {
+  const { calls, runner } = makeRunner({ retryAttempts: 0, retryBackoffMs: 0 })
+  const pending = runner.call("d", { retry: { attempts: 1 } })
+  await tick()
+  calls[0]!.reject(new AgentCallError("outcome", "down"))
+  await tick()
+  assert.equal(calls.length, 2, "per-call retry must apply when plugin default is 0")
+  calls[1]!.resolve(okResult("ses_x"))
+  assert.equal((await pending).sessionID, "ses_x")
+})
+
+test("AgentRunner spawnModel: resolved pin recorded on the agent record", async () => {
+  const { registry, run, calls, runner } = makeRunner({
+    pinForAgent: async () => ({ providerID: "xai", id: "grok-4.6", variant: "high" }),
+  })
+  const pending = runner.call("pinned", {})
+  await tick()
+  calls[0]!.resolve(okResult("ses_p"))
+  await pending
+  assert.deepEqual(registry.getAgent(run.id, "a1")!.spawnModel, {
+    providerID: "xai",
+    id: "grok-4.6",
+    variant: "high",
+  })
+})
+
+test("delayAbortable: abort during backoff rejects immediately", async () => {
+  const c = new AbortController()
+  const p = delayAbortable(10_000, c.signal)
+  c.abort()
+  await assert.rejects(p, /run stopping/)
+})
+
+test("retry clamps: attempts 0..3, backoff 0..120000", () => {
+  assert.equal(clampRetryAttempts(undefined, 1), 1)
+  assert.equal(clampRetryAttempts(9, 0), 3)
+  assert.equal(clampRetryAttempts(-2, 2), 0)
+  assert.equal(clampRetryBackoffMs(999_999, 5_000), 120_000)
+  assert.equal(clampRetryBackoffMs(-1, 5_000), 0)
+})
+
+test("delayAbortable: resolves after ms and cleans up listeners when not aborted", async () => {
+  const c = new AbortController()
+  let listeners = 0
+  const origAdd = c.signal.addEventListener.bind(c.signal)
+  c.signal.addEventListener = ((type: string, fn: unknown, opts?: unknown) => {
+    listeners++
+    return origAdd(type, fn as EventListener, opts as AddEventListenerOptions)
+  }) as typeof c.signal.addEventListener
+  const start = Date.now()
+  await delayAbortable(20, c.signal)
+  assert.ok(Date.now() - start >= 15, "waited the delay")
+  assert.ok(listeners <= 1, `listener count sane: ${listeners}`)
+  // No abort fires afterwards — the cleaned-up listener must not throw.
+  c.abort()
+  await tick(5)
 })

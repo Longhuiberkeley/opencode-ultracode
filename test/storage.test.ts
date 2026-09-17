@@ -15,6 +15,7 @@ import {
   WORKFLOW_NAME_RE,
   buildGraphBody,
   normalizePath,
+  readProjectWorkflowFile,
   resolveContainedPath,
 } from "../src/storage.ts"
 import { compileGraphSpec } from "../src/graph.ts"
@@ -1151,4 +1152,40 @@ test("RunRecord.graphSpec survives the KV round-trip (a restarted server can sti
   await second.storage.loadRunsAsync()
   const loaded = second.storage.loadRuns().find((r) => r.id === "run_graph1")
   assert.deepEqual(loaded?.graphSpec, run.graphSpec)
+})
+
+// ---------------------------------------------------------------------------
+// readProjectWorkflowFile ({ path } runs — symlink-aware containment)
+// ---------------------------------------------------------------------------
+
+test("readProjectWorkflowFile: reads content, derives stem name", async () => {
+  const fs = new FakeFs()
+  await fs.writeFile("/proj/.opencode/workflows/audit.js", "return 1")
+  const r = await readProjectWorkflowFile(fs, "/proj", ".opencode/workflows/audit.js")
+  assert.equal(r.ok, true)
+  if (r.ok) {
+    assert.equal(r.content, "return 1")
+    assert.equal(r.name, "audit")
+  }
+})
+
+test("readProjectWorkflowFile: symlink escaping the project root is refused (fail closed)", async () => {
+  const fs = new FakeFs()
+  await fs.writeFile("/outside/secret.js", "steal()")
+  fs.symlinks.set("/proj/.opencode/workflows/evil.js", "/outside/secret.js")
+  const r = await readProjectWorkflowFile(fs, "/proj", ".opencode/workflows/evil.js")
+  assert.equal(r.ok, false)
+  if (!r.ok) assert.match(r.error, /refusing|not inside/)
+})
+
+test("readProjectWorkflowFile: missing and empty files are precise errors", async () => {
+  const fs = new FakeFs()
+  await fs.writeFile("/proj/.opencode/workflows/.anchor", "") // project tree exists
+  const missing = await readProjectWorkflowFile(fs, "/proj", ".opencode/workflows/nope.js")
+  assert.equal(missing.ok, false)
+  if (!missing.ok) assert.match(missing.error, /not found/)
+  await fs.writeFile("/proj/.opencode/workflows/empty.js", "   ")
+  const empty = await readProjectWorkflowFile(fs, "/proj", ".opencode/workflows/empty.js")
+  assert.equal(empty.ok, false)
+  if (!empty.ok) assert.match(empty.error, /empty/)
 })

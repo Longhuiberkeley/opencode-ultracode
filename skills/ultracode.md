@@ -13,10 +13,18 @@ Two ways to author, and the order matters:
 2. **Script** — a plain-JS async function body. The escape hatch for what nodes cannot express:
    bounded loops, retries, conditional re-planning, arithmetic over intermediates.
 
-Invoke `ultracode_run` with `{ graph, args? }`, `{ script, name?, meta?, args? }`, or
-`{ workflow: "name", args? }` (saved). Every form also takes `background` and `resumeFrom` — a
+Invoke `ultracode_run` with `{ graph, args? }`, `{ script, name?, meta?, args? }`, `{ path, args? }`
+(a project-root-relative workflow file you write with your file tool — preferred for anything over
+~30 lines), `{ template: "name", args? }` (served script template), or `{ workflow: "name", args? }`
+(saved). Every form also takes `background` and `resumeFrom` — a
 prior runID that warm-starts the run so keyed succeeded agents replay from cache and an
 interrupted long run costs only its unfinished tail. `meta` and `args` are injected as globals.
+
+**Never embed a long script as a string in tool input.** Author it as
+`.opencode/workflows/<name>.js` with your file-write tool, then run
+`{ path: ".opencode/workflows/<name>.js", args }` (no `/ultracode save` or trust
+needed). Escaping a large script through a generic
+execute/JS sandbox mangles it (workflow globals only exist inside `ultracode_run`).
 
 ## Discovery first: ultracode_catalog
 

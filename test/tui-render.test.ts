@@ -10,12 +10,15 @@ import {
   STATUS_DOT,
   agentRows,
   applySettleTick,
+  blockedSessionIDs,
+  buildAskSelectOptions,
   cacheDecision,
   canRefreshRunSettings,
   chipCounts,
   compactRunAcks,
   cycleRunSelection,
   defaultRunIndex,
+  dedupePendingPermissions,
   detailsCacheEntry,
   detailsFromMessages,
   filterSessionsForChip,
@@ -23,6 +26,7 @@ import {
   formatChipText,
   formatCounts,
   formatPermissionLines,
+  formatStandalonePermissionLines,
   formatDetailLines,
   formatTreeLines,
   groupRuns,
@@ -30,6 +34,7 @@ import {
   inspectPaneView,
   inspectPhaseList,
   inspectSelFromSelection,
+  markBlockedTreeRows,
   moveTree,
   nextSettlePrev,
   buildInspectTree,
@@ -45,6 +50,7 @@ import {
   phaseDetailLines,
   runStripLines,
   runsForParent,
+  standalonePendingPermissions,
   phaseColumns,
   statusDot,
   planSettleCheck,
@@ -72,10 +78,12 @@ import {
   twoColumn,
   type InspectPane,
   type InspectSelection,
+  type PendingPermissionView,
   type RunAgentView,
   type RunView,
   type SessionView,
   type SettlePrev,
+  type TreeRow,
   type TreeSelection,
 } from "../src/tui-render.ts"
 
@@ -1592,8 +1600,8 @@ test("tui chip paints formatChipText and binds ctrl+g, not return", () => {
   assert.match(tuiSrc, /toggleFollowPin\(/)
   assert.match(tuiSrc, /client\?\.permission/)
   assert.match(tuiSrc, /replyPermission\("once"\)/)
+  assert.match(tuiSrc, /replyPermission\("always"\)/)
   assert.match(tuiSrc, /replyPermission\("reject"\)/)
-  assert.doesNotMatch(tuiSrc, /reply:\s*"always"/)
   assert.match(tuiSrc, /includeFinished:\s*true/)
 })
 
@@ -1761,4 +1769,124 @@ test("parsePermissionList and formatPermissionLines: blocked child, never always
   assert.doesNotMatch(lines[0]!, /allow once/, "key hints live in the footer only")
   assert.match(lines[1]!, /ses_child/)
   assert.doesNotMatch(lines.join("\n"), /always/)
+})
+
+test("standalonePendingPermissions: only sessions owned by no displayed run", () => {
+  const run: RunView = {
+    runID: "run_a",
+    agents: [{ sessionID: "ses_child", status: "running", title: "t" }],
+    phases: [],
+    counts: { total: 1, done: 0, failed: 0 },
+    startedAt: 0,
+    settled: false,
+  }
+  const items = [
+    { id: "perm_run", sessionID: "ses_child", action: "edit", resources: ["/a"] },
+    { id: "perm_sub", sessionID: "ses_reviewer", action: "read", resources: ["x.env"] },
+    { id: "perm_sub2", sessionID: "ses_explore", action: "external_directory", resources: ["/ext/*"] },
+  ]
+  const standalone = standalonePendingPermissions(items, [run])
+  assert.deepEqual(standalone.map((p) => p.id), ["perm_sub", "perm_sub2"])
+  assert.deepEqual(standalonePendingPermissions([], [run]), [])
+  assert.deepEqual(standalonePendingPermissions(items, []), items)
+})
+
+test("dedupePendingPermissions keeps first occurrence per request id", () => {
+  const a = { id: "p1", sessionID: "s1", action: "read", resources: [] }
+  const b = { id: "p2", sessionID: "s1", action: "shell", resources: [] }
+  const dup = { id: "p1", sessionID: "s2", action: "edit", resources: [] }
+  assert.deepEqual(dedupePendingPermissions([a, b, dup, a]), [a, b])
+})
+
+test("blockedSessionIDs and markBlockedTreeRows flag awaiting-permission rows", () => {
+  const items = [
+    { id: "p1", sessionID: "ses_child", action: "edit", resources: ["/a"] },
+    { id: "p2", sessionID: "ses_child", action: "shell", resources: ["pytest x"] },
+  ]
+  assert.deepEqual(blockedSessionIDs(items), new Set(["ses_child"]))
+  const rows: TreeRow[] = [
+    { kind: "phase", id: "scan", label: "scan 1/1", phase: "scan", status: "running", expanded: true, depth: 0 },
+    { kind: "agent", id: "ses_child", label: "rev", phase: "scan", sessionID: "ses_child", status: "running", depth: 1 },
+    { kind: "agent", id: "ses_ok", label: "ok", phase: "scan", sessionID: "ses_ok", status: "running", depth: 1 },
+  ]
+  const marked = markBlockedTreeRows(rows, blockedSessionIDs(items))
+  assert.equal(marked[0], rows[0], "phase rows untouched")
+  assert.equal(marked[2], rows[2], "unblocked agent rows untouched")
+  assert.equal(marked[1]!.blocked, true)
+  assert.match(marked[1]!.label, /rev ⚠$/)
+})
+
+test("formatStandalonePermissionLines: header, lines, cap, and key hints", () => {
+  const mk = (i: number): PendingPermissionView => ({
+    id: `p${i}`,
+    sessionID: `ses_${i}`,
+    action: "read",
+    resources: [`f${i}.env`],
+  })
+  assert.deepEqual(formatStandalonePermissionLines([]), [])
+  const one = formatStandalonePermissionLines([mk(1)])
+  assert.match(one[0]!, /subagents awaiting permission 1/)
+  assert.match(one[1]!, /read ses_1 f1\.env/)
+  assert.match(one[2]!, /y allow once · a allow always · n reject · enter open/)
+  const many = formatStandalonePermissionLines([mk(1), mk(2), mk(3), mk(4), mk(5)])
+  assert.equal(many.length, 6)
+  assert.match(many[4]!, /\+2 more/)
+})
+
+test("buildAskSelectOptions: always-first, current always, truncated title", () => {
+  const item: PendingPermissionView = {
+    id: "p1",
+    sessionID: "ses_1",
+    action: "edit",
+    resources: ["/proj/src/foo.ts"],
+  }
+  const built = buildAskSelectOptions(item)
+  assert.equal(built.current, "always")
+  assert.equal(built.title, "Subagent permission: edit — /proj/src/foo.ts")
+  assert.equal(built.title.includes("\n"), false)
+  assert.deepEqual(
+    built.options.map((o) => o.value),
+    ["always", "once", "reject"],
+  )
+  assert.deepEqual(
+    built.options.map((o) => o.title),
+    ["Allow always", "Allow once", "Reject"],
+  )
+  for (const option of built.options) {
+    assert.ok(option.description.length > 0)
+  }
+  assert.match(built.options[0]!.description, /durable project rule/)
+  assert.match(built.options[1]!.description, /just this request/)
+  assert.match(built.options[2]!.description, /refusal/)
+
+  const long = "x".repeat(80)
+  const truncated = buildAskSelectOptions({ ...item, resources: [long] })
+  assert.equal(truncated.title, `Subagent permission: edit — ${clip(long, 60)}`)
+  assert.ok(truncated.title.endsWith("…"))
+  assert.equal(truncated.title.includes("\n"), false)
+
+  const empty = buildAskSelectOptions({ id: "p2", sessionID: "ses_2", action: "read", resources: [] })
+  assert.equal(empty.title, "Subagent permission: read — ?")
+
+  const viaMessage = buildAskSelectOptions({
+    id: "p3",
+    sessionID: "ses_3",
+    action: "shell",
+    resources: [],
+    message: "npm test",
+  })
+  assert.equal(viaMessage.title, "Subagent permission: shell — npm test")
+})
+
+test("formatChipText: subagent asks show standalone, even with zero runs", () => {
+  assert.equal(formatChipText({ running: 0, paused: 0, failed: 0, subagentBlocked: 1 }), "ultracode · 1 subagent awaiting permission")
+  assert.equal(
+    formatChipText({ running: 0, paused: 0, failed: 0, subagentBlocked: 3 }),
+    "ultracode · 3 subagents awaiting permission",
+  )
+  assert.equal(
+    formatChipText({ running: 1, paused: 0, failed: 0, agents: 2, blocked: 1, subagentBlocked: 1 }),
+    "ultracode · 1 run · 2 agents · 1 awaiting permission · 1 subagent awaiting permission",
+  )
+  assert.equal(formatChipText({ running: 0, paused: 0, failed: 1, subagentBlocked: 0 }), "", "zero standalone stays hidden")
 })

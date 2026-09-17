@@ -9,11 +9,14 @@
  * keys, wrong types and oversized inputs with precise messages.
  */
 import { CONTROL_ACTIONS, type ControlAction } from "./control.ts"
+import { SCRIPT_TEMPLATES } from "./script-templates.ts"
 import type {
   GraphRunInput,
   InlineRunInput,
   Json,
+  PathRunInput,
   SavedRunInput,
+  TemplateRunInput,
   WorkflowMeta,
   WorkflowToolInput,
 } from "./types.ts"
@@ -161,6 +164,8 @@ export function validateToolInput(raw: unknown): ToolInputResult {
 
   const hasScript = has(raw, "script")
   const hasWorkflow = has(raw, "workflow")
+  const hasPath = has(raw, "path")
+  const hasTemplate = has(raw, "template")
 
   if (hasScript && hasWorkflow) {
     return { ok: false, error: `input cannot specify both "script" and "workflow" — choose one` }
@@ -169,6 +174,15 @@ export function validateToolInput(raw: unknown): ToolInputResult {
   const hasGraph = has(raw, "graph")
   if ((hasScript || hasWorkflow) && hasGraph) {
     return { ok: false, error: `input cannot combine "graph" with "script"/"workflow" — choose one` }
+  }
+  const sourceKeys = [hasScript && "script", hasWorkflow && "workflow", hasGraph && "graph", hasPath && "path", hasTemplate && "template"].filter(
+    (k): k is string => typeof k === "string",
+  )
+  if (sourceKeys.length > 1) {
+    return {
+      ok: false,
+      error: `input cannot combine ${sourceKeys.map((k) => `"${k}"`).join(" and ")} — choose one`,
+    }
   }
 
   if (hasGraph) {
@@ -248,6 +262,92 @@ export function validateToolInput(raw: unknown): ToolInputResult {
     return { ok: true, input }
   }
 
+  if (hasPath) {
+    // ---- project-file shape: author with the file tool, run by path ----
+    const extra = rejectExtras(raw, new Set(["path", "args", "background", "resumeFrom", "timeoutMs"]))
+    if (extra) return { ok: false, error: extra }
+
+    const path = raw["path"]
+    if (typeof path !== "string" || path.trim() === "") {
+      return { ok: false, error: `"path" must be a non-empty string, got ${typeOf(path) === "string" ? "empty string" : typeOf(path)}` }
+    }
+    if (path.startsWith("/") || path.startsWith("~")) {
+      return { ok: false, error: `"path" must be relative to the project root, got an absolute/home path: ${JSON.stringify(path)}` }
+    }
+    if (path.includes("\\")) {
+      return { ok: false, error: `"path" must use / separators (POSIX-style), got backslashes: ${JSON.stringify(path)}` }
+    }
+    const segments = path.split("/")
+    if (segments.some((s) => s === "..")) {
+      return { ok: false, error: `"path" must stay inside the project root (".." segments rejected): ${JSON.stringify(path)}` }
+    }
+    if (!/\.(js|mjs|cjs|ts|mts|cts)$/i.test(segments[segments.length - 1] ?? "")) {
+      return { ok: false, error: `"path" must point at a JavaScript/TypeScript workflow file (.js/.mjs/.cjs/.ts), got ${JSON.stringify(path)}` }
+    }
+
+    const args = validateArgs(raw["args"])
+    if (!args.ok) return { ok: false, error: args.error }
+    if (args.serializedBytes > MAX_ARGS_BYTES) {
+      return {
+        ok: false,
+        error: `"args" is too large: ${args.serializedBytes} bytes serialized (max ${MAX_ARGS_BYTES}). Pass large data via a saved workflow or trim the payload`,
+      }
+    }
+    const background = validateBackground(raw)
+    if (!background.ok) return { ok: false, error: background.error }
+    const resume = validateResumeFrom(raw)
+    if (!resume.ok) return { ok: false, error: resume.error }
+    const timeout = validateTimeoutMs(raw)
+    if (!timeout.ok) return { ok: false, error: timeout.error }
+
+    const input: PathRunInput = { path }
+    if (raw["args"] !== undefined) input.args = args.args
+    if (background.background !== undefined) input.background = background.background
+    if (resume.resumeFrom !== undefined) input.resumeFrom = resume.resumeFrom
+    if (timeout.timeoutMs !== undefined) input.timeoutMs = timeout.timeoutMs
+    return { ok: true, input }
+  }
+
+  if (hasTemplate) {
+    // ---- served script-template shape (args feed declared params) ----
+    const extra = rejectExtras(raw, new Set(["template", "args", "background", "resumeFrom", "timeoutMs"]))
+    if (extra) return { ok: false, error: extra }
+
+    const template = raw["template"]
+    if (typeof template !== "string" || template.trim() === "") {
+      return { ok: false, error: `"template" must be a non-empty string, got ${typeOf(template) === "string" ? "empty string" : typeOf(template)}` }
+    }
+    const known = SCRIPT_TEMPLATES.some((t) => t.name === template)
+    if (!known) {
+      return {
+        ok: false,
+        error: `unknown script template ${JSON.stringify(template)} — known: ${SCRIPT_TEMPLATES.map((t) => t.name).join(", ")}`,
+      }
+    }
+
+    const args = validateArgs(raw["args"])
+    if (!args.ok) return { ok: false, error: args.error }
+    if (args.serializedBytes > MAX_ARGS_BYTES) {
+      return {
+        ok: false,
+        error: `"args" is too large: ${args.serializedBytes} bytes serialized (max ${MAX_ARGS_BYTES}). Pass large data via a saved workflow or trim the payload`,
+      }
+    }
+    const background = validateBackground(raw)
+    if (!background.ok) return { ok: false, error: background.error }
+    const resume = validateResumeFrom(raw)
+    if (!resume.ok) return { ok: false, error: resume.error }
+    const timeout = validateTimeoutMs(raw)
+    if (!timeout.ok) return { ok: false, error: timeout.error }
+
+    const input: TemplateRunInput = { template }
+    if (raw["args"] !== undefined) input.args = args.args
+    if (background.background !== undefined) input.background = background.background
+    if (resume.resumeFrom !== undefined) input.resumeFrom = resume.resumeFrom
+    if (timeout.timeoutMs !== undefined) input.timeoutMs = timeout.timeoutMs
+    return { ok: true, input }
+  }
+
   if (hasScript) {
     // ---- inline-script shape ----
     const extra = rejectExtras(raw, new Set(["script", "name", "meta", "args", "background", "resumeFrom", "timeoutMs"]))
@@ -264,7 +364,7 @@ export function validateToolInput(raw: unknown): ToolInputResult {
     if (scriptBytes > MAX_SCRIPT_BYTES) {
       return {
         ok: false,
-        error: `"script" is too large: ${scriptBytes} bytes (max ${MAX_SCRIPT_BYTES}). Move long workflows into a saved workflow file`,
+        error: `"script" is too large: ${scriptBytes} bytes (max ${MAX_SCRIPT_BYTES}). Author it as .opencode/workflows/<name>.js and run { path } instead`,
       }
     }
 
@@ -308,7 +408,7 @@ export function validateToolInput(raw: unknown): ToolInputResult {
 
   return {
     ok: false,
-    error: `input must specify either "script" (inline workflow source) or "workflow" (saved workflow name)`,
+    error: `input must specify one of "script" (inline source), "workflow" (saved name), "path" (project file), "template" (served script template) or "graph" (DAG spec)`,
   }
 }
 

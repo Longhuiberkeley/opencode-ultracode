@@ -148,9 +148,11 @@ export function createSessionDriver(sessions: SessionCtx, options: SessionDriver
     const info = await sessions.get({ sessionID })
     const first = await readAssistantReply(sessions, sessionID, info.outcome)
     if (info.outcome !== "succeeded") {
+      const detail = describeSessionFailure(info, first.message)
       throw new AgentCallError(
         "outcome",
-        `agent session outcome "${info.outcome ?? "unknown"}"${first.text ? `: ${snippet(first.text, snippetChars)}` : ""}`,
+        `agent session outcome "${info.outcome ?? "unknown"}"${detail ? `: ${snippet(detail, snippetChars)}` : ""}` +
+          (first.text ? `${detail ? " | " : ": "}${snippet(first.text, snippetChars)}` : ""),
         first.text,
       )
     }
@@ -275,6 +277,31 @@ export function createSessionDriver(sessions: SessionCtx, options: SessionDriver
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Best-effort failure detail for a non-succeeded outcome: the server-side
+ * error text (when exposed) plus any error part on the last message. Empty
+ * string when nothing is available — never throws.
+ */
+export function describeSessionFailure(
+  info: { error?: string },
+  last: ContextMessage | undefined,
+): string {
+  const parts: string[] = []
+  if (typeof info.error === "string" && info.error.length > 0) parts.push(info.error)
+  if (last?.content) {
+    for (const part of last.content) {
+      if (part.type === "error" && typeof part.text === "string" && part.text.length > 0) {
+        parts.push(part.text)
+        break // one error part is enough signal
+      }
+    }
+  }
+  if (parts.length === 0 && last?.finish && last.finish !== "stop" && last.finish !== "unknown") {
+    parts.push(`finish: ${last.finish}`)
+  }
+  return parts.join(" | ")
+}
 
 function resolveAgent(input: AgentRunInput, availableAgents: string[] | undefined): string {
   if (input.agent !== undefined) {

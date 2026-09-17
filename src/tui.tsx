@@ -37,6 +37,11 @@ import {
   PANE_TITLE_LIVE,
   PANE_TITLE_SETTINGS,
   compactRunAcks,
+  blockedSessionIDs,
+  buildAskSelectOptions,
+  dedupePendingPermissions,
+  formatStandalonePermissionLines,
+  markBlockedTreeRows,
   parsePermissionList,
   parseRunAck,
   pausedRunIDsFromAcks,
@@ -48,6 +53,7 @@ import {
   settingsPaneView,
   shouldEnableTui,
   shortRunID,
+  standalonePendingPermissions,
   toggleExpand,
   wrapPaneLines,
   splitPanelWidth,
@@ -120,6 +126,13 @@ type UiApi = {
   dialog?: {
     confirm?: (opts: { title: string; message: string; label?: { confirm: string; cancel: string } }) => Promise<boolean>
     prompt?: (opts: { title: string; description?: string; placeholder?: string }) => Promise<string | undefined>
+    /** Multi-option dialog (SDK DialogSelectOptions); `current` preselects. */
+    select?: <Value>(opts: {
+      title: string
+      placeholder?: string
+      options: ReadonlyArray<{ title: string; value: Value; description?: string; disabled?: boolean }>
+      current?: Value
+    }) => Promise<Value | undefined>
   }
   router?: { current?: () => { type?: string; sessionID?: string }; navigate?: (input: { type: "session"; sessionID: string }) => void }
 }
@@ -147,7 +160,15 @@ type TuiContext = {
     message?: { list?: (input: unknown) => Promise<unknown> }
     permission?: {
       list?: (input: { sessionID: string }) => Promise<unknown>
-      reply?: (input: { sessionID: string; requestID: string; reply: "once" | "reject" }) => Promise<void>
+      request?: {
+        list?: (input?: { location?: { directory?: string; workspace?: string } }) => Promise<unknown>
+      }
+      reply?: (input: {
+        sessionID: string
+        requestID: string
+        reply: "once" | "always" | "reject"
+        message?: string
+      }) => Promise<void>
     }
     rpc?: (definition: unknown) => {
       runStatus?: (input?: unknown, options?: unknown) => Promise<unknown>
@@ -171,7 +192,7 @@ type InspectState = {
 
 type RowDetails = DetailCacheEntry
 
-const PANEL_KEYS = ["up", "down", "left", "right", "h", "l", "x", "p", "s", "r", "return", "esc", "ctrl+g", "[", "]", ".", "f", "y", "n", "+", "-", "="] as const
+const PANEL_KEYS = ["up", "down", "left", "right", "h", "l", "x", "p", "s", "r", "return", "esc", "ctrl+g", "[", "]", ".", "f", "y", "a", "n", "+", "-", "="] as const
 
 function treeSelEqual(a: TreeSelection | undefined, b: TreeSelection | undefined): boolean {
   if (a === b) return true
@@ -541,8 +562,63 @@ export default Plugin.define({
         return out
       }
 
+      /** Session the user is currently viewing — its asks render natively. */
+      const viewedSessionID = (): string | undefined =>
+        transportSessionID(context.ui?.router?.current?.()?.sessionID, context.ui?.router) ?? currentParentID()
+
+      /**
+       * Location-wide pending asks in one call (plain subagents included).
+       * Undefined when the client method is missing → caller falls back to the
+       * per-session store scan.
+       */
+      const fetchStandalonePermissions = async (): Promise<PendingPermissionView[] | undefined> => {
+        const list = context.client?.permission?.request?.list
+        if (typeof list !== "function") return undefined
+        const scope = chipScopeFromContext(context)
+        const input = scope?.directory !== undefined ? { location: { directory: scope.directory } } : undefined
+        const raw = await list(input)
+        const parsed = parsePermissionList(raw)
+        const viewed = viewedSessionID()
+        return viewed ? parsed.filter((p) => p.sessionID !== viewed) : parsed
+      }
+
+      /** Sync store fallback for standalone sessions (subagents, background). */
+      const standaloneFromStore = (): PendingPermissionView[] => {
+        const out: PendingPermissionView[] = []
+        const viewed = viewedSessionID()
+        try {
+          for (const s of scopedSessionSnapshot()) {
+            if (!s.id || s.id === viewed) continue
+            try {
+              const listed = context.data?.session?.permission?.list?.(s.id)
+              out.push(...parsePermissionList(listed))
+            } catch {
+              // host store may omit permission
+            }
+          }
+        } catch {
+          // snapshot failure — keep empty
+        }
+        return out
+      }
+
       let permissionGeneration = 0
       let permissionPollKey: string | undefined
+      // Pending-ask announcement state (shared by poll and event paths).
+      const seenAskIDs = new Set<string>()
+      let askDialogBusy = false
+      const askDialogQueue: PendingPermissionView[] = []
+      let panelFocused = false
+
+      /** Set the pending list and prune announce-seen ids that no longer exist. */
+      const applyBlockedPerms = (items: readonly PendingPermissionView[]): void => {
+        setBlockedPerms([...items])
+        const live = new Set(items.map((p) => p.id))
+        for (const id of seenAskIDs) {
+          if (!live.has(id)) seenAskIDs.delete(id)
+        }
+      }
+
       const refreshPermissions = (runs: readonly RunView[]): void => {
         const ids = [...new Set(runs.filter((r) => !r.settled).flatMap((r) => r.agents
           .filter((a) => (a.status === "running" || a.status === "pending") && a.sessionID).map((a) => a.sessionID)))].sort()
@@ -552,7 +628,7 @@ export default Plugin.define({
         const gen = ++permissionGeneration
         const list = context.client?.permission?.list
         if (typeof list !== "function") {
-          setBlockedPerms(blockedFromStore(runs))
+          applyBlockedPerms(dedupePendingPermissions([...blockedFromStore(runs), ...standaloneFromStore()]))
           return
         }
         permissionPollKey = key
@@ -564,10 +640,28 @@ export default Plugin.define({
               catch { /* retry on the next poll */ }
             }))
           }
-          if (!disposed && gen === permissionGeneration && parent === currentParentID()) setBlockedPerms(out)
+          try {
+            const standalone = await fetchStandalonePermissions()
+            out.push(...(standalone ?? standaloneFromStore()))
+          } catch {
+            out.push(...standaloneFromStore())
+          }
+          if (!disposed && gen === permissionGeneration && parent === currentParentID()) {
+            applyBlockedPerms(dedupePendingPermissions(out))
+          }
         })().finally(() => {
           if (gen === permissionGeneration) permissionPollKey = undefined
         })
+      }
+
+      /** Immediate re-poll bypassing the poll-key dedupe (permission events). */
+      const forcePermissionRefresh = (): void => {
+        permissionPollKey = undefined
+        try {
+          refreshPermissions(runsForParent(runsForUi(scopedSessionSnapshot(), Date.now()), currentParentID()))
+        } catch {
+          // never throw from the event loop
+        }
       }
 
       const toast = (opts: { message: string; variant?: string }): void => {
@@ -576,6 +670,142 @@ export default Plugin.define({
           context.ui?.toast?.show?.(opts)
         } catch (err) {
           warn("ui.toast.show failed", err)
+        }
+      }
+
+      // ---- pending-ask announcements (chip + toast + sound + main-page dialog) ----
+      const sendAskReply = async (
+        item: PendingPermissionView,
+        reply: "once" | "always" | "reject",
+      ): Promise<void> => {
+        const fn = context.client?.permission?.reply
+        if (typeof fn !== "function") throw new Error("permission.reply unavailable")
+        await fn({ sessionID: item.sessionID, requestID: item.id, reply })
+      }
+
+      const askPermissionText = (item: PendingPermissionView): string =>
+        [
+          item.action,
+          item.resources.slice(0, 3).join("\n"),
+          item.message ?? "",
+          `Session: ${item.sessionID}`,
+        ]
+          .filter((s) => s.length > 0)
+          .join("\n")
+
+      /**
+       * Single select() on the MAIN page (allow always / once / reject).
+       * Esc/dismiss keeps the request pending (chip/panel still show it).
+       * Only standalone (non-run) asks auto-pop; run-owned asks keep the
+       * panel flow plus the stall watchdog. Older hosts without select()
+       * fall back to one confirm (always vs reject).
+       */
+      const runAskDialog = (item: PendingPermissionView): void => {
+        if (disposed) return
+        const select = context.ui?.dialog?.select
+        const confirm = context.ui?.dialog?.confirm
+        if (typeof select !== "function" && typeof confirm !== "function") {
+          toast({ message: `awaiting permission: ${item.action} — Ctrl+G to answer`, variant: "info" })
+          return
+        }
+        if (askDialogBusy) {
+          if (!askDialogQueue.some((q) => q.id === item.id)) askDialogQueue.push(item)
+          return
+        }
+        askDialogBusy = true
+        void (async () => {
+          try {
+            const built = buildAskSelectOptions(item)
+            if (typeof select === "function") {
+              const choice = await select({
+                title: built.title,
+                options: built.options,
+                current: built.current,
+              })
+              if (disposed || choice === undefined) return
+              await sendAskReply(item, choice)
+              return
+            }
+            toast({
+              message: "Allow once: open the panel (Ctrl+G) and press y",
+              variant: "info",
+            })
+            const accepted = await confirm!({
+              title: built.title,
+              message: askPermissionText(item),
+              label: { confirm: "Allow always", cancel: "Reject" },
+            })
+            if (disposed) return
+            if (accepted === true) await sendAskReply(item, "always")
+            else if (accepted === false) await sendAskReply(item, "reject")
+          } catch (err) {
+            warn("ask dialog failed", err)
+            toast({
+              message: `ultracode permission reply failed: ${err instanceof Error ? err.message : String(err)}`,
+              variant: "error",
+            })
+          } finally {
+            askDialogBusy = false
+            bump()
+            forcePermissionRefresh()
+            const next = askDialogQueue.shift()
+            if (next && !disposed) runAskDialog(next)
+          }
+        })()
+      }
+
+      /** Chip + toast + sound for a newly seen ask; main-page dialog for standalone ones. */
+      const announceNewAsk = (id: string): void => {
+        const item = blockedPerms().find((p) => p.id === id)
+        if (!item || disposed) return
+        const res = item.resources[0] ?? item.message ?? ""
+        toast({ message: `awaiting permission: ${item.action} ${res}`.trim(), variant: "info" })
+        try {
+          void context.attention?.notify?.({
+            message: `permission requested: ${item.action}`,
+            sound: { name: "permission" },
+          })
+        } catch (err) {
+          warn("attention.notify failed", err)
+        }
+        let owned = false
+        try {
+          const runs = runsForParent(runsForUi(scopedSessionSnapshot(), Date.now()), currentParentID())
+          owned = runs.some((r) => r.agents.some((a) => a.sessionID === item.sessionID))
+        } catch {
+          // treat as standalone — the dialog is the safer default
+        }
+        if (!owned && !panelFocused) runAskDialog(item)
+      }
+
+      const handlePermissionAskedTui = (data: unknown): void => {
+        try {
+          const d = data as { id?: string; sessionID?: string }
+          const id = typeof d?.id === "string" ? d.id : undefined
+          const sid = typeof d?.sessionID === "string" ? d.sessionID : undefined
+          if (!id || !sid) return
+          if (sid === viewedSessionID()) return
+          const fresh = !seenAskIDs.has(id)
+          seenAskIDs.add(id)
+          forcePermissionRefresh()
+          // The request details land one refresh later — small delay, fail-soft.
+          if (fresh) setTimeout(() => { if (!disposed) announceNewAsk(id) }, 400)
+        } catch {
+          // never throw from the event loop
+        }
+      }
+
+      const handlePermissionRepliedTui = (data: unknown): void => {
+        try {
+          const d = data as { requestID?: string; id?: string }
+          const rid =
+            typeof d?.requestID === "string" ? d.requestID : typeof d?.id === "string" ? d.id : undefined
+          if (!rid) return
+          seenAskIDs.delete(rid)
+          applyBlockedPerms(blockedPerms().filter((p) => p.id !== rid))
+          forcePermissionRefresh()
+        } catch {
+          // never throw from the event loop
         }
       }
 
@@ -614,6 +844,12 @@ export default Plugin.define({
 
       const onSessionEvent = (ev: unknown): void => {
         if (disposed) return
+        const evType = eventType(ev)
+        if (evType === "permission.asked") {
+          handlePermissionAskedTui((ev as { data?: unknown }).data ?? ev)
+        } else if (evType === "permission.replied") {
+          handlePermissionRepliedTui((ev as { data?: unknown }).data ?? ev)
+        }
         const sessionID = eventSessionID(ev)
         const kind = executionKind(eventType(ev))
         if (sessionID && kind) executionBySession.set(sessionID, kind)
@@ -732,6 +968,7 @@ export default Plugin.define({
 
       const closeInspect = (input?: { close?: unknown }): void => {
         if (disposed) return
+        panelFocused = false
         try {
           if (typeof input?.close === "function") {
             input.close()
@@ -866,7 +1103,9 @@ export default Plugin.define({
               parent,
             )
             const blocked = runs.flatMap((run) => permissionsForRun(run, blockedPerms()))
-            const counts = chipCounts(runs, pausedIDs, blocked.length)
+            const standalone = standalonePendingPermissions(blockedPerms(), runs)
+            const standaloneSessions = new Set(standalone.map((p) => p.sessionID)).size
+            const counts = chipCounts(runs, pausedIDs, blocked.length, standaloneSessions)
             counts.agents = Math.max(0, (counts.agents ?? 0) - new Set(blocked.map((p) => p.sessionID)).size)
             return formatChipText(counts)
           } catch {
@@ -889,6 +1128,7 @@ export default Plugin.define({
         close?: () => void
         toggleFullscreen?: () => void
       }) {
+        panelFocused = input?.focused === true
         // Theme tokens, fail-soft. The host hands plugins a ResolvedTheme whose
         // values are nested RGBA token objects (text.subdued,
         // text.action.primary.default, text.feedback.<kind>.default); OpenTUI
@@ -928,6 +1168,8 @@ export default Plugin.define({
             if (row.status === "running") return focusFg()
             return mutedFg()
           }
+          // A pending permission ask is the most actionable agent state — amber.
+          if (row.blocked) return warnFg()
           if (row.status === "succeeded") return successFg()
           if (row.status === "failed") return errorFg()
           if (row.status === "running") return focusFg()
@@ -1128,9 +1370,12 @@ export default Plugin.define({
         }
 
         let permissionReplyPending = false
-        const replyPermission = (reply: "once" | "reject"): void => {
+        const replyPermission = (reply: "once" | "always" | "reject"): void => {
           if (disposed) return
-          const pending = permissionsForRun(model().run, blockedPerms())
+          const pending = [
+            ...permissionsForRun(model().run, blockedPerms()),
+            ...standalonePendingPermissions(blockedPerms(), model().runs),
+          ]
           const item = pending[0]
           const fn = context.client?.permission?.reply
           if (!item || typeof fn !== "function" || permissionReplyPending) return
@@ -1141,10 +1386,18 @@ export default Plugin.define({
               context.ui?.router?.navigate?.({ type: "session", sessionID: item.sessionID })
               return
             }
+            const titles: Record<typeof reply, string> = {
+              once: "Allow child permission once?",
+              always: "Allow always? (saves a durable project rule)",
+              reject: "Reject child permission?",
+            }
             const accepted = await confirm({
-              title: reply === "once" ? "Allow child permission once?" : "Reject child permission?",
+              title: titles[reply],
               message: `${item.action}\n${item.resources.join("\n")}\n${item.message ?? ""}\nChild: ${item.sessionID}`,
-              label: { confirm: reply === "once" ? "Allow once" : "Reject", cancel: "Cancel" },
+              label: {
+                confirm: reply === "once" ? "Allow once" : reply === "always" ? "Allow always" : "Reject",
+                cancel: "Cancel",
+              },
             })
             if (!accepted || disposed) return
             await fn({ sessionID: item.sessionID, requestID: item.id, reply })
@@ -1168,7 +1421,10 @@ export default Plugin.define({
         const drill = (): void => {
           if (disposed) return
           try {
-            const pending = permissionsForRun(model().run, blockedPerms())
+            const pending = [
+              ...permissionsForRun(model().run, blockedPerms()),
+              ...standalonePendingPermissions(blockedPerms(), model().runs),
+            ]
             const row = firstBlockedSessionID(pending) ?? model().selectedSessionID
             if (!row) return
             // tabs.open adds the tab when not already open (focus only targets existing tabs,
@@ -1299,6 +1555,12 @@ export default Plugin.define({
                 run: () => replyPermission("once"),
               },
               {
+                id: "ultracode.inspect.perm.always",
+                title: "Allow child permission always (saves a project rule)",
+                bind: "a",
+                run: () => replyPermission("always"),
+              },
+              {
                 id: "ultracode.inspect.perm.reject",
                 title: "Reject child permission",
                 bind: "n",
@@ -1386,14 +1648,19 @@ export default Plugin.define({
         if (input?.name && input.name !== PANEL_NAME) return <box></box>
 
         const hints = footerHints([...PANEL_KEYS])
+        const blockedIds = createMemo(() => blockedSessionIDs(blockedPerms()))
+        const panelModel = createMemo((): InspectModel => {
+          const m = model()
+          return { ...m, tree: markBlockedTreeRows(m.tree, blockedIds()) }
+        })
         const paneView = createMemo(() =>
-          inspectPaneView(model(), sel().pane, typeof input?.width === "number" ? input.width : 0),
+          inspectPaneView(panelModel(), sel().pane, typeof input?.width === "number" ? input.width : 0),
         )
         const treeLines = createMemo(() => paneView().treeLines)
         const treeRows = createMemo(() => paneView().treeWindow)
         const detailLines = createMemo(() => paneView().detailLines)
         const selectedTreeRow = (): TreeRow | undefined => {
-          const m = model()
+          const m = panelModel()
           const cursor = m.treeSel?.cursor
           if (!cursor) return undefined
           return (m.tree ?? []).find((r) => r.kind === cursor.kind && r.id === cursor.id)
@@ -1422,12 +1689,16 @@ export default Plugin.define({
           runStripLines(model().runs, model().run?.runID, { pinned: sel().pinned === true, limit: 3 }),
         )
         const permLines = createMemo(() => formatPermissionLines(permissionsForRun(model().run, blockedPerms())))
+        const standaloneLines = createMemo(() =>
+          formatStandalonePermissionLines(standalonePendingPermissions(blockedPerms(), model().runs)),
+        )
 
         return (
           <box flexDirection="column">
             <text fg={mutedFg()}>ultracode inspect</text>
             {pickerLines().length > 0 ? <text fg={mutedFg()}>{wrapPaneLines(pickerLines(), input.width ?? 80).join("\n")}</text> : <text></text>}
             {permLines().length > 0 ? <text fg={errorFg()}>{wrapPaneLines(permLines(), input.width ?? 80).join("\n")}</text> : <text></text>}
+            {standaloneLines().length > 0 ? <text fg={warnFg()}>{wrapPaneLines(standaloneLines(), input.width ?? 80).join("\n")}</text> : <text></text>}
             {(sel().pane ?? "tree") === "settings" ? (
               <box flexDirection="column">
                 {model().run ? <text>{model().header}</text> : <text></text>}
@@ -1484,6 +1755,7 @@ export default Plugin.define({
 
       return () => {
         disposed = true
+        panelFocused = false
         clearInterval(settleTimer)
         for (const key of Object.keys(settleMaps.lastChange)) delete settleMaps.lastChange[key]
         for (const key of Object.keys(settleMaps.fired)) delete settleMaps.fired[key]

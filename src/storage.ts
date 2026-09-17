@@ -176,6 +176,38 @@ export async function resolveContainedPath(fs: FsLike, anchor: string, target: s
   return { ok: true, path: current }
 }
 
+/**
+ * Read a `{ path }`-run workflow file with the SAME symlink-aware containment
+ * every other workflow-file access uses (fail closed on escape, dangling
+ * symlink, or fs error — never fall back to a lexical read). Also derives
+ * the friendly run name from the filename stem. Host-free: pure fs injection.
+ */
+export async function readProjectWorkflowFile(
+  fs: FsLike,
+  projectRoot: string,
+  relPath: string,
+): Promise<{ ok: true; content: string; name: string; resolved: string } | { ok: false; error: string }> {
+  const candidate = normalizePath(`${projectRoot}/${relPath}`)
+  const resolved = await resolveContainedPath(fs, projectRoot, candidate)
+  if (!resolved.ok) {
+    return { ok: false, error: `refusing to read workflow file — ${resolved.error}` }
+  }
+  let content: string
+  try {
+    content = await fs.readFile(resolved.path)
+  } catch (err) {
+    return {
+      ok: false,
+      error: `workflow file not found or unreadable: ${relPath} (${err instanceof Error ? err.message : String(err)})`,
+    }
+  }
+  if (content.trim() === "") {
+    return { ok: false, error: `workflow file is empty: ${relPath}` }
+  }
+  const stem = (relPath.split("/").pop() ?? "workflow").replace(/\.[^.]+$/, "")
+  return { ok: true, content, name: stem || "workflow", resolved: resolved.path }
+}
+
 export class StorageError extends Error {}
 
 function requireValidWorkflowName(name: string): void {

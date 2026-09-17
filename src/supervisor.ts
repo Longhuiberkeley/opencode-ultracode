@@ -99,6 +99,12 @@ interface RunState {
   pausedAt: number | undefined
   pausedMs: number
   watchdog: ReturnType<typeof setTimeout> | undefined
+  /** Child-liveness scanner (childStallMs); undefined when disabled. */
+  stallTimer: ReturnType<typeof setInterval> | undefined
+  /** sessionID -> last activity timestamp (spawn time seeds it). */
+  childLastActivity: Map<string, number>
+  /** sessionIDs already stall-interrupted (never re-fired for one child). */
+  stallNotified: Set<string>
   pauseWaiters: PauseWaiter[]
   /** Immutable copy of effective options for this run. */
   effective: Required<UltracodeOptions>
@@ -289,6 +295,7 @@ export class SupervisorImpl implements Supervisor {
                     created = sessionID
                     state.children.add(sessionID)
                     state.live.add(sessionID)
+                    state.childLastActivity.set(sessionID, Date.now())
                     try {
                       this.registry.markOwned(runID, sessionID)
                     } catch {
@@ -312,6 +319,10 @@ export class SupervisorImpl implements Supervisor {
         availableAgents: parent.availableAgents,
         concurrency: state.effective.concurrency,
         maxAgents: state.effective.maxAgents,
+        // Provider-shaped (outcome) failures retry with abort-aware backoff;
+        // per-call opts.retry can override each agent() call.
+        retryAttempts: state.effective.agentRetryAttempts,
+        retryBackoffMs: state.effective.agentRetryBackoffMs,
         report: (status) => parent.report(status),
         ambientPhase: () => state.ambientPhase,
         ...(this.pinForAgent ? { pinForAgent: this.pinForAgent } : {}),
@@ -333,6 +344,7 @@ export class SupervisorImpl implements Supervisor {
 
       // 6. Watchdog -> stop(runID, "timeout"). Suspended while paused.
       this.armWatchdog(state)
+      this.armStallScanner(state)
 
       // 7. Await the script outcome. The worker has settled by now — cancel
       // any pending delayed stop-kill (main flow handles children from here).
@@ -438,6 +450,7 @@ export class SupervisorImpl implements Supervisor {
     }
     state.paused = false
     this.armWatchdog(state)
+    this.armStallScanner(state)
     this.resumePauseWaiters(state)
     this.safeParentReport(state, `resumed ${runID}`)
     return true
@@ -497,6 +510,9 @@ export class SupervisorImpl implements Supervisor {
       pausedAt: undefined,
       pausedMs: 0,
       watchdog: undefined,
+      stallTimer: undefined,
+      childLastActivity: new Map<string, number>(),
+      stallNotified: new Set<string>(),
       pauseWaiters: [],
       effective,
     }
@@ -538,6 +554,13 @@ export class SupervisorImpl implements Supervisor {
     if (typeof o.key === "string") {
       const key = o.key.trim().slice(0, 128)
       if (key) opts.key = key
+    }
+    if (o.retry !== null && typeof o.retry === "object" && !Array.isArray(o.retry)) {
+      const r = o.retry as { attempts?: Json | undefined; backoffMs?: Json | undefined }
+      const retry: { attempts?: number; backoffMs?: number } = {}
+      if (typeof r.attempts === "number" && Number.isFinite(r.attempts)) retry.attempts = r.attempts
+      if (typeof r.backoffMs === "number" && Number.isFinite(r.backoffMs)) retry.backoffMs = r.backoffMs
+      if (retry.attempts !== undefined || retry.backoffMs !== undefined) opts.retry = retry
     }
     return opts
   }
@@ -665,6 +688,77 @@ export class SupervisorImpl implements Supervisor {
     if (state.watchdog !== undefined) {
       clearTimeout(state.watchdog)
       state.watchdog = undefined
+    }
+    // The stall scanner lives and dies with the run-level watchdog: every
+    // path that stops the wall-clock bound (settle, stop, pause, dispose)
+    // also stops child-stall marking.
+    this.clearStallScanner(state)
+  }
+
+  // -------------------------------------------------------------------------
+  // Child-liveness watchdog (childStallMs)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Bump a child's last-activity timestamp. Called from the host event
+   * subscription (message/part events per session); cheap map writes.
+   */
+  noteChildActivity(sessionID: string): void {
+    for (const state of this.runs.values()) {
+      if (state.children.has(sessionID)) state.childLastActivity.set(sessionID, Date.now())
+    }
+  }
+
+  /** Arm the per-run stall scanner; no-op when childStallMs is 0/disabled. */
+  private armStallScanner(state: RunState): void {
+    this.clearStallScanner(state)
+    const stallMs = state.effective.childStallMs
+    if (stallMs <= 0) return
+    const tick = Math.max(1_000, Math.min(30_000, Math.ceil(stallMs / 2)))
+    state.stallTimer = setInterval(() => {
+      if (state.paused || this.disposed) return
+      this.scanForStalledChildren(state)
+    }, tick)
+    if (typeof (state.stallTimer as { unref?: () => void }).unref === "function") {
+      ;(state.stallTimer as { unref: () => void }).unref()
+    }
+  }
+
+  /**
+   * One stall scan: live children with no activity for childStallMs get an
+   * error on their record and a best-effort interrupt (the interrupt settles
+   * the driver's wait; the normal failure path finalizes the record — and if
+   * even that hangs, the run-level watchdog still bounds the run).
+   */
+  private scanForStalledChildren(state: RunState): void {
+    const stallMs = state.effective.childStallMs
+    if (stallMs <= 0) return
+    const now = Date.now()
+    for (const sessionID of state.live) {
+      if (state.stallNotified.has(sessionID)) continue
+      const last = state.childLastActivity.get(sessionID)
+      if (last === undefined) continue
+      const elapsed = now - last
+      if (elapsed < stallMs) continue
+      state.stallNotified.add(sessionID)
+      const owned = this.registry.agentForSession(sessionID)
+      if (owned) {
+        this.registry.updateAgent(owned.runID, owned.agentID, {
+          error: `child stalled: no activity for ${Math.round(elapsed / 1000)}s (childStallMs ${stallMs}ms) — interrupting`,
+        })
+      }
+      this.safeParentReport(
+        state,
+        `child ${owned?.agentID ?? sessionID} stalled (no activity ${Math.round(elapsed / 1000)}s) — interrupting`,
+      )
+      this.trackCleanup(state, this.interruptChild(sessionID))
+    }
+  }
+
+  private clearStallScanner(state: RunState): void {
+    if (state.stallTimer !== undefined) {
+      clearInterval(state.stallTimer)
+      state.stallTimer = undefined
     }
   }
 

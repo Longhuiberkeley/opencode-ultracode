@@ -24,6 +24,18 @@ export type Json =
 
 export type PermissionMode = "ask" | "autoEditsWorkflow" | "noEditTools"
 
+/**
+ * Which agents a workflow may use:
+ * - "host": every agent the location's registry exposes (shipped primaries
+ *   like `build` included) — the historical behavior.
+ * - "configured": only agents with a definition file in
+ *   `<project>/.opencode/agents/` or `~/.config/opencode/agents/` — i.e.
+ *   exactly the set managed by `opencode2 subagent-config` (enable/disable/
+ *   add). Shipped agents become usable only once you create their file
+ *   (e.g. `subagent-config set build <model>`).
+ */
+export type AgentScope = "host" | "configured"
+
 export interface UltracodeOptions {
   /** Default agent id for spawned agent() calls. Validated at run start (fail fast). Default "general". */
   agent?: string
@@ -45,6 +57,23 @@ export interface UltracodeOptions {
   permissionStallMs?: number
   /** Max serialized result size returned to the session. Default 65_536 chars. */
   maxResultChars?: number
+  /** Restrict usable agents to your configured set. Default "host". */
+  agentScope?: AgentScope
+  /**
+   * Extra attempts for a child whose session fails at the provider level
+   * (outcome "failed" — outage/rate-limit shaped). Only outcome failures are
+   * retried; aborts and schema errors never are. Default 1. 0 disables.
+   */
+  agentRetryAttempts?: number
+  /** Backoff before each retry attempt. Default 5_000 ms. */
+  agentRetryBackoffMs?: number
+  /**
+   * Mark a running child failed when it produces no activity for this many
+   * ms (frozen provider streams, orphaned sessions), so runs fail visibly
+   * instead of hanging on the run-level timeout. 0 disables.
+   * Default 900_000 (15 min).
+   */
+  childStallMs?: number
 }
 
 export const DEFAULT_OPTIONS: Required<UltracodeOptions> = {
@@ -55,6 +84,10 @@ export const DEFAULT_OPTIONS: Required<UltracodeOptions> = {
   permissions: "ask",
   permissionStallMs: 300_000,
   maxResultChars: 65_536,
+  agentScope: "host",
+  agentRetryAttempts: 1,
+  agentRetryBackoffMs: 5_000,
+  childStallMs: 900_000,
 }
 
 /** Local admission clamp (this repo default). Not a host API. */
@@ -139,7 +172,39 @@ export interface GraphRunInput {
   timeoutMs?: number
 }
 
-export type WorkflowToolInput = InlineRunInput | SavedRunInput | GraphRunInput
+export type WorkflowToolInput = InlineRunInput | SavedRunInput | GraphRunInput | PathRunInput | TemplateRunInput
+
+/**
+ * Run a project-relative workflow file by path (e.g.
+ * ".opencode/workflows/foo.js"). Kills string-embedding pain: the authoring
+ * agent writes the file with its file tool, then runs it by path. Trust
+ * level equals an inline { script } — the user's own agent wrote the file
+ * deliberately; the file is read at call time.
+ */
+export interface PathRunInput {
+  /** Project-root-relative POSIX path; no absolute paths, no ".." segments. */
+  path: string
+  args?: Json
+  /** Default true: return after admission. Explicit false blocks until the envelope. */
+  background?: boolean
+  /** Warm-start from a prior run: keyed succeeded agents replay from cache. */
+  resumeFrom?: string
+  /** Per-run wall-clock override (ms, MIN_RUN_TIMEOUT_MS..MAX_RUN_TIMEOUT_MS). This run only. */
+  timeoutMs?: number
+}
+
+/** Run a served script template by name (args feed its declared params). */
+export interface TemplateRunInput {
+  /** Known script-template name (see ultracode_catalog scriptTemplates). */
+  template: string
+  args?: Json
+  /** Default true: return after admission. Explicit false blocks until the envelope. */
+  background?: boolean
+  /** Warm-start from a prior run: keyed succeeded agents replay from cache. */
+  resumeFrom?: string
+  /** Per-run wall-clock override (ms, MIN_RUN_TIMEOUT_MS..MAX_RUN_TIMEOUT_MS). This run only. */
+  timeoutMs?: number
+}
 
 /**
  * Resolved launch payload: what the tool executor hands the supervisor after
@@ -202,6 +267,12 @@ export interface AgentRecord {
   effectiveAgent?: string
   /** Model actually used (differs from pins/defaults when pins don't load). */
   effectiveModel?: { providerID: string; id: string } | null
+  /**
+   * Model intended at spawn (the resolved pin, when any). Set before the
+   * child runs, so FAILED rows still show which model/provider was targeted
+   * — 0-token provider deaths never populate effectiveModel.
+   */
+  spawnModel?: { providerID: string; id: string; variant?: string }
   sessionID?: string
   status: AgentStatus
   error?: string
@@ -347,6 +418,12 @@ export interface AgentOpts {
    * semantics: a resumed run never redoes successful children.
    */
   key?: string
+  /**
+   * Per-call retry override for provider-shaped (outcome) failures.
+   * attempts clamped 0..3, backoffMs clamped 0..120_000. Falls back to the
+   * plugin-level agentRetryAttempts / agentRetryBackoffMs.
+   */
+  retry?: { attempts?: number; backoffMs?: number }
 }
 
 export interface AgentResult {
@@ -651,6 +728,13 @@ export interface Supervisor {
   resume(runID: string): boolean
   stopAll(reason: string): void
   isOwnedSession(sessionID: string): boolean
+  /**
+   * Bump a child session's last-activity timestamp (called from the host
+   * event subscription). Feeds the child-liveness watchdog (childStallMs):
+   * a running child with no activity for that long is interrupted and its
+   * record marked with a stall error — runs fail visibly, no zombie rows.
+   */
+  noteChildActivity(sessionID: string): void
   activeRuns(): RunRecord[]
   /** Plugin unload: stop everything, kill workers, reject pending bridge calls. */
   dispose(): Promise<void>
@@ -679,6 +763,8 @@ export interface SessionCtx {
     agent?: string
     outcome?: string
     tokens?: TokenUsage
+    /** Provider/host error text for failed sessions, when the server exposes it. */
+    error?: string
   }>
   prompt(input: { sessionID: string; text: string }): Promise<{ id: string }>
   wait(input: { sessionID: string }): Promise<void>

@@ -5,7 +5,7 @@
  */
 import test from "node:test"
 import assert from "node:assert/strict"
-import { createSessionDriver, buildChildTitle, parseChildTitle } from "../src/sessions.ts"
+import { createSessionDriver, buildChildTitle, parseChildTitle, describeSessionFailure } from "../src/sessions.ts"
 import { AgentCallError, RunClosedError } from "../src/sessions.ts"
 import { FakeSessionCtx } from "./fakes.ts"
 import type { ScriptedReply } from "./fakes.ts"
@@ -483,4 +483,22 @@ test("runAgent: failed outcome + context failure still reports the outcome error
     driver.runAgent(input(), ["general"], hooks()),
     (err: unknown) => err instanceof AgentCallError && err.kind === "outcome" && /outcome "failed"/.test(err.message),
   )
+})
+
+// ---------------------------------------------------------------------------
+// Failure-detail enrichment (describeSessionFailure)
+// ---------------------------------------------------------------------------
+
+test("describeSessionFailure: server error text, error parts, finish reason — empty when none", () => {
+  assert.equal(describeSessionFailure({}, undefined), "")
+  assert.equal(describeSessionFailure({ error: "403 quota exceeded" }, undefined), "403 quota exceeded")
+  const withErrorPart: ContextMessage = {
+    id: "m",
+    type: "assistant",
+    content: [{ type: "text", text: "partial" }, { type: "error", text: "provider stream aborted" }],
+  }
+  assert.equal(describeSessionFailure({}, withErrorPart), "provider stream aborted")
+  assert.equal(describeSessionFailure({ error: "e1" }, withErrorPart), "e1 | provider stream aborted")
+  assert.equal(describeSessionFailure({}, { id: "m", type: "assistant", finish: "length" }), "finish: length")
+  assert.equal(describeSessionFailure({}, { id: "m", type: "assistant", finish: "stop" }), "")
 })

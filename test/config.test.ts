@@ -33,6 +33,10 @@ test("loadOptions: empty object gives all defaults", () => {
     permissions: "ask",
     permissionStallMs: 300_000,
     maxResultChars: 65_536,
+    agentScope: "host",
+    agentRetryAttempts: 1,
+    agentRetryBackoffMs: 5_000,
+    childStallMs: 900_000,
   })
   assert.deepEqual(warnings, [])
 })
@@ -46,10 +50,26 @@ test("loadOptions: fully valid options round-trip", () => {
     permissions: "noEditTools",
     permissionStallMs: 60_000,
     maxResultChars: 10_000,
+    agentScope: "configured",
+    agentRetryAttempts: 2,
+    agentRetryBackoffMs: 30_000,
+    childStallMs: 600_000,
   }
   const { options, warnings } = loadOptions(raw)
   assert.deepEqual(options, raw)
   assert.deepEqual(warnings, [])
+})
+
+test("loadOptions: agentScope enum", () => {
+  const on = loadOptions({ agentScope: "configured" })
+  assert.equal(on.options.agentScope, "configured")
+  assert.deepEqual(on.warnings, [])
+  for (const bad of [" Host", "strict", 1, null]) {
+    const { options, warnings } = loadOptions({ agentScope: bad })
+    assert.equal(options.agentScope, DEFAULT_OPTIONS.agentScope)
+    assert.equal(warnings.length, 1)
+    assert.match(warnings[0]!, /agentScope/)
+  }
 })
 
 test("loadOptions: permissionStallMs accepts 0 (disabled) and rejects out-of-range", () => {

@@ -4,7 +4,7 @@
  * Rules (CONTRACTS.md): unknown keys ignored; bad values fall back to defaults
  * and collect a human-readable warning. Never throws.
  */
-import type { PermissionMode, UltracodeOptions } from "./types.ts"
+import type { AgentScope, PermissionMode, UltracodeOptions } from "./types.ts"
 import { DEFAULT_OPTIONS, MAX_RUN_TIMEOUT_MS, MIN_RUN_TIMEOUT_MS } from "./types.ts"
 
 export interface LoadedOptions {
@@ -18,7 +18,17 @@ interface NumRange {
 }
 
 /** Verified ranges — see CONTRACTS.md Builder A. */
-const RANGES: Record<"concurrency" | "maxAgents" | "timeoutMs" | "maxResultChars" | "permissionStallMs", NumRange> = {
+const RANGES: Record<
+  | "concurrency"
+  | "maxAgents"
+  | "timeoutMs"
+  | "maxResultChars"
+  | "permissionStallMs"
+  | "agentRetryAttempts"
+  | "agentRetryBackoffMs"
+  | "childStallMs",
+  NumRange
+> = {
   concurrency: { min: 1, max: 64 },
   maxAgents: { min: 1, max: 10_000 },
   // Shared with the per-run override and /ultracode set (src/types.ts).
@@ -26,9 +36,15 @@ const RANGES: Record<"concurrency" | "maxAgents" | "timeoutMs" | "maxResultChars
   maxResultChars: { min: 1_000, max: 1_000_000 },
   // 0 disables the stall watchdog (noEditTools rejects immediately anyway).
   permissionStallMs: { min: 0, max: 3_600_000 },
+  agentRetryAttempts: { min: 0, max: 3 },
+  agentRetryBackoffMs: { min: 0, max: 120_000 },
+  // 0 disables the child-liveness watchdog.
+  childStallMs: { min: 0, max: 3_600_000 },
 }
 
 const PERMISSION_MODES: ReadonlySet<string> = new Set(["ask", "autoEditsWorkflow", "noEditTools"])
+
+const AGENT_SCOPES: ReadonlySet<string> = new Set(["host", "configured"])
 
 function num(warnings: string[], raw: Record<string, unknown>, key: keyof typeof RANGES): number | undefined {
   const range = RANGES[key]
@@ -87,6 +103,17 @@ export function loadOptions(raw: unknown): LoadedOptions {
     } else {
       warnings.push(
         `option "agent" must be a non-empty string, got ${JSON.stringify(agent) ?? String(agent)} — using default "${DEFAULT_OPTIONS.agent}"`,
+      )
+    }
+  }
+
+  const agentScope = record["agentScope"]
+  if (agentScope !== undefined) {
+    if (typeof agentScope === "string" && AGENT_SCOPES.has(agentScope)) {
+      options.agentScope = agentScope as AgentScope
+    } else {
+      warnings.push(
+        `option "agentScope" must be one of host | configured, got ${JSON.stringify(agentScope) ?? String(agentScope)} — using default "${DEFAULT_OPTIONS.agentScope}"`,
       )
     }
   }

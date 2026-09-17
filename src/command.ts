@@ -137,7 +137,7 @@ export const TOOL_DESCRIPTION: string = [
   "WHEN: the task outgrows one context window, needs fan-out, needs structural verification, or should be a repeatable orchestration.",
   "NOT: one reply answers it, or a single subagent is enough.",
   "",
-  "Input: { graph, name?, args? } (a JSON DAG — validated then compiled for you; preferred for standard shapes), { script, name?, meta?, args? } (inline JS), or { workflow: name, args? } (saved; trust first via /ultracode trust <name>). Every form also takes background? and resumeFrom? (warm-start from a prior runID: keyed succeeded agents replay from cache).",
+  "Input: { graph, name?, args? } (a JSON DAG — validated then compiled for you; preferred for standard shapes), { script, name?, meta?, args? } (inline JS — short scripts only, under ~30 lines), { path: \".opencode/workflows/<name>.js\", args? } (project file — PREFERRED for scripts over ~30 lines: write the file with your file tool, then run by path), { template: name, args? } (served script template), or { workflow: name, args? } (saved; trust first via /ultracode trust <name>). Every form also takes background? and resumeFrom? (warm-start from a prior runID: keyed succeeded agents replay from cache).",
   "Script = plain-JS async function body (no import/export). Return a small JSON value.",
   "Graph = { nodes: [{ id, kind, ... }], returns? }; kinds: agent, fanout (over a ref, {{item}}), partition (token-budgeted lanes), merge (batched), gate (QC verdict, aborts on fail), checkpoint, workflow. Refs like \"$scout.items\" must flow forward; node ids are phases; every call is auto-keyed. /ultracode graph <name|runID> renders the DAG.",
   "",

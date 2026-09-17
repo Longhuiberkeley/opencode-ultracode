@@ -40,7 +40,7 @@ it — every `agent()` call is a real subagent session with its own context wind
 | `↑` / `↓` | move the tree / scroll the detail pane |
 | `h` / `l` | switch panes: tree ↔ detail ↔ settings |
 | `enter` | open the selected child session as a tab (see what it is doing) |
-| `y` / `n` | review a pending child permission: allow once / reject |
+| `y` / `a` / `n` | review a pending child permission: allow once / allow always (saves a project rule) / reject |
 | `p` / `x` / `s` | pause/resume · stop · save the workflow |
 | `f` | full-screen presentation |
 | `esc` / Ctrl+G | close |
@@ -253,6 +253,10 @@ back to defaults.
 | `permissions` | string | `"ask"` | `ask` (host user prompt for children — recommended), `autoEditsWorkflow` (auto-approve edit-class actions for active run children inside the project root), `noEditTools` (deny edit-class tools **and best-effort write-shaped shell commands** — `sed -i`, `tee`, redirections, `git commit`, `sh -c …` — for active run children; `/dev/null` and `2>&1`-style redirects pass). Panel cycles these three. |
 | `permissionStallMs` | number | `300000` | Auto-reject a child's pending permission request after this many ms unanswered, so runs fail visibly instead of hanging on prompts the user cannot see. `0` disables. `noEditTools` rejects immediately regardless. Not a panel setting. |
 | `maxResultChars` | number | `65536` | Max serialized result returned to the session; larger results come back as a compact `preview` + `truncated: true` + `resultChars`, full value retrievable page-by-page via the `ultracode_result` tool (or `/ultracode result <runID>` for humans). |
+| `agentScope` | string | `"host"` | `host` (default): every agent the location registry exposes, shipped primaries like `build` included. `configured`: only agents with a definition file in `<project>/.opencode/agents/` or `~/.config/opencode/agents/` — exactly the set `opencode2 subagent-config` manages, with `disabled: true` agents and agents pinned to providers in `disabled_providers` excluded. Shipped file-less agents are rejected with a clear error until you create their file (`subagent-config set build <model>`), and unpinned configured agents inherit the default agent's pin. |
+| `agentRetryAttempts` | number | `1` | Extra attempts for a child whose session fails at the provider level (outcome `failed` — outage/rate-limit shaped). Only outcome failures retry; aborts and schema errors never do. Per-call override: `agent(prompt, { retry: { attempts, backoffMs } })`. `0` disables. |
+| `agentRetryBackoffMs` | number | `5000` | Backoff before each retry attempt (0..120000 ms). A stopping run never waits out a backoff. |
+| `childStallMs` | number | `900000` | Child-liveness watchdog: a running child with no activity for this many ms gets its record marked with a stall cause and is interrupted, so frozen provider streams fail visibly instead of hanging until the run timeout. `0` disables. Paused runs suspend the scan. |
 
 Panel settings (`h`/`l` to the settings pane, `+/-` to edit) persist a project-scoped KV overlay and refresh next-run defaults. Changes apply to the **next** run only — in-flight runs keep the snapshot captured at `startDetached`.
 
@@ -295,8 +299,10 @@ Ultracode is for **multi-agent orchestration with an isolated script and structu
 Native subagents (`general` / `explore` / Task) are for **one** focused child. Ultracode
 composes with those native OpenCode subagents: it spawns ordinary child sessions users already
 know; it does not replace or hide them. Plan mode: author `.opencode/workflows/<name>.js` +
-`/ultracode save <name>` + `/ultracode trust <name>`. Build mode: `{ workflow: name }`. Do not
-mix native fan-out and a workflow in one task; children do not inherit parent skills — restate
+`/ultracode save <name>` + `/ultracode trust <name>`. Build mode: `{ workflow: name }` — or run
+an authored file directly with `{ path: ".opencode/workflows/<name>.js", args }` (preferred over
+embedding any script longer than ~30 lines) and served templates with `{ template: "verify-fix", args }`.
+Do not mix native fan-out and a workflow in one task; children do not inherit parent skills — restate
 rules inside `agent()` prompts.
 
 Examples that work:
@@ -402,13 +408,30 @@ existing user-intent command path.
 the current conversation. The selected run has a `*`; each row shows its lifecycle
 status. `[` / `]` select and pin history; `.` toggles **follow-latest** so a new run
 can take focus across Plan → Build. The status chip distinguishes workflow runs,
-active agents, queued agents, and requests **awaiting permission**. An authoritative
-running workflow remains visible between agent stages. The default inventory is the
-newest 50 runs (RPC limit up to 100); `/ultracode show <id>` remains available for older IDs.
+active agents, queued agents, requests **awaiting permission**, and **standalone
+subagent asks** (`N subagent awaiting permission` — visible even with zero runs).
+An authoritative running workflow remains visible between agent stages. The default
+inventory is the newest 50 runs (RPC limit up to 100); `/ultracode show <id>` remains
+available for older IDs.
+
+**Subagent permission asks (any session in the location, not just run children).**
+A plain subagent (task tool) that hits an `ask` waits inside its own session — the
+native dialog only renders where the ask lives, so from the main page it used to be
+an invisible hang. The TUI now polls the location-wide pending list
+(`permission.request.list`, per-session store fallback) and, for every ask on a
+session you are not viewing: shows it in the chip, fires a toast plus an attention
+notification (sound `permission`), and — for **standalone** (non-run) asks — pops an
+**allow once → allow always → reject** dialog right on the main page (every Cancel
+keeps it pending; run-owned asks keep the panel flow plus the stall watchdog below).
+`permission.replied` clears the item immediately. Sessions you are viewing are
+skipped: the host already shows their native dialog.
 
 Permissions from owned children appear in this inspector: `y` opens a full-request
-confirmation for **allow once**, `n` reviews rejection, and Enter navigates to the
-blocked child. No permission is automatically approved — but pending requests on
+confirmation for **allow once**, `a` for **allow always**, `n` reviews rejection,
+and Enter navigates to the blocked child. Agent rows with a pending ask are marked
+`⚠` and colored amber; standalone asks get their own `subagents awaiting permission`
+block (also shown when there are no runs). No permission is automatically approved —
+but pending requests on
 owned children may be **auto-rejected** (immediately in `noEditTools`, after
 `permissionStallMs` otherwise) so an unseen prompt never hangs the run. Full
 selected task labels
@@ -570,9 +593,17 @@ Workflows multiply tokens. Controls, in order of leverage:
    No model or provider id appears anywhere in this plugin; children run as **your** configured
    agents **on your pinned models**: the plugin reads the same documented agent config the
    client reads and applies the pin when creating each child session (OpenCode's server-side
-   `session.create` does not apply global pins itself — live-verified). Unpinned agents fall
-   back to the location default. Every run records the `effectiveModel` each child actually
-   used and the envelope lists the distinct `models`, so drift is visible, never silent.
+   `session.create` does not apply global pins itself — live-verified). An agent without a pin of its own (e.g. shipped `build`) inherits the default agent's pin
+   instead of the location default, so a workflow child can never drift onto a model you
+   did not choose (such as the free-tier fallback). Under `agentScope: "configured"` agents
+   you disabled (`disabled: true` via `subagent-config`) and pins on providers you took
+   offline (`disabled_providers`) are never used — your subagent-config is the single source
+   of truth; under the default `host` scope the registry list still governs, and a child
+   whose requested AND default pins both sit on offline providers falls back to the location
+   default (fail-open). Every run records
+   the `effectiveModel` each child actually used (and the intended `spawnModel` before the
+   child runs, so provider-dead children still show their target), and the envelope lists
+   the distinct `models`, so drift is visible, never silent.
 2. **Pins hot-reload.** Re-pinning an agent mid-run applies to the *next spawned agent* —
    already-running sessions keep their model. You can retune a long run without stopping it.
 3. **Watch the tokens.** Every envelope carries summed token usage; `/ultracode show <runID>`

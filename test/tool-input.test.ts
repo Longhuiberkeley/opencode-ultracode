@@ -121,8 +121,8 @@ test("rejects non-object inputs", () => {
 })
 
 test("rejects input with neither script nor workflow", () => {
-  bad({}, /must specify either/)
-  bad({ name: "x", args: {} }, /must specify either/)
+  bad({}, /must specify/)
+  bad({ name: "x", args: {} }, /must specify/)
 })
 
 test("rejects input with both script and workflow", () => {
@@ -403,4 +403,57 @@ test("timeoutMs bounds match /ultracode set: 10 s to 24 h, integers only", () =>
   bad({ workflow: "w", timeoutMs: 1 }, /"timeoutMs" must be between/)
   ok({ script: "s", timeoutMs: 10_000 })
   ok({ script: "s", timeoutMs: 86_400_000 })
+})
+
+// ---------------------------------------------------------------------------
+// path / template run inputs
+// ---------------------------------------------------------------------------
+
+test("path input: relative js file accepted, args/background/resumeFrom/timeoutMs carried", () => {
+  const r = validateToolInput({
+    path: ".opencode/workflows/audit.js",
+    args: { goal: "x" },
+    background: false,
+    resumeFrom: "run_ab12cd34ef56",
+    timeoutMs: 600_000,
+  })
+  assert.equal(r.ok, true)
+  if (r.ok && "path" in r.input) {
+    assert.equal(r.input.path, ".opencode/workflows/audit.js")
+    assert.deepEqual(r.input.args, { goal: "x" })
+    assert.equal(r.input.background, false)
+    assert.equal(r.input.resumeFrom, "run_ab12cd34ef56")
+    assert.equal(r.input.timeoutMs, 600_000)
+  }
+})
+
+test("path input: absolute, home, traversal and non-js targets rejected precisely", () => {
+  for (const path of ["/etc/passwd", "~/w.js", ".opencode/../../escape.js", "notes.txt"]) {
+    const r = validateToolInput({ path })
+    assert.equal(r.ok, false, `expected rejection for ${path}`)
+    if (!r.ok) assert.ok(r.error.includes('"path"'), `error names the key: ${r.error}`)
+  }
+})
+
+test("template input: known name accepted; unknown name lists the known set", () => {
+  const ok = validateToolInput({ template: "verify-fix", args: { goal: "g" } })
+  assert.equal(ok.ok, true)
+  if (ok.ok && "template" in ok.input) assert.equal(ok.input.template, "verify-fix")
+  const bad = validateToolInput({ template: "nope" })
+  assert.equal(bad.ok, false)
+  if (!bad.ok) assert.ok(bad.error.includes("verify-fix") && bad.error.includes("staged-delivery"), bad.error)
+})
+
+test("source keys are mutually exclusive across all five forms", () => {
+  for (const raw of [
+    { path: "a.js", script: "return 1" },
+    { path: "a.js", workflow: "w" },
+    { path: "a.js", template: "verify-fix" },
+    { template: "verify-fix", script: "return 1" },
+    { template: "verify-fix", graph: { nodes: [] } },
+  ]) {
+    const r = validateToolInput(raw)
+    assert.equal(r.ok, false, `expected rejection for ${JSON.stringify(raw)}`)
+    if (!r.ok) assert.match(r.error, /cannot combine|cannot specify both/)
+  }
 })

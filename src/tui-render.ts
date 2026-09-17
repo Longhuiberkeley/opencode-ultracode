@@ -227,6 +227,8 @@ export type ChipCounts = {
   agents?: number
   /** Pending permission requests on owned child sessions. */
   blocked?: number
+  /** Pending permission requests on sessions owned by no displayed run (plain subagents). */
+  subagentBlocked?: number
   queued?: number
 }
 
@@ -280,6 +282,7 @@ export function chipCounts(
   runs: readonly RunView[],
   pausedRunIDs?: ReadonlySet<string>,
   blocked?: number,
+  subagentBlocked?: number,
 ): ChipCounts {
   let running = 0
   let paused = 0
@@ -305,6 +308,7 @@ export function chipCounts(
   }
   const counts: ChipCounts = { running, paused, failed, agents }
   if (blocked !== undefined && blocked > 0) counts.blocked = blocked
+  if (subagentBlocked !== undefined && subagentBlocked > 0) counts.subagentBlocked = subagentBlocked
   if (queued > 0) counts.queued = queued
   return counts
 }
@@ -312,7 +316,8 @@ export function chipCounts(
 /** Empty when nothing is active (hide-when-zero). Units: workflow runs vs agents. */
 export function formatChipText(counts: ChipCounts): string {
   const blocked = counts.blocked ?? 0
-  if (counts.running === 0 && counts.paused === 0 && blocked === 0) return ""
+  const subBlocked = counts.subagentBlocked ?? 0
+  if (counts.running === 0 && counts.paused === 0 && blocked === 0 && subBlocked === 0) return ""
   const parts = ["ultracode"]
   if (counts.running > 0) parts.push(`${counts.running} ${counts.running === 1 ? "run" : "runs"}`)
   const agents = counts.agents ?? 0
@@ -321,6 +326,9 @@ export function formatChipText(counts: ChipCounts): string {
   if (counts.failed > 0) parts.push(`${counts.failed} failed`)
   if ((counts.queued ?? 0) > 0) parts.push(`${counts.queued} queued`)
   if (blocked > 0) parts.push(`${blocked} awaiting permission`)
+  if (subBlocked > 0) {
+    parts.push(`${subBlocked} subagent${subBlocked === 1 ? "" : "s"} awaiting permission`)
+  }
   return parts.join(" · ")
 }
 
@@ -868,6 +876,8 @@ export type TreeRow = {
   sessionID?: string
   /** Agent status, or the phase-level aggregate ("mixed" = successes + failures). */
   status?: AgentStatus | "mixed"
+  /** Session has a pending permission request (marker + amber row). */
+  blocked?: boolean
   expanded?: boolean
   depth: number
 }
@@ -1612,6 +1622,95 @@ export function formatPermissionLines(items: readonly PendingPermissionView[]): 
 /** First blocked child session — inspector drill target. */
 export function firstBlockedSessionID(items: readonly PendingPermissionView[]): string | undefined {
   return items[0]?.sessionID
+}
+
+/** Dedupe pending-permission views by request id (first occurrence wins). */
+export function dedupePendingPermissions(items: readonly PendingPermissionView[]): PendingPermissionView[] {
+  const seen = new Set<string>()
+  const out: PendingPermissionView[] = []
+  for (const item of items) {
+    if (seen.has(item.id)) continue
+    seen.add(item.id)
+    out.push(item)
+  }
+  return out
+}
+
+/**
+ * Pending requests whose session belongs to none of the displayed runs —
+ * plain subagent children (task tool), background sessions, and any other
+ * non-run session in the location.
+ */
+export function standalonePendingPermissions(
+  items: readonly PendingPermissionView[],
+  runs: readonly RunView[],
+): PendingPermissionView[] {
+  if (items.length === 0) return []
+  const owned = new Set(runs.flatMap((r) => r.agents.map((a) => a.sessionID)))
+  return items.filter((p) => !owned.has(p.sessionID))
+}
+
+/** Session ids with at least one pending permission request. */
+export function blockedSessionIDs(items: readonly PendingPermissionView[]): Set<string> {
+  return new Set(items.map((p) => p.sessionID))
+}
+
+/** Clone tree rows, marking agent rows whose session has a pending ask. */
+export function markBlockedTreeRows(rows: readonly TreeRow[], blocked: ReadonlySet<string>): TreeRow[] {
+  return rows.map((row) => {
+    if (row.kind !== "agent" || !row.sessionID || !blocked.has(row.sessionID)) return row
+    return { ...row, blocked: true, label: `${row.label} ⚠` }
+  })
+}
+
+/** Standalone-ask block for the inspector: header, up to 3 requests, key hints. */
+export function formatStandalonePermissionLines(items: readonly PendingPermissionView[]): string[] {
+  if (items.length === 0) return []
+  const lines = [`subagents awaiting permission ${items.length}`]
+  for (const item of items.slice(0, 3)) {
+    const res = item.resources.join(", ") || "?"
+    lines.push(`! ${item.action} ${shortRunID(item.sessionID)} ${res}`)
+  }
+  if (items.length > 3) lines.push(`… +${items.length - 3} more`)
+  lines.push("y allow once · a allow always · n reject · enter open")
+  return lines
+}
+
+/** Max visible chars for the first resource in the standalone-ask select title. */
+const ASK_RESOURCE_MAX = 60
+
+/**
+ * One-shot select() payload for a standalone subagent permission ask.
+ * Default (`current`) is allow-always. Title stays a single short line.
+ */
+export function buildAskSelectOptions(item: PendingPermissionView): {
+  title: string
+  current: "always"
+  options: Array<{ title: string; value: "always" | "once" | "reject"; description: string }>
+} {
+  const raw = (item.resources[0] || item.message || "?").replace(/\s+/g, " ").trim() || "?"
+  const resource = clip(raw, ASK_RESOURCE_MAX)
+  return {
+    title: `Subagent permission: ${item.action} — ${resource}`,
+    current: "always",
+    options: [
+      {
+        title: "Allow always",
+        value: "always",
+        description: "saves a durable project rule — no more asks like this",
+      },
+      {
+        title: "Allow once",
+        value: "once",
+        description: "approve just this request",
+      },
+      {
+        title: "Reject",
+        value: "reject",
+        description: "deny; the subagent sees the refusal and continues",
+      },
+    ],
+  }
 }
 
 function firstPhaseChildSession(run: RunView, phaseId: string): string | undefined {

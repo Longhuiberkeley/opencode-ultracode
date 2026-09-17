@@ -778,3 +778,50 @@ test("supervisor: per-run timeoutMs overrides effective for that run only", asyn
   assert.equal(nextRun.effective?.timeoutMs, 5_000)
   assert.equal(nextRun.timeoutOverrideMs, undefined)
 })
+
+// ---------------------------------------------------------------------------
+// Child-liveness watchdog (childStallMs)
+// ---------------------------------------------------------------------------
+
+test("childStallMs watchdog: stalled live child marked + interrupted; activity resets the clock", async () => {
+  const made = makeSupervisor({ childStallMs: 60_000, timeoutMs: 60_000, agentRetryAttempts: 0 })
+  const { supervisor, registry, sessions, parent } = made
+  const reports = made.reports
+  sessions.hangWait = true
+  const started = supervisor.startDetached({ script: "await agent('hi')", name: "stall-test" }, parent)
+  await tick(30) // child created, its wait() parked in hangWait
+
+  const internals = supervisor as unknown as {
+    runs: Map<
+      string,
+      { live: Set<string>; childLastActivity: Map<string, number>; stallNotified: Set<string> }
+    >
+    scanForStalledChildren(state: unknown): void
+  }
+  const state = internals.runs.get(started.runID)!
+  assert.ok(state, "run state exists while a child is live")
+  const sid = [...state.live][0]!
+  assert.ok(sid, "one live child session")
+
+  // Activity bump resets the clock: backdate, bump via noteChildActivity, scan -> no action.
+  state.childLastActivity.set(sid, Date.now() - 120_000)
+  supervisor.noteChildActivity(sid)
+  internals.scanForStalledChildren(state)
+  assert.equal(sessions.interrupts.length, 0, "fresh activity must not stall")
+  assert.equal(state.stallNotified.size, 0)
+
+  // Backdate past the threshold -> record error + best-effort interrupt + report.
+  state.childLastActivity.set(sid, Date.now() - 120_000)
+  internals.scanForStalledChildren(state)
+  assert.ok(sessions.interrupts.includes(sid), "stalled child is interrupted")
+  assert.ok(reports.some((r) => r.includes("stalled")), `expected stall report, got: ${reports.join(" / ")}`)
+  const rec = registry.getAgent(started.runID, "a1")!
+  assert.ok((rec.error ?? "").includes("child stalled"), `record carries stall cause, got: ${rec.error}`)
+  assert.equal(state.stallNotified.size, 1, "stall fires once per child")
+
+  // Release the hang: the interrupt-driven outcome fails the run VISIBLY
+  // (no zombie "running" rows) and the run settles.
+  sessions.releaseHangs()
+  const outcome = await started.done
+  assert.equal(outcome.run.status, "failed")
+})

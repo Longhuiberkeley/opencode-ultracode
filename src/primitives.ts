@@ -177,8 +177,50 @@ export interface AgentRunnerOptions {
   warmCache?: ReadonlyMap<string, WarmCacheEntry>
   /** Digest for keyed replay identity (defaults to sha256-based agentCacheDigest). */
   digest?: (prompt: string, opts: AgentOpts) => string
+  /** Plugin-level retry attempts for outcome (provider-shaped) failures. Default 0 (off here unless set). */
+  retryAttempts?: number
+  /** Backoff before each retry attempt. Default 5_000 ms. */
+  retryBackoffMs?: number
   /** Clock injection for throttle tests. */
   now?: () => number
+}
+
+/** Clamp per-call/plugin retry attempts (0..3). */
+export function clampRetryAttempts(value: number | undefined, fallback: number): number {
+  const n = typeof value === "number" && Number.isFinite(value) ? Math.floor(value) : fallback
+  return Math.min(3, Math.max(0, n))
+}
+
+/** Clamp retry backoff (0..120_000 ms). */
+export function clampRetryBackoffMs(value: number | undefined, fallback: number): number {
+  const n = typeof value === "number" && Number.isFinite(value) ? Math.floor(value) : fallback
+  return Math.min(120_000, Math.max(0, n))
+}
+
+/**
+ * Abort-aware delay between retry attempts: resolves after `ms`, rejects with
+ * an abort error the moment the run signal fires (a stopping run never waits
+ * out a backoff).
+ */
+export function delayAbortable(ms: number, signal: AbortSignal | undefined): Promise<void> {
+  if (ms <= 0) return Promise.resolve()
+  return new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort)
+      resolve()
+    }, ms)
+    const onAbort = () => {
+      clearTimeout(timer)
+      reject(new AgentCallError("abort", "agent aborted: run stopping"))
+    }
+    if (signal) {
+      if (signal.aborted) {
+        onAbort()
+        return
+      }
+      signal.addEventListener("abort", onAbort, { once: true })
+    }
+  })
 }
 
 /**
@@ -203,6 +245,8 @@ export class AgentRunner {
   private readonly signal?: AbortSignal
   private readonly warmCache: ReadonlyMap<string, WarmCacheEntry> | undefined
   private readonly digestFn: (prompt: string, opts: AgentOpts) => string
+  private readonly retryAttempts: number
+  private readonly retryBackoffMs: number
   private readonly now: () => number
   private started = 0
   private lastReportAt = 0
@@ -220,6 +264,8 @@ export class AgentRunner {
     this.pinForAgent = options.pinForAgent
     this.signal = options.signal
     this.warmCache = options.warmCache
+    this.retryAttempts = clampRetryAttempts(options.retryAttempts, 0)
+    this.retryBackoffMs = clampRetryBackoffMs(options.retryBackoffMs, 5_000)
     this.digestFn =
       options.digest ?? ((prompt, opts) => agentCacheDigest(prompt, opts, this.defaultAgent))
     this.now = options.now ?? Date.now
@@ -297,52 +343,87 @@ export class AgentRunner {
       if (this.pinForAgent) {
         try {
           model = await this.pinForAgent(requestedAgent)
+          if (model === undefined && requestedAgent !== this.defaultAgent) {
+            // Unpinned requested agent (e.g. shipped `build`): the server's
+            // session-create fallback is the location default — observed live
+            // as a free-tier model the user never chose. The default agent's
+            // pin is the user's standing model choice (they rotate it via
+            // subagent-config), so inherit it instead.
+            model = await this.pinForAgent(this.defaultAgent)
+          }
         } catch {
           model = undefined // pin resolution must never break a run
         }
       }
-      const result = await this.driver.runAgent(
-        {
-          prompt,
-          agent: opts.agent,
-          ...(model !== undefined ? { model } : {}),
-          label: opts.label,
-          phase: titlePhase,
-          schema: opts.schema,
-          defaultAgent: this.defaultAgent,
-          runID: this.runID,
-          ord: record.id,
-        },
-        this.availableAgents,
-        {
-          signal: this.signal ?? NEVER_ABORTED.signal,
-          onSessionID: (sessionID) => {
-            this.registry.updateAgent(this.runID, record.id, {
-              status: "running",
-              sessionID,
-              startedAt: Date.now(),
-            })
-            try {
-              this.registry.bindAgentSession(this.runID, record.id, sessionID)
-            } catch {
-              // provenance must not break the call
-            }
-          },
-        },
-      )
+      // Intended-model provenance BEFORE the child runs: 0-token provider
+      // deaths never populate effectiveModel, so failed rows need spawnModel
+      // to show which model/provider was targeted.
+      if (model !== undefined) {
+        this.registry.updateAgent(this.runID, record.id, { spawnModel: model })
+      }
+      // Provider-shaped failures (outcome "failed" — outages, rate limits)
+      // get bounded retries with abort-aware backoff. Aborts, schema errors
+      // and agent-resolution errors are never retried. Retries reuse the
+      // SAME registry record (one row per agent() call, not per attempt).
+      const attempts = clampRetryAttempts(opts.retry?.attempts, this.retryAttempts)
+      const backoffMs = clampRetryBackoffMs(opts.retry?.backoffMs, this.retryBackoffMs)
+      let result: AgentResult | undefined
+      for (let attempt = 0; ; attempt++) {
+        try {
+          result = await this.driver.runAgent(
+            {
+              prompt,
+              agent: opts.agent,
+              ...(model !== undefined ? { model } : {}),
+              label: opts.label,
+              phase: titlePhase,
+              schema: opts.schema,
+              defaultAgent: this.defaultAgent,
+              runID: this.runID,
+              ord: record.id,
+            },
+            this.availableAgents,
+            {
+              signal: this.signal ?? NEVER_ABORTED.signal,
+              onSessionID: (sessionID) => {
+                this.registry.updateAgent(this.runID, record.id, {
+                  status: "running",
+                  sessionID,
+                  startedAt: Date.now(),
+                })
+                try {
+                  this.registry.bindAgentSession(this.runID, record.id, sessionID)
+                } catch {
+                  // provenance must not break the call
+                }
+              },
+            },
+          )
+          break
+        } catch (err) {
+          const retryable =
+            err instanceof AgentCallError && err.kind === "outcome" && attempt < attempts
+          if (!retryable) throw err
+          this.safeReport(
+            `${phase} — ${opts.label ?? record.id} retry ${attempt + 1}/${attempts} after outcome failure: ${errorMessage(err).slice(0, 140)}`,
+          )
+          await delayAbortable(backoffMs, this.signal)
+        }
+      }
+      const agentResult = result!
       this.registry.updateAgent(this.runID, record.id, {
         status: "succeeded",
-        effectiveAgent: result.agent,
-        effectiveModel: result.model,
-        tokens: result.tokens,
-        data: result.data,
+        effectiveAgent: agentResult.agent,
+        effectiveModel: agentResult.model,
+        tokens: agentResult.tokens,
+        data: agentResult.data,
         endedAt: Date.now(),
         // Keyed calls persist replay identity (and the text a future warm
         // rerun needs) so resumeFrom can skip this child next time.
-        ...(key && digest ? { key, promptDigest: digest, resultText: result.text } : {}),
+        ...(key && digest ? { key, promptDigest: digest, resultText: agentResult.text } : {}),
       })
       this.maybeReport()
-      return result
+      return agentResult
     } catch (err) {
       const aborted = err instanceof AgentCallError && err.kind === "abort"
       this.registry.updateAgent(this.runID, record.id, {
