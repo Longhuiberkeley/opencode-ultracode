@@ -54,7 +54,7 @@ import {
   runStateTransition,
   settingsPayload,
 } from "./run-status.ts"
-import { agentUsable, lookupAgentPin, parseModelPin, readDisabledProviders } from "./agent-pins.ts"
+import { agentUsable, lookupAgentPin, normalizeModelRef, parseModelPin, readDisabledProviders } from "./agent-pins.ts"
 import { RegistryImpl } from "./registry.ts"
 import { emptyToolEventState } from "./run-events.ts"
 import { EMPTY_CATALOG, SKILL_CONTENT, SKILL_DESCRIPTION, SKILL_NAME, buildSkillContent } from "./skill-content.ts"
@@ -134,6 +134,20 @@ const RUN_TIMEOUT_MS_PROPERTY: Record<string, unknown> = {
     "Optional wall-clock limit for THIS run in ms (10 s–24 h, same bounds as /ultracode set timeoutMs). Pass it when your budgeted waves × stages exceed the configured default — it applies to this run only, never changes the project default, and is recorded on the run and shown in ultracode_status.",
 }
 
+/** Shared explicit model-override property (all run forms). */
+const MODEL_OVERRIDE_PROPERTY: Record<string, unknown> = {
+  type: "string",
+  description:
+    'Optional explicit model override for THIS run: "provider/id" or "provider/id#variant". Beats the user\'s agent-config pins for every child without a per-call agent(prompt, { model }) override. A provider the user disabled (disabled_providers) stays blocked unless allowDisabledProviders: true. Routing by agent id remains the default — use this only when the user explicitly asks for a model.',
+}
+
+/** Shared disabled-provider escape hatch (companion to MODEL_OVERRIDE_PROPERTY). */
+const ALLOW_DISABLED_PROVIDERS_PROPERTY: Record<string, unknown> = {
+  type: "boolean",
+  description:
+    "Default false. Pass true only when the user explicitly wants an override to run on a provider they disabled (disabled_providers) — it unlocks that provider for THIS run only.",
+}
+
 /** JSON Schema for the workflow tool input union (inline script vs saved workflow). */
 const WORKFLOW_TOOL_INPUT_SCHEMA: Record<string, unknown> = {
   anyOf: [
@@ -174,6 +188,8 @@ const WORKFLOW_TOOL_INPUT_SCHEMA: Record<string, unknown> = {
             "Warm-start from a prior run id (run_…): keyed succeeded agents replay from that run's cache instead of respawning, so an interrupted long run costs only its unfinished tail.",
         },
         timeoutMs: RUN_TIMEOUT_MS_PROPERTY,
+        model: MODEL_OVERRIDE_PROPERTY,
+        allowDisabledProviders: ALLOW_DISABLED_PROVIDERS_PROPERTY,
       },
     },
     {
@@ -197,6 +213,8 @@ const WORKFLOW_TOOL_INPUT_SCHEMA: Record<string, unknown> = {
             "Warm-start from a prior run id (run_…): keyed succeeded agents replay from that run's cache instead of respawning, so an interrupted long run costs only its unfinished tail.",
         },
         timeoutMs: RUN_TIMEOUT_MS_PROPERTY,
+        model: MODEL_OVERRIDE_PROPERTY,
+        allowDisabledProviders: ALLOW_DISABLED_PROVIDERS_PROPERTY,
       },
     },
     {
@@ -226,6 +244,8 @@ const WORKFLOW_TOOL_INPUT_SCHEMA: Record<string, unknown> = {
             "Warm-start from a prior run id (run_…). Graph calls are auto-keyed per node, so every finished child replays from cache and only the unfinished tail respawns.",
         },
         timeoutMs: RUN_TIMEOUT_MS_PROPERTY,
+        model: MODEL_OVERRIDE_PROPERTY,
+        allowDisabledProviders: ALLOW_DISABLED_PROVIDERS_PROPERTY,
       },
     },
     {
@@ -249,6 +269,8 @@ const WORKFLOW_TOOL_INPUT_SCHEMA: Record<string, unknown> = {
           description: "Warm-start from a prior run id (run_…): keyed succeeded agents replay from cache.",
         },
         timeoutMs: RUN_TIMEOUT_MS_PROPERTY,
+        model: MODEL_OVERRIDE_PROPERTY,
+        allowDisabledProviders: ALLOW_DISABLED_PROVIDERS_PROPERTY,
       },
     },
     {
@@ -271,6 +293,8 @@ const WORKFLOW_TOOL_INPUT_SCHEMA: Record<string, unknown> = {
           description: "Warm-start from a prior run id (run_…): keyed succeeded agents replay from cache.",
         },
         timeoutMs: RUN_TIMEOUT_MS_PROPERTY,
+        model: MODEL_OVERRIDE_PROPERTY,
+        allowDisabledProviders: ALLOW_DISABLED_PROVIDERS_PROPERTY,
       },
     },
   ],
@@ -712,6 +736,19 @@ export default Plugin.define({
           }
           return parsed
         },
+        // Explicit model overrides (call-site opts.model or the run input
+        // model) on a provider the user took offline are rejected by the
+        // supervisor preflight/dispatch gate — same config the pin path reads,
+        // per-call so re-disabling applies to the next child.
+        isProviderDisabled: async (providerID: string) => {
+          const home = process.env["HOME"] ?? homedir()
+          try {
+            const disabled = await readDisabledProviders(fs, projectRoot, home)
+            return disabled.has(providerID)
+          } catch {
+            return false // best-effort check — fail open
+          }
+        },
       })
     } catch (err) {
       supervisorError =
@@ -907,9 +944,36 @@ export default Plugin.define({
                   availableAgents: prep.availableAgents,
                 }
                 const background = resolveBackground(input)
+                // Explicit run-level model override (all run variants share the
+                // field): shape-validated at tool input; parsed here into the
+                // object the runner applies. An offline provider fails inside
+                // the supervisor preflight (before any child spawns).
+                let runModel:
+                  | { providerID: string; id: string; variant?: string }
+                  | undefined
+                if (input.model !== undefined) {
+                  const normalized = normalizeModelRef(input.model)
+                  if (!normalized.ok) {
+                    return { content: `error: "model" — ${normalized.error}` }
+                  }
+                  runModel = normalized.model
+                }
                 return await executeWorkflowLaunch(
                   supervisor,
-                  { script, meta, args, name, workflowName, graphSpec, resumeFrom: input.resumeFrom, timeoutMs: input.timeoutMs },
+                  {
+                    script,
+                    meta,
+                    args,
+                    name,
+                    workflowName,
+                    graphSpec,
+                    resumeFrom: input.resumeFrom,
+                    timeoutMs: input.timeoutMs,
+                    ...(runModel !== undefined ? { model: runModel } : {}),
+                    ...(input.allowDisabledProviders !== undefined
+                      ? { allowDisabledProviders: input.allowDisabledProviders }
+                      : {}),
+                  },
                   parent,
                   background,
                   background

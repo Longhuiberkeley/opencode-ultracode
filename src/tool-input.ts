@@ -9,6 +9,7 @@
  * keys, wrong types and oversized inputs with precise messages.
  */
 import { CONTROL_ACTIONS, type ControlAction } from "./control.ts"
+import { parseModelPin } from "./agent-pins.ts"
 import { SCRIPT_TEMPLATES } from "./script-templates.ts"
 import type {
   GraphRunInput,
@@ -157,6 +158,38 @@ function validateTimeoutMs(
   return { ok: true, timeoutMs: value }
 }
 
+/**
+ * Explicit run-level model override (all run variants): "provider/id" or
+ * "provider/id#variant" — the same shape agent-config pins use.
+ */
+function validateModelOverride(
+  raw: Record<string, unknown>,
+): { ok: true; model?: string; allowDisabledProviders?: boolean } | { ok: false; error: string } {
+  if (has(raw, "model")) {
+    const value = raw["model"]
+    if (typeof value !== "string" || parseModelPin(value) === undefined) {
+      return {
+        ok: false,
+        error: `"model" must be a "provider/id" or "provider/id#variant" string, got ${typeof value === "string" ? JSON.stringify(value) : typeOf(value)}`,
+      }
+    }
+  }
+  if (has(raw, "allowDisabledProviders")) {
+    const value = raw["allowDisabledProviders"]
+    if (typeof value !== "boolean") {
+      return { ok: false, error: `"allowDisabledProviders" must be a boolean, got ${typeOf(value)}` }
+    }
+  }
+  return {
+    ok: true,
+    ...(typeof raw["model"] === "string" ? { model: raw["model"].trim() } : {}),
+    ...(typeof raw["allowDisabledProviders"] === "boolean" ? { allowDisabledProviders: raw["allowDisabledProviders"] } : {}),
+  }
+}
+
+/** Common per-run option keys every variant accepts (beyond its source key). */
+const RUN_OPTION_KEYS = ["args", "background", "resumeFrom", "timeoutMs", "model", "allowDisabledProviders"] as const
+
 export function validateToolInput(raw: unknown): ToolInputResult {
   if (!isObj(raw)) {
     return { ok: false, error: `input must be an object, got ${typeOf(raw)}` }
@@ -187,7 +220,7 @@ export function validateToolInput(raw: unknown): ToolInputResult {
 
   if (hasGraph) {
     // ---- graph-spec shape (deep validation happens in validateGraphSpec) ----
-    const extra = rejectExtras(raw, new Set(["graph", "name", "args", "background", "resumeFrom", "timeoutMs"]))
+    const extra = rejectExtras(raw, new Set(["graph", "name", ...RUN_OPTION_KEYS]))
     if (extra) return { ok: false, error: extra }
 
     const graph = raw["graph"]
@@ -218,6 +251,8 @@ export function validateToolInput(raw: unknown): ToolInputResult {
     if (!resume.ok) return { ok: false, error: resume.error }
     const timeout = validateTimeoutMs(raw)
     if (!timeout.ok) return { ok: false, error: timeout.error }
+    const override = validateModelOverride(raw)
+    if (!override.ok) return { ok: false, error: override.error }
 
     const input: GraphRunInput = { graph: graph as Record<string, unknown> }
     if (name !== undefined) input.name = name as string
@@ -225,12 +260,14 @@ export function validateToolInput(raw: unknown): ToolInputResult {
     if (background.background !== undefined) input.background = background.background
     if (resume.resumeFrom !== undefined) input.resumeFrom = resume.resumeFrom
     if (timeout.timeoutMs !== undefined) input.timeoutMs = timeout.timeoutMs
+    if (override.model !== undefined) input.model = override.model
+    if (override.allowDisabledProviders !== undefined) input.allowDisabledProviders = override.allowDisabledProviders
     return { ok: true, input }
   }
 
   if (hasWorkflow) {
     // ---- saved-workflow shape ----
-    const extra = rejectExtras(raw, new Set(["workflow", "args", "background", "resumeFrom", "timeoutMs"]))
+    const extra = rejectExtras(raw, new Set(["workflow", ...RUN_OPTION_KEYS]))
     if (extra) return { ok: false, error: extra }
 
     const workflow = raw["workflow"]
@@ -253,18 +290,22 @@ export function validateToolInput(raw: unknown): ToolInputResult {
     if (!resume.ok) return { ok: false, error: resume.error }
     const timeout = validateTimeoutMs(raw)
     if (!timeout.ok) return { ok: false, error: timeout.error }
+    const override = validateModelOverride(raw)
+    if (!override.ok) return { ok: false, error: override.error }
 
     const input: SavedRunInput = { workflow }
     if (raw["args"] !== undefined) input.args = args.args
     if (background.background !== undefined) input.background = background.background
     if (resume.resumeFrom !== undefined) input.resumeFrom = resume.resumeFrom
     if (timeout.timeoutMs !== undefined) input.timeoutMs = timeout.timeoutMs
+    if (override.model !== undefined) input.model = override.model
+    if (override.allowDisabledProviders !== undefined) input.allowDisabledProviders = override.allowDisabledProviders
     return { ok: true, input }
   }
 
   if (hasPath) {
     // ---- project-file shape: author with the file tool, run by path ----
-    const extra = rejectExtras(raw, new Set(["path", "args", "background", "resumeFrom", "timeoutMs"]))
+    const extra = rejectExtras(raw, new Set(["path", ...RUN_OPTION_KEYS]))
     if (extra) return { ok: false, error: extra }
 
     const path = raw["path"]
@@ -299,18 +340,22 @@ export function validateToolInput(raw: unknown): ToolInputResult {
     if (!resume.ok) return { ok: false, error: resume.error }
     const timeout = validateTimeoutMs(raw)
     if (!timeout.ok) return { ok: false, error: timeout.error }
+    const override = validateModelOverride(raw)
+    if (!override.ok) return { ok: false, error: override.error }
 
     const input: PathRunInput = { path }
     if (raw["args"] !== undefined) input.args = args.args
     if (background.background !== undefined) input.background = background.background
     if (resume.resumeFrom !== undefined) input.resumeFrom = resume.resumeFrom
     if (timeout.timeoutMs !== undefined) input.timeoutMs = timeout.timeoutMs
+    if (override.model !== undefined) input.model = override.model
+    if (override.allowDisabledProviders !== undefined) input.allowDisabledProviders = override.allowDisabledProviders
     return { ok: true, input }
   }
 
   if (hasTemplate) {
     // ---- served script-template shape (args feed declared params) ----
-    const extra = rejectExtras(raw, new Set(["template", "args", "background", "resumeFrom", "timeoutMs"]))
+    const extra = rejectExtras(raw, new Set(["template", ...RUN_OPTION_KEYS]))
     if (extra) return { ok: false, error: extra }
 
     const template = raw["template"]
@@ -339,18 +384,22 @@ export function validateToolInput(raw: unknown): ToolInputResult {
     if (!resume.ok) return { ok: false, error: resume.error }
     const timeout = validateTimeoutMs(raw)
     if (!timeout.ok) return { ok: false, error: timeout.error }
+    const override = validateModelOverride(raw)
+    if (!override.ok) return { ok: false, error: override.error }
 
     const input: TemplateRunInput = { template }
     if (raw["args"] !== undefined) input.args = args.args
     if (background.background !== undefined) input.background = background.background
     if (resume.resumeFrom !== undefined) input.resumeFrom = resume.resumeFrom
     if (timeout.timeoutMs !== undefined) input.timeoutMs = timeout.timeoutMs
+    if (override.model !== undefined) input.model = override.model
+    if (override.allowDisabledProviders !== undefined) input.allowDisabledProviders = override.allowDisabledProviders
     return { ok: true, input }
   }
 
   if (hasScript) {
     // ---- inline-script shape ----
-    const extra = rejectExtras(raw, new Set(["script", "name", "meta", "args", "background", "resumeFrom", "timeoutMs"]))
+    const extra = rejectExtras(raw, new Set(["script", "name", "meta", ...RUN_OPTION_KEYS]))
     if (extra) return { ok: false, error: extra }
 
     const script = raw["script"]
@@ -395,6 +444,8 @@ export function validateToolInput(raw: unknown): ToolInputResult {
     if (!resume.ok) return { ok: false, error: resume.error }
     const timeout = validateTimeoutMs(raw)
     if (!timeout.ok) return { ok: false, error: timeout.error }
+    const override = validateModelOverride(raw)
+    if (!override.ok) return { ok: false, error: override.error }
 
     const input: InlineRunInput = { script }
     if (name !== undefined) input.name = name as string
@@ -403,6 +454,8 @@ export function validateToolInput(raw: unknown): ToolInputResult {
     if (background.background !== undefined) input.background = background.background
     if (resume.resumeFrom !== undefined) input.resumeFrom = resume.resumeFrom
     if (timeout.timeoutMs !== undefined) input.timeoutMs = timeout.timeoutMs
+    if (override.model !== undefined) input.model = override.model
+    if (override.allowDisabledProviders !== undefined) input.allowDisabledProviders = override.allowDisabledProviders
     return { ok: true, input }
   }
 

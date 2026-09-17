@@ -15,6 +15,7 @@
  * injected worker globals.
  */
 import type { Json } from "./types.ts"
+import { parseModelPin } from "./agent-pins.ts"
 
 // ---------------------------------------------------------------------------
 // Spec types
@@ -45,6 +46,12 @@ export type GraphNode = {
   kind: GraphNodeKind
   /** agent/fanout/merge/gate: agent id (default: plugin option). */
   agent?: string
+  /**
+   * agent/fanout/merge/gate: explicit per-child model override,
+   * "provider/id" or "provider/id#variant" (same shape as config pins).
+   * Beats pins and the run-level override; disabled_providers still block.
+   */
+  model?: string
   /** agent/fanout/merge: prompt template. {{item}}/{{index}} valid in fanout+merge. */
   prompt?: string
   /** agent/fanout/merge: JSON Schema for structured output. */
@@ -106,11 +113,11 @@ export const DEFAULT_MERGE_BATCH = 8
 const ID_RE = /^[a-zA-Z_$][a-zA-Z0-9_$]{0,63}$/
 const RESERVED_IDS = new Set(["args", "item", "index"])
 const ALLOWED_NODE_KEYS: Record<GraphNodeKind, ReadonlySet<string>> = {
-  agent: new Set(["id", "kind", "agent", "prompt", "schema", "label"]),
-  fanout: new Set(["id", "kind", "agent", "prompt", "schema", "label", "max", "over"]),
+  agent: new Set(["id", "kind", "agent", "model", "prompt", "schema", "label"]),
+  fanout: new Set(["id", "kind", "agent", "model", "prompt", "schema", "label", "max", "over"]),
   partition: new Set(["id", "kind", "from", "budgetTokens", "tokensPerLine"]),
-  merge: new Set(["id", "kind", "agent", "prompt", "schema", "from", "batches"]),
-  gate: new Set(["id", "kind", "agent", "prompt", "schema", "from", "onFail"]),
+  merge: new Set(["id", "kind", "agent", "model", "prompt", "schema", "from", "batches"]),
+  gate: new Set(["id", "kind", "agent", "model", "prompt", "schema", "from", "onFail"]),
   checkpoint: new Set(["id", "kind", "from", "value"]),
   workflow: new Set(["id", "kind", "name", "argsFrom"]),
 }
@@ -320,6 +327,14 @@ export function validateGraphSpec(spec: unknown): GraphCheck {
     if (kind === "checkpoint" && typeof n["from"] !== "string" && typeof n["value"] !== "string") {
       errors.push(`${where} (${id}): checkpoint needs from or value`)
     }
+    if (kind === "agent" || kind === "fanout" || kind === "merge" || kind === "gate") {
+      const model = n["model"]
+      if (model !== undefined && (typeof model !== "string" || parseModelPin(model) === undefined)) {
+        errors.push(
+          `${where} (${id}): model must be a "provider/id" or "provider/id#variant" string, got ${JSON.stringify(model)}`,
+        )
+      }
+    }
 
     // refs must point at nodes defined EARLIER (spec order is topo order)
     const deps = nodeDeps(n as unknown as GraphNode)
@@ -439,6 +454,7 @@ function promptExpr(node: GraphNode, defined: ReadonlySet<string>, context: VarC
 function singleCallExpr(node: GraphNode, defined: ReadonlySet<string>): string {
   const parts: string[] = []
   if (node.agent !== undefined) parts.push(`agent: ${jsonLiteral(node.agent)}`)
+  if (node.model !== undefined) parts.push(`model: ${jsonLiteral(node.model)}`)
   parts.push(`phase: ${jsonLiteral(node.id)}`)
   parts.push(`label: ${jsonLiteral(node.label ?? node.id)}`)
   parts.push(`key: ${jsonLiteral(node.id)}`)
@@ -455,6 +471,7 @@ function parallelCallExpr(node: GraphNode, defined: ReadonlySet<string>, refExpr
   const perItem = (): string => {
     const parts: string[] = []
     if (node.agent !== undefined) parts.push(`agent: ${jsonLiteral(node.agent)}`)
+    if (node.model !== undefined) parts.push(`model: ${jsonLiteral(node.model)}`)
     parts.push(`phase: ${jsonLiteral(node.id)}`)
     const base = node.label ?? node.id
     parts.push(`label: ${jsonLiteral(base + ":")} + index`)

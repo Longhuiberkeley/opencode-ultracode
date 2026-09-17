@@ -41,6 +41,7 @@
 import { createHash } from "node:crypto"
 import { compileGraphSpec, validateGraphSpec } from "./graph.ts"
 import type { GraphSpec } from "./graph.ts"
+import { parseModelPin, scanModelRefs } from "./agent-pins.ts"
 import { mergeParams, paramsFromGraph, paramsFromScript } from "./params.ts"
 import type { WorkflowParam } from "./params.ts"
 import type {
@@ -117,6 +118,21 @@ export type ResolveResult = { ok: true; path: string } | { ok: false; error: str
 
 function errText(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
+}
+
+/** Per-node model overrides in a graph spec (trust surfacing, bounded). */
+function graphModelRefs(spec: Json): string[] {
+  const out = new Set<string>()
+  const nodes = (spec as { nodes?: unknown } | null)?.nodes
+  if (Array.isArray(nodes)) {
+    for (const n of nodes) {
+      if (n === null || typeof n !== "object" || Array.isArray(n)) continue
+      const m = (n as { model?: unknown }).model
+      if (typeof m === "string" && parseModelPin(m) !== undefined) out.add(m.trim())
+      if (out.size >= 16) break
+    }
+  }
+  return [...out].sort()
 }
 
 /**
@@ -607,6 +623,10 @@ export class StorageImpl implements Storage {
     // artifact, so `ultracode_catalog` can serve it without reading any code.
     const scriptParams = mergeParams(manifest.params, paramsFromScript(script))
     if (scriptParams !== undefined) full.params = scriptParams
+    // Trust surfacing: explicit model literals in the script body (the compiled
+    // body is digest-covered for graphs; for scripts this is the hint layer).
+    const models = scanModelRefs(script)
+    if (models.length > 0) full.modelsUsed = models
     await this.assertNoShadowingArtifact(name, source, dir, "script")
     const scriptPath = joinInside(dir, `${name}.js`, "workflow script")
     const manifestPath = joinInside(dir, `${name}.json`, "workflow manifest")
@@ -670,6 +690,9 @@ export class StorageImpl implements Storage {
     }
     const graphParams = mergeParams(manifest.params, paramsFromGraph(body.spec))
     if (graphParams !== undefined) full.params = graphParams
+    // Trust surfacing: per-node model overrides from the spec itself.
+    const graphModels = graphModelRefs(body.spec)
+    if (graphModels.length > 0) full.modelsUsed = graphModels
     await this.assertNoShadowingArtifact(name, source, dir, "graph")
     const specPath = joinInside(dir, `${name}${GRAPH_ARTIFACT_SUFFIX}`, "workflow graph spec")
     const manifestPath = joinInside(dir, `${name}.json`, "workflow manifest")

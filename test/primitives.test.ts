@@ -5,7 +5,7 @@
  */
 import test from "node:test"
 import assert from "node:assert/strict"
-import { AgentRunner, Semaphore, getWorkflowComposer, parallelHelper, pipelineHelper, storageWorkflowLoader, buildWarmCache, agentCacheDigest, clampRetryAttempts, clampRetryBackoffMs, delayAbortable } from "../src/primitives.ts"
+import { AgentRunner, Semaphore, getWorkflowComposer, parallelHelper, pipelineHelper, storageWorkflowLoader, buildWarmCache, agentCacheDigest, agentCacheKey, clampRetryAttempts, clampRetryBackoffMs, delayAbortable } from "../src/primitives.ts"
 import { compileGraphSpec } from "../src/graph.ts"
 import type { GraphSpec } from "../src/graph.ts"
 import type { AgentRunnerOptions } from "../src/primitives.ts"
@@ -638,7 +638,7 @@ test("AgentRunner retry: per-call opts.retry overrides plugin default", async ()
   assert.equal((await pending).sessionID, "ses_x")
 })
 
-test("AgentRunner spawnModel: resolved pin recorded on the agent record", async () => {
+test("AgentRunner spawnModel: resolved pin recorded on the agent record (with source)", async () => {
   const { registry, run, calls, runner } = makeRunner({
     pinForAgent: async () => ({ providerID: "xai", id: "grok-4.6", variant: "high" }),
   })
@@ -650,7 +650,61 @@ test("AgentRunner spawnModel: resolved pin recorded on the agent record", async 
     providerID: "xai",
     id: "grok-4.6",
     variant: "high",
+    source: "pin",
   })
+})
+
+test("AgentRunner model precedence: call-site override beats run-level and pin", async () => {
+  const { registry, run, calls, runner } = makeRunner({
+    pinForAgent: async () => ({ providerID: "xai", id: "pinned-model" }),
+    runModel: { providerID: "openai", id: "gpt-6" },
+  })
+  const pending = runner.call("call wins", { model: { providerID: "google", id: "gemini-3.7-flash" } })
+  await tick()
+  const created = calls[0]!.input as { model?: { providerID: string; id: string } }
+  assert.deepEqual(created.model, { providerID: "google", id: "gemini-3.7-flash" })
+  assert.deepEqual(registry.getAgent(run.id, "a1")!.spawnModel, {
+    providerID: "google",
+    id: "gemini-3.7-flash",
+    source: "call",
+  })
+  calls[0]!.resolve(okResult("ses_c"))
+  await pending
+})
+
+test("AgentRunner model precedence: run-level override beats pin", async () => {
+  const { registry, run, calls, runner } = makeRunner({
+    pinForAgent: async () => ({ providerID: "xai", id: "pinned-model" }),
+    runModel: { providerID: "openai", id: "gpt-6" },
+  })
+  const pending = runner.call("run wins", {})
+  await tick()
+  const created = calls[0]!.input as { model?: { providerID: string; id: string } }
+  assert.deepEqual(created.model, { providerID: "openai", id: "gpt-6" })
+  assert.equal(registry.getAgent(run.id, "a1")!.spawnModel!.source, "run")
+  calls[0]!.resolve(okResult("ses_r"))
+  await pending
+})
+
+test("AgentRunner model precedence: pin applies when no override is set", async () => {
+  const { registry, run, calls, runner } = makeRunner({
+    pinForAgent: async () => ({ providerID: "xai", id: "pinned-model" }),
+  })
+  const pending = runner.call("pin wins", {})
+  await tick()
+  assert.equal(registry.getAgent(run.id, "a1")!.spawnModel!.source, "pin")
+  calls[0]!.resolve(okResult("ses_p"))
+  await pending
+})
+
+test("agentCacheKey: per-call model changes the digest; absent model keeps legacy digests", () => {
+  const base = agentCacheKey("prompt", {}, "general")
+  const legacy = `${"prompt"}\u0000${JSON.stringify(null)}\u0000${"general"}`
+  assert.equal(base, legacy, "no-model calls keep the pre-override digest format (warm replays survive)")
+  const overridden = agentCacheKey("prompt", { model: { providerID: "google", id: "gemini-3.7-flash" } }, "general")
+  assert.notEqual(overridden, base, "same key + different model must never replay the old result")
+  const variant = agentCacheKey("prompt", { model: { providerID: "google", id: "gemini-3.7-flash", variant: "high" } }, "general")
+  assert.notEqual(variant, overridden, "variant participates in the digest")
 })
 
 test("delayAbortable: abort during backoff rejects immediately", async () => {

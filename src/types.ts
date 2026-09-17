@@ -116,6 +116,19 @@ export type CapturedSettings = {
   permissionStallMs?: number
 }
 
+/** Model reference as `session.create` expects it ({ providerID, id, variant? }). */
+export type ModelRef = { providerID: string; id: string; variant?: string }
+
+/** Where a spawned child's intended model came from — precedence provenance. */
+export type ModelSpawnSource = "call" | "run" | "pin" | "default"
+
+/**
+ * Intended spawn model on an agent record. `source` distinguishes an
+ * INTENTIONAL override ("call"/"run") from a config pin or server default, so
+ * drift reports can tell them apart.
+ */
+export type SpawnModel = ModelRef & { source?: ModelSpawnSource }
+
 // ---------------------------------------------------------------------------
 // Tool input (union, validated by src/tool-input.ts)
 // ---------------------------------------------------------------------------
@@ -129,8 +142,20 @@ export interface WorkflowMeta {
   requires?: string[]
 }
 
+/**
+ * Explicit model override, shared by every run-input variant: "provider/id"
+ * or "provider/id#variant". Beats the user's agent-config pins for children
+ * without a per-call model. Providers the user took offline
+ * (`disabled_providers`) stay a hard block unless `allowDisabledProviders`.
+ */
+export interface ModelOverrideInput {
+  model?: string
+  /** Default false: a model on a disabled provider is rejected. Explicit true unlocks it for THIS run. */
+  allowDisabledProviders?: boolean
+}
+
 /** Run an inline script (async function body, plain JS — no ESM exports). */
-export interface InlineRunInput {
+export interface InlineRunInput extends ModelOverrideInput {
   script: string
   name?: string
   meta?: WorkflowMeta
@@ -144,7 +169,7 @@ export interface InlineRunInput {
 }
 
 /** Run a saved workflow by name (project dir beats personal dir). */
-export interface SavedRunInput {
+export interface SavedRunInput extends ModelOverrideInput {
   workflow: string
   args?: Json
   /** Default true: return after admission. Explicit false blocks until the envelope. */
@@ -160,7 +185,7 @@ export interface SavedRunInput {
  * src/graph.ts into a plain async-body script). Kept as a plain object here to
  * avoid a types <-> graph import cycle; deep validation lives in graph.ts.
  */
-export interface GraphRunInput {
+export interface GraphRunInput extends ModelOverrideInput {
   graph: Record<string, unknown>
   name?: string
   args?: Json
@@ -181,7 +206,7 @@ export type WorkflowToolInput = InlineRunInput | SavedRunInput | GraphRunInput |
  * level equals an inline { script } — the user's own agent wrote the file
  * deliberately; the file is read at call time.
  */
-export interface PathRunInput {
+export interface PathRunInput extends ModelOverrideInput {
   /** Project-root-relative POSIX path; no absolute paths, no ".." segments. */
   path: string
   args?: Json
@@ -194,7 +219,7 @@ export interface PathRunInput {
 }
 
 /** Run a served script template by name (args feed its declared params). */
-export interface TemplateRunInput {
+export interface TemplateRunInput extends ModelOverrideInput {
   /** Known script-template name (see ultracode_catalog scriptTemplates). */
   template: string
   args?: Json
@@ -225,6 +250,14 @@ export interface RunLaunchInput {
    * run's frozen effective options — never persisted into the settings overlay.
    */
   timeoutMs?: number
+  /**
+   * Explicit run-level model override (parsed from the tool input `model`
+   * string): applies to every child without a per-call `opts.model`. Beats
+   * agent-config pins; gated by `allowDisabledProviders` for offline providers.
+   */
+  model?: ModelRef
+  /** Escape hatch for the disabled_providers hard block (this run only). */
+  allowDisabledProviders?: boolean
 }
 
 // ---------------------------------------------------------------------------
@@ -268,11 +301,12 @@ export interface AgentRecord {
   /** Model actually used (differs from pins/defaults when pins don't load). */
   effectiveModel?: { providerID: string; id: string } | null
   /**
-   * Model intended at spawn (the resolved pin, when any). Set before the
-   * child runs, so FAILED rows still show which model/provider was targeted
-   * — 0-token provider deaths never populate effectiveModel.
+   * Model intended at spawn (the resolved pin or override, when any). Set
+   * before the child runs, so FAILED rows still show which model/provider was
+   * targeted — 0-token provider deaths never populate effectiveModel.
+   * `source` records precedence: "call" | "run" (explicit overrides) vs "pin".
    */
-  spawnModel?: { providerID: string; id: string; variant?: string }
+  spawnModel?: SpawnModel
   sessionID?: string
   status: AgentStatus
   error?: string
@@ -348,6 +382,14 @@ export interface RunRecord {
    */
   timeoutOverrideMs?: number
   /**
+   * Explicit run-level model override from the run tool input (additive).
+   * Persisted so `/ultracode rerun` reproduces the override; absent when the
+   * run used pins/defaults only.
+   */
+  modelOverride?: ModelRef
+  /** Set when the run unlocked disabled providers for its overrides. */
+  allowDisabledProviders?: boolean
+  /**
    * Process ownership for orphan reconciliation. Optional/additive: records
    * without owner keep the legacy "flip on restart" behavior.
    */
@@ -405,6 +447,13 @@ export interface RunEnvelope {
 export interface AgentOpts {
   /** Agent id. Default: plugin options.agent. Missing agent => fail fast with available list. */
   agent?: string
+  /**
+   * Explicit per-call model override ("provider/id#variant" resolved by the
+   * host): beats the run-level override and agent-config pins for THIS child.
+   * Invalid shapes fail the call fast; offline providers are rejected unless
+   * the run set allowDisabledProviders.
+   */
+  model?: ModelRef
   /** Short label for progress UI + run records. */
   label?: string
   /** Phase grouping (explicit beats ambient phase() in concurrent code). */
@@ -538,6 +587,12 @@ export interface SavedWorkflowManifest {
   savedFromRunID?: string
   /** Artifact kind: `<name>.js` (script) or `<name>.graph.json` (graph spec). */
   kind?: WorkflowKind
+  /**
+   * Model ids the workflow explicitly names (trust surfacing): static scan of
+   * `model:` literals in the script body and `model` fields in a graph spec.
+   * Absent when the workflow routes only via agent ids / config pins.
+   */
+  modelsUsed?: string[]
   /** Declared `args` shape — see WorkflowParams (workstream C). */
   params?: Json
 }

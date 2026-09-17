@@ -191,6 +191,8 @@ export class FakeSessionCtx implements SessionCtx {
   >()
   /** Records interrupt calls for abort tests. */
   interrupts: string[] = []
+  /** The `model` each create() received, in order (model-override tests). */
+  createdModels: Array<{ providerID: string; id: string; variant?: string } | undefined> = []
   /** When true, `wait` never resolves on its own (tests must abort). */
   hangWait = false
   /** Optional delay for wait() (pause/in-flight tests). */
@@ -205,9 +207,11 @@ export class FakeSessionCtx implements SessionCtx {
   async create(input: {
     title?: string
     agent?: string
+    model?: { providerID: string; id: string; variant?: string }
     metadata?: Record<string, unknown>
   }): Promise<{ id: string; agent?: string }> {
     const id = `ses_fake${++sessionCounter}`
+    this.createdModels.push(input.model)
     this.sessions.set(id, {
       id,
       agent: input.agent,

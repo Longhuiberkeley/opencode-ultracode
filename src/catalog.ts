@@ -137,6 +137,7 @@ function workflowRow(entry: CatalogWorkflow, runs: readonly RunRecord[]): Json {
   if (params !== "") row["params"] = params
   if (manifest.phases !== undefined && manifest.phases.length > 0) row["phases"] = manifest.phases
   if (manifest.requires !== undefined && manifest.requires.length > 0) row["requires"] = manifest.requires
+  if (manifest.modelsUsed !== undefined && manifest.modelsUsed.length > 0) row["models"] = manifest.modelsUsed
   if (kind === "graph") row["nodes"] = graphNodeCount(workflow.graphSpec)
   if (workflow.graphError !== undefined) {
     row["broken"] = safeSlice(workflow.graphError, MAX_CATALOG_DESCRIPTION_CHARS)
@@ -165,6 +166,7 @@ function workflowDetail(entry: CatalogWorkflow, runs: readonly RunRecord[]): Jso
   if (manifest.description !== undefined) detail["description"] = safeSlice(manifest.description, MAX_CATALOG_DESCRIPTION_CHARS)
   if (manifest.phases !== undefined) detail["phases"] = manifest.phases
   if (manifest.requires !== undefined) detail["requires"] = manifest.requires
+  if (manifest.modelsUsed !== undefined && manifest.modelsUsed.length > 0) detail["models"] = manifest.modelsUsed
   if (manifest.savedFromRunID !== undefined) detail["savedFromRunID"] = manifest.savedFromRunID
   const params = parseParams(manifest.params)
   if (params && params.args.length > 0) detail["params"] = params.args as unknown as Json

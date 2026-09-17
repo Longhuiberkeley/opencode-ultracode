@@ -72,6 +72,60 @@ export function parseModelPin(pin: string): { providerID: string; id: string; va
   return out
 }
 
+/**
+ * Normalize an explicit model override (call-site `opts.model` or the run tool
+ * input `model`): accepts the pin string shape ("provider/id#variant") or the
+ * expanded object { providerID, id, variant? }. Unlike config pins (which SKIP
+ * unreadable/offline values), an override the caller spelled wrong is an ERROR
+ * — fail the call fast instead of silently spawning on a default.
+ */
+export function normalizeModelRef(
+  raw: unknown,
+): { ok: true; model: { providerID: string; id: string; variant?: string } } | { ok: false; error: string } {
+  if (typeof raw === "string") {
+    const parsed = parseModelPin(raw)
+    if (parsed === undefined) {
+      return {
+        ok: false,
+        error: `model must be "provider/id" or "provider/id#variant", got ${JSON.stringify(raw)}`,
+      }
+    }
+    return { ok: true, model: parsed }
+  }
+  if (raw !== null && typeof raw === "object" && !Array.isArray(raw)) {
+    const o = raw as { providerID?: unknown; id?: unknown; variant?: unknown }
+    if (typeof o.providerID === "string" && typeof o.id === "string" && o.providerID !== "" && o.id !== "") {
+      if (/[#/\s]/.test(o.id)) {
+        return { ok: false, error: `model.id must be the bare model id (no provider/ or #variant), got ${JSON.stringify(o.id)}` }
+      }
+      const model: { providerID: string; id: string; variant?: string } = { providerID: o.providerID, id: o.id }
+      if (typeof o.variant === "string" && o.variant !== "") model.variant = o.variant
+      return { ok: true, model }
+    }
+    return { ok: false, error: `model object must be { providerID, id, variant? }, got ${JSON.stringify(raw)}` }
+  }
+  return { ok: false, error: `model must be "provider/id" or { providerID, id, variant? }, got ${JSON.stringify(raw)}` }
+}
+
+/**
+ * Model strings referenced by a workflow body/spec (trust surfacing): scan for
+ * pin-shaped literals in `model:` option position and return the deduped list.
+ * Deliberately conservative — a false negative only hides a hint from the
+ * trust listing (the digest still covers the executable body); a false
+ * positive would require a pin-shaped string literal after `model:`.
+ */
+export function scanModelRefs(text: string): string[] {
+  const out = new Set<string>()
+  const re = /model\s*:\s*["'`]([^"'`\n]+)["'`]/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(text)) !== null) {
+    const parsed = parseModelPin(m[1]!)
+    if (parsed !== undefined) out.add(m[1]!.trim())
+    if (out.size >= 16) break // bounded — 16 distinct model ids is far past any real workflow
+  }
+  return [...out].sort()
+}
+
 async function readPin(fs: FsLike, path: string): Promise<string | undefined> {
   try {
     if (!(await fs.exists(path))) return undefined

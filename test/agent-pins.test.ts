@@ -316,3 +316,36 @@ test("agentConfigured: unreadable project file falls through to the global check
   assert.equal(await agentConfigured(fs, "/p", "/h", "fallback"), true)
   assert.equal(await agentConfigured(fs, "/p", "/h", "absent"), false)
 })
+
+// ---------------------------------------------------------------------------
+// Explicit model overrides (normalizeModelRef + scanModelRefs)
+// ---------------------------------------------------------------------------
+
+test("normalizeModelRef accepts pin strings and objects, rejects garbage", async () => {
+  const { normalizeModelRef } = await import("../src/agent-pins.ts")
+  assert.deepEqual(normalizeModelRef("google/gemini-3.7-flash#lite"), {
+    ok: true,
+    model: { providerID: "google", id: "gemini-3.7-flash", variant: "lite" },
+  })
+  assert.deepEqual(normalizeModelRef({ providerID: "openai", id: "gpt-6" }), {
+    ok: true,
+    model: { providerID: "openai", id: "gpt-6" },
+  })
+  for (const bad of ["nope", "", 42, null, { providerID: "x" }, { id: "y" }, { providerID: "x", id: "a/b" }, []]) {
+    const r = normalizeModelRef(bad)
+    assert.equal(r.ok, false, `expected rejection for ${JSON.stringify(bad)}`)
+  }
+})
+
+test("scanModelRefs finds pin-shaped model literals and stays bounded", async () => {
+  const { scanModelRefs } = await import("../src/agent-pins.ts")
+  const src = `
+await agent("a", { model: "openai/gpt-6" })
+await agent("b", { model: 'google/gemini-3.7-flash#lite' })
+const notAModel = "my/model" // no model: prefix -> ignored
+await agent("c", { label: "model: x" })
+`
+  const found = scanModelRefs(src)
+  assert.deepEqual(found, ["google/gemini-3.7-flash#lite", "openai/gpt-6"])
+  assert.deepEqual(scanModelRefs("return 1"), [])
+})

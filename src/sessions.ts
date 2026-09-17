@@ -48,7 +48,7 @@ export class RunClosedError extends AgentCallError {
 export interface AgentRunInput {
   prompt: string
   agent?: string
-  /** Pinned model for the resolved agent (from user agent config); applied at create. */
+  /** Model for the resolved agent (explicit override or config pin); applied at create. */
   model?: { providerID: string; id: string; variant?: string }
   label?: string
   phase?: string

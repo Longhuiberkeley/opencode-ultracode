@@ -457,3 +457,50 @@ test("source keys are mutually exclusive across all five forms", () => {
     if (!r.ok) assert.match(r.error, /cannot combine|cannot specify both/)
   }
 })
+
+// ---------------------------------------------------------------------------
+// Model override inputs (all run variants)
+// ---------------------------------------------------------------------------
+
+test("model + allowDisabledProviders accepted on every run variant", () => {
+  const cases: Array<[Record<string, unknown>, string]> = [
+    [{ script: "return 1", model: "google/gemini-3.7-flash#lite", allowDisabledProviders: true }, "inline"],
+    [{ workflow: "w", model: "openai/gpt-6" }, "saved"],
+    [{ graph: { nodes: [] }, model: "openai/gpt-6" }, "graph"],
+    [{ path: "a.js", model: "openai/gpt-6" }, "path"],
+    [{ template: "verify-fix", model: "openai/gpt-6" }, "template"],
+  ]
+  for (const [raw, label] of cases) {
+    const r = validateToolInput(raw)
+    assert.ok(r.ok, `${label}: ${r.ok ? "" : r.error}`)
+    if (r.ok) {
+      assert.equal(r.input.model, raw["model"], `${label}: model preserved`)
+      assert.equal(
+        r.input.allowDisabledProviders,
+        raw["allowDisabledProviders"],
+        `${label}: allowDisabledProviders preserved`,
+      )
+    }
+  }
+})
+
+test("model input rejects bad shapes and wrong types", () => {
+  for (const raw of [
+    { script: "return 1", model: "no-slash" },
+    { script: "return 1", model: 42 },
+    { script: "return 1", model: { providerID: "x" } },
+    { script: "return 1", allowDisabledProviders: "yes" },
+    { workflow: "w", model: "" },
+    { graph: { nodes: [] }, model: "a/b/c" },
+  ]) {
+    const r = validateToolInput(raw)
+    assert.equal(r.ok, false, `expected rejection for ${JSON.stringify(raw)}`)
+    if (!r.ok) assert.match(r.error, /"model" must be|"allowDisabledProviders" must be/)
+  }
+})
+
+test("model variant string with #variant parses to provider/id#variant", () => {
+  const r = validateToolInput({ script: "return 1", model: "google/gemini-3.7-flash#lite" })
+  assert.ok(r.ok)
+  if (r.ok) assert.equal(r.input.model, "google/gemini-3.7-flash#lite")
+})

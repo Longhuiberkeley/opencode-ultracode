@@ -323,6 +323,8 @@ export function enrichStatusPayload(
   resumedFrom?: string
   /** Explicit per-run wall-clock override from the run input, when present. */
   timeoutOverrideMs?: number
+  /** Explicit run-level model override ("provider/id"), when present. */
+  modelOverride?: string
   result?: Json
   resultPreview?: string
   /** True when THIS payload does not contain the complete result. */
@@ -340,6 +342,9 @@ export function enrichStatusPayload(
   if (run.workflowName) out["workflowName"] = run.workflowName
   if (run.resumedFrom) out["resumedFrom"] = run.resumedFrom
   if (run.timeoutOverrideMs !== undefined) out["timeoutOverrideMs"] = run.timeoutOverrideMs
+  if (run.modelOverride !== undefined) {
+    out["modelOverride"] = `${run.modelOverride.providerID}/${run.modelOverride.id}${run.modelOverride.variant ? `#${run.modelOverride.variant}` : ""}`
+  }
   out["elapsedMs"] = Math.max(0, (run.endedAt ?? now) - run.startedAt)
   const children: StatusChildView[] = run.agents.slice(0, STATUS_CHILDREN_LIMIT).map((a) => {
     const child: StatusChildView = { agentID: a.id, status: a.status }
@@ -1430,6 +1435,11 @@ async function rerunRun(deps: CommandDeps, sessionID: string, rest: string): Pro
         // reruns at the same timeout (warm reruns of long runs must not die
         // at the project default). Absent when the original used the default.
         ...(source.timeoutOverrideMs !== undefined ? { timeoutMs: source.timeoutOverrideMs } : {}),
+        // Reproduce the explicit run-level model override the same way —
+        // without it, a rerun's unpinned children would silently fall back to
+        // config pins and break warm-digest expectations.
+        ...(source.modelOverride !== undefined ? { model: source.modelOverride } : {}),
+        ...(source.allowDisabledProviders === true ? { allowDisabledProviders: true } : {}),
         ...(warm ? { resumeFrom: source.id } : {}),
       },
       { sessionID, report: () => {}, availableAgents: prep.availableAgents },

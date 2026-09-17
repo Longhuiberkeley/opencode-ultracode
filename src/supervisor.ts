@@ -27,6 +27,7 @@ import type {
   WorkflowMeta,
 } from "./types.ts"
 import { addTokens, emptyTokens, isActiveRunStatus } from "./types.ts"
+import { normalizeModelRef } from "./agent-pins.ts"
 import { freezeEffective, panelSettingsFrom, remainingTimeoutMs } from "./settings.ts"
 import { buildEnvelope, resultFits } from "./serialize.ts"
 import { createSessionDriver } from "./sessions.ts"
@@ -64,6 +65,14 @@ export interface SupervisorDeps {
    * Index wiring; optional for tests.
    */
   pinForAgent?: (agentId: string) => Promise<{ providerID: string; id: string; variant?: string } | undefined>
+  /**
+   * True when the user took a provider offline (`disabled_providers` in
+   * subagent-config). Explicit model overrides (call-site or run-level) on a
+   * disabled provider are REJECTED unless the run set allowDisabledProviders —
+   * config pins keep their existing skip-fallback behavior. Index wiring;
+   * optional for tests.
+   */
+  isProviderDisabled?: (providerID: string) => Promise<boolean>
 }
 
 interface PauseWaiter {
@@ -108,6 +117,10 @@ interface RunState {
   pauseWaiters: PauseWaiter[]
   /** Immutable copy of effective options for this run. */
   effective: Required<UltracodeOptions>
+  /** Explicit run-level model override (run tool input `model`). */
+  runModel: { providerID: string; id: string; variant?: string } | undefined
+  /** Escape hatch: explicit overrides may target disabled providers. */
+  allowDisabledProviders: boolean
 }
 
 type FinalOutcome = {
@@ -150,6 +163,7 @@ export class SupervisorImpl implements Supervisor {
   private readonly pinForAgent:
     | ((agentId: string) => Promise<{ providerID: string; id: string; variant?: string } | undefined>)
     | undefined
+  private readonly isProviderDisabled: ((providerID: string) => Promise<boolean>) | undefined
   private readonly settleGraceMs: number
   private readonly stopKillMs: number
   private readonly driver: SessionDriver
@@ -163,6 +177,7 @@ export class SupervisorImpl implements Supervisor {
     this.sessions = deps.sessions
     this.options = { ...deps.options }
     this.pinForAgent = deps.pinForAgent
+    this.isProviderDisabled = deps.isProviderDisabled
     this.settleGraceMs = deps.settleGraceMs ?? SETTLE_GRACE_MS
     this.stopKillMs = deps.stopKillGraceMs ?? STOP_KILL_GRACE_MS
     // Driver construction performs no session calls — safe outside executors.
@@ -214,11 +229,15 @@ export class SupervisorImpl implements Supervisor {
       input.timeoutMs !== undefined ? { ...this.options, timeoutMs: input.timeoutMs } : this.options,
     )
     if (input.timeoutMs !== undefined) record.timeoutOverrideMs = input.timeoutMs
+    // Persist the explicit model override for rerun reproduction (mirrors
+    // timeoutOverrideMs; absent = pins/defaults only).
+    if (input.model !== undefined) record.modelOverride = input.model
+    if (input.allowDisabledProviders === true) record.allowDisabledProviders = true
     // panelSettingsFrom alone drops permissionStallMs (panel shows 4 keys),
     // but the permission stall watchdog reads it off this record — keep it.
     record.effective = { ...panelSettingsFrom(effective), permissionStallMs: effective.permissionStallMs }
     this.registry.persistNow(runID)
-    const state = this.makeState(runID, parent, effective)
+    const state = this.makeState(runID, parent, effective, input)
     this.runs.set(runID, state)
     const done = this.executeRun(record, input, parent, state)
     return { runID, done }
@@ -261,6 +280,26 @@ export class SupervisorImpl implements Supervisor {
           })()
         warmCache = buildWarmCache(source)
         this.safeParentReport(state, `warm start from ${input.resumeFrom}: ${warmCache.size} keyed result(s) replayable`)
+      }
+
+      // Run-level model override preflight: a model on a provider the user
+      // took offline fails the run BEFORE any child spawns (config pins skip
+      // silently; an explicit request is an explicit error). The escape hatch
+      // is the run input's allowDisabledProviders: true.
+      if (input.model !== undefined && !state.allowDisabledProviders && this.isProviderDisabled) {
+        let disabled = false
+        try {
+          disabled = await this.isProviderDisabled(input.model.providerID)
+        } catch {
+          disabled = false // fail open — mirrors the pin-path behavior
+        }
+        if (disabled) {
+          throw new Error(
+            `run-level model override "${input.model.providerID}/${input.model.id}" targets provider ` +
+              `"${input.model.providerID}", which the user disabled (disabled_providers). ` +
+              "Re-enable the provider or pass allowDisabledProviders: true on this run input.",
+          )
+        }
       }
 
       // 3.-4. AgentRunner over a driver wrapper that tracks child sessions,
@@ -326,6 +365,7 @@ export class SupervisorImpl implements Supervisor {
         report: (status) => parent.report(status),
         ambientPhase: () => state.ambientPhase,
         ...(this.pinForAgent ? { pinForAgent: this.pinForAgent } : {}),
+        ...(state.runModel !== undefined ? { runModel: state.runModel } : {}),
         signal: state.controller.signal,
         ...(warmCache ? { warmCache } : {}),
       })
@@ -484,7 +524,12 @@ export class SupervisorImpl implements Supervisor {
   // internals
   // -------------------------------------------------------------------------
 
-  private makeState(runID: string, parent: ParentContext, effective: Required<UltracodeOptions>): RunState {
+  private makeState(
+    runID: string,
+    parent: ParentContext,
+    effective: Required<UltracodeOptions>,
+    input: RunLaunchInput,
+  ): RunState {
     let resolveDone!: () => void
     const done = new Promise<void>((resolve) => {
       resolveDone = resolve
@@ -515,6 +560,8 @@ export class SupervisorImpl implements Supervisor {
       stallNotified: new Set<string>(),
       pauseWaiters: [],
       effective,
+      runModel: input.model,
+      allowDisabledProviders: input.allowDisabledProviders === true,
     }
   }
 
@@ -526,7 +573,7 @@ export class SupervisorImpl implements Supervisor {
         throw new Error("agent(prompt, opts) — prompt must be a non-empty string")
       }
       const prompt = args[0]
-      const opts = this.coerceAgentOpts(args[1])
+      const opts = await this.coerceAgentOpts(args[1], state)
       const result = await runner.call(prompt, opts)
       return result as unknown as Json
     }
@@ -542,7 +589,14 @@ export class SupervisorImpl implements Supervisor {
     throw new Error(`unknown bridge call: ${fn}`)
   }
 
-  private coerceAgentOpts(raw: Json | undefined): AgentOpts {
+  /**
+   * Coerce raw agent() opts from the bridge into AgentOpts. `model` accepts
+   * the "provider/id#variant" string (or object form) and is GATED here: an
+   * override targeting a provider the user disabled is an error (config pins
+   * skip; explicit requests fail loud) unless the run set
+   * allowDisabledProviders.
+   */
+  private async coerceAgentOpts(raw: Json | undefined, state: RunState): Promise<AgentOpts> {
     const o = raw !== null && typeof raw === "object" && !Array.isArray(raw)
       ? (raw as { [key: string]: Json | undefined })
       : {}
@@ -554,6 +608,28 @@ export class SupervisorImpl implements Supervisor {
     if (typeof o.key === "string") {
       const key = o.key.trim().slice(0, 128)
       if (key) opts.key = key
+    }
+    if (o.model !== undefined && o.model !== null) {
+      const normalized = normalizeModelRef(o.model)
+      if (!normalized.ok) {
+        throw new Error(`agent(prompt, opts) — opts.model: ${normalized.error}`)
+      }
+      if (!state.allowDisabledProviders && this.isProviderDisabled) {
+        let disabled = false
+        try {
+          disabled = await this.isProviderDisabled(normalized.model.providerID)
+        } catch {
+          disabled = false // fail open — mirrors the pin-path behavior
+        }
+        if (disabled) {
+          throw new Error(
+            `opts.model "${normalized.model.providerID}/${normalized.model.id}" targets provider ` +
+              `"${normalized.model.providerID}", which the user disabled (disabled_providers). ` +
+              "Re-enable the provider or relaunch the run with allowDisabledProviders: true.",
+          )
+        }
+      }
+      opts.model = normalized.model
     }
     if (o.retry !== null && typeof o.retry === "object" && !Array.isArray(o.retry)) {
       const r = o.retry as { attempts?: Json | undefined; backoffMs?: Json | undefined }

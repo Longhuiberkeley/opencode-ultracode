@@ -16,6 +16,10 @@ const tick = (ms = 10): Promise<void> => new Promise((r) => setTimeout(r, ms))
 function makeSupervisor(
   optionsOverrides: Partial<UltracodeOptions> = {},
   graces: { settleGraceMs?: number; stopKillGraceMs?: number } = {},
+  extraDeps: {
+    pinForAgent?: (agentId: string) => Promise<{ providerID: string; id: string; variant?: string } | undefined>
+    isProviderDisabled?: (providerID: string) => Promise<boolean>
+  } = {},
 ) {
   const registry = new FakeRegistry()
   const storage = new FakeStorage()
@@ -28,6 +32,7 @@ function makeSupervisor(
     options,
     settleGraceMs: graces.settleGraceMs ?? 300,
     stopKillGraceMs: graces.stopKillGraceMs ?? 80,
+    ...extraDeps,
   })
   const reports: string[] = []
   const parent: ParentContext = {
@@ -824,4 +829,110 @@ test("childStallMs watchdog: stalled live child marked + interrupted; activity r
   sessions.releaseHangs()
   const outcome = await started.done
   assert.equal(outcome.run.status, "failed")
+})
+
+// ---------------------------------------------------------------------------
+// Model overrides (call-site > run-level > pin; disabled providers gate)
+// ---------------------------------------------------------------------------
+
+test("model override: call-site string reaches session.create with source provenance", async () => {
+  const ctx = makeSupervisor({}, {}, {
+    pinForAgent: async () => ({ providerID: "xai", id: "pinned-model" }),
+  })
+  ctx.sessions.push({ text: "ok", agent: "general" })
+  const outcome = await ctx.supervisor.start(
+    {
+      script: `const r = await agent("hello", { model: "google/gemini-3.7-flash#lite" })
+return { text: r.text }`,
+    },
+    ctx.parent,
+  )
+  assert.equal(outcome.run.status, "succeeded")
+  assert.deepEqual(ctx.sessions.createdModels[0], {
+    providerID: "google",
+    id: "gemini-3.7-flash",
+    variant: "lite",
+  }, "the per-call override rides session.create (beats the pin)")
+  const rec = ctx.registry.getAgent(outcome.run.id, "a1")!
+  assert.equal(rec.spawnModel?.source, "call")
+  assert.equal(rec.spawnModel?.providerID, "google")
+})
+
+test("model override: invalid shape fails the agent call fast", async () => {
+  const ctx = makeSupervisor()
+  const outcome = await ctx.supervisor.start(
+    {
+      script: `await agent("hello", { model: "not-a-pin" })
+return { ok: true }`,
+    },
+    ctx.parent,
+  )
+  assert.equal(outcome.run.status, "failed")
+  assert.match(outcome.run.error ?? "", /model must be/)
+  assert.equal(ctx.sessions.createdModels.length, 0, "no session spawned for a bad override")
+})
+
+test("model override: disabled provider is a hard error; allowDisabledProviders unlocks it", async () => {
+  // Vetoed
+  {
+    const ctx = makeSupervisor({}, {}, { isProviderDisabled: async () => true })
+    const outcome = await ctx.supervisor.start(
+      { script: `await agent("hello", { model: "offline/m1" })\nreturn 1` },
+      ctx.parent,
+    )
+    assert.equal(outcome.run.status, "failed")
+    assert.match(outcome.run.error ?? "", /disabled \(disabled_providers\)/)
+    assert.match(outcome.run.error ?? "", /allowDisabledProviders/)
+    assert.equal(ctx.sessions.createdModels.length, 0)
+  }
+  // Unlocked per-run
+  {
+    const ctx = makeSupervisor({}, {}, { isProviderDisabled: async () => true })
+    ctx.sessions.push({ text: "ok", agent: "general" })
+    const outcome = await ctx.supervisor.start(
+      {
+        script: `await agent("hello", { model: "offline/m1" })\nreturn 1`,
+        allowDisabledProviders: true,
+      },
+      ctx.parent,
+    )
+    assert.equal(outcome.run.status, "succeeded")
+    assert.deepEqual(ctx.sessions.createdModels[0], { providerID: "offline", id: "m1" })
+  }
+})
+
+test("model override: run-level model applies to children without a per-call model", async () => {
+  const ctx = makeSupervisor({}, {}, {
+    pinForAgent: async () => ({ providerID: "xai", id: "pinned-model" }),
+  })
+  ctx.sessions.push({ text: "a", agent: "general" })
+  ctx.sessions.push({ text: "b", agent: "general" })
+  const outcome = await ctx.supervisor.start(
+    {
+      script: `
+await agent("run model")
+await agent("call model", { model: "google/gemini-3.7-flash" })
+return 1`,
+      model: { providerID: "openai", id: "gpt-6" },
+    },
+    ctx.parent,
+  )
+  assert.equal(outcome.run.status, "succeeded")
+  assert.deepEqual(ctx.sessions.createdModels[0], { providerID: "openai", id: "gpt-6" }, "run model applied")
+  assert.deepEqual(ctx.sessions.createdModels[1], { providerID: "google", id: "gemini-3.7-flash" }, "call beats run")
+  const a1 = ctx.registry.getAgent(outcome.run.id, "a1")!
+  const a2 = ctx.registry.getAgent(outcome.run.id, "a2")!
+  assert.equal(a1.spawnModel?.source, "run")
+  assert.equal(a2.spawnModel?.source, "call")
+})
+
+test("model override: run-level model on a disabled provider fails before any child spawns", async () => {
+  const ctx = makeSupervisor({}, {}, { isProviderDisabled: async (p) => p === "offline" })
+  const outcome = await ctx.supervisor.start(
+    { script: `await agent("hello")\nreturn 1`, model: { providerID: "offline", id: "m1" } },
+    ctx.parent,
+  )
+  assert.equal(outcome.run.status, "failed")
+  assert.match(outcome.run.error ?? "", /targets provider "offline"/)
+  assert.equal(ctx.sessions.createdModels.length, 0, "preflight gate: no session created")
 })

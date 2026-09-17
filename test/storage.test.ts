@@ -1189,3 +1189,34 @@ test("readProjectWorkflowFile: missing and empty files are precise errors", asyn
   assert.equal(empty.ok, false)
   if (!empty.ok) assert.match(empty.error, /empty/)
 })
+
+// ---------------------------------------------------------------------------
+// modelsUsed trust surfacing on save
+// ---------------------------------------------------------------------------
+
+test("saveWorkflow records explicit model literals as manifest modelsUsed", async () => {
+  const { storage, fs } = makeStorage()
+  seedAnchors(fs)
+  const saved = await storage.saveWorkflow(
+    "modeluser",
+    'await agent("a", { model: "google/gemini-3.7-flash" })\nawait agent("b", { model: "openai/gpt-6#high" })\nawait agent("c")',
+    { name: "modeluser", source: "project" },
+  )
+  assert.deepEqual(saved.manifest.modelsUsed, ["google/gemini-3.7-flash", "openai/gpt-6#high"])
+
+  const noModels = await storage.saveWorkflow("nomodels", "return 1", { name: "nomodels", source: "project" })
+  assert.equal(noModels.manifest.modelsUsed, undefined, "no literals -> no modelsUsed key")
+})
+
+test("saveGraphWorkflow records per-node model overrides as modelsUsed", async () => {
+  const { storage, fs } = makeStorage()
+  seedAnchors(fs)
+  const spec = {
+    nodes: [
+      { id: "a", kind: "agent", model: "openai/gpt-6", prompt: "hi" },
+      { id: "b", kind: "fanout", over: "$a", max: 2, model: "openai/gpt-6", prompt: "go {{item}}" },
+    ],
+  }
+  const saved = await storage.saveGraphWorkflow("gmodel", spec, { name: "gmodel", source: "project" })
+  assert.deepEqual(saved.manifest.modelsUsed, ["openai/gpt-6"], "deduped across nodes")
+})

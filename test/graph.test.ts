@@ -662,3 +662,64 @@ test("graph e2e: a mixed wave actually fans out over the partitioned lanes", asy
   assert.deepEqual(value.reviewed, ["reply-3"])
   assert.equal(value.summary, "reply-2")
 })
+
+// ---------------------------------------------------------------------------
+// Node model overrides
+// ---------------------------------------------------------------------------
+
+test("graph nodes accept model overrides; bad shapes are rejected", () => {
+  const okSpec: GraphSpec = {
+    nodes: [
+      {
+        id: "work",
+        kind: "fanout",
+        over: "$args.items",
+        max: 4,
+        agent: "explore",
+        model: "google/gemini-3.7-flash",
+        prompt: "do {{item}}",
+      },
+    ],
+  }
+  const check = validateGraphSpec(okSpec)
+  assert.equal(check.ok, true, check.ok ? "" : check.errors.join("; "))
+
+  const bad: GraphSpec = {
+    nodes: [
+      { id: "work", kind: "agent", model: "not-a-pin", prompt: "hi" },
+    ],
+  }
+  const badCheck = validateGraphSpec(bad)
+  assert.equal(badCheck.ok, false)
+  if (!badCheck.ok) assert.match(badCheck.errors.join("; "), /model must be/)
+
+  // non-agent kinds reject the field outright
+  const wrongKind: GraphSpec = {
+    nodes: [
+      { id: "cp", kind: "checkpoint", from: "$work", model: "a/b" },
+    ],
+  }
+  const wrongCheck = validateGraphSpec(wrongKind)
+  assert.equal(wrongCheck.ok, false)
+  if (!wrongCheck.ok) assert.match(wrongCheck.errors.join("; "), /unexpected key "model"/)
+})
+
+test("compiled script carries node model into agent opts", () => {
+  const spec: GraphSpec = {
+    nodes: [
+      { id: "solo", kind: "agent", model: "openai/gpt-6#high", prompt: "hi" },
+      {
+        id: "fan",
+        kind: "fanout",
+        over: "$solo",
+        max: 2,
+        model: "google/gemini-3.7-flash",
+        prompt: "go {{item}}",
+      },
+    ],
+  }
+  const compiled = compileGraphSpec(spec)
+  assert.match(compiled.script, /model: "openai\/gpt-6#high"/)
+  assert.match(compiled.script, /model: "google\/gemini-3.7-flash"/)
+  assert.equal(validateScriptSource(compiled.script).ok, true)
+})

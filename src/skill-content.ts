@@ -155,7 +155,7 @@ inline or save it. Injected globals, nothing else:
 
 | Global | Call | Semantics |
 | --- | --- | --- |
-| \`agent\` | \`agent(prompt, opts?)\` | Spawns one subagent and waits. Resolves \`{ text, sessionID, agent, model, tokens, data?, cachedFrom? }\`. \`opts\`: \`agent\` (agent id), \`label\`, \`phase\`, \`schema\`, \`key\`. With \`opts.schema\`, extracted JSON lands in \`.data\`, validated and repaired once. \`opts.key\` (stable id, e.g. \`"lane:3"\`) marks the call replayable: on a warm rerun (\`resumeFrom\`, or \`/ultracode rerun <runID> --warm\`) a succeeded call with the same key AND the same prompt+schema+agent digest returns from cache — no session, no cap hit. Key every deterministic call in a long run. |
+| \`agent\` | \`agent(prompt, opts?)\` | Spawns one subagent and waits. Resolves \`{ text, sessionID, agent, model, tokens, data?, cachedFrom? }\`. \`opts\`: \`agent\` (agent id), \`model\` (EXPLICIT override in the pin-string shape — only when the user asked for a model; beats pins and the run-level model), \`label\`, \`phase\`, \`schema\`, \`key\`. With \`opts.schema\`, extracted JSON lands in \`.data\`, validated and repaired once. \`opts.key\` (stable id, e.g. \`"lane:3"\`) marks the call replayable: on a warm rerun (\`resumeFrom\`, or \`/ultracode rerun <runID> --warm\`) a succeeded call with the same key AND the same prompt+schema+agent digest returns from cache — no session, no cap hit. Key every deterministic call in a long run. |
 | \`parallel\` | \`parallel(thunks)\` | Barrier over thunks. A thunk that throws resolves as \`null\`; siblings still run. |
 | \`pipeline\` | \`pipeline(items, ...stages)\` | Runs every item through the stages in order. A failing item becomes \`null\`; other items are unaffected. |
 | \`phase\` | \`phase(name)\` | Sets the ambient phase label for progress grouping. |
@@ -170,11 +170,10 @@ inline or save it. Injected globals, nothing else:
 Caps are project settings, not constants: \`ultracode_catalog\` reports the live concurrency, agent
 cap and timeout under \`caps\` (defaults: 8 concurrent agents, 200 agent calls per run, 60 minutes
 wall clock; separately, scripts are hard-capped at 512 KB and results truncate after 64 KB by
-default). Budget the wall clock before anything else — waves
-(ceil(agents / concurrency)) × dependent stages × ~5-10 minutes per child must fit; prefer wide-not-deep.
-When a run legitimately needs longer than the configured timeout, pass \`timeoutMs\` in the run call
-(10 s to 24 h; applies to that run only and is recorded on the run). Ask the user to raise the default
-with \`/ultracode set timeoutMs <ms>\` when it should stick.
+default). Budget the wall clock before anything else — waves × dependent stages × ~5-10 min per child
+must fit; prefer wide-not-deep. When a run legitimately needs longer, pass \`timeoutMs\` in the run
+call (10 s to 24 h; this run only, recorded on the run). Ask the user to raise the default with
+\`/ultracode set timeoutMs <ms>\` when it should stick.
 
 ## Hard rules
 
@@ -186,8 +185,9 @@ with \`/ultracode set timeoutMs <ms>\` when it should stick.
 3. **Return small JSON.** A few keys: a report string, counts, verdicts. Bigger values come back
    as a truncated preview — recover the full value with \`ultracode_result\` (offset paging), never
    by guessing past the cut.
-4. **Route by agent, never by model.** No provider or model ids anywhere. Pass an agent id in
-   \`opts.agent\`; the user's own agent config decides which model runs.
+4. **Route by agent, not by model — \`opts.model\` is the exception.** The user's pins decide each
+   agent's model; use \`opts.model\` (or run input \`model\`) ONLY when the user asked for one — an
+   override beats pins, but a provider the user disabled stays locked unless the run unlocks it.
 5. **Prompts are the entire world.** A child agent sees ONLY its prompt string, zero conversation
    context. Make every prompt self-contained: paths, pasted snippets, criteria, output format.
 6. **Serialize write agents.** A clean context is NOT filesystem isolation: two write agents

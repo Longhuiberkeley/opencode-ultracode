@@ -38,11 +38,17 @@ export interface WarmCacheEntry {
 }
 
 /**
- * Warm-cache identity: prompt + schema + resolved agent. Everything that
- * changes what the child would produce must change the digest.
+ * Warm-cache identity: prompt + schema + resolved agent (+ the per-call model
+ * override, when set). Everything that changes what the child would produce
+ * must change the digest. The model segment is appended ONLY when set so
+ * digests of pre-override runs stay valid across the upgrade (warm replays
+ * keep working); an overridden call with the same key never replays a result
+ * produced on a different model.
  */
 export function agentCacheKey(prompt: string, opts: AgentOpts, defaultAgent: string): string {
-  return `${prompt}\u0000${JSON.stringify(opts.schema ?? null)}\u0000${opts.agent ?? defaultAgent}`
+  const base = `${prompt}\u0000${JSON.stringify(opts.schema ?? null)}\u0000${opts.agent ?? defaultAgent}`
+  if (opts.model === undefined) return base
+  return `${base}\u0000${opts.model.providerID}/${opts.model.id}${opts.model.variant ? `#${opts.model.variant}` : ""}`
 }
 
 /** Digest used for keyed replay matching (sha256 hex). */
@@ -171,6 +177,12 @@ export interface AgentRunnerOptions {
    * server-side creates don't apply pins themselves.
    */
   pinForAgent?: (agentId: string) => Promise<{ providerID: string; id: string; variant?: string } | undefined>
+  /**
+   * Explicit run-level model override (from the run tool input `model`):
+   * applies to every child WITHOUT a per-call opts.model. Precedence inside
+   * the runner: opts.model > runModel > pinForAgent > server default.
+   */
+  runModel?: { providerID: string; id: string; variant?: string }
   /** Run-wide abort signal: rejects queued semaphore waits + aborts in-flight sessions. */
   signal?: AbortSignal
   /** Warm cache for keyed replay (resumeFrom); a hit spawns no session. */
@@ -242,6 +254,7 @@ export class AgentRunner {
   private readonly pinForAgent:
     | ((agentId: string) => Promise<{ providerID: string; id: string; variant?: string } | undefined>)
     | undefined
+  private readonly runModel: { providerID: string; id: string; variant?: string } | undefined
   private readonly signal?: AbortSignal
   private readonly warmCache: ReadonlyMap<string, WarmCacheEntry> | undefined
   private readonly digestFn: (prompt: string, opts: AgentOpts) => string
@@ -262,6 +275,7 @@ export class AgentRunner {
     this.reportFn = options.report
     this.ambientPhase = options.ambientPhase
     this.pinForAgent = options.pinForAgent
+    this.runModel = options.runModel
     this.signal = options.signal
     this.warmCache = options.warmCache
     this.retryAttempts = clampRetryAttempts(options.retryAttempts, 0)
@@ -339,8 +353,19 @@ export class AgentRunner {
     try {
       const titlePhase = opts.phase ?? this.ambientPhase()
       const requestedAgent = opts.agent ?? this.defaultAgent
+      // Model precedence: per-call override > run-level override > agent-config
+      // pin > server default. Explicit overrides skip pin lookup entirely (the
+      // caller asked for THIS model), and carry their source so drift reports
+      // can tell an intentional override from a config pin.
       let model: { providerID: string; id: string; variant?: string } | undefined
-      if (this.pinForAgent) {
+      let modelSource: "call" | "run" | "pin" | undefined
+      if (opts.model !== undefined) {
+        model = opts.model
+        modelSource = "call"
+      } else if (this.runModel !== undefined) {
+        model = this.runModel
+        modelSource = "run"
+      } else if (this.pinForAgent) {
         try {
           model = await this.pinForAgent(requestedAgent)
           if (model === undefined && requestedAgent !== this.defaultAgent) {
@@ -351,6 +376,7 @@ export class AgentRunner {
             // subagent-config), so inherit it instead.
             model = await this.pinForAgent(this.defaultAgent)
           }
+          if (model !== undefined) modelSource = "pin"
         } catch {
           model = undefined // pin resolution must never break a run
         }
@@ -359,7 +385,9 @@ export class AgentRunner {
       // deaths never populate effectiveModel, so failed rows need spawnModel
       // to show which model/provider was targeted.
       if (model !== undefined) {
-        this.registry.updateAgent(this.runID, record.id, { spawnModel: model })
+        this.registry.updateAgent(this.runID, record.id, {
+          spawnModel: { ...model, ...(modelSource !== undefined ? { source: modelSource } : {}) },
+        })
       }
       // Provider-shaped failures (outcome "failed" — outages, rate limits)
       // get bounded retries with abort-aware backoff. Aborts, schema errors
