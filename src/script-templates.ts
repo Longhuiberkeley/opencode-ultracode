@@ -296,10 +296,9 @@ return {
     .map(function (t) { return { id: t.id, text: t.text, status: t.status, note: t.note } }),
 }`
 
-const KAGGLE_ML = `// kaggle-ml — refinement loop for ML/quant work: reflect on the plan, propose
-// per-component variations, SELECT <=3 full pipeline configurations (never the
-// cross product), run each in its own artifacts dir, judge metrics from
-// verbatim evidence, keep the best. Agentic honing, not grid search.
+const KAGGLE_ML = `// kaggle-ml — refinement loop for ML/quant work: reflect, propose per-component
+// variations, SELECT <=3 full configs (never the cross product), run each in its
+// own artifacts dir, judge metrics from evidence, keep the best. Not grid search.
 // Tool input: { args: { goal: "best CV score", components: ["data", "features", "model"], metric: "cv", target: 0.9, evalCommand: "python eval.py", dataRoot: "/data", judge: "general", deadline: "2026-09-18T08:00:00", maxIterations: 8, agentsPerIteration: 12 } }
 if (!args || typeof args.goal !== "string" || args.goal.trim() === "") {
   throw new Error("kaggle-ml: args.goal is required (what to optimize)")
@@ -353,15 +352,15 @@ const summary = await loop({
         ".\\nRound result: " + JSON.stringify(c.result) +
         ".\\nBest metrics: " + JSON.stringify(c.state.best && c.state.best.metrics ? c.state.best.metrics : null) +
         ".\\nRE-DERIVE the best candidate's metric: run the evaluation, quote the command and the number. status=done ONLY if your own re-derivation meets the target." +
-        ".\\nSet candidateId to that runner candidate's note; metrics = YOUR numbers."
+        ".\\nSet candidateId to the id of the round candidate you re-derived (see round result); metrics = YOUR numbers."
     },
   },
 }, async function (ctx) {
   const state = ctx.state || {}
   const trials = (state.trials || []).slice()
-  // Fold judge re-derivation into the trials (judge metrics win).
+  // Fold judge metrics into the trials.
   if (
-    ctx.lastVerdict && ctx.lastVerdict.metrics && typeof ctx.lastVerdict.metrics[metric] === "number" &&
+    ctx.lastVerdict && ctx.lastVerdict.metrics && Number.isFinite(Number(ctx.lastVerdict.metrics[metric])) &&
     typeof ctx.lastVerdict.candidateId === "string"
   ) {
     for (let fti = 0; fti < trials.length; fti++) {
@@ -377,7 +376,7 @@ const summary = await loop({
     return { config: t.config, metric: t.metrics ? t.metrics[metric] : null, source: t.metricsSource || "runner", note: t.note }
   })
   const plan = (await agent(
-    "You are improving: " + goal + ".\\nMetric: " + metric + (hasTarget ? " (target >= " + target + ")" : "") +
+    "Improve: " + goal + ".\\nMetric: " + metric + (hasTarget ? " (target >= " + target + ")" : "") +
     ".\\nKnown best: " + JSON.stringify(state.best && state.best.metrics ? state.best.metrics : null) +
     ".\\nRecent trials: " + JSON.stringify(recent) +
     ".\\nCurrent plan: " + JSON.stringify(state.plan) +
@@ -404,7 +403,7 @@ const summary = await loop({
   }
 
   const select = (await agent(
-    "Select AT MOST 3 full pipeline configurations to run this round.\\nGoal: " + goal +
+    "Select AT MOST 3 full configs to run this round.\\nGoal: " + goal +
     ".\\nPlan: " + JSON.stringify(plan) +
     ".\\nVariations per component: " + JSON.stringify(variations) +
     ".\\nIncumbent best config: " + JSON.stringify(state.best ? state.best.config : null) +
@@ -412,7 +411,7 @@ const summary = await loop({
     "Respond JSON: configs [{id, chosen: [{componentId, variationId}], why}] (<=3).",
     { schema: MSELECT, key: "kaggle-ml:i" + ctx.i + ":select", label: "select", phase: "kaggle-ml" }
   )).data || { configs: [] }
-  // Dedupe by chosen-variation signature (no double-running the same config).
+  // Dedupe by chosen-variation signature.
   const seenSig = {}
   const configs = []
   const rawConfigs = Array.isArray(select.configs) ? select.configs : []
@@ -439,7 +438,7 @@ const summary = await loop({
     const cfg = configs[ci]
     const cfgId = sanitizeId(cfg.id, "c" + ctx.i + "-" + (ci + 1))
     const dir = baseDir + "/cand-" + cfgId
-    // Resolve the selector's variation ids to actual ideas (the runner must know WHAT to build).
+    // Resolve selector ids to actual ideas (the runner must know WHAT to build).
     const resolved = []
     const chosen = Array.isArray(cfg.chosen) ? cfg.chosen : []
     for (let ri = 0; ri < chosen.length; ri++) {
@@ -447,13 +446,13 @@ const summary = await loop({
       const pool = variations[String(pick.componentId)] || []
       let match = null
       for (let pi = 0; pi < pool.length; pi++) if (pool[pi].id === pick.variationId) match = pool[pi]
-      resolved.push({ componentId: String(pick.componentId), variationId: String(pick.variationId), idea: match ? match.idea : "(no matching proposal)", rationale: match ? match.rationale : "" })
+      resolved.push({ componentId: String(pick.componentId), variationId: String(pick.variationId), idea: match ? match.idea : "(no matching proposal)" })
     }
     const build = (await agent(
       "Run this ML configuration.\\nGoal: " + goal +
       ".\\nConfig: " + JSON.stringify(cfg) +
       ".\\nResolved variations (what each chosen component must implement): " + JSON.stringify(resolved) +
-      ".\\nWork ONLY inside this directory (create it): " + dir +
+      ".\\nWork ONLY inside (create it): " + dir +
       (dataRoot ? ". Read data read-only from: " + dataRoot : "") +
       (evalCommand ? ".\\nThen run exactly: " + evalCommand : ".\\nUse your own evaluation and cite the exact command you ran") +
       ".\\nRespond JSON: candidateId (exactly " + JSON.stringify(cfgId) + "), metrics (numbers keyed by name, include '" + metric + "'), evidence {command, exitCode, outputQuote (the line with the metric)}, artifactsRef.",
@@ -471,7 +470,11 @@ const summary = await loop({
   const rounds = (state.rounds || []).concat([{ r: ctx.i, configs: configs.length, best: best && best.metrics ? best.metrics[metric] : null }])
   return {
     state: { plan: plan, variations: variations, trials: kept, best: best, rounds: rounds },
-    result: { configs: configs.length, best: best && best.metrics ? best.metrics[metric] : null },
+    result: {
+      configs: configs.length,
+      candidates: nextTrials.slice(trials.length).map(function (t) { return { id: t.note, metric: t.metrics ? t.metrics[metric] : null } }),
+      best: best && best.metrics ? best.metrics[metric] : null,
+    },
   }
 })
 

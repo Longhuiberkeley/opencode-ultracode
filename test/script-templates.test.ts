@@ -522,3 +522,27 @@ test("kaggle-ml: a round with zero selected configs still judges and continues",
   assert.deepEqual(result.rounds.map((r) => r.configs), [0, 0])
   assert.equal(outcome.run.agents.some((a) => a.label?.startsWith("run:")), false, "no runner spawned without configs")
 })
+
+test("kaggle-ml: a storage without runDirFor fails structurally before any runner spawns", async () => {
+  const ctx = makeSupervisor()
+  ;(ctx.storage as unknown as { runDirFor?: undefined }).runDirFor = undefined
+  ctx.sessions
+    .push({ text: JSON.stringify({ strategy: "s", components: [{ id: "data", focus: "f", status: "active" }, { id: "model", focus: "f", status: "active" }] }), agent: "general" })
+    .push({ text: JSON.stringify({ variations: [{ idea: "x", rationale: "y" }] }), agent: "general" })
+    .push({ text: JSON.stringify({ variations: [{ idea: "x", rationale: "y" }] }), agent: "general" })
+    .push({ text: JSON.stringify({ configs: [{ id: "c1", chosen: [{ componentId: "data", variationId: "data-v1" }, { componentId: "model", variationId: "model-v1" }], why: "w" }] }), agent: "general" })
+  const outcome = await ctx.supervisor.start(
+    {
+      script: scriptTemplate("kaggle-ml")!.script,
+      args: { goal: "best CV", components: ["data", "model"], metric: "cv", maxIterations: 2 } as never,
+    },
+    ctx.parent,
+  )
+  assert.equal(outcome.envelope.status, "failed")
+  assert.match(String(outcome.envelope.error), /no run artifacts dir/)
+  assert.equal(
+    outcome.run.agents.filter((a) => a.label?.startsWith("run:")).length,
+    0,
+    "structural failure happens before any runner spawns",
+  )
+})

@@ -597,3 +597,36 @@ return { sizes, firstText: first ? first.text : null, itemCount: q.items().lengt
   assert.equal(value.sizes.missingDeps, 1)
   assert.equal(value.firstText, "same")
 })
+
+test("loop: a retry that trips the iteration budget surfaces the first attempt's error", async () => {
+  const result = await runInWorker(
+    `
+const summary = await loop({ key: "retrybudget", budget: { iterations: 1, agentsPerIteration: 2 }, stop: { stallK: 1 } },
+  async () => {
+    await agent("a")
+    await agent("b")
+    return { state: {} }
+  })
+return { summary }
+`,
+    {
+      caps: GENERAL_AGENT_CAPS,
+      onCall: async (fn, args) => {
+        if (fn !== "agent") return { ok: true }
+        if (String(args[0]) === "b") throw new Error("provider exploded")
+        return agentResult()
+      },
+    },
+  )
+  assert.equal(result.ok, true, result.error ?? "loop run failed")
+  const summary = (result.value as { summary: Record<string, Json> }).summary
+  const history = summary["history"] as Array<{ status: string; error?: string }>
+  const errorRow = history.find((row) => row.status === "error")
+  assert.ok(errorRow, "an error row is recorded")
+  assert.match(errorRow!.error ?? "", /provider exploded/, "the real first-attempt error is surfaced")
+  assert.doesNotMatch(
+    errorRow!.error ?? "",
+    /exceeded its agent budget/,
+    "the deterministic budget trip must not mask the first failure",
+  )
+})
