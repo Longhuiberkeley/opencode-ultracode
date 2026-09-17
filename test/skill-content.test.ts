@@ -55,7 +55,7 @@ test("skill content covers every injected global", () => {
     // where the authoring model reads them.
     `expected a lean 120-430 line skill, got ${lines.length}`,
   )
-  for (const name of ["agent", "parallel", "pipeline", "phase", "progress", "workflow", "sleep", "args", "meta", "console"]) {
+  for (const name of ["agent", "parallel", "pipeline", "phase", "progress", "workflow", "loop", "queue", "sleep", "args", "meta", "console"]) {
     assert.match(SKILL_CONTENT, new RegExp(`\\b${name}\\b`), `SKILL_CONTENT must mention the global \`${name}\``)
   }
 })

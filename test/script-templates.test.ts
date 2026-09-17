@@ -86,6 +86,10 @@ test("script templates: fail fast on missing or degenerate args, spawning nothin
     ["staged-delivery", { goal: "g", stages: [] }, /args\.stages must be a non-empty array/],
     ["verify-fix", undefined, /args\.issues must be a non-empty array/],
     ["verify-fix", { goal: "g", issues: [] }, /args\.issues must be a non-empty array/],
+    ["kanban", undefined, /args\.tickets must be a non-empty array/],
+    ["kanban", { tickets: [] }, /args\.tickets must be a non-empty array/],
+    ["kaggle-ml", undefined, /args\.goal is required/],
+    ["kaggle-ml", { goal: "x" }, /args\.components must be a non-empty array/],
   ]
   for (const [name, args, pattern] of cases) {
     const ctx = makeSupervisor()
@@ -125,7 +129,7 @@ test("script templates: lookup helpers", () => {
   const rows = scriptTemplateSummaries()
   assert.deepEqual(
     rows.map((r) => r.name).sort(),
-    ["staged-delivery", "verify-fix"],
+    ["kaggle-ml", "kanban", "staged-delivery", "verify-fix"],
   )
   for (const r of rows) assert.equal(r.chars > 0, true)
 })
@@ -322,7 +326,7 @@ test("catalog: scriptTemplate detail serves the body; summaries list in the defa
   const rows = whole["scriptTemplates"] as unknown as Array<{ name: string; chars: number }>
   assert.deepEqual(
     rows.map((r) => r.name).sort(),
-    ["staged-delivery", "verify-fix"],
+    ["kaggle-ml", "kanban", "staged-delivery", "verify-fix"],
   )
   assert.equal(rows.every((r) => r.chars > 0), true)
   assert.equal(whole["scriptTemplate"], undefined) // summary view carries no bodies
@@ -340,4 +344,121 @@ test("catalog: scriptTemplates: true serves every body", () => {
   const rows = out["scriptTemplates"] as unknown as Array<{ name: string; script: string }>
   assert.equal(rows.length, SCRIPT_TEMPLATES.length)
   for (const row of rows) assert.equal(row.script.length > 0, true)
+})
+
+// ---------------------------------------------------------------------------
+// loop templates end-to-end
+// ---------------------------------------------------------------------------
+
+const KPLAN_REPLY = (approach: string) => ({
+  text: JSON.stringify({ approach, steps: ["s1", "s2"], risks: [] }),
+  agent: "explore",
+})
+const KWORK_REPLY = (summary: string, done = true) => ({
+  text: JSON.stringify({ done, summary, files: ["src/x.ts"] }),
+  agent: "general",
+})
+const KREVIEW_REPLY = (pass: boolean, issue?: string) => ({
+  text: JSON.stringify({
+    pass,
+    issues: issue ? [{ issue, suggestion: "do better", severity: "major" }] : [],
+    evidence: "checked the diff",
+  }),
+  agent: "general",
+})
+
+test("kanban: two clean tickets drain the queue and stop with queue-empty", async () => {
+  const ctx = makeSupervisor()
+  ctx.sessions
+    .push(KPLAN_REPLY("first approach"))
+    .push(KWORK_REPLY("did ticket one"))
+    .push(KREVIEW_REPLY(true))
+    .push(KPLAN_REPLY("second approach"))
+    .push(KWORK_REPLY("did ticket two"))
+    .push(KREVIEW_REPLY(true))
+  const outcome = await ctx.supervisor.start(
+    {
+      script: scriptTemplate("kanban")!.script,
+      args: { goal: "empty the board", tickets: [{ text: "fix login", id: "T-1" }, { text: "add tests", id: "T-2" }] } as never,
+    },
+    ctx.parent,
+  )
+  assert.equal(outcome.envelope.status, "succeeded", outcome.envelope.error ?? "run failed")
+  assert.equal(outcome.envelope.agents.total, 6)
+  const result = outcome.envelope.result as {
+    stopReason: string
+    iterations: number
+    processed: number
+    reviewPassed: number
+    queue: { done: number; open: number }
+  }
+  assert.equal(result.stopReason, "queue-empty")
+  assert.equal(result.iterations, 2)
+  assert.equal(result.processed, 2)
+  assert.equal(result.reviewPassed, 2)
+  assert.equal(result.queue.done, 2)
+  // One writer at a time: exactly one non-explore agent per iteration phase.
+  const labels = outcome.run.agents.map((a) => a.label)
+  assert.deepEqual(labels, ["T-1:plan", "T-1:work", "T-1:review", "T-2:plan", "T-2:work", "T-2:review"])
+})
+
+test("kanban: a failed review spawns a follow-up ticket that gets processed", async () => {
+  const ctx = makeSupervisor()
+  ctx.sessions
+    .push(KPLAN_REPLY("approach one"))
+    .push(KWORK_REPLY("attempt one"))
+    .push(KREVIEW_REPLY(false, "missing error handling"))
+    .push(KPLAN_REPLY("follow-up approach"))
+    .push(KWORK_REPLY("addressed the finding"))
+    .push(KREVIEW_REPLY(true))
+  const outcome = await ctx.supervisor.start(
+    {
+      script: scriptTemplate("kanban")!.script,
+      args: { goal: "empty the board", tickets: [{ text: "fix login", id: "T-1" }] } as never,
+    },
+    ctx.parent,
+  )
+  assert.equal(outcome.envelope.status, "succeeded", outcome.envelope.error ?? "run failed")
+  const result = outcome.envelope.result as {
+    stopReason: string
+    processed: number
+    reviewPassed: number
+  }
+  assert.equal(result.stopReason, "queue-empty")
+  assert.equal(result.processed, 2, "the follow-up ticket was processed too")
+  assert.equal(result.reviewPassed, 1, "only the follow-up passed review")
+})
+
+test("kaggle-ml: one round meeting the target stops with target after skeptic verification", async () => {
+  const ctx = makeSupervisor()
+  ctx.sessions
+    .push({ text: JSON.stringify({ strategy: "stack", components: [{ id: "data", focus: "clean", status: "active" }, { id: "model", focus: "gbdt", status: "active" }] }), agent: "general" })
+    .push({ text: JSON.stringify({ variations: [{ idea: "winsorize", rationale: "outliers", expectedDelta: 0.01 }] }), agent: "general" })
+    .push({ text: JSON.stringify({ variations: [{ idea: "hist-gbdt", rationale: "tabular", expectedDelta: 0.02 }] }), agent: "general" })
+    .push({ text: JSON.stringify({ configs: [{ id: "c1", chosen: [{ componentId: "data", variationId: "winsorize" }, { componentId: "model", variationId: "hist-gbdt" }], why: "one change from incumbent" }] }), agent: "general" })
+    .push({ text: JSON.stringify({ candidateId: "c1", metrics: { cv: 0.95 }, evidence: { command: "python eval.py", exitCode: 0, outputQuote: "cv=0.95" }, artifactsRef: "cand-c1" }), agent: "general" })
+    .push({ text: JSON.stringify({ status: "done", metrics: { cv: 0.95 }, insight: { componentDelta: [], nextHints: [] }, evidence: { command: "python eval.py", exitCode: 0, outputQuote: "cv=0.95" } }), agent: "general" })
+    .push({ text: JSON.stringify({ verified: true, reason: "re-ran eval.py: cv=0.95" }), agent: "general" })
+  const outcome = await ctx.supervisor.start(
+    {
+      script: scriptTemplate("kaggle-ml")!.script,
+      args: { goal: "best CV", components: ["data", "model"], metric: "cv", target: 0.9, evalCommand: "python eval.py" } as never,
+    },
+    ctx.parent,
+  )
+  assert.equal(outcome.envelope.status, "succeeded", outcome.envelope.error ?? "run failed")
+  const result = outcome.envelope.result as { stopReason: string; iterations: number; best: { cv: number } | null }
+  assert.equal(result.stopReason, "target")
+  assert.equal(result.iterations, 1)
+  assert.equal(result.best?.cv, 0.95)
+  const keys = outcome.run.agents.map((a) => a.key)
+  assert.deepEqual(keys, [
+    "kaggle-ml:i0:reflect",
+    "kaggle-ml:i0:var:data",
+    "kaggle-ml:i0:var:model",
+    "kaggle-ml:i0:select",
+    "kaggle-ml:i0:run:c1",
+    "kaggle-ml:i0:verdict",
+    "kaggle-ml:i0:skeptic",
+  ])
 })

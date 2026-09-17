@@ -148,10 +148,10 @@ Author in Plan mode; run by name from Build mode. Do not call \`ultracode_run\` 
 ## Script mode (the escape hatch)
 
 The script is an async function body: top-level \`await\` and \`return\` are legal, module syntax is
-rejected. Two script shapes recur enough to ship as served templates — sequential write stages with
-verify-fix gates (\`staged-delivery\`) and a bounded fix loop (\`verify-fix\`). Get one with
-\`ultracode_catalog { scriptTemplate: "staged-delivery" }\`, edit prompts and args, then run it
-inline or save it. Injected globals, nothing else:
+rejected. Served templates cover the recurring shapes — \`staged-delivery\` (write stages with
+verify-fix gates), \`verify-fix\` (bounded fix loop), and the loop-mode recipes \`kanban\` and
+\`kaggle-ml\` (below). Get one with \`ultracode_catalog { scriptTemplate: "staged-delivery" }\`, edit
+prompts and args, then run it inline or save it. Injected globals, nothing else:
 
 | Global | Call | Semantics |
 | --- | --- | --- |
@@ -162,6 +162,8 @@ inline or save it. Injected globals, nothing else:
 | \`progress\` | \`progress(text)\` | Emits a progress line into the run log. |
 | \`checkpoint\` | \`checkpoint(name, value?)\` | Persists a named phase-boundary snapshot (small JSON) onto the run record — visible in \`/ultracode show\` and \`ultracode_status\`. Call it after each expensive phase; it survives interruption and marks where a warm rerun resumes from. |
 | \`workflow\` | \`workflow(name, args?)\` | Runs a SAVED workflow, resolves its JSON return. Depth 1 only: it may not compose another. |
+| \`loop\` | \`loop(spec, iterate)\` | Engine-owned iteration (budgets, verdicts, stall, checkpoints). Use it instead of hand-rolled \`while\` loops — see Loop mode below. |
+| \`queue\` | \`queue(items, opts?)\` | Pure serializable worklist: push, pop, popMany, done, block, unblock, sizes, items — content-hash ids (dedupe), \`deps\` gate readiness. Statuses survive \`items()\` round-trips, so a queue persists inside loop state. |
 | \`sleep\` | \`sleep(ms)\` | Pause, capped at 60000 ms per call. |
 | \`console\` | \`console.log(x)\` | Buffered into the run log. |
 | \`args\` | \`args\` | Your tool-input arguments, a JSON value. |
@@ -174,6 +176,48 @@ default). Budget the wall clock before anything else — waves × dependent stag
 must fit; prefer wide-not-deep. When a run legitimately needs longer, pass \`timeoutMs\` in the run
 call (10 s to 24 h; this run only, recorded on the run). Ask the user to raise the default with
 \`/ultracode set timeoutMs <ms>\` when it should stick.
+
+## Loop mode (engine-owned iteration)
+
+Hand-rolled \`while\` loops re-derive budget math, stall detection, verdict validation and resume
+keys every time — \`loop(spec, iterate)\` makes the engine own them:
+
+\`\`\`js
+const summary = await loop({
+  key: "green-suite",                    // auto-keys <key>:i<n>:a<m>; checkpoints loop:<key>:i<n>
+  goal: "tests green, no regressions",
+  state: { open: issues },               // yours; iterate is the ONLY writer; keep it small
+  budget: { iterations: 8, agentsPerIteration: 6, wallMs: 30*60_000 },  // deadline: "8am-shaped" too
+  stop: { predicate: (v) => v.state.open.length === 0 && "queue-empty", stallK: 3 },
+  verdict: { agent: "general", schema: EVIDENCE, prompt: (c) => "Judge round " + c.i + ": " + JSON.stringify(c.result) },
+}, async (c) => {
+  const q = queue(c.state.open)          // statuses round-trip through state
+  const item = q.pop()
+  if (!item) return { state: c.state }
+  // agent() calls here get auto-keys and count against the iteration budget
+  return { state: { open: q.items() }, result: {} }
+})
+\`\`\`
+
+- \`iterate(ctx)\` must return \`{ state, result? }\`; \`result\` feeds prompts and the verdict.
+- Budgets are engine-owned: iterations / agentsPerIteration / wallMs / tokens / deadline checked
+  every iteration; preflight rejects a worst case beyond the run caps; \`ctx.budgetLeft\` shows what
+  remains (agentsPerIteration already excludes the verdict+skeptic reservation).
+- \`verdict\`: an independent judge (different agent than the workers) with a schema; a terminating
+  \`done\` must survive ONE skeptic re-derivation before the loop stops (\`skeptic: false\` opts out);
+  a refuted termination continues the loop. Evidence-shaped schemas (command / exitCode / outputQuote
+  / metrics) keep "done" falsifiable.
+- Stop reasons (returned + checkpointed): \`target | queue-empty | stall | budget | blocked | error\`.
+- \`ctx.artifactsDir\` (\`<run artifacts>/it-<i>\`) and \`ctx.runDir\` are where iterations put files;
+  checkpoints store refs, not contents. \`ctx.history\` / \`ctx.lastVerdict\` / \`ctx.lastResult\` feed
+  the next iteration without bloating state.
+- \`unit: { name, args(state) }\` runs a TRUSTED saved workflow per iteration instead of a local
+  iterate (preflighted before iteration 1); nesting is capped (\`maxLoopDepth\`, default 2) and the
+  budget ledger is shared across nested loops.
+- Structural failures (bad spec, depth cap, unit trust) fail loud; per-iteration failures follow
+  \`onIterationError: retry | record | abort\`.
+- Served loop templates: \`kanban\` (ticket worklist) and \`kaggle-ml\` (metric-targeted refinement).
+  Inspect with \`ultracode_catalog { scriptTemplate: "kanban" }\`.
 
 ## Hard rules
 
@@ -208,6 +252,10 @@ call (10 s to 24 h; this run only, recorded on the run). Ask the user to raise t
 12. **Verify before you trust.** Generators fan out, independent verifiers check, a skeptic pass
     overturns weak survivals. If the verifier shares the generator's failure modes, the workflow
     is theater. A \`gate\` node between an expensive phase and the next one is this, pre-built.
+13. **Iterate through \`loop()\`, not a hand-rolled \`while\`.** The engine owns budgets, auto-keys,
+    checkpoints, stall detection and the skeptics behind terminating verdicts; a raw loop forfeits
+    all of it (and its un-keyed children cannot warm-replay). Graph first, \`loop()\` for iteration,
+    raw scripts only when neither shape fits.
 
 ## Sizing: partition, budget, merge (read this before any wide fan-out)
 

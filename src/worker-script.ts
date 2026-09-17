@@ -79,7 +79,12 @@ function createQueue(initial, opts) {
     if (typeof o.id === "string" && o.id) id = o.id;
     else if (idField && typeof o[idField] === "string" && o[idField]) id = String(o[idField]);
     if (!id) id = "q" + fnv1a(JSON.stringify([text, deps, tags, meta]));
-    return { id: id, text: text, deps: deps, tags: tags, meta: meta, status: "open", note: null };
+    // Persisted statuses survive a rebuild (state round-trips through items()):
+    // done/blocked stay; "active" (a popped-but-unfinished item from an
+    // interrupted iteration) returns to the open pool for the retry.
+    var status = o.status === "done" || o.status === "blocked" ? o.status : "open";
+    var note = o.note === undefined ? null : o.note;
+    return { id: id, text: text, deps: deps, tags: tags, meta: meta, status: status, note: note };
   }
 
   function add(raw) {

@@ -168,6 +168,287 @@ for (let pass = 1; pass <= maxPasses && open.length > 0; pass++) {
 }
 return { goal: goal, remaining: open.length, open: open, passesUsed: passesUsed, passes: passes }`
 
+// ---------------------------------------------------------------------------
+// Loop templates (loop() runtime: engine-owned budgets, verdicts, stall)
+// ---------------------------------------------------------------------------
+
+const KANBAN = `// kanban — worklist loop: pull ONE ticket at a time and run it through a team
+// pipeline (plan -> implement -> review); review findings become follow-up
+// tickets; the queue drains or budgets stop the run. One writer per iteration.
+// Seed note: tickets can come from any tracker — a first explore agent can
+// parse a markdown/CSV board into args.tickets; the engine never reads files.
+// Tool input: { args: { goal: "what done means", tickets: [{ text: "ticket", id: "T-1", deps: ["T-0"], tags: ["ui"] }], maxIterations: 12, agentsPerIteration: 6, reviewer: "general" } }
+if (!args || !Array.isArray(args.tickets) || args.tickets.length === 0) {
+  throw new Error("kanban: args.tickets must be a non-empty array of { text }")
+}
+const goal = String(args.goal || "")
+const maxIterations = Math.max(
+  1,
+  Math.min(Number.isFinite(Number(args.maxIterations)) ? Math.floor(Number(args.maxIterations)) : args.tickets.length + 8, 50)
+)
+const agentsPerIteration = Math.max(
+  4,
+  Math.min(Number.isFinite(Number(args.agentsPerIteration)) ? Math.floor(Number(args.agentsPerIteration)) : 6, 12)
+)
+const reviewer = typeof args.reviewer === "string" && args.reviewer.trim() ? args.reviewer.trim() : "general"
+
+const KPLAN = { type: "object", required: ["approach", "steps"], properties: {
+  approach: { type: "string" },
+  steps: { type: "array", items: { type: "string" } },
+  risks: { type: "array", items: { type: "string" } } } }
+const KWORK = { type: "object", required: ["done", "summary"], properties: {
+  done: { type: "boolean" }, summary: { type: "string" },
+  files: { type: "array", items: { type: "string" } } } }
+const KREVIEW = { type: "object", required: ["pass", "issues"], properties: {
+  pass: { type: "boolean" },
+  issues: { type: "array", items: { type: "object", required: ["issue"], properties: {
+    issue: { type: "string" }, suggestion: { type: "string" }, severity: { type: "string" } } } },
+  evidence: { type: "string" } } }
+
+const summary = await loop({
+  key: "kanban",
+  goal: goal || "process the ticket queue",
+  state: { tickets: args.tickets, processed: [], followUps: 0 },
+  budget: { iterations: maxIterations, agentsPerIteration: agentsPerIteration },
+  stop: { predicate: function (v) {
+    const open = (v.state.tickets || []).filter(function (t) { return t.status !== "done" && t.status !== "blocked" })
+    return open.length === 0 ? "queue-empty" : false
+  }, stallK: 4 },
+}, async function (ctx) {
+  const q = queue(ctx.state.tickets, { id: "id" })
+  const ticket = q.pop()
+  if (!ticket) return { state: ctx.state }
+  const tid = ticket.id.slice(0, 22)
+  progress("ticket: " + String(ticket.text).slice(0, 100))
+  const ticketJson = JSON.stringify({ id: ticket.id, text: ticket.text })
+  const plan = (await agent(
+    goal + "\\nPlan ONE ticket before any changes. Inspect the repo as needed.\\nTicket: " + ticketJson +
+    "\\nRespond JSON: approach, ordered steps, risks.",
+    { agent: "explore", schema: KPLAN, key: "kanban:" + tid + ":plan", label: tid + ":plan", phase: "kanban" }
+  )).data || {}
+  const work = (await agent(
+    goal + "\\nImplement the ticket now; change only what it needs.\\nTicket: " + ticketJson +
+    "\\nPlan:\\n" + JSON.stringify(plan) + "\\nRespond JSON: done, summary, files.",
+    { schema: KWORK, key: "kanban:" + tid + ":work", label: tid + ":work", phase: "kanban" }
+  )).data || { done: false, summary: "no structured reply" }
+  let review = { pass: false, issues: [], evidence: "reviewer unavailable" }
+  try {
+    review = (await agent(
+      goal + "\\nReview the completed ticket as an adversary; verify the claims against the actual diff/files.\\nTicket: " + ticketJson +
+      "\\nClaims:\\n" + JSON.stringify(work) +
+      "\\nRespond JSON: pass, issues [{issue, suggestion, severity}], evidence (quote what you checked).",
+      { agent: reviewer, schema: KREVIEW, key: "kanban:" + tid + ":review", label: tid + ":review", phase: "kanban" }
+    )).data || review
+  } catch (e) {
+    review = { pass: false, issues: [], evidence: "reviewer unavailable: " + (e && e.message ? e.message : String(e)) }
+  }
+  let followUps = 0
+  const openIssues = Array.isArray(review.issues) ? review.issues.slice(0, 6) : []
+  if (work.done === true && review.pass === true) {
+    q.done(ticket.id, "review passed")
+  } else if (work.done === true && openIssues.length > 0) {
+    q.done(ticket.id, "findings deferred to a follow-up")
+    const text = "Address review findings for " + ticket.id + ": " +
+      openIssues.map(function (i) { return i.issue + (i.suggestion ? " (" + i.suggestion + ")" : "") }).join("; ")
+    q.push({ text: text, tags: (ticket.tags || []).concat(["follow-up"]), meta: { from: ticket.id } })
+    followUps = 1
+  } else if (work.done !== true) {
+    q.block(ticket.id, "implementation incomplete")
+  } else {
+    q.done(ticket.id, "review did not pass cleanly")
+  }
+  const processed = ctx.state.processed.concat([{ id: ticket.id, workOk: work.done === true, reviewPass: review.pass === true, followUps: followUps }])
+  return {
+    state: { tickets: q.items(), processed: processed, followUps: ctx.state.followUps + followUps },
+    result: processed[processed.length - 1],
+  }
+})
+
+const tickets = (summary.state && summary.state.tickets) || []
+const sizes = queue(tickets).sizes()
+return {
+  stopReason: summary.stopReason,
+  iterations: summary.iterations,
+  processed: ((summary.state && summary.state.processed) || []).length,
+  reviewPassed: ((summary.state && summary.state.processed) || []).filter(function (p) { return p.reviewPass === true }).length,
+  queue: sizes,
+  spent: summary.spent,
+  remaining: tickets
+    .filter(function (t) { return t.status !== "done" })
+    .map(function (t) { return { id: t.id, text: t.text, status: t.status, note: t.note } }),
+}`
+
+const KAGGLE_ML = `// kaggle-ml — refinement loop for ML/quant work: reflect on the plan, propose
+// per-component variations, SELECT a shortlist of full pipeline configurations
+// (never the cross product), run each in its own artifacts dir, judge metrics
+// from verbatim evidence, keep the best. Agentic honing, not grid search: the
+// selector sees the trial history and carries the incumbent forward.
+// Tool input: { args: { goal: "best CV score", components: ["data", "features", "model"], metric: "cv", target: 0.9, evalCommand: "python eval.py", dataRoot: "/data", judge: "general", deadline: "2026-09-18T08:00:00", maxIterations: 8, agentsPerIteration: 12 } }
+if (!args || typeof args.goal !== "string" || args.goal.trim() === "") {
+  throw new Error("kaggle-ml: args.goal is required (what to optimize)")
+}
+if (!Array.isArray(args.components) || args.components.length === 0) {
+  throw new Error("kaggle-ml: args.components must be a non-empty array, e.g. [\\"data\\", \\"features\\", \\"model\\"]")
+}
+const goal = args.goal.trim()
+const components = args.components.slice(0, 5).map(String)
+const metric = typeof args.metric === "string" && args.metric.trim() ? args.metric.trim() : "score"
+const target = Number(args.target)
+const hasTarget = Number.isFinite(target)
+const evalCommand = typeof args.evalCommand === "string" && args.evalCommand.trim() ? args.evalCommand.trim() : ""
+const dataRoot = typeof args.dataRoot === "string" && args.dataRoot.trim() ? args.dataRoot.trim() : ""
+const judge = typeof args.judge === "string" && args.judge.trim() ? args.judge.trim() : "general"
+const maxIterations = Math.max(
+  1,
+  Math.min(Number.isFinite(Number(args.maxIterations)) ? Math.floor(Number(args.maxIterations)) : 8, 20)
+)
+const agentsPerIteration = Math.max(
+  6,
+  Math.min(Number.isFinite(Number(args.agentsPerIteration)) ? Math.floor(Number(args.agentsPerIteration)) : 12, 20)
+)
+
+const MPLAN = { type: "object", required: ["strategy", "components"], properties: {
+  strategy: { type: "string" },
+  components: { type: "array", items: { type: "object", required: ["id", "focus"], properties: {
+    id: { type: "string" }, focus: { type: "string" }, status: { type: "string", enum: ["active", "dropped", "new"] } } } } } }
+const MIDEA = { type: "object", required: ["variations"], properties: {
+  variations: { type: "array", items: { type: "object", required: ["idea", "rationale"], properties: {
+    idea: { type: "string" }, rationale: { type: "string" }, expectedDelta: { type: "number" } } } } } }
+const MSELECT = { type: "object", required: ["configs"], properties: {
+  configs: { type: "array", items: { type: "object", required: ["id", "chosen", "why"], properties: {
+    id: { type: "string" },
+    chosen: { type: "array", items: { type: "object", required: ["componentId", "variationId"], properties: {
+      componentId: { type: "string" }, variationId: { type: "string" } } } },
+    why: { type: "string" } } } },
+  rationale: { type: "string" } } }
+const MBUILD = { type: "object", required: ["candidateId", "metrics", "evidence"], properties: {
+  candidateId: { type: "string" },
+  metrics: { type: "object" },
+  evidence: { type: "object", required: ["command", "outputQuote"], properties: {
+    command: { type: "string" }, exitCode: { type: "number" }, outputQuote: { type: "string" } } },
+  artifactsRef: { type: "string" } } }
+const MVERDICT = { type: "object", required: ["status", "metrics", "evidence"], properties: {
+  status: { type: "string", enum: ["improve", "done", "blocked"] },
+  metrics: { type: "object" },
+  insight: { type: "object", properties: {
+    componentDelta: { type: "array", items: { type: "object", properties: {
+      component: { type: "string" }, variation: { type: "string" }, kept: { type: "boolean" }, why: { type: "string" } } } },
+    nextHints: { type: "array", items: { type: "string" } } } },
+  evidence: { type: "object", required: ["command", "outputQuote"], properties: {
+    command: { type: "string" }, exitCode: { type: "number" }, outputQuote: { type: "string" } } } } }
+
+const summary = await loop({
+  key: "kaggle-ml",
+  goal: goal,
+  state: { plan: null, trials: [], best: null, rounds: [] },
+  budget: {
+    iterations: maxIterations,
+    agentsPerIteration: agentsPerIteration,
+    ...(typeof args.deadline === "string" && args.deadline ? { deadline: args.deadline } : {}),
+  },
+  stop: { predicate: function (v) {
+    if (!hasTarget || !v.verdict || !v.verdict.metrics) return false
+    const got = Number(v.verdict.metrics[metric])
+    return Number.isFinite(got) && got >= target ? "target" : false
+  }, stallK: 3 },
+  verdict: {
+    agent: judge,
+    schema: MVERDICT,
+    prompt: function (c) {
+      return "Judge ML round " + c.i + " for: " + goal +
+        ".\\nMetric: " + metric + (hasTarget ? " (target >= " + target + ")" : "") +
+        ".\\nRound result: " + JSON.stringify(c.result) +
+        ".\\nState best metrics: " + JSON.stringify(c.state.best && c.state.best.metrics ? c.state.best.metrics : null) +
+        ".\\nRE-DERIVE the best candidate's metric yourself: run the evaluation, then quote the exact command and the output line with the number. status=done ONLY when the target is actually met by your own re-derivation." +
+        ".\\ninsight: which variation helped or hurt per component (componentDelta) and what to try next."
+    },
+  },
+}, async function (ctx) {
+  const state = ctx.state || {}
+  const trials = state.trials || []
+  const recent = trials.slice(-5).map(function (t) {
+    return { config: t.config, metric: t.metrics ? t.metrics[metric] : null, note: t.note }
+  })
+  const plan = (await agent(
+    "You are improving: " + goal + ".\\nMetric: " + metric + (hasTarget ? " (target >= " + target + ")" : "") +
+    ".\\nKnown best: " + JSON.stringify(state.best && state.best.metrics ? state.best.metrics : null) +
+    ".\\nRecent trials: " + JSON.stringify(recent) +
+    ".\\nCurrent plan: " + JSON.stringify(state.plan) +
+    ".\\nRevise the plan from the evidence (drop/add components, refocus); keep it if it is working. Respond JSON: strategy, components [{id, focus, status}].",
+    { schema: MPLAN, key: "kaggle-ml:i" + ctx.i + ":reflect", label: "reflect", phase: "kaggle-ml" }
+  )).data || { strategy: "", components: components.map(function (id) { return { id: id, focus: "", status: "active" } }) }
+
+  const active = (plan.components || []).filter(function (c) { return c.status !== "dropped" }).slice(0, 4)
+  const variations = {}
+  for (let vi = 0; vi < active.length; vi++) {
+    const comp = active[vi]
+    progress("variations: " + comp.id)
+    try {
+      const idea = (await agent(
+        "Propose 2-3 concrete variations for the '" + comp.id + "' component.\\nGoal: " + goal +
+        ".\\nComponent focus: " + String(comp.focus || "") +
+        ".\\nHistory (do not repeat failed ideas; exploit what helped): " + JSON.stringify(recent) +
+        ".\\nRespond JSON: variations [{idea, rationale, expectedDelta}].",
+        { schema: MIDEA, key: "kaggle-ml:i" + ctx.i + ":var:" + String(comp.id).slice(0, 20), label: "variations:" + comp.id, phase: "kaggle-ml" }
+      )).data
+      variations[comp.id] = idea && Array.isArray(idea.variations) ? idea.variations.slice(0, 3) : []
+    } catch (e) {
+      variations[comp.id] = []
+    }
+  }
+
+  const select = (await agent(
+    "Select AT MOST 3 full pipeline configurations to run this round.\\nGoal: " + goal +
+    ".\\nPlan: " + JSON.stringify(plan) +
+    ".\\nVariations per component: " + JSON.stringify(variations) +
+    ".\\nIncumbent best config: " + JSON.stringify(state.best ? state.best.config : null) +
+    ".\\nRules: NEVER enumerate combinations (no grid search). Carry the incumbent forward as one config, changing at most one component. Use the rest of the budget on the most promising single variations. " +
+    "Respond JSON: configs [{id, chosen: [{componentId, variationId}], why}] (<=3), rationale.",
+    { schema: MSELECT, key: "kaggle-ml:i" + ctx.i + ":select", label: "select", phase: "kaggle-ml" }
+  )).data || { configs: [] }
+  const configs = Array.isArray(select.configs) ? select.configs.slice(0, 3) : []
+
+  const nextTrials = trials.slice()
+  for (let ci = 0; ci < configs.length; ci++) {
+    const cfg = configs[ci]
+    const dir = String(ctx.artifactsDir || ctx.runDir || ".") + "/cand-" + String(cfg.id || ci).slice(0, 16)
+    progress("run: " + String(cfg.id))
+    const build = (await agent(
+      "Run this ML configuration end-to-end.\\nGoal: " + goal +
+      ".\\nConfig: " + JSON.stringify(cfg) +
+      ".\\nWork ONLY inside this directory (create it): " + dir +
+      (dataRoot ? ". Read data read-only from: " + dataRoot : "") +
+      (evalCommand ? ".\\nThen run exactly: " + evalCommand : ".\\nUse your own evaluation and cite the exact command you ran") +
+      ".\\nRespond JSON: candidateId, metrics (numbers keyed by name, include '" + metric + "'), evidence {command, exitCode, outputQuote (the line with the metric)}, artifactsRef.",
+      { schema: MBUILD, key: "kaggle-ml:i" + ctx.i + ":run:" + String(cfg.id || ci).slice(0, 20), label: "run:" + cfg.id, phase: "kaggle-ml" }
+    )).data
+    if (build) {
+      nextTrials.push({ round: ctx.i, config: cfg, metrics: build.metrics || {}, evidence: build.evidence || null, artifactsRef: build.artifactsRef || dir, note: build.candidateId })
+    }
+  }
+
+  const scored = nextTrials.filter(function (t) { return t.metrics && Number.isFinite(Number(t.metrics[metric])) })
+  scored.sort(function (a, b) { return Number(b.metrics[metric]) - Number(a.metrics[metric]) })
+  const kept = scored.length > 0 ? scored.slice(0, 5) : nextTrials.slice(-5)
+  const best = scored.length > 0 ? scored[0] : state.best
+  const rounds = (state.rounds || []).concat([{ r: ctx.i, configs: configs.length, best: best && best.metrics ? best.metrics[metric] : null }])
+  return {
+    state: { plan: plan, variations: variations, trials: kept, best: best, rounds: rounds },
+    result: { configs: configs.length, best: best && best.metrics ? best.metrics[metric] : null },
+  }
+})
+
+return {
+  stopReason: summary.stopReason,
+  iterations: summary.iterations,
+  metric: metric,
+  best: summary.state && summary.state.best ? summary.state.best.metrics : null,
+  bestConfig: summary.state && summary.state.best ? summary.state.best.config : null,
+  rounds: (summary.state && summary.state.rounds) || [],
+  lastVerdict: summary.lastVerdict,
+  spent: summary.spent,
+}`
+
 export const SCRIPT_TEMPLATES: readonly ScriptTemplate[] = [
   {
     name: "staged-delivery",
@@ -182,6 +463,20 @@ export const SCRIPT_TEMPLATES: readonly ScriptTemplate[] = [
       "Bounded fix loop over a known issue list: one write agent per pass, an independent recheck after each pass, survivors carry forward. 2 child calls per pass — pass timeoutMs for long lists.",
     args: ["goal", "issues", "maxPasses"],
     script: VERIFY_FIX,
+  },
+  {
+    name: "kanban",
+    description:
+      "Worklist loop over a ticket queue (loop()+queue()): pull ONE ticket per iteration, plan → implement → review with an independent reviewer, follow-up tickets from review findings, deps gate readiness, stop when the queue drains. ~3 child calls per ticket; pass timeoutMs for boards larger than ~10 tickets.",
+    args: ["goal", "tickets", "maxIterations", "agentsPerIteration", "reviewer"],
+    script: KANBAN,
+  },
+  {
+    name: "kaggle-ml",
+    description:
+      "Refinement loop for ML/quant work (loop() + verdict/skeptic): reflect on the plan, propose per-component variations, select ≤3 full configurations (never a cross product), run each in its own artifacts dir, judge metrics from verbatim evidence, keep the best. Stops on the target metric, deadline, or budgets. ~6 child calls per round.",
+    args: ["goal", "components", "metric", "target", "evalCommand", "dataRoot", "judge", "deadline", "maxIterations", "agentsPerIteration"],
+    script: KAGGLE_ML,
   },
 ]
 

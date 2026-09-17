@@ -159,7 +159,7 @@ const WORKFLOW_TOOL_INPUT_SCHEMA: Record<string, unknown> = {
         script: {
           type: "string",
           description:
-            "Workflow source: a plain-JS async function body (no import/export). Injected globals: agent(prompt, opts?) -> {text, data?, tokens}, parallel(thunks), pipeline(items, ...stages), phase(name), progress(text), workflow(name, args), sleep(ms), console.log, args, meta. Return a small JSON value.",
+            "Workflow source: a plain-JS async function body (no import/export). Injected globals: agent(prompt, opts?) -> {text, data?, tokens}, parallel(thunks), pipeline(items, ...stages), phase(name), progress(text), workflow(name, args), loop(spec, iterate) (engine-owned iteration: budgets, auto-keys, checkpoints, verdict+skeptic), queue(items) (worklist), sleep(ms), console.log, args, meta. Return a small JSON value.",
         },
         name: { type: "string", description: "Optional run name shown in /ultracode summaries." },
         meta: {

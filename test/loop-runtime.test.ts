@@ -430,3 +430,25 @@ return { summary }
   const left = (summary["lastResult"] as { left: { agentsPerIteration: number } }).left
   assert.equal(left.agentsPerIteration, 3, "4 total minus the 1 verdict reservation (skeptic off)")
 })
+
+test("queue: statuses and notes survive an items() round-trip (state persistence)", async () => {
+  const result = await runInWorker(
+    `
+const q = queue([{ text: "a" }, { text: "b" }, { text: "c" }])
+q.done(q.items()[0].id, "shipped")
+q.block(q.items()[1].id, "needs triage")
+const persisted = q.items()          // what the template writes into loop state
+const q2 = queue(persisted)           // next iteration rebuilds from state
+const sizes = q2.sizes()
+const popped = q2.pop()               // only "c" is open
+return { sizes, poppedText: popped ? popped.text : null, note: q2.items()[0].note }
+`,
+    { caps: GENERAL_AGENT_CAPS, onCall: async () => agentResult() },
+  )
+  assert.equal(result.ok, true, result.error ?? "loop run failed")
+  const value = result.value as { sizes: Record<string, number>; poppedText: string | null; note: string }
+  assert.equal(value.sizes.done, 1, "done survives the rebuild")
+  assert.equal(value.sizes.blocked, 1, "blocked survives the rebuild")
+  assert.equal(value.poppedText, "c", "the open item is the only one poppable")
+  assert.equal(value.note, "shipped", "notes persist")
+})
