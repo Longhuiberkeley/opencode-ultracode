@@ -95,11 +95,19 @@ export function normalizeModelRef(
   if (raw !== null && typeof raw === "object" && !Array.isArray(raw)) {
     const o = raw as { providerID?: unknown; id?: unknown; variant?: unknown }
     if (typeof o.providerID === "string" && typeof o.id === "string" && o.providerID !== "" && o.id !== "") {
+      if (!/^[A-Za-z0-9._-]+$/.test(o.providerID)) {
+        return { ok: false, error: `model.providerID must match the provider id charset [A-Za-z0-9._-], got ${JSON.stringify(o.providerID)}` }
+      }
       if (/[#/\s]/.test(o.id)) {
         return { ok: false, error: `model.id must be the bare model id (no provider/ or #variant), got ${JSON.stringify(o.id)}` }
       }
       const model: { providerID: string; id: string; variant?: string } = { providerID: o.providerID, id: o.id }
-      if (typeof o.variant === "string" && o.variant !== "") model.variant = o.variant
+      if (typeof o.variant === "string" && o.variant !== "") {
+        if (/[#\s]/.test(o.variant)) {
+          return { ok: false, error: `model.variant must not contain "#" or whitespace, got ${JSON.stringify(o.variant)}` }
+        }
+        model.variant = o.variant
+      }
       return { ok: true, model }
     }
     return { ok: false, error: `model object must be { providerID, id, variant? }, got ${JSON.stringify(raw)}` }

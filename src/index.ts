@@ -145,7 +145,7 @@ const MODEL_OVERRIDE_PROPERTY: Record<string, unknown> = {
 const ALLOW_DISABLED_PROVIDERS_PROPERTY: Record<string, unknown> = {
   type: "boolean",
   description:
-    "Default false. Pass true only when the user explicitly wants an override to run on a provider they disabled (disabled_providers) — it unlocks that provider for THIS run only.",
+    "Default false. Pass true only when the user explicitly wants overrides to run on providers they disabled (disabled_providers) — it unlocks ALL disabled providers for THIS run only (run-wide), not just the one named in model.",
 }
 
 /** JSON Schema for the workflow tool input union (inline script vs saved workflow). */

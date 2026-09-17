@@ -936,3 +936,28 @@ test("model override: run-level model on a disabled provider fails before any ch
   assert.match(outcome.run.error ?? "", /targets provider "offline"/)
   assert.equal(ctx.sessions.createdModels.length, 0, "preflight gate: no session created")
 })
+
+test("model override: graph node model flows end-to-end through the worker", async () => {
+  const { compileGraphSpec } = await import("../src/graph.ts")
+  const ctx = makeSupervisor({}, {}, {
+    pinForAgent: async () => ({ providerID: "xai", id: "pinned-model" }),
+  })
+  ctx.sessions.push({ text: "done", agent: "explore" })
+  const compiled = compileGraphSpec({
+    nodes: [
+      { id: "solo", kind: "agent", agent: "explore", model: "google/gemini-3.7-flash", prompt: "hi {{args.x}}" },
+    ],
+  })
+  const outcome = await ctx.supervisor.start({ script: compiled.script, args: { x: 1 } }, ctx.parent)
+  assert.equal(outcome.run.status, "succeeded", outcome.run.error ?? "")
+  assert.deepEqual(ctx.sessions.createdModels[0], { providerID: "google", id: "gemini-3.7-flash" })
+  assert.equal(ctx.registry.getAgent(outcome.run.id, "a1")!.spawnModel?.source, "call")
+  // run-level model persists on the record for rerun reproduction
+  const ctx2 = makeSupervisor()
+  ctx2.sessions.push({ text: "ok", agent: "general" })
+  const out2 = await ctx2.supervisor.start(
+    { script: `return 1`, model: { providerID: "openai", id: "gpt-6" } },
+    ctx2.parent,
+  )
+  assert.deepEqual(out2.run.modelOverride, { providerID: "openai", id: "gpt-6" })
+})

@@ -120,7 +120,7 @@ export type CapturedSettings = {
 export type ModelRef = { providerID: string; id: string; variant?: string }
 
 /** Where a spawned child's intended model came from — precedence provenance. */
-export type ModelSpawnSource = "call" | "run" | "pin" | "default"
+export type ModelSpawnSource = "call" | "run" | "pin"
 
 /**
  * Intended spawn model on an agent record. `source` distinguishes an
@@ -150,7 +150,7 @@ export interface WorkflowMeta {
  */
 export interface ModelOverrideInput {
   model?: string
-  /** Default false: a model on a disabled provider is rejected. Explicit true unlocks it for THIS run. */
+  /** Default false: a model on a disabled provider is rejected. Explicit true unlocks ALL disabled providers for THIS run (run-wide). */
   allowDisabledProviders?: boolean
 }
 

@@ -738,3 +738,52 @@ test("delayAbortable: resolves after ms and cleans up listeners when not aborted
   c.abort()
   await tick(5)
 })
+
+test("AgentRunner warm cache: changed run-level model flips the digest (no stale replay)", async () => {
+  // Source run produced the keyed result with NO explicit model (pins/default).
+  const source = makeSourceRun()
+  const { calls, runner } = makeRunner({
+    warmCache: buildWarmCache(source),
+    runModel: { providerID: "openai", id: "gpt-6" },
+  })
+  const pending = runner.call("scout the repo", { key: "scout" })
+  await tick()
+  assert.equal(calls.length, 1, "same key + run-level model must NOT replay the old-model result")
+  calls[0]!.resolve(okResult("ses_redone"))
+  await pending
+})
+
+test("AgentRunner warm cache: changed per-call model flips the digest (no stale replay)", async () => {
+  const source = makeSourceRun()
+  const { calls, runner } = makeRunner({ warmCache: buildWarmCache(source) })
+  const pending = runner.call("scout the repo", { key: "scout", model: { providerID: "google", id: "gemini-3.7-flash" } })
+  await tick()
+  assert.equal(calls.length, 1, "same key + per-call model override must spawn, not replay")
+  calls[0]!.resolve(okResult("ses_redone2"))
+  await pending
+})
+
+test("AgentRunner warm cache: identical run-level model to the recorded digest replays", async () => {
+  // Record a source whose digest was computed WITH the run model, then warm
+  // start with the same run model — the digest matches and replays.
+  const registry0 = new FakeRegistry()
+  const source = registry0.create({ parentSessionID: "ses_old", script: "return 1" })
+  registry0.addAgent(source.id, {
+    status: "succeeded",
+    requestedAgent: "general",
+    key: "scout",
+    promptDigest: agentCacheDigest("scout the repo", { model: { providerID: "openai", id: "gpt-6" } }, "general"),
+    sessionID: "ses_old_scout",
+    effectiveAgent: "general",
+    resultText: "scout findings",
+    data: { files: 3 },
+  })
+  const { calls, runner } = makeRunner({
+    warmCache: buildWarmCache(source),
+    runModel: { providerID: "openai", id: "gpt-6" },
+  })
+  const res = await runner.call("scout the repo", { key: "scout" })
+  assert.equal(calls.length, 0, "same effective model + same key replays")
+  assert.equal(res.text, "scout findings")
+  assert.equal(res.cachedFrom, source.id)
+})

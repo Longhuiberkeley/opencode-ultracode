@@ -38,12 +38,13 @@ export interface WarmCacheEntry {
 }
 
 /**
- * Warm-cache identity: prompt + schema + resolved agent (+ the per-call model
- * override, when set). Everything that changes what the child would produce
- * must change the digest. The model segment is appended ONLY when set so
- * digests of pre-override runs stay valid across the upgrade (warm replays
- * keep working); an overridden call with the same key never replays a result
- * produced on a different model.
+ * Warm-cache identity: prompt + schema + resolved agent (+ the effective
+ * explicit model override — per-call, or the run-level model folded in by the
+ * runner). Everything that changes what the child would produce must change
+ * the digest. The model segment is appended ONLY when set so digests of
+ * pre-override runs stay valid across the upgrade (warm replays keep
+ * working); an overridden call with the same key never replays a result
+ * produced on a different model. Config pins are excluded by design.
  */
 export function agentCacheKey(prompt: string, opts: AgentOpts, defaultAgent: string): string {
   const base = `${prompt}\u0000${JSON.stringify(opts.schema ?? null)}\u0000${opts.agent ?? defaultAgent}`
@@ -299,7 +300,13 @@ export class AgentRunner {
 
   async call(prompt: string, opts: AgentOpts = {}): Promise<AgentResult> {
     const key = typeof opts.key === "string" ? opts.key.trim() : ""
-    const digest = key ? this.digestFn(prompt, opts) : undefined
+    // Digest identity sees the EFFECTIVE model (per-call override, else the
+    // run-level override — the runner's precedence for this child). Config
+    // pins are deliberately excluded (user-config context, pre-existing
+    // behavior): a warm rerun after re-pinning replays keyed results.
+    const digestOpts: AgentOpts =
+      opts.model === undefined && this.runModel !== undefined ? { ...opts, model: this.runModel } : opts
+    const digest = key ? this.digestFn(prompt, digestOpts) : undefined
 
     // Keyed warm replay: a succeeded agent with the same key AND the same
     // prompt digest returns from the source run — no session spawned, no cap

@@ -1315,3 +1315,33 @@ test("/ultracode result: honest messages for no-result runs", async () => {
   const ok = await invoke("result run_done", { registry: registry2 })
   assert.match(ok.texts[0]!, /"ok": 1/) // fits — printed directly, background or not
 })
+
+test("rerun reproduces the original run's model override and provider unlock", async () => {
+  const registry = new FakeRegistry()
+  seed(
+    registry,
+    baseRun({
+      id: "run_m",
+      status: "succeeded",
+      script: "return 1",
+      modelOverride: { providerID: "openai", id: "gpt-6", variant: "high" },
+      allowDisabledProviders: true,
+      timeoutOverrideMs: 1_200_000,
+    }),
+  )
+  const { supervisor } = await invoke("rerun run_m", { registry })
+  assert.equal(supervisor.startCalls.length, 1)
+  const input = supervisor.startCalls[0]!.input as RunLaunchInput
+  assert.deepEqual(input.model, { providerID: "openai", id: "gpt-6", variant: "high" })
+  assert.equal(input.allowDisabledProviders, true)
+  assert.equal(input.timeoutMs, 1_200_000)
+})
+
+test("rerun of a run without overrides launches without model fields", async () => {
+  const registry = new FakeRegistry()
+  seed(registry, baseRun({ id: "run_plain", status: "succeeded", script: "return 1" }))
+  const { supervisor } = await invoke("rerun run_plain", { registry })
+  const input = supervisor.startCalls[0]!.input as RunLaunchInput
+  assert.equal(input.model, undefined)
+  assert.equal(input.allowDisabledProviders, undefined)
+})
