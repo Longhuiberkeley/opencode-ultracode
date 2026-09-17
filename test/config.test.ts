@@ -37,6 +37,7 @@ test("loadOptions: empty object gives all defaults", () => {
     agentRetryAttempts: 1,
     agentRetryBackoffMs: 5_000,
     childStallMs: 900_000,
+    maxLoopDepth: 2,
   })
   assert.deepEqual(warnings, [])
 })
@@ -54,6 +55,7 @@ test("loadOptions: fully valid options round-trip", () => {
     agentRetryAttempts: 2,
     agentRetryBackoffMs: 30_000,
     childStallMs: 600_000,
+    maxLoopDepth: 3,
   }
   const { options, warnings } = loadOptions(raw)
   assert.deepEqual(options, raw)

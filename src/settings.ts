@@ -63,6 +63,7 @@ export function freezeEffective(options: Required<UltracodeOptions>): Required<U
     agentRetryAttempts: options.agentRetryAttempts,
     agentRetryBackoffMs: options.agentRetryBackoffMs,
     childStallMs: options.childStallMs,
+    maxLoopDepth: options.maxLoopDepth,
   })
 }
 

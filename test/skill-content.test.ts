@@ -47,10 +47,13 @@ test("skill metadata: name and one-sentence trigger description", () => {
 test("skill content covers every injected global", () => {
   const lines = SKILL_CONTENT.split("\n")
   assert.ok(
-    lines.length >= 120 && lines.length <= 380,
+    lines.length >= 120 && lines.length <= 430,
     // 320 → 380 (2026-09-12): the sizing/partitioning contract added after
     // production runs blew single-child contexts to 300-400k.
-    `expected a lean 120-380 line skill, got ${lines.length}`,
+    // 380 → 430 (2026-09-17): the loop()/queue() runtime — engine-owned loop
+    // disciplines, queue worklists, verdict/skeptic contract — needs its rules
+    // where the authoring model reads them.
+    `expected a lean 120-430 line skill, got ${lines.length}`,
   )
   for (const name of ["agent", "parallel", "pipeline", "phase", "progress", "workflow", "sleep", "args", "meta", "console"]) {
     assert.match(SKILL_CONTENT, new RegExp(`\\b${name}\\b`), `SKILL_CONTENT must mention the global \`${name}\``)

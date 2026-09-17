@@ -74,6 +74,13 @@ export interface UltracodeOptions {
    * Default 900_000 (15 min).
    */
   childStallMs?: number
+  /**
+   * Hard cap on `loop()` nesting depth inside one run (engine-owned; the
+   * worker preflight rejects deeper nesting before iteration 1). Budgets are
+   * shared across nested loops — the cap bounds structural blowup only.
+   * Default 2.
+   */
+  maxLoopDepth?: number
 }
 
 export const DEFAULT_OPTIONS: Required<UltracodeOptions> = {
@@ -88,6 +95,7 @@ export const DEFAULT_OPTIONS: Required<UltracodeOptions> = {
   agentRetryAttempts: 1,
   agentRetryBackoffMs: 5_000,
   childStallMs: 900_000,
+  maxLoopDepth: 2,
 }
 
 /** Local admission clamp (this repo default). Not a host API. */
@@ -488,6 +496,127 @@ export interface AgentResult {
   cachedFrom?: string
 }
 
+/** A queue() worklist item (serializable; ids are content-hashed when absent). */
+export interface QueueItem {
+  id: string
+  text: string
+  deps?: string[]
+  tags?: string[]
+  meta?: Json
+  status?: "open" | "active" | "blocked" | "done"
+  note?: string | null
+}
+
+export interface QueueSizes {
+  total: number
+  open: number
+  active: number
+  blocked: number
+  done: number
+  ready: number
+}
+
+/** Pure serializable worklist returned by the queue() global. */
+export interface QueueHandle {
+  push(item: QueueItem | QueueItem[]): string[]
+  pop(): QueueItem | null
+  popMany(n: number): QueueItem[]
+  done(id: string, note?: string): boolean
+  block(id: string, reason?: string): boolean
+  unblock(id: string): boolean
+  sizes(): QueueSizes
+  items(): QueueItem[]
+}
+
+export type LoopStopReason = "target" | "queue-empty" | "stall" | "budget" | "blocked" | "error"
+
+export interface LoopBudgetInput {
+  /** Max iterations (default 10, engine-clamped 1..200). */
+  iterations?: number
+  /** Max TOTAL agent calls per iteration — iterate + verdict + skeptic (default 12, clamped 1..64). */
+  agentsPerIteration?: number
+  /** Max loop wall-clock ms (also bounded by the run clock). */
+  wallMs?: number
+  /** Max summed child tokens (input+output+reasoning) before the loop stops. */
+  tokens?: number
+  /** Absolute stop: epoch ms or a Date-parseable string ("til 8am"-shaped). */
+  deadline?: number | string
+}
+
+export interface LoopIterationCtx {
+  /** 0-based iteration index. */
+  i: number
+  key: string
+  goal: string
+  /** The current loop state (what the previous iterate returned). */
+  state: Json
+  /** The previous iteration's `result`, when provided. */
+  lastResult: Json | null
+  /** Budget remaining (agentsPerIteration is AFTER the verdict/skeptic reservation). */
+  budgetLeft: { iterations: number; agentsPerIteration: number; wallMs: number; tokens: number }
+  /** Per-iteration artifact directory (`<run artifacts>/it-<i>`) or null. */
+  artifactsDir: string | null
+  /** Stable run-level directory for cross-iteration artifacts. */
+  runDir: string | null
+  /** Bounded compact log of prior iterations (status/digest/error). */
+  history: Array<{ i: number; status: string; digest?: string; error?: string }>
+  /** Previous iteration's verdict data (schema-validated), when declared. */
+  lastVerdict: Json | null
+}
+
+export type LoopIterate = (
+  ctx: LoopIterationCtx,
+) => Promise<{ state: Json; result?: Json }> | { state: Json; result?: Json }
+
+export interface LoopVerdictInput {
+  /** Judge agent id (default: the plugin default agent). Use a DIFFERENT agent than the workers. */
+  agent?: string
+  /** JSON Schema for the judge's structured output (evidence-shaped recommended). */
+  schema?: Json
+  /** Prompt builder (string or function of the iteration); the judge is told to cite evidence. */
+  prompt?: string | ((ctx: LoopIterationCtx) => string)
+  /** Default true: a terminating verdict must survive one independent skeptic re-derivation. */
+  skeptic?: boolean
+}
+
+export interface LoopSpec {
+  /** Stable loop id: drives auto-keys (`<key>:i<n>:a<m>`), checkpoints and phases. */
+  key: string
+  goal?: string
+  /** Initial state (the script owns state; iterate is the sole writer). */
+  state?: Json
+  budget?: LoopBudgetInput
+  stop?: {
+    /** Truthy stops the loop (a string names the stop reason) until-conditions. */
+    predicate?: (input: {
+      i: number
+      state: Json
+      result: Json | null
+      verdict: Json | null
+      goal: string
+    }) => boolean | string
+    /** Consecutive no-progress iterations before a stall stop (default 3, 1..10). */
+    stallK?: number
+  }
+  verdict?: LoopVerdictInput
+  /** Run a TRUSTED saved workflow each iteration instead of a local iterate fn. */
+  unit?: { name: string; args?: Json | ((ctx: LoopIterationCtx) => Json) }
+  /** Iteration-failure policy: retry once (default) | record and continue | stop with reason "error". */
+  onIterationError?: "retry" | "record" | "abort"
+}
+
+export interface LoopSummary {
+  key: string
+  goal: string
+  iterations: number
+  stopReason: LoopStopReason | string
+  state: Json
+  lastVerdict: Json | null
+  lastResult: Json | null
+  history: Json[]
+  spent: { agents: number; tokens: number; wallMs: number; errors: number }
+}
+
 /** The globals injected into the worker sandbox (see src/worker-script.ts). */
 export interface WorkflowScriptGlobal {
   agent(prompt: string, opts?: AgentOpts): Promise<AgentResult>
@@ -501,6 +630,10 @@ export interface WorkflowScriptGlobal {
   /** Persist a named checkpoint (small JSON value) onto the run record. */
   checkpoint(name: string, value?: Json): void
   workflow(name: string, args?: Json): Promise<Json>
+  /** Engine-owned iteration primitive (budgets, verdicts, stall, checkpoints). */
+  loop(spec: LoopSpec, iterate?: LoopIterate): Promise<LoopSummary>
+  /** Pure serializable worklist (pop/push/done/block; content-hashed ids). */
+  queue(initial?: QueueItem[], opts?: { id?: string }): QueueHandle
   sleep(ms: number): Promise<void>
   console: { log(...args: unknown[]): void }
   args: Json | undefined
@@ -511,7 +644,7 @@ export interface WorkflowScriptGlobal {
 // Worker <-> host RPC bridge (JSON messages over postMessage)
 // ---------------------------------------------------------------------------
 
-export type BridgeCallName = "agent" | "workflow" | "stopAck"
+export type BridgeCallName = "agent" | "workflow" | "workflow-check" | "stopAck"
 
 export interface BridgeCall {
   type: "call"
@@ -693,6 +826,12 @@ export interface Storage {
   loadRuns(): RunRecord[]
   /** Write the script artifact file; returns absolute path. */
   writeScriptArtifact(runID: string, script: string): Promise<string | undefined>
+  /**
+   * Absolute directory for a run's artifacts (loop ctx.artifactsDir/runDir)
+   * — `.opencode/workflows/runs/<runID>/`. Optional: test doubles may omit;
+   * the loop runtime then exposes null dirs.
+   */
+  runDirFor?(runID: string): string | undefined
   /**
    * Persist a large result; returns the storage key, or undefined when the
    * value could not be serialized (no key is claimed in that case — callers

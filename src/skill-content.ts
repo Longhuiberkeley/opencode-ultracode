@@ -384,7 +384,8 @@ Two rules keep the layers from fighting:
   \`requires\` for you). The preflight then fails fast with the list of available agents instead of
   the run dying midway.
 - Cost shape: extraction and search go to the cheap agent; judgment and synthesis go to the strong
-  one. The user pins which model each agent runs. You never name models, ever.
+  one. The user pins which model each agent runs. Name a model (\`opts.model\` / run-input \`model\`)
+  ONLY when the user explicitly asked for one — see hard rule 4.
 - \`model\` on results is informational (what actually ran). Do not branch on it.
 
 Before authoring, answer two questions: what is the fan-out? who verifies? If both answers exist,

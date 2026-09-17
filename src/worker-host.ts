@@ -26,6 +26,17 @@ export interface SpawnWorkerInput {
   source: string
   args?: Json
   meta?: WorkflowMeta
+  /**
+   * Engine caps for the loop runtime (maxAgents / maxLoopDepth caps +
+   * artifact dirs). Advisory worker-side preflight; the host remains the
+   * hard enforcer of maxAgents and the run wall clock.
+   */
+  caps?: {
+    maxAgents?: number
+    maxLoopDepth?: number
+    artifactsDir?: string | null
+    runDir?: string | null
+  }
   handlers: WorkerBridgeHandlers
 }
 
@@ -113,7 +124,13 @@ export function spawnWorker(input: SpawnWorkerInput): WorkerHandle {
   return {
     start(): Promise<WorkerResult> {
       if (!gateClosed) {
-        worker.postMessage({ type: "init", script: input.source, args: input.args, meta: input.meta })
+        worker.postMessage({
+          type: "init",
+          script: input.source,
+          args: input.args,
+          meta: input.meta,
+          ...(input.caps !== undefined ? { caps: input.caps } : {}),
+        })
       } else {
         settle({ ok: false, error: "run stopping" })
       }

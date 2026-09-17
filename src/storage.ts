@@ -462,6 +462,12 @@ export class StorageImpl implements Storage {
     }
   }
 
+  /** `<...>/runs/<runID>` — loop artifact root handed to ctx.runDir/artifactsDir. */
+  runDirFor(runID: string): string | undefined {
+    if (typeof runID !== "string" || !RUN_ID_RE.test(runID) || runID.includes("..")) return undefined
+    return joinInside(this.runsArtifactDir, runID, "run artifacts dir")
+  }
+
   // ------------------------------------------------------------------
   // Saved workflows (fs pairs + KV trust, cached for sync interface methods)
   // ------------------------------------------------------------------
@@ -1023,6 +1029,10 @@ function parseManifest(raw: unknown, source: "project" | "personal"): SavedWorkf
   if (typeof v["name"] !== "string") return undefined
   const kind = v["kind"] === "graph" || v["kind"] === "script" ? v["kind"] : undefined
   const params = asJson(v["params"])
+  const modelsUsed =
+    Array.isArray(v["modelsUsed"]) && v["modelsUsed"].every((m) => typeof m === "string")
+      ? (v["modelsUsed"] as string[]).slice(0, 16)
+      : undefined
   const manifest: SavedWorkflowManifest = {
     version: MANIFEST_VERSION,
     name: v["name"],
@@ -1038,6 +1048,7 @@ function parseManifest(raw: unknown, source: "project" | "personal"): SavedWorkf
     savedFromRunID: typeof v["savedFromRunID"] === "string" ? v["savedFromRunID"] : undefined,
     ...(kind !== undefined ? { kind } : {}),
     ...(params !== undefined ? { params } : {}),
+    ...(modelsUsed !== undefined && modelsUsed.length > 0 ? { modelsUsed } : {}),
   }
   return manifest
 }

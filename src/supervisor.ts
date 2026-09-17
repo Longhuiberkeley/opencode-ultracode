@@ -371,10 +371,17 @@ export class SupervisorImpl implements Supervisor {
       })
 
       // 5. Spawn the worker with bridge dispatch.
+      const runDir = this.storage.runDirFor?.(runID)
       worker = spawnWorker({
         source: input.script,
         args: input.args,
         meta: input.meta,
+        caps: {
+          maxAgents: state.effective.maxAgents,
+          maxLoopDepth: state.effective.maxLoopDepth,
+          artifactsDir: runDir ?? null,
+          runDir: runDir ?? null,
+        },
         handlers: {
           onCall: (fn, args) => this.trackInFlight(state, () => this.dispatch(fn, args, runner, state)),
           onEvent: (kind, data) => this.handleEvent(state, kind, data, parent),
@@ -585,6 +592,21 @@ export class SupervisorImpl implements Supervisor {
       const depth = typeof args[2] === "number" ? args[2] : 0
       const composed = await getWorkflowComposer(this.workflowLoader, name, args[1], depth)
       return composed as unknown as Json
+    }
+    if (fn === "workflow-check") {
+      // loop({ unit }) preflight: load + trust-check + validate the named
+      // workflow BEFORE iteration 1, WITHOUT executing it. Same loader and
+      // depth rule as workflow(); the composed script is discarded.
+      if (typeof args[0] !== "string" || args[0].length === 0) {
+        throw new Error("workflow-check(name) — name must be a non-empty string")
+      }
+      const depth = typeof args[2] === "number" ? args[2] : 0
+      const composed = await getWorkflowComposer(this.workflowLoader, args[0], args[1], depth)
+      return {
+        ok: true,
+        name: args[0],
+        meta: (composed as { meta?: unknown }).meta ?? null,
+      } as unknown as Json
     }
     throw new Error(`unknown bridge call: ${fn}`)
   }

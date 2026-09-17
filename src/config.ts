@@ -26,7 +26,8 @@ const RANGES: Record<
   | "permissionStallMs"
   | "agentRetryAttempts"
   | "agentRetryBackoffMs"
-  | "childStallMs",
+  | "childStallMs"
+  | "maxLoopDepth",
   NumRange
 > = {
   concurrency: { min: 1, max: 64 },
@@ -40,6 +41,8 @@ const RANGES: Record<
   agentRetryBackoffMs: { min: 0, max: 120_000 },
   // 0 disables the child-liveness watchdog.
   childStallMs: { min: 0, max: 3_600_000 },
+  // loop() nesting depth inside one run (engine-owned preflight).
+  maxLoopDepth: { min: 1, max: 16 },
 }
 
 const PERMISSION_MODES: ReadonlySet<string> = new Set(["ask", "autoEditsWorkflow", "noEditTools"])

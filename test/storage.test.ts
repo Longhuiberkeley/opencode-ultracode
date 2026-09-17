@@ -1220,3 +1220,22 @@ test("saveGraphWorkflow records per-node model overrides as modelsUsed", async (
   const saved = await storage.saveGraphWorkflow("gmodel", spec, { name: "gmodel", source: "project" })
   assert.deepEqual(saved.manifest.modelsUsed, ["openai/gpt-6"], "deduped across nodes")
 })
+
+test("modelsUsed survives a reload (refreshWorkflows reads it back from disk)", async () => {
+  const { storage, fs } = makeStorage()
+  seedAnchors(fs)
+  await storage.saveWorkflow("reloadme", 'await agent("a", { model: "openai/gpt-6" })', {
+    name: "reloadme",
+    source: "project",
+  })
+  // The catalog refreshes from disk on every call — the reload path must not
+  // drop modelsUsed (parseManifest whitelist).
+  await storage.refreshWorkflows()
+  const listed = storage.listWorkflows().find((w) => w.manifest.name === "reloadme")
+  assert.deepEqual(listed?.manifest.modelsUsed, ["openai/gpt-6"], "modelsUsed read back from disk")
+
+  const { storage: fresh } = makeStorage({ fs, kv: undefined })
+  await fresh.refreshWorkflows()
+  const relisted = fresh.listWorkflows().find((w) => w.manifest.name === "reloadme")
+  assert.deepEqual(relisted?.manifest.modelsUsed, ["openai/gpt-6"], "fresh instance sees it too")
+})
