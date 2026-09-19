@@ -38,6 +38,7 @@ test("loadOptions: empty object gives all defaults", () => {
     agentRetryBackoffMs: 5_000,
     childStallMs: 900_000,
     maxLoopDepth: 2,
+    modelFallbacks: {},
   })
   assert.deepEqual(warnings, [])
 })
@@ -56,10 +57,40 @@ test("loadOptions: fully valid options round-trip", () => {
     agentRetryBackoffMs: 30_000,
     childStallMs: 600_000,
     maxLoopDepth: 3,
+    modelFallbacks: { "xai/grok-4.6": ["google/gemini-3.7-flash#lite", "anthropic/claude-x"] },
   }
   const { options, warnings } = loadOptions(raw)
   assert.deepEqual(options, raw)
   assert.deepEqual(warnings, [])
+})
+
+test("loadOptions: modelFallbacks validates per entry and normalizes keys", () => {
+  const { options, warnings } = loadOptions({
+    modelFallbacks: {
+      "xai/grok-4.6#medium": ["openai/gpt-6#high"], // variant on the key is normalized away
+      "no-slash": ["openai/gpt-6"], // invalid key dropped
+      "google/gemini-3.7-flash": ["also-bad", 42, "openai/gpt-6"], // invalid pins dropped, valid one kept
+      "anthropic/claude-x": "not-an-array", // invalid value dropped
+      "deepseek/v4": [], // empty list: nothing to store
+    },
+  })
+  assert.deepEqual(options.modelFallbacks, {
+    "xai/grok-4.6": ["openai/gpt-6#high"],
+    "google/gemini-3.7-flash": ["openai/gpt-6"],
+  })
+  assert.equal(warnings.length, 4, warnings.join(" | "))
+  assert.ok(warnings.some((w) => /modelFallbacks.*key/.test(w)))
+  assert.ok(warnings.some((w) => /must be an array/.test(w)))
+  assert.ok(warnings.filter((w) => /invalid pin/.test(w)).length === 2)
+})
+
+test("loadOptions: non-object modelFallbacks falls back to the empty default", () => {
+  for (const bad of [42, "openai/gpt-6", [], null]) {
+    const { options, warnings } = loadOptions({ modelFallbacks: bad })
+    assert.deepEqual(options.modelFallbacks, {})
+    assert.equal(warnings.length, 1)
+    assert.match(warnings[0]!, /modelFallbacks/)
+  }
 })
 
 test("loadOptions: agentScope enum", () => {

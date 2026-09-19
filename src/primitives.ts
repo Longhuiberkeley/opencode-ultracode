@@ -11,6 +11,8 @@ import type {
   AgentRecord,
   AgentResult,
   Json,
+  ModelRef,
+  PermissionMode,
   Registry,
   RunRecord,
   SavedWorkflow,
@@ -21,6 +23,8 @@ import { clampConcurrency } from "./types.ts"
 import type { SessionDriver } from "./sessions.ts"
 import { AgentCallError, buildContinuationPrompt } from "./sessions.ts"
 import type { FailureClassification } from "./failure-classify.ts"
+import { isReadOnlyChild, resolveFallbacks } from "./failover.ts"
+import type { PinPoolEntry } from "./failover.ts"
 import { validateScriptSource } from "./worker-script.ts"
 import { createHash } from "node:crypto"
 
@@ -70,6 +74,18 @@ export function buildWarmCache(source: RunRecord | undefined): Map<string, WarmC
   for (const a of source.agents as AgentRecord[]) {
     if (a.status !== "succeeded" || !a.key || !a.promptDigest) continue
     if (a.data === undefined && a.resultText === undefined) continue
+    // Failover guard: the digest describes the INTENDED pin/override, but this
+    // row finished on a different model (quota failover). Replaying it under
+    // the original pin would present another model's work as that pin's output,
+    // so such rows are never warm-replayable. Absent metadata = legacy row.
+    if (
+      a.spawnModel !== undefined &&
+      a.effectiveModel !== null &&
+      a.effectiveModel !== undefined &&
+      (a.spawnModel.providerID !== a.effectiveModel.providerID || a.spawnModel.id !== a.effectiveModel.id)
+    ) {
+      continue
+    }
     cache.set(a.key, {
       digest: a.promptDigest,
       sourceRunID: source.id,
@@ -185,6 +201,30 @@ export interface AgentRunnerOptions {
    * the runner: opts.model > runModel > pinForAgent > server default.
    */
   runModel?: { providerID: string; id: string; variant?: string }
+  /**
+   * Plugin option modelFallbacks: failover ladder keyed by the dead model's
+   * "provider/id". Applied only after a quota-shaped failure (or an exhausted
+   * burst budget), always as a same-session model switch.
+   */
+  modelFallbacks?: Readonly<Record<string, ReadonlyArray<string>>>
+  /**
+   * Run permission mode: `noEditTools` children (and the `explore` agent) are
+   * read-only — they may use catalog-inference fallbacks and fail over to a
+   * cheaper model. Edit-capable children may only move same-tier-or-better.
+   */
+  permissions?: PermissionMode
+  /**
+   * Agent-config pin pool lookup for failover (agent-pins.collectAgentPins),
+   * called lazily with the run's known agent ids at failover time. Failures
+   * degrade to "no pin candidates" and never break a run.
+   */
+  pinPool?: (agentIDs: readonly string[]) => Promise<ReadonlyArray<PinPoolEntry>>
+  /**
+   * `disabled_providers` snapshot for failover filtering; read lazily at
+   * failover time. Absent/failed => no exclusions (fail open — mirrors the
+   * spawn-path pin resolution; pins were already filtered at collection).
+   */
+  disabledProviders?: () => Promise<ReadonlySet<string>>
   /** Run-wide abort signal: rejects queued semaphore waits + aborts in-flight sessions. */
   signal?: AbortSignal
   /** Warm cache for keyed replay (resumeFrom); a hit spawns no session. */
@@ -204,6 +244,23 @@ export interface AgentRunnerOptions {
   retryBackoffMs?: number
   /** Clock injection for throttle tests. */
   now?: () => number
+}
+
+/** Inputs shared by the runner's failover attempts (built once per agent call). */
+interface FailoverContext {
+  /** Original prompt: re-anchored in the continuation instruction. */
+  prompt: string
+  /** Same structured-output contract as the original call (repair included). */
+  schema: Json | undefined
+  /** Resolved intended model; undefined = policy cannot route (fail closed). */
+  dead: ModelRef | undefined
+  /** Agent the child was requested as (read-only gate: "explore"). */
+  requestedAgent: string
+  phase: string
+  label: string | undefined
+  recordID: string
+  /** Per-call opts.fallbacks (top ladder rung). */
+  callFallbacks: ReadonlyArray<string> | undefined
 }
 
 /** Clamp per-call/plugin retry attempts (0..3). */
@@ -293,6 +350,10 @@ export class AgentRunner {
     | ((agentId: string) => Promise<{ providerID: string; id: string; variant?: string } | undefined>)
     | undefined
   private readonly runModel: { providerID: string; id: string; variant?: string } | undefined
+  private readonly modelFallbacks: Readonly<Record<string, ReadonlyArray<string>>> | undefined
+  private readonly permissions: PermissionMode | undefined
+  private readonly pinPool: ((agentIDs: readonly string[]) => Promise<ReadonlyArray<PinPoolEntry>>) | undefined
+  private readonly disabledProviders: (() => Promise<ReadonlySet<string>>) | undefined
   private readonly signal?: AbortSignal
   private readonly warmCache: ReadonlyMap<string, WarmCacheEntry> | undefined
   private readonly digestFn: (prompt: string, opts: AgentOpts) => string
@@ -314,6 +375,10 @@ export class AgentRunner {
     this.ambientPhase = options.ambientPhase
     this.pinForAgent = options.pinForAgent
     this.runModel = options.runModel
+    this.modelFallbacks = options.modelFallbacks
+    this.permissions = options.permissions
+    this.pinPool = options.pinPool
+    this.disabledProviders = options.disabledProviders
     this.signal = options.signal
     this.warmCache = options.warmCache
     this.retryAttempts = clampRetryAttempts(options.retryAttempts, 0)
@@ -437,17 +502,31 @@ export class AgentRunner {
       // CLASSIFIED first and retried as a CONTINUE of the same session: a
       // failed session that already did work is never replaced by a fresh one.
       // Burst/unclassified failures get a same-model probe with jittered
-      // backoff; quota-shaped failures are NEVER retried (same-model and
-      // same-provider retries are guaranteed instant deaths), and a continue
-      // that dies with 0 new work is promoted to quota. Aborts, schema errors
-      // and agent-resolution errors are never retried. Retries reuse the SAME
-      // registry record (one row per agent() call, not per attempt).
+      // backoff; quota-shaped failures are NEVER retried on the same provider —
+      // they fail over to the ordered fallback ladder in the SAME session (or
+      // surface the typed error when nothing eligible remains). A continue that
+      // dies with 0 new work is promoted to quota. Aborts, schema errors and
+      // agent-resolution errors are never retried or failed over. Retries and
+      // failovers reuse the SAME registry record (one row per agent() call).
       const attempts = clampRetryAttempts(opts.retry?.attempts, this.retryAttempts)
       const baseBackoffMs = clampRetryBackoffMs(opts.retry?.backoffMs, this.retryBackoffMs)
       const continueFn = this.driver.continueAgent
       let result: AgentResult | undefined
       let continuedSessionID: string | undefined
       let continuationPrompt: string | undefined
+      // Failover inputs shared by every branch. Without a resolved spawn model
+      // the policy cannot prove a candidate differs from the dead one, so the
+      // ladder refuses to route (fail closed).
+      const failoverContext: FailoverContext = {
+        prompt,
+        schema: opts.schema,
+        dead: model,
+        requestedAgent,
+        phase,
+        label: opts.label,
+        recordID: record.id,
+        callFallbacks: opts.fallbacks,
+      }
       for (let attempt = 0; ; attempt++) {
         try {
           if (attempt === 0) {
@@ -499,17 +578,43 @@ export class AgentRunner {
         } catch (err) {
           if (!(err instanceof AgentCallError) || err.kind !== "outcome") throw err
           // Quota-shaped: account-level and hours long — no same-model and no
-          // same-provider retry, ever. Surface the typed error to the failover
-          // policy (which owns cross-provider continuation).
-          if (err.failure?.class === "quota") throw err
+          // same-provider retry, ever. Fail over on the SAME session instead.
+          if (err.failure?.class === "quota") {
+            const failedOver = await this.tryFailover(err, "quota", failoverContext, continuedSessionID)
+            if (failedOver !== undefined) {
+              result = failedOver
+              break
+            }
+            throw err
+          }
           // A continue that died with 0 new work is the observed 0-token
           // instant-death shape: treat it as quota and stop probing.
-          if (attempt > 0 && err.noProgress === true) throw promoteQuotaFailure(err)
+          if (attempt > 0 && err.noProgress === true) {
+            const promoted = promoteQuotaFailure(err)
+            const failedOver = await this.tryFailover(promoted, "quota", failoverContext, continuedSessionID)
+            if (failedOver !== undefined) {
+              result = failedOver
+              break
+            }
+            throw promoted
+          }
           // Burst-shaped failures may use the configured retry budget; without
           // a burst classification the policy allows exactly ONE same-model
           // continue probe — never a blind retry loop.
           const budget = err.failure?.class === "burst" ? attempts : Math.min(attempts, 1)
-          if (attempt >= budget) throw err
+          if (attempt >= budget) {
+            // Burst budget exhausted: the provider keeps throttling this model.
+            // The ordered fallback ladder is the last resort before the typed
+            // error surfaces; unclassified failures stay fail-closed.
+            if (err.failure?.class === "burst") {
+              const failedOver = await this.tryFailover(err, "burst", failoverContext, continuedSessionID)
+              if (failedOver !== undefined) {
+                result = failedOver
+                break
+              }
+            }
+            throw err
+          }
           // Same-session continue is the only legal retry; without a session
           // to continue (or a driver that cannot continue one) the error
           // surfaces instead of spawning a fresh session.
@@ -547,6 +652,112 @@ export class AgentRunner {
     } finally {
       this.semaphore.release()
     }
+  }
+
+  /**
+   * Quota (or burst-exhausted) failover: continue the SAME session on the
+   * first eligible model of resolveFallbacks' ordered ladder — per-call
+   * opts.fallbacks > plugin option modelFallbacks > agent-config pin pool >
+   * catalog inference for read-only children — switching models in place via
+   * the driver's session.switchModel (feature-detected there; absent => the
+   * switch fails typed and the original quota error surfaces). Returns
+   * undefined when no candidate can be attempted (no live session, no model
+   * identity, no eligible rung), and the caller rethrows the typed error —
+   * fail closed, never a fresh session.
+   *
+   * Candidates are tried in order: a fallback that ALSO dies moves to the next
+   * rung (each attempt is a fresh continuation on that candidate). An abort is
+   * rethrown immediately — a stopping run never keeps switching models — and
+   * on success the returned result carries the informational `failover` note
+   * the registry row and status text expose.
+   */
+  private async tryFailover(
+    err: AgentCallError,
+    failureClass: "quota" | "burst",
+    context: FailoverContext,
+    sessionID: string | undefined,
+  ): Promise<AgentResult | undefined> {
+    const continueFn = this.driver.continueAgent
+    if (sessionID === undefined || continueFn === undefined || context.dead === undefined) return undefined
+    let pinPool: ReadonlyArray<PinPoolEntry> = []
+    if (this.pinPool) {
+      try {
+        pinPool = await this.pinPool(this.availableAgents ?? [])
+      } catch {
+        pinPool = [] // pin collection must never break a run
+      }
+    }
+    let disabledProviders: ReadonlySet<string> | undefined
+    if (this.disabledProviders) {
+      try {
+        disabledProviders = await this.disabledProviders()
+      } catch {
+        disabledProviders = undefined // fail open — mirrors spawn-path pin resolution
+      }
+    }
+    const candidates = resolveFallbacks({
+      dead: context.dead,
+      failureClass,
+      ...(context.callFallbacks !== undefined ? { callFallbacks: context.callFallbacks } : {}),
+      ...(this.modelFallbacks !== undefined ? { modelFallbacks: this.modelFallbacks } : {}),
+      pinPool,
+      ...(disabledProviders !== undefined ? { disabledProviders } : {}),
+      readOnly: isReadOnlyChild(this.permissions, context.requestedAgent),
+    })
+    if (candidates.length === 0) {
+      this.safeReport(
+        `${context.phase} — ${context.label ?? context.recordID} provider ${failureClass} failure on ` +
+          `${context.dead.providerID}/${context.dead.id}; no eligible failover candidate`,
+      )
+      return undefined
+    }
+    const from: ModelRef = { ...context.dead }
+    const signal = this.signal ?? NEVER_ABORTED.signal
+    // Reason starts with the provider signal itself and is refreshed by each
+    // failed candidate so the returned note describes the real last failure.
+    let lastReason = err.failure?.reason ?? errorMessage(err)
+    for (let index = 0; index < candidates.length; index++) {
+      const candidate = candidates[index]!
+      this.safeReport(
+        `${context.phase} — ${context.label ?? context.recordID} failover ${index + 1}/${candidates.length} (${failureClass}): ` +
+          `${from.providerID}/${from.id} → ${candidate.model.providerID}/${candidate.model.id} [${candidate.source}]`,
+      )
+      try {
+        const continued = await continueFn.call(
+          this.driver,
+          {
+            sessionID,
+            continuationPrompt: buildContinuationPrompt(context.prompt, failoverReason(from, candidate.model)),
+            model: { ...candidate.model },
+            ...(context.schema !== undefined ? { schema: context.schema } : {}),
+          },
+          { signal },
+        )
+        return {
+          ...continued,
+          failover: {
+            from,
+            to: { ...candidate.model },
+            // Always quota-shaped: quota itself, or a burst budget exhausted
+            // after the same-model probes (the observed 0-token death shape is
+            // promoted upstream). The reason names the real provider signal.
+            class: "quota",
+            reason: `provider ${failureClass} failure on ${from.providerID}/${from.id}: ${lastReason}`.slice(0, 300),
+          },
+        }
+      } catch (retryErr) {
+        if (retryErr instanceof AgentCallError && retryErr.kind === "abort") throw retryErr
+        lastReason =
+          retryErr instanceof AgentCallError && retryErr.failure !== undefined
+            ? retryErr.failure.reason
+            : errorMessage(retryErr)
+        this.safeReport(
+          `${context.phase} — ${context.label ?? context.recordID} fallback ` +
+            `${candidate.model.providerID}/${candidate.model.id} failed: ${errorMessage(retryErr).slice(0, 140)}`,
+        )
+      }
+    }
+    return undefined
   }
 
   private maybeReport(force = false): void {
@@ -666,6 +877,17 @@ function continuationReason(err: AgentCallError): string {
   if (err.failure?.class === "burst") return "transient provider rate limit (burst) — retrying on the same model"
   if (err.failure?.class === "other") return "provider-side failure — retrying on the same model"
   return "provider failure — same-model probe"
+}
+
+/**
+ * Human-readable reason embedded into a failover continuation prompt: names
+ * the dead provider and the model the child is switching to. The surrounding
+ * buildContinuationPrompt text already says the previous turn may be EMPTY and
+ * re-anchors the original request; the schema instruction is appended by the
+ * driver when the call had one.
+ */
+function failoverReason(from: ModelRef, to: ModelRef): string {
+  return `provider ${from.providerID} hit a rate limit/account quota on ${from.id} — continuing on ${to.providerID}/${to.id}`
 }
 
 /**

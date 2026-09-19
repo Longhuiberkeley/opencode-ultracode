@@ -34,6 +34,7 @@ import { createSessionDriver } from "./sessions.ts"
 import type { SessionDriver } from "./sessions.ts"
 import { AgentRunner, buildWarmCache, getWorkflowComposer, storageWorkflowLoader } from "./primitives.ts"
 import type { WarmCacheEntry, WorkflowLoader } from "./primitives.ts"
+import type { PinPoolEntry } from "./failover.ts"
 import { validateScriptSource } from "./worker-script.ts"
 import { spawnWorker } from "./worker-host.ts"
 import type { WorkerHandle, WorkerResult } from "./worker-host.ts"
@@ -73,6 +74,18 @@ export interface SupervisorDeps {
    * optional for tests.
    */
   isProviderDisabled?: (providerID: string) => Promise<boolean>
+  /**
+   * Agent-config pin pool for quota failover (agent-pins.collectAgentPins):
+   * every usable pin across the run's known agent ids. Called lazily per
+   * failover; absent => the ladder skips its pin rung. Index wiring; optional
+   * for tests.
+   */
+  pinPool?: (agentIDs: readonly string[]) => Promise<ReadonlyArray<PinPoolEntry>>
+  /**
+   * `disabled_providers` snapshot for failover filtering. Called lazily per
+   * failover; absent => no exclusions. Index wiring; optional for tests.
+   */
+  disabledProviders?: () => Promise<ReadonlySet<string>>
 }
 
 interface PauseWaiter {
@@ -166,6 +179,8 @@ export class SupervisorImpl implements Supervisor {
     | ((agentId: string) => Promise<{ providerID: string; id: string; variant?: string } | undefined>)
     | undefined
   private readonly isProviderDisabled: ((providerID: string) => Promise<boolean>) | undefined
+  private readonly pinPool: ((agentIDs: readonly string[]) => Promise<ReadonlyArray<PinPoolEntry>>) | undefined
+  private readonly disabledProviders: (() => Promise<ReadonlySet<string>>) | undefined
   private readonly settleGraceMs: number
   private readonly stopKillMs: number
   private readonly driver: Required<SessionDriver>
@@ -180,6 +195,8 @@ export class SupervisorImpl implements Supervisor {
     this.options = { ...deps.options }
     this.pinForAgent = deps.pinForAgent
     this.isProviderDisabled = deps.isProviderDisabled
+    this.pinPool = deps.pinPool
+    this.disabledProviders = deps.disabledProviders
     this.settleGraceMs = deps.settleGraceMs ?? SETTLE_GRACE_MS
     this.stopKillMs = deps.stopKillGraceMs ?? STOP_KILL_GRACE_MS
     // Driver construction performs no session calls — safe outside executors.
@@ -392,6 +409,13 @@ export class SupervisorImpl implements Supervisor {
         // per-call opts.retry can override each agent() call.
         retryAttempts: state.effective.agentRetryAttempts,
         retryBackoffMs: state.effective.agentRetryBackoffMs,
+        // Quota failover: the frozen run's ladder + permission mode decide
+        // read-only eligibility; pin pool / disabled providers are lazy
+        // index-wired lookups shared across the run's children.
+        modelFallbacks: state.effective.modelFallbacks,
+        permissions: state.effective.permissions,
+        ...(this.pinPool ? { pinPool: this.pinPool } : {}),
+        ...(this.disabledProviders ? { disabledProviders: this.disabledProviders } : {}),
         report: (status) => parent.report(status),
         ambientPhase: () => state.ambientPhase,
         ...(this.pinForAgent ? { pinForAgent: this.pinForAgent } : {}),
@@ -691,6 +715,26 @@ export class SupervisorImpl implements Supervisor {
       if (typeof r.attempts === "number" && Number.isFinite(r.attempts)) retry.attempts = r.attempts
       if (typeof r.backoffMs === "number" && Number.isFinite(r.backoffMs)) retry.backoffMs = r.backoffMs
       if (retry.attempts !== undefined || retry.backoffMs !== undefined) opts.retry = retry
+    }
+    // Per-call failover ladder: explicit pins are validated at admission (an
+    // override the caller spelled wrong is an error, mirroring opts.model),
+    // then stored as pin strings — the failover policy owns pin parsing.
+    if (o.fallbacks !== undefined && o.fallbacks !== null) {
+      if (!Array.isArray(o.fallbacks)) {
+        throw new Error('agent(prompt, opts) — opts.fallbacks must be an array of "provider/id#variant" pin strings')
+      }
+      const fallbacks: string[] = []
+      for (const item of o.fallbacks) {
+        if (typeof item !== "string") {
+          throw new Error(`agent(prompt, opts) — opts.fallbacks entries must be strings, got ${JSON.stringify(item) ?? String(item)}`)
+        }
+        const normalized = normalizeModelRef(item)
+        if (!normalized.ok) {
+          throw new Error(`agent(prompt, opts) — opts.fallbacks: ${normalized.error}`)
+        }
+        fallbacks.push(item.trim())
+      }
+      if (fallbacks.length > 0) opts.fallbacks = fallbacks
     }
     return opts
   }

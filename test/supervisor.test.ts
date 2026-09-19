@@ -19,6 +19,8 @@ function makeSupervisor(
   extraDeps: {
     pinForAgent?: (agentId: string) => Promise<{ providerID: string; id: string; variant?: string } | undefined>
     isProviderDisabled?: (providerID: string) => Promise<boolean>
+    pinPool?: (agentIDs: readonly string[]) => Promise<ReadonlyArray<{ agentID: string; pin: string }>>
+    disabledProviders?: () => Promise<ReadonlySet<string>>
   } = {},
 ) {
   const registry = new FakeRegistry()
@@ -160,6 +162,112 @@ test("supervisor: burst failure retries as a same-session continue — one sessi
   assert.equal(agent.sessionID, [...ctx.sessions.sessions.keys()][0])
   assert.equal(ctx.sessions.sessions.get(agent.sessionID!)!.prompts, 2)
   assert.ok(ctx.reports.some((s) => s.includes("retry 1/1")), `expected continue report, got: ${ctx.reports.join(" / ")}`)
+})
+
+test("supervisor: quota failure fails over the SAME session via modelFallbacks (one session, one row)", async () => {
+  const ctx = makeSupervisor({ modelFallbacks: { "xai/grok-4.6": ["google/gemini-3.7-flash"] } })
+  ctx.sessions.push({
+    text: "",
+    outcome: "failed",
+    finish: "error",
+    failure: { type: "provider.rate-limit", message: "Usage limit reached for 5 hour", status: 429 },
+  })
+  ctx.sessions.push({
+    text: "FAILED_OVER",
+    agent: "general",
+    model: { providerID: "google", id: "gemini-3.7-flash" },
+  })
+  const outcome = await ctx.supervisor.start(
+    {
+      script: `const r = await agent("do the thing", { model: { providerID: "xai", id: "grok-4.6" } }); return r.text;`,
+    },
+    ctx.parent,
+  )
+  assert.equal(outcome.envelope.status, "succeeded")
+  assert.equal(outcome.envelope.result, "FAILED_OVER")
+  assert.equal(ctx.sessions.sessions.size, 1, "failover must continue the existing session")
+  assert.equal(outcome.run.agents.length, 1, "one registry row per agent() call")
+  const sessionID = [...ctx.sessions.sessions.keys()][0]!
+  assert.deepEqual(ctx.sessions.switches, [
+    { sessionID, model: { providerID: "google", id: "gemini-3.7-flash" }, beforePrompt: 1 },
+  ])
+  const agent = outcome.run.agents[0]!
+  assert.equal(agent.status, "succeeded")
+  assert.equal(agent.spawnModel?.providerID, "xai")
+  assert.equal(agent.effectiveModel?.providerID, "google")
+  assert.ok(ctx.reports.some((s) => s.includes("failover 1/1")), ctx.reports.join(" / "))
+})
+
+test("supervisor: quota failover uses the agent-config pin pool when no explicit ladder exists", async () => {
+  const seenAgentIDs: string[][] = []
+  const ctx = makeSupervisor(
+    {},
+    {},
+    {
+      pinForAgent: async (agentId) =>
+        agentId === "general" ? { providerID: "xai", id: "grok-4.6" } : undefined,
+      pinPool: async (agentIDs) => {
+        seenAgentIDs.push([...agentIDs])
+        return [
+          { agentID: "general", pin: "xai/grok-mini" }, // dead provider: quota excludes it
+          { agentID: "explore", pin: "google/gemini-3.7-flash" },
+        ]
+      },
+    },
+  )
+  ctx.parent.availableAgents = ["general", "explore"]
+  ctx.sessions.push({
+    text: "",
+    outcome: "failed",
+    finish: "error",
+    failure: { type: "provider.rate-limit", message: "Usage limit reached for 5 hour", status: 429 },
+  })
+  ctx.sessions.push({ text: "PIN_POOL_RECOVERY", agent: "general", model: { providerID: "google", id: "gemini-3.7-flash" } })
+  const outcome = await ctx.supervisor.start({ script: `const r = await agent("do it"); return r.text;` }, ctx.parent)
+  assert.equal(outcome.envelope.status, "succeeded")
+  assert.equal(outcome.envelope.result, "PIN_POOL_RECOVERY")
+  assert.deepEqual(seenAgentIDs, [["general", "explore"]])
+  assert.equal(ctx.sessions.sessions.size, 1)
+  const sessionID = [...ctx.sessions.sessions.keys()][0]!
+  assert.deepEqual(ctx.sessions.switches, [
+    { sessionID, model: { providerID: "google", id: "gemini-3.7-flash" }, beforePrompt: 1 },
+  ])
+})
+
+test("supervisor: per-call opts.fallbacks are admitted and win; invalid pins fail the call fast", async () => {
+  // The plugin-option ladder is configured too — the per-call rung must win.
+  const ctx = makeSupervisor({ modelFallbacks: { "xai/grok-4.6": ["option/never-tried"] } })
+  ctx.sessions.push({
+    text: "",
+    outcome: "failed",
+    finish: "error",
+    failure: { type: "provider.rate-limit", message: "Usage limit reached for 5 hour", status: 429 },
+  })
+  ctx.sessions.push({ text: "CALL_LADDER", agent: "explore", model: { providerID: "google", id: "gemini-3.7-flash" } })
+  const ok = await ctx.supervisor.start(
+    {
+      script:
+        `const r = await agent("go", { agent: "explore", model: { providerID: "xai", id: "grok-4.6" },` +
+        ` fallbacks: ["google/gemini-3.7-flash", "anthropic/claude-x"] }); return r.text;`,
+    },
+    ctx.parent,
+  )
+  assert.equal(ok.envelope.status, "succeeded")
+  assert.equal(ok.envelope.result, "CALL_LADDER")
+  assert.deepEqual(
+    ctx.sessions.switches.map((s) => `${s.model.providerID}/${s.model.id}`),
+    ["google/gemini-3.7-flash"],
+    "the per-call first rung recovered; the option-map rung was never tried",
+  )
+
+  const bad = makeSupervisor()
+  const outcome = await bad.supervisor.start(
+    { script: `await agent("x", { fallbacks: ["not-a-pin"] }); return 1;` },
+    bad.parent,
+  )
+  assert.equal(outcome.envelope.status, "failed")
+  assert.match(outcome.envelope.error ?? "", /opts\.fallbacks/)
+  assert.equal(bad.sessions.sessions.size, 0, "admission rejects the call before any session is created")
 })
 
 test("supervisor: invalid script rejected before any run is created", async () => {

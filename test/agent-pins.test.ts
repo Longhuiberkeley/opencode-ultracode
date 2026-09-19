@@ -7,6 +7,7 @@ import assert from "node:assert/strict"
 import {
   agentConfigured,
   agentUsable,
+  collectAgentPins,
   lookupAgentPin,
   parseAgentFrontmatterDisabled,
   parseAgentFrontmatterModel,
@@ -298,6 +299,35 @@ test("agentUsable: configured + not disabled + pin provider not offline", async 
   assert.equal(await agentUsable(fs, "/p", "/h", "off-provider", disabled), false)
   assert.equal(await agentUsable(fs, "/p", "/h", "dis", disabled), false)
   assert.equal(await agentUsable(fs, "/p", "/h", "missing", disabled), false)
+})
+
+// ---------------------------------------------------------------------------
+// Failover pin pool (collectAgentPins)
+// ---------------------------------------------------------------------------
+
+test("collectAgentPins: usable pins across agent ids; disabled agents and offline providers skipped", async () => {
+  const fs = fakeFs({
+    [`${ROOT}/.opencode/agents/general.md`]: "---\nmodel: xai/grok-4.6#medium\n---\n",
+    [`${HOME}/.config/opencode/agents/explore.md`]: "---\nmodel: google/gemini-3.7-flash\n---\n",
+    [`${HOME}/.config/opencode/agents/dis.md`]: "---\nmodel: openai/gpt-6\ndisabled: true\n---\n",
+    [`${HOME}/.config/opencode/agents/offline.md`]: "---\nmodel: deepseek/v4\n---\n",
+    [`${HOME}/.config/opencode/agents/unpinned.md`]: "---\ndescription: x\n---\n",
+    [`${HOME}/.config/opencode/opencode.json`]: JSON.stringify({ disabled_providers: ["deepseek"] }),
+  })
+  const pool = await collectAgentPins(fs, ROOT, HOME, [
+    "general",
+    "explore",
+    "dis",
+    "offline",
+    "unpinned",
+    "general", // duplicate id ignored
+    "missing",
+  ])
+  assert.deepEqual(pool, [
+    { agentID: "general", pin: "xai/grok-4.6#medium" },
+    { agentID: "explore", pin: "google/gemini-3.7-flash" },
+  ])
+  assert.deepEqual(await collectAgentPins(fakeFs({}), ROOT, HOME, ["general"]), [])
 })
 
 test("agentConfigured: unreadable project file falls through to the global check", async () => {

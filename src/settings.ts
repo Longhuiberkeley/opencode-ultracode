@@ -64,6 +64,9 @@ export function freezeEffective(options: Required<UltracodeOptions>): Required<U
     agentRetryBackoffMs: options.agentRetryBackoffMs,
     childStallMs: options.childStallMs,
     maxLoopDepth: options.maxLoopDepth,
+    // Copy the map so a later mutation of the shared options can never change
+    // what an in-flight run's failover ladder resolves.
+    modelFallbacks: { ...options.modelFallbacks },
   })
 }
 

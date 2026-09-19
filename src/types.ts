@@ -88,6 +88,16 @@ export interface UltracodeOptions {
    * Default 2.
    */
   maxLoopDepth?: number
+  /**
+   * Per-model failover ladder for quota-shaped provider failures: keys are
+   * "provider/id" pin strings (no variant), values are ordered lists of
+   * "provider/id#variant" fallback pins. Precedence: per-call
+   * `agent(prompt, { fallbacks })` > this map > agent-config pins on other
+   * providers (read-only children may additionally infer from the model
+   * catalog). Failover always CONTINUES the same session via
+   * `session.switchModel` — never a fresh session. Default {} (no ladder).
+   */
+  modelFallbacks?: Record<string, string[]>
 }
 
 export const DEFAULT_OPTIONS: Required<UltracodeOptions> = {
@@ -103,6 +113,7 @@ export const DEFAULT_OPTIONS: Required<UltracodeOptions> = {
   agentRetryBackoffMs: 5_000,
   childStallMs: 900_000,
   maxLoopDepth: 2,
+  modelFallbacks: {},
 }
 
 /** Local admission clamp (this repo default). Not a host API. */
@@ -564,6 +575,14 @@ export interface AgentOpts {
    * session on the same model; quota-shaped failures never retry.
    */
   retry?: { attempts?: number; backoffMs?: number }
+  /**
+   * Per-call failover ladder (pin strings, ordered), applied ONLY when the
+   * provider fails quota-shaped (or a burst budget is exhausted): beats the
+   * plugin option modelFallbacks map for THIS child. The child continues in
+   * the SAME session on the first eligible candidate; invalid/misspelled pins
+   * fail the call at admission instead of being skipped.
+   */
+  fallbacks?: string[]
 }
 
 export interface AgentResult {
@@ -577,6 +596,20 @@ export interface AgentResult {
   data?: Json
   /** Present when this result was replayed from a prior run's warm cache. */
   cachedFrom?: string
+  /**
+   * Present when the child finished on a DIFFERENT model than the one it was
+   * spawned on (provider quota failover): the spawn model, the model that
+   * actually finished, and why. Informational — the registry row keeps
+   * spawnModel (intended) and effectiveModel (what ran) alongside it. `class`
+   * is always "quota": a burst-exhausted failover is recorded through the same
+   * quota-shaped routing constraint.
+   */
+  failover?: {
+    from: ModelRef
+    to: ModelRef
+    class: "quota"
+    reason: string
+  }
 }
 
 /** A queue() worklist item (serializable; ids are content-hashed when absent). */

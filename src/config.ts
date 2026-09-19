@@ -6,6 +6,7 @@
  */
 import type { AgentScope, PermissionMode, UltracodeOptions } from "./types.ts"
 import { DEFAULT_OPTIONS, MAX_LOOP_DEPTH, MAX_RUN_TIMEOUT_MS, MIN_LOOP_DEPTH, MIN_RUN_TIMEOUT_MS } from "./types.ts"
+import { parseModelPin } from "./agent-pins.ts"
 
 export interface LoadedOptions {
   options: Required<UltracodeOptions>
@@ -70,12 +71,58 @@ function num(warnings: string[], raw: Record<string, unknown>, key: keyof typeof
 }
 
 /**
+ * Parse the `modelFallbacks` option: `{ "provider/id": ["provider/id#variant", …] }`.
+ * Fail-closed per entry (bad values fall back, never throw): a key that is not
+ * a pin, a non-array value, or an invalid pin inside a list is dropped with a
+ * warning — the valid remainder of the map still applies. Keys are normalized
+ * through the SAME pin parser the failover ladder uses, so lookups key on the
+ * exact `provider/id` the policy produces. Returns undefined when the whole
+ * option is absent (caller keeps the default), an empty-but-valid map when
+ * every entry was dropped.
+ */
+function modelFallbacksOption(warnings: string[], raw: unknown): Record<string, string[]> | undefined {
+  if (raw === undefined) return undefined
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    warnings.push(
+      `option "modelFallbacks" must be an object mapping "provider/id" to an array of pin strings, got ${JSON.stringify(raw) ?? String(raw)} — using default {}`,
+    )
+    return undefined
+  }
+  const out: Record<string, string[]> = {}
+  for (const [rawKey, rawList] of Object.entries(raw as Record<string, unknown>)) {
+    const key = parseModelPin(rawKey)
+    if (key === undefined) {
+      warnings.push(`option "modelFallbacks" key ${JSON.stringify(rawKey)} is not a "provider/id" pin — entry ignored`)
+      continue
+    }
+    if (!Array.isArray(rawList)) {
+      warnings.push(`option "modelFallbacks" value for "${rawKey}" must be an array of pin strings — entry ignored`)
+      continue
+    }
+    const pins: string[] = []
+    for (const item of rawList) {
+      if (typeof item !== "string" || parseModelPin(item) === undefined) {
+        warnings.push(
+          `option "modelFallbacks" value for "${rawKey}" contains an invalid pin ${JSON.stringify(item) ?? String(item)} — entry dropped`,
+        )
+        continue
+      }
+      pins.push(item.trim())
+    }
+    if (pins.length > 0) out[`${key.providerID}/${key.id}`] = pins
+  }
+  return out
+}
+
+/**
  * Parse `ctx.options` into validated options. Always returns a fully-populated
  * `Required<UltracodeOptions>` plus warnings for every value that was rejected.
  */
 export function loadOptions(raw: unknown): LoadedOptions {
   const warnings: string[] = []
-  const options: Required<UltracodeOptions> = { ...DEFAULT_OPTIONS }
+  // Fresh map (never the shared DEFAULT_OPTIONS reference): callers may mutate
+  // the returned options, and a shared nested object would leak across loads.
+  const options: Required<UltracodeOptions> = { ...DEFAULT_OPTIONS, modelFallbacks: {} }
 
   if (raw === null || raw === undefined) return { options, warnings }
   if (typeof raw !== "object" || Array.isArray(raw)) {
@@ -121,6 +168,9 @@ export function loadOptions(raw: unknown): LoadedOptions {
       )
     }
   }
+
+  const modelFallbacks = modelFallbacksOption(warnings, record["modelFallbacks"])
+  if (modelFallbacks !== undefined) options.modelFallbacks = modelFallbacks
 
   // Unknown keys intentionally ignored (forward compatibility).
   return { options, warnings }

@@ -12,8 +12,9 @@ import type { AgentRunnerOptions } from "../src/primitives.ts"
 import type { AgentResult } from "../src/types.ts"
 import type { Json, SavedWorkflow, Storage } from "../src/types.ts"
 import type { AgentRunHooks, AgentRunInput, SessionDriver } from "../src/sessions.ts"
-import { AgentCallError } from "../src/sessions.ts"
-import { FakeRegistry, FakeStorage } from "./fakes.ts"
+import { AgentCallError, createSessionDriver } from "../src/sessions.ts"
+import { FakeRegistry, FakeSessionCtx, FakeStorage } from "./fakes.ts"
+import type { ContextMessage, SessionCtx } from "../src/types.ts"
 
 const tick = (ms = 5): Promise<void> => new Promise((r) => setTimeout(r, ms))
 
@@ -964,4 +965,238 @@ test("AgentRunner warm cache: identical run-level model to the recorded digest r
   assert.equal(calls.length, 0, "same effective model + same key replays")
   assert.equal(res.text, "scout findings")
   assert.equal(res.cachedFrom, source.id)
+})
+
+// ---------------------------------------------------------------------------
+// Quota failover: same-session switchModel continuation (failover-core)
+// ---------------------------------------------------------------------------
+
+const QUOTA_FAILURE = {
+  type: "provider.rate-limit",
+  message: "Usage limit reached for 5 hour",
+  status: 429,
+}
+
+/** Quota death reply for the scripted session. */
+function quotaReply() {
+  return {
+    text: "",
+    outcome: "failed",
+    finish: "error",
+    failure: QUOTA_FAILURE,
+  }
+}
+
+function fakeFailoverSession(replies: Parameters<FakeSessionCtx["push"]>[0][]) {
+  const fake = new FakeSessionCtx()
+  for (const reply of replies) fake.push(reply)
+  return fake
+}
+
+test("AgentRunner failover: quota switches the SAME session via modelFallbacks and records the note", async () => {
+  const fake = fakeFailoverSession([
+    quotaReply(),
+    { text: "RECOVERED", model: { providerID: "google", id: "gemini-3.7-flash" } },
+  ])
+  const { registry, run, reports, runner } = makeRunner({
+    driver: createSessionDriver(fake),
+    modelFallbacks: { "xai/grok-4.6": ["google/gemini-3.7-flash#lite"] },
+    // Quota must bypass retries entirely, even with a budget configured.
+    retryAttempts: 3,
+    retryBackoffMs: 0,
+  })
+  const res = await runner.call("do the work", { model: { providerID: "xai", id: "grok-4.6" } })
+  assert.equal(fake.sessions.size, 1, "failover must never create a second session")
+  const sessionID = [...fake.sessions.keys()][0]!
+  assert.equal(res.sessionID, sessionID)
+  assert.equal(res.text, "RECOVERED")
+  assert.deepEqual(fake.switches, [
+    {
+      sessionID,
+      model: { providerID: "google", id: "gemini-3.7-flash", variant: "lite" },
+      beforePrompt: 1,
+    },
+  ])
+  assert.equal(res.failover?.from.providerID, "xai")
+  assert.equal(res.failover?.from.id, "grok-4.6")
+  assert.equal(res.failover?.to.providerID, "google")
+  assert.equal(res.failover?.to.id, "gemini-3.7-flash")
+  assert.equal(res.failover?.to.variant, "lite")
+  assert.equal(res.failover?.class, "quota")
+  assert.match(res.failover?.reason ?? "", /quota/)
+  const rec = registry.getAgent(run.id, "a1")!
+  assert.equal(run.agents.length, 1, "one registry row per agent() call")
+  assert.equal(rec.status, "succeeded")
+  assert.equal(rec.spawnModel?.providerID, "xai", "spawnModel keeps the intended pin")
+  assert.equal(rec.spawnModel?.source, "call")
+  assert.equal(rec.effectiveModel?.providerID, "google", "effectiveModel shows what ran")
+  assert.ok(reports.some((r) => r.includes("failover 1/1")), reports.join(" / "))
+})
+
+test("AgentRunner failover: per-call fallbacks win and a dead fallback advances to the next rung", async () => {
+  const fake = fakeFailoverSession([quotaReply(), quotaReply(), { text: "on the second", model: { providerID: "anthropic", id: "claude-x" } }])
+  const { runner } = makeRunner({
+    driver: createSessionDriver(fake),
+    modelFallbacks: { "xai/grok-4.6": ["option/provider"] },
+    retryAttempts: 0,
+    retryBackoffMs: 0,
+  })
+  const res = await runner.call("go", {
+    model: { providerID: "xai", id: "grok-4.6" },
+    fallbacks: ["call/dead", "call/second"],
+  })
+  assert.equal(res.text, "on the second")
+  assert.deepEqual(
+    fake.switches.map((s) => `${s.model.providerID}/${s.model.id}`),
+    ["call/dead", "call/second"],
+  )
+  assert.equal(res.failover?.to.providerID, "call")
+  assert.equal(res.failover?.to.id, "second")
+})
+
+test("AgentRunner failover: pin pool picks a cross-provider pin and skips disabled providers", async () => {
+  const fake = fakeFailoverSession([quotaReply(), { text: "pinned recovery", model: { providerID: "google", id: "gemini-3.7-flash" } }])
+  const seenAgentIDs: string[][] = []
+  const { runner } = makeRunner({
+    driver: createSessionDriver(fake),
+    retryAttempts: 0,
+    retryBackoffMs: 0,
+    pinPool: async (agentIDs) => {
+      seenAgentIDs.push([...agentIDs])
+      return [
+        { agentID: "general", pin: "xai/grok-mini" }, // dead provider: quota excludes it
+        { agentID: "off", pin: "disabledprov/model" }, // offline provider: excluded
+        { agentID: "explore", pin: "google/gemini-3.7-flash" },
+      ]
+    },
+    disabledProviders: async () => new Set(["disabledprov"]),
+  })
+  const res = await runner.call("go", { model: { providerID: "xai", id: "grok-4.6" }, agent: "general" })
+  assert.equal(res.text, "pinned recovery")
+  assert.deepEqual(seenAgentIDs, [["general", "explore"]])
+  assert.equal(res.failover?.to.providerID, "google")
+})
+
+test("AgentRunner failover: burst budget exhausted fails over on the same session", async () => {
+  const burst = { text: "", outcome: "failed", finish: "error", failure: { type: "provider.rate-limit", message: "Rate limit reached for requests", status: 429 } }
+  // The same-model probe produced token growth (no 0-token promotion), so the
+  // exhausted BURST budget — not the instant-death promotion — is what routes
+  // this failure into the ladder.
+  const burstWithWork = {
+    ...burst,
+    tokens: { input: 5, output: 2, reasoning: 0, cache: { read: 0, write: 0 } },
+  }
+  const fake = fakeFailoverSession([burst, burstWithWork, { text: "burst recovered", model: { providerID: "google", id: "gemini-3.7-flash" } }])
+  const { runner } = makeRunner({
+    driver: createSessionDriver(fake),
+    modelFallbacks: { "xai/grok-4.6": ["google/gemini-3.7-flash"] },
+    retryAttempts: 1,
+    retryBackoffMs: 0,
+  })
+  const res = await runner.call("go", { model: { providerID: "xai", id: "grok-4.6" } })
+  assert.equal(res.text, "burst recovered")
+  assert.equal(res.failover?.class, "quota")
+  assert.match(res.failover?.reason ?? "", /burst/)
+  assert.deepEqual(
+    fake.switches.map((s) => `${s.model.providerID}/${s.model.id}`),
+    ["google/gemini-3.7-flash"],
+  )
+})
+
+test("AgentRunner failover: no eligible candidate rethrows the typed quota error, no switch, no retry", async () => {
+  const fake = fakeFailoverSession([quotaReply()])
+  const { registry, run, runner } = makeRunner({
+    driver: createSessionDriver(fake),
+    retryAttempts: 3,
+    retryBackoffMs: 0,
+  })
+  await assert.rejects(
+    runner.call("go", { model: { providerID: "xai", id: "grok-4.6" } }),
+    (err: unknown) => {
+      assert.ok(err instanceof AgentCallError)
+      assert.equal(err.kind, "outcome")
+      assert.equal(err.failure?.class, "quota")
+      return true
+    },
+  )
+  assert.equal(fake.switches.length, 0)
+  assert.equal(fake.sessions.size, 1)
+  assert.equal([...fake.sessions.values()][0]!.prompts, 1, "no same-model retry on quota")
+  assert.equal(registry.getAgent(run.id, "a1")!.status, "failed")
+})
+
+test("AgentRunner failover: switchModel unavailable surfaces the original typed quota error", async () => {
+  let prompts = 0
+  const sessions: SessionCtx = {
+    create: async () => ({ id: "ses_min" }),
+    get: async () => ({ id: "ses_min", outcome: "failed" }),
+    prompt: async () => {
+      prompts++
+      return { id: "msg_min" }
+    },
+    wait: async () => {},
+    context: async (): Promise<ReadonlyArray<ContextMessage>> => [
+      {
+        id: "msg_min",
+        type: "assistant",
+        finish: "error",
+        error: { type: "provider.rate-limit", message: "Usage limit reached for 5 hour", status: 429 },
+      },
+    ],
+    interrupt: async () => {},
+  }
+  const { runner } = makeRunner({
+    driver: createSessionDriver(sessions),
+    modelFallbacks: { "xai/grok-4.6": ["google/gemini-3.7-flash"] },
+    retryAttempts: 0,
+    retryBackoffMs: 0,
+  })
+  await assert.rejects(
+    runner.call("go", { model: { providerID: "xai", id: "grok-4.6" } }),
+    (err: unknown) => {
+      assert.ok(err instanceof AgentCallError)
+      assert.equal(err.kind, "outcome", "the typed quota error must win over the switch failure")
+      assert.equal(err.failure?.class, "quota")
+      assert.match(err.message, /Usage limit reached/)
+      return true
+    },
+  )
+  assert.equal(prompts, 1, "the dead model is never re-prompted")
+})
+
+test("buildWarmCache: a row whose effectiveModel differs from spawnModel is not replayable (failover)", async () => {
+  const registry0 = new FakeRegistry()
+  const source = registry0.create({ parentSessionID: "ses_old", script: "return 1" })
+  registry0.addAgent(source.id, {
+    status: "succeeded",
+    requestedAgent: "general",
+    key: "failover-row",
+    promptDigest: agentCacheDigest("do it", {}, "general"),
+    sessionID: "ses_fo",
+    resultText: "produced on the fallback",
+    spawnModel: { providerID: "xai", id: "grok-4.6", source: "pin" },
+    effectiveModel: { providerID: "google", id: "gemini-3.7-flash" },
+  })
+  registry0.addAgent(source.id, {
+    status: "succeeded",
+    requestedAgent: "general",
+    key: "same-row",
+    promptDigest: agentCacheDigest("do it twice", {}, "general"),
+    sessionID: "ses_same",
+    resultText: "produced on the pin",
+    spawnModel: { providerID: "xai", id: "grok-4.6", source: "pin" },
+    effectiveModel: { providerID: "xai", id: "grok-4.6" },
+  })
+  const cache = buildWarmCache(source)
+  assert.equal(cache.has("failover-row"), false, "failover rows must never replay as the original pin")
+  assert.equal(cache.has("same-row"), true)
+
+  // End-to-end: a matching key/digest still spawns because the cache skipped
+  // the failover row.
+  const { calls, runner } = makeRunner({ warmCache: cache })
+  const pending = runner.call("do it", { key: "failover-row" })
+  await tick()
+  assert.equal(calls.length, 1, "no replay for the failed-over row")
+  calls[0]!.resolve(okResult("ses_redone"))
+  await pending
 })

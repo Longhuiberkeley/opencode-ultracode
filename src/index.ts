@@ -54,7 +54,7 @@ import {
   runStateTransition,
   settingsPayload,
 } from "./run-status.ts"
-import { agentUsable, lookupAgentPin, normalizeModelRef, parseModelPin, readDisabledProviders } from "./agent-pins.ts"
+import { agentUsable, collectAgentPins, lookupAgentPin, normalizeModelRef, parseModelPin, readDisabledProviders } from "./agent-pins.ts"
 import { RegistryImpl } from "./registry.ts"
 import { emptyToolEventState } from "./run-events.ts"
 import { EMPTY_CATALOG, SKILL_CONTENT, SKILL_DESCRIPTION, SKILL_NAME, buildSkillContent } from "./skill-content.ts"
@@ -796,6 +796,29 @@ export default Plugin.define({
             return disabled.has(providerID)
           } catch {
             return false // best-effort check — fail open
+          }
+        },
+        // Quota failover pin pool: the user's agent-config pins across the
+        // run's known agent ids, resolved from the same config the spawn path
+        // reads. Disabled agents and offline providers are skipped inside;
+        // collection failures degrade to "no pin candidates" (the ladder's
+        // explicit/per-call rungs still apply).
+        pinPool: async (agentIDs: readonly string[]) => {
+          const home = process.env["HOME"] ?? homedir()
+          try {
+            return await collectAgentPins(fs, projectRoot, home, agentIDs)
+          } catch {
+            return []
+          }
+        },
+        // disabled_providers snapshot for failover filtering; per-failover
+        // fresh read so a provider turned off mid-server is respected.
+        disabledProviders: async () => {
+          const home = process.env["HOME"] ?? homedir()
+          try {
+            return await readDisabledProviders(fs, projectRoot, home)
+          } catch {
+            return new Set<string>() // best-effort — fail open
           }
         },
       })

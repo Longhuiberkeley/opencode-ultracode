@@ -22,6 +22,7 @@
  */
 
 import type { FsLike } from "./types.ts"
+import type { PinPoolEntry } from "./failover.ts"
 
 /** Agent ids are file names; keep them boring. */
 const AGENT_ID_RE = /^[a-zA-Z0-9][a-zA-Z0-9-_]{0,63}$/
@@ -229,6 +230,44 @@ export async function readDisabledProviders(
     } catch {
       // unreadable/invalid config — contributes nothing
     }
+  }
+  return out
+}
+
+/**
+ * Resolve the failover pin pool: every usable agent-config pin across the
+ * given agent ids, tagged with its agent id. Disabled agents (`disabled:
+ * true`) contribute nothing (project-disabled blocks a stale global file via
+ * lookupAgentPin) and pins on providers in `disabled_providers` are skipped —
+ * the failover ladder must never route onto a provider the user took offline
+ * or reuse a model choice from an agent they turned off. Lookups are the SAME
+ * project-beats-global resolution the spawn path uses, so re-pinning applies
+ * to the next failover exactly as it applies to the next spawn. Never throws;
+ * unreadable files just contribute nothing.
+ */
+export async function collectAgentPins(
+  fs: FsLike,
+  projectRoot: string,
+  homeDir: string,
+  agentIds: readonly string[],
+): Promise<PinPoolEntry[]> {
+  let disabledProviders: ReadonlySet<string> = new Set()
+  try {
+    disabledProviders = await readDisabledProviders(fs, projectRoot, homeDir)
+  } catch {
+    // best-effort — fail open (mirrors the spawn-path pin resolution)
+  }
+  const out: PinPoolEntry[] = []
+  const seenAgents = new Set<string>()
+  for (const agentID of agentIds) {
+    if (typeof agentID !== "string" || agentID.length === 0 || seenAgents.has(agentID)) continue
+    seenAgents.add(agentID)
+    const pin = await lookupAgentPin(fs, projectRoot, homeDir, agentID)
+    if (pin === undefined) continue
+    const parsed = parseModelPin(pin)
+    if (parsed === undefined) continue
+    if (disabledProviders.has(parsed.providerID)) continue
+    out.push({ agentID, pin })
   }
   return out
 }
