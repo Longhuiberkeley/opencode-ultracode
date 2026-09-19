@@ -19,7 +19,8 @@ import type {
 } from "./types.ts"
 import { clampConcurrency } from "./types.ts"
 import type { SessionDriver } from "./sessions.ts"
-import { AgentCallError } from "./sessions.ts"
+import { AgentCallError, buildContinuationPrompt } from "./sessions.ts"
+import type { FailureClassification } from "./failure-classify.ts"
 import { validateScriptSource } from "./worker-script.ts"
 import { createHash } from "node:crypto"
 
@@ -190,9 +191,16 @@ export interface AgentRunnerOptions {
   warmCache?: ReadonlyMap<string, WarmCacheEntry>
   /** Digest for keyed replay identity (defaults to sha256-based agentCacheDigest). */
   digest?: (prompt: string, opts: AgentOpts) => string
-  /** Plugin-level retry attempts for outcome (provider-shaped) failures. Default 0 (off here unless set). */
+  /**
+   * Plugin-level retry attempts for outcome (provider-shaped) failures.
+   * Default 0 here (the plugin passes its own default, 1). Retries CONTINUE
+   * the same session; quota-shaped failures are never retried.
+   */
   retryAttempts?: number
-  /** Backoff before each retry attempt. Default 5_000 ms. */
+  /**
+   * Base of the jittered exponential retry backoff (attempt n waits
+   * base * 2^n, ±50%, capped at RETRY_BACKOFF_CAP_MS). Default 2_000 ms.
+   */
   retryBackoffMs?: number
   /** Clock injection for throttle tests. */
   now?: () => number
@@ -208,6 +216,35 @@ export function clampRetryAttempts(value: number | undefined, fallback: number):
 export function clampRetryBackoffMs(value: number | undefined, fallback: number): number {
   const n = typeof value === "number" && Number.isFinite(value) ? Math.floor(value) : fallback
   return Math.min(120_000, Math.max(0, n))
+}
+
+/** Default base of the jittered retry schedule (helper default; the plugin retry base seeds it). */
+export const RETRY_BACKOFF_BASE_MS = 2_000
+/**
+ * Hard cap on any single retry wait. A burst clears in seconds, and the run
+ * clock is 60 min — a long sleep would burn the run for a provider that may
+ * not recover. Attempts, not wait length, are the retry bound.
+ */
+export const RETRY_BACKOFF_CAP_MS = 30_000
+
+/**
+ * Jittered exponential backoff for a same-session continue: base * 2^attempt
+ * with +/-50% jitter, capped at capMs. Never negative, never above the cap;
+ * an injected `rand` makes the bounds deterministic under test. Jitter matters
+ * because many children hit the same provider cap at once — synchronized
+ * retries would re-trigger the burst.
+ */
+export function jitteredDelay(
+  attempt: number,
+  baseMs = RETRY_BACKOFF_BASE_MS,
+  capMs = RETRY_BACKOFF_CAP_MS,
+  rand: () => number = Math.random,
+): number {
+  const step = Number.isFinite(attempt) ? Math.max(0, Math.floor(attempt)) : 0
+  const base = Number.isFinite(baseMs) ? Math.max(0, baseMs) : RETRY_BACKOFF_BASE_MS
+  const cap = Number.isFinite(capMs) ? Math.max(0, capMs) : RETRY_BACKOFF_CAP_MS
+  const jitter = (rand() * 2 - 1) * 0.5 // ±50%
+  return Math.round(Math.min(cap, Math.max(0, base * 2 ** step * (1 + jitter))))
 }
 
 /**
@@ -280,7 +317,7 @@ export class AgentRunner {
     this.signal = options.signal
     this.warmCache = options.warmCache
     this.retryAttempts = clampRetryAttempts(options.retryAttempts, 0)
-    this.retryBackoffMs = clampRetryBackoffMs(options.retryBackoffMs, 5_000)
+    this.retryBackoffMs = clampRetryBackoffMs(options.retryBackoffMs, RETRY_BACKOFF_BASE_MS)
     this.digestFn =
       options.digest ?? ((prompt, opts) => agentCacheDigest(prompt, opts, this.defaultAgent))
     this.now = options.now ?? Date.now
@@ -396,53 +433,92 @@ export class AgentRunner {
           spawnModel: { ...model, ...(modelSource !== undefined ? { source: modelSource } : {}) },
         })
       }
-      // Provider-shaped failures (outcome "failed" — outages, rate limits)
-      // get bounded retries with abort-aware backoff. Aborts, schema errors
-      // and agent-resolution errors are never retried. Retries reuse the
-      // SAME registry record (one row per agent() call, not per attempt).
+      // Provider-shaped failures (outcome "failed" — outages, rate limits) are
+      // CLASSIFIED first and retried as a CONTINUE of the same session: a
+      // failed session that already did work is never replaced by a fresh one.
+      // Burst/unclassified failures get a same-model probe with jittered
+      // backoff; quota-shaped failures are NEVER retried (same-model and
+      // same-provider retries are guaranteed instant deaths), and a continue
+      // that dies with 0 new work is promoted to quota. Aborts, schema errors
+      // and agent-resolution errors are never retried. Retries reuse the SAME
+      // registry record (one row per agent() call, not per attempt).
       const attempts = clampRetryAttempts(opts.retry?.attempts, this.retryAttempts)
-      const backoffMs = clampRetryBackoffMs(opts.retry?.backoffMs, this.retryBackoffMs)
+      const baseBackoffMs = clampRetryBackoffMs(opts.retry?.backoffMs, this.retryBackoffMs)
+      const continueFn = this.driver.continueAgent
       let result: AgentResult | undefined
+      let continuedSessionID: string | undefined
+      let continuationPrompt: string | undefined
       for (let attempt = 0; ; attempt++) {
         try {
-          result = await this.driver.runAgent(
-            {
-              prompt,
-              agent: opts.agent,
-              ...(model !== undefined ? { model } : {}),
-              label: opts.label,
-              phase: titlePhase,
-              schema: opts.schema,
-              defaultAgent: this.defaultAgent,
-              runID: this.runID,
-              ord: record.id,
-            },
-            this.availableAgents,
-            {
-              signal: this.signal ?? NEVER_ABORTED.signal,
-              onSessionID: (sessionID) => {
-                this.registry.updateAgent(this.runID, record.id, {
-                  status: "running",
-                  sessionID,
-                  startedAt: Date.now(),
-                })
-                try {
-                  this.registry.bindAgentSession(this.runID, record.id, sessionID)
-                } catch {
-                  // provenance must not break the call
-                }
+          if (attempt === 0) {
+            result = await this.driver.runAgent(
+              {
+                prompt,
+                agent: opts.agent,
+                ...(model !== undefined ? { model } : {}),
+                label: opts.label,
+                phase: titlePhase,
+                schema: opts.schema,
+                defaultAgent: this.defaultAgent,
+                runID: this.runID,
+                ord: record.id,
               },
-            },
-          )
+              this.availableAgents,
+              {
+                signal: this.signal ?? NEVER_ABORTED.signal,
+                onSessionID: (sessionID) => {
+                  continuedSessionID = sessionID
+                  this.registry.updateAgent(this.runID, record.id, {
+                    status: "running",
+                    sessionID,
+                    startedAt: Date.now(),
+                  })
+                  try {
+                    this.registry.bindAgentSession(this.runID, record.id, sessionID)
+                  } catch {
+                    // provenance must not break the call
+                  }
+                },
+              },
+            )
+          } else {
+            result = await continueFn!.call(
+              this.driver,
+              {
+                sessionID: continuedSessionID!,
+                continuationPrompt: continuationPrompt!,
+                ...(opts.schema !== undefined ? { schema: opts.schema } : {}),
+              },
+              { signal: this.signal ?? NEVER_ABORTED.signal },
+            )
+            // One row per agent() call: a continue keeps the row's identity and
+            // its original sessionID (no rebinding, no second row).
+            this.registry.updateAgent(this.runID, record.id, { sessionID: continuedSessionID! })
+          }
           break
         } catch (err) {
-          const retryable =
-            err instanceof AgentCallError && err.kind === "outcome" && attempt < attempts
-          if (!retryable) throw err
+          if (!(err instanceof AgentCallError) || err.kind !== "outcome") throw err
+          // Quota-shaped: account-level and hours long — no same-model and no
+          // same-provider retry, ever. Surface the typed error to the failover
+          // policy (which owns cross-provider continuation).
+          if (err.failure?.class === "quota") throw err
+          // A continue that died with 0 new work is the observed 0-token
+          // instant-death shape: treat it as quota and stop probing.
+          if (attempt > 0 && err.noProgress === true) throw promoteQuotaFailure(err)
+          // Burst-shaped failures may use the configured retry budget; without
+          // a burst classification the policy allows exactly ONE same-model
+          // continue probe — never a blind retry loop.
+          const budget = err.failure?.class === "burst" ? attempts : Math.min(attempts, 1)
+          if (attempt >= budget) throw err
+          // Same-session continue is the only legal retry; without a session
+          // to continue (or a driver that cannot continue one) the error
+          // surfaces instead of spawning a fresh session.
+          if (continuedSessionID === undefined || continueFn === undefined) throw err
           this.safeReport(
-            `${phase} — ${opts.label ?? record.id} retry ${attempt + 1}/${attempts} after outcome failure: ${errorMessage(err).slice(0, 140)}`,
+            `${phase} — ${opts.label ?? record.id} retry ${attempt + 1}/${budget} (same-session continue): ${errorMessage(err).slice(0, 140)}`,
           )
-          await delayAbortable(backoffMs, this.signal)
+          await delayAbortable(jitteredDelay(attempt, baseBackoffMs, RETRY_BACKOFF_CAP_MS), this.signal)
+          continuationPrompt = buildContinuationPrompt(prompt, continuationReason(err))
         }
       }
       const agentResult = result!
@@ -579,6 +655,42 @@ export async function getWorkflowComposer(
 function errorMessage(err: unknown): string {
   if (err instanceof Error) return err.message
   return String(err)
+}
+
+/**
+ * Human-readable reason embedded into a same-session continuation prompt.
+ * Branches on the typed class only — policy must never parse classification
+ * reason strings.
+ */
+function continuationReason(err: AgentCallError): string {
+  if (err.failure?.class === "burst") return "transient provider rate limit (burst) — retrying on the same model"
+  if (err.failure?.class === "other") return "provider-side failure — retrying on the same model"
+  return "provider failure — same-model probe"
+}
+
+/**
+ * Promote a no-progress continue re-failure to a quota-shaped typed error.
+ * Production showed 0-token instant deaths when a throttled/quota-exhausted
+ * provider was re-prompted, so failover must see `class: "quota"` even when
+ * the raw signal was only rate-limit shaped. Message/status/resetAt are
+ * preserved; the reason records the promotion.
+ */
+function promoteQuotaFailure(err: AgentCallError): AgentCallError {
+  const base = err.failure
+  const failure: FailureClassification = {
+    class: "quota",
+    ...(base?.message !== undefined ? { message: base.message } : {}),
+    ...(base?.status !== undefined ? { status: base.status } : {}),
+    ...(base?.resetAt !== undefined ? { resetAt: base.resetAt } : {}),
+    reason: `0-token instant re-failure after a same-session continue — treated as quota (${base?.reason ?? "unclassified"})`,
+  }
+  return new AgentCallError(
+    "outcome",
+    `${err.message} [promoted to quota: the continued turn produced no progress]`,
+    err.text,
+    failure,
+    true,
+  )
 }
 
 /**

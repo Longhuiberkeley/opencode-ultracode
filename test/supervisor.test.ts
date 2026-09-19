@@ -134,6 +134,34 @@ test("supervisor: script throw => failed envelope with error", async () => {
   assert.match(outcome.envelope.error ?? "", /script kaboom/)
 })
 
+test("supervisor: burst failure retries as a same-session continue — one session, one row", async () => {
+  const ctx = makeSupervisor({ agentRetryBackoffMs: 0 })
+  ctx.sessions.push({
+    text: "",
+    outcome: "failed",
+    finish: "error",
+    failure: { type: "provider.rate-limit", message: "Rate limit reached for requests", status: 429 },
+  })
+  ctx.sessions.push({
+    text: "RECOVERED",
+    agent: "general",
+    tokens: { input: 5, output: 2, reasoning: 0, cache: { read: 0, write: 0 } },
+  })
+  const outcome = await ctx.supervisor.start(
+    { script: `const r = await agent("do the thing"); return r.text;` },
+    ctx.parent,
+  )
+  assert.equal(outcome.envelope.status, "succeeded")
+  assert.equal(outcome.envelope.result, "RECOVERED")
+  assert.equal(ctx.sessions.sessions.size, 1, "the retry must continue the existing session")
+  assert.equal(outcome.run.agents.length, 1, "one registry row per agent() call")
+  const agent = outcome.run.agents[0]!
+  assert.equal(agent.status, "succeeded")
+  assert.equal(agent.sessionID, [...ctx.sessions.sessions.keys()][0])
+  assert.equal(ctx.sessions.sessions.get(agent.sessionID!)!.prompts, 2)
+  assert.ok(ctx.reports.some((s) => s.includes("retry 1/1")), `expected continue report, got: ${ctx.reports.join(" / ")}`)
+})
+
 test("supervisor: invalid script rejected before any run is created", async () => {
   const ctx = makeSupervisor()
   await assert.rejects(

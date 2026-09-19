@@ -5,7 +5,7 @@
  */
 import test from "node:test"
 import assert from "node:assert/strict"
-import { AgentRunner, Semaphore, getWorkflowComposer, parallelHelper, pipelineHelper, storageWorkflowLoader, buildWarmCache, agentCacheDigest, agentCacheKey, clampRetryAttempts, clampRetryBackoffMs, delayAbortable } from "../src/primitives.ts"
+import { AgentRunner, Semaphore, getWorkflowComposer, parallelHelper, pipelineHelper, storageWorkflowLoader, buildWarmCache, agentCacheDigest, agentCacheKey, clampRetryAttempts, clampRetryBackoffMs, delayAbortable, jitteredDelay, RETRY_BACKOFF_BASE_MS, RETRY_BACKOFF_CAP_MS } from "../src/primitives.ts"
 import { compileGraphSpec } from "../src/graph.ts"
 import type { GraphSpec } from "../src/graph.ts"
 import type { AgentRunnerOptions } from "../src/primitives.ts"
@@ -22,7 +22,16 @@ const tick = (ms = 5): Promise<void> => new Promise((r) => setTimeout(r, ms))
 // ---------------------------------------------------------------------------
 
 interface DriverCall {
+  /** "run" = runAgent (fresh session); "continue" = continueAgent (same session). */
+  kind: "run" | "continue"
+  /** runAgent input; for a "continue" call, that session's original run input. */
   input: AgentRunInput
+  /** Continue target session (kind "continue" only). */
+  sessionID?: string
+  /** Continuation prompt (kind "continue" only). */
+  continuationPrompt?: string
+  /** Requested model switch (kind "continue" only). */
+  model?: { providerID: string; id: string; variant?: string }
   hooks: AgentRunHooks
   resolve(result: AgentResult): void
   reject(err: unknown): void
@@ -30,10 +39,34 @@ interface DriverCall {
 
 function makeFakeDriver(): { driver: SessionDriver; calls: DriverCall[] } {
   const calls: DriverCall[] = []
+  const inputBySession = new Map<string, AgentRunInput>()
   const driver: SessionDriver = {
     runAgent(input, _availableAgents, hooks) {
       return new Promise<AgentResult>((resolve, reject) => {
-        calls.push({ input, hooks, resolve, reject })
+        // Wrap registration so a later continue can carry the original input.
+        const wrapped: AgentRunHooks = {
+          signal: hooks.signal,
+          onSessionID: (sessionID) => {
+            inputBySession.set(sessionID, input)
+            return hooks.onSessionID(sessionID)
+          },
+        }
+        calls.push({ kind: "run", input, hooks: wrapped, resolve, reject })
+      })
+    },
+    continueAgent(input, hooks) {
+      return new Promise<AgentResult>((resolve, reject) => {
+        calls.push({
+          kind: "continue",
+          input: inputBySession.get(input.sessionID) ?? { prompt: "", defaultAgent: "" },
+          sessionID: input.sessionID,
+          continuationPrompt: input.continuationPrompt,
+          model: input.model,
+          // Continues never re-register: a no-op onSessionID keeps tests honest.
+          hooks: { signal: hooks.signal, onSessionID: () => {} },
+          resolve,
+          reject,
+        })
       })
     },
   }
@@ -583,22 +616,120 @@ test("AgentRunner warm cache: schema or agent changes flip the digest (no stale 
 })
 
 // ---------------------------------------------------------------------------
-// Outcome-failure retry with backoff (agentRetryAttempts / opts.retry)
+// Outcome-failure retry: classified, same-session continue (agentRetryAttempts / opts.retry)
 // ---------------------------------------------------------------------------
 
-test("AgentRunner retry: outcome failure retried, same record, success after retry", async () => {
+/** Register the fake driver's session so the runner has a continue target. */
+function registerSession(call: DriverCall, sessionID: string): void {
+  call.hooks.onSessionID(sessionID)
+}
+
+test("AgentRunner retry: outcome failure continues the SAME session, same record, success after retry", async () => {
   const { registry, run, calls, runner, reports } = makeRunner({ retryAttempts: 1, retryBackoffMs: 0 })
   const pending = runner.call("do work", { label: "w1" })
   await tick()
   assert.equal(calls.length, 1)
+  registerSession(calls[0]!, "ses_orig")
   calls[0]!.reject(new AgentCallError("outcome", 'agent session outcome "failed"'))
   await tick()
   assert.equal(calls.length, 2, "outcome failure must be retried once")
-  calls[1]!.resolve(okResult("ses_retry"))
-  assert.equal((await pending).sessionID, "ses_retry")
+  assert.equal(calls[1]!.kind, "continue", "the retry must CONTINUE the session, not spawn a fresh one")
+  assert.equal(calls[1]!.sessionID, "ses_orig")
+  assert.match(calls[1]!.continuationPrompt ?? "", /Original request:\ndo work/)
+  calls[1]!.resolve(okResult("ses_orig"))
+  const res = await pending
+  assert.equal(res.sessionID, "ses_orig", "same-session continue keeps the original sessionID")
   const rec = registry.getAgent(run.id, "a1")!
+  assert.equal(run.agents.length, 1, "one registry row per agent() call, not per attempt")
   assert.equal(rec.status, "succeeded")
+  assert.equal(rec.sessionID, "ses_orig")
   assert.ok(reports.some((r) => r.includes("retry 1/1")), `expected retry report, got: ${reports.join(" / ")}`)
+})
+
+test("AgentRunner retry: burst classification continues the same session (no second create)", async () => {
+  const { calls, runner } = makeRunner({ retryAttempts: 1, retryBackoffMs: 0 })
+  const pending = runner.call("scrape", {})
+  await tick()
+  registerSession(calls[0]!, "ses_burst")
+  calls[0]!.reject(
+    new AgentCallError("outcome", 'agent session outcome "failed"', "", {
+      class: "burst",
+      status: 429,
+      message: "Rate limit reached for requests",
+      reason: "rate-limit: status 429",
+    }),
+  )
+  await tick()
+  assert.equal(calls.length, 2)
+  assert.equal(calls[1]!.kind, "continue")
+  assert.equal(calls.filter((c) => c.kind === "run").length, 1, "no fresh runAgent spawn on a burst retry")
+  assert.match(calls[1]!.continuationPrompt ?? "", /transient provider rate limit/)
+  calls[1]!.resolve(okResult("ses_burst"))
+  await pending
+})
+
+test("AgentRunner retry: quota failure throws immediately — no continue, no fresh session, no sleep", async () => {
+  const { registry, run, calls, runner, reports } = makeRunner({ retryAttempts: 3, retryBackoffMs: 0 })
+  const pending = runner.call("doomed", {})
+  await tick()
+  registerSession(calls[0]!, "ses_quota")
+  calls[0]!.reject(
+    new AgentCallError("outcome", 'agent session outcome "failed"', "", {
+      class: "quota",
+      resetAt: Date.now() + 5 * 60 * 60_000,
+      message: "Usage limit reached for 5 hour",
+      reason: "quota: reset in ~300m",
+    }),
+  )
+  await assert.rejects(pending, (err: unknown) => {
+    assert.ok(err instanceof AgentCallError)
+    assert.equal(err.failure?.class, "quota")
+    return true
+  })
+  assert.equal(calls.length, 1, "quota failures are never retried (attempts=3 configured)")
+  assert.equal(calls.filter((c) => c.kind === "run").length, 1)
+  assert.deepEqual(reports.filter((r) => r.includes("retry")), [])
+  assert.equal(registry.getAgent(run.id, "a1")!.status, "failed")
+})
+
+test("AgentRunner retry: unclassified failure gets ONE same-model probe; a 0-progress re-failure promotes to quota", async () => {
+  const { calls, runner } = makeRunner({ retryAttempts: 3, retryBackoffMs: 0 })
+  const pending = runner.call("probe me", {})
+  await tick()
+  registerSession(calls[0]!, "ses_probe")
+  // No classification at all: policy allows exactly one same-model continue.
+  calls[0]!.reject(new AgentCallError("outcome", 'agent session outcome "failed"'))
+  await tick()
+  assert.equal(calls.length, 2)
+  assert.equal(calls[1]!.kind, "continue")
+  // The probe died instantly with 0 new work: promote to quota, stop probing.
+  calls[1]!.reject(
+    new AgentCallError("outcome", 'agent session outcome "failed"', "", { class: "burst", status: 429, reason: "rate-limit: status 429" }, true),
+  )
+  await assert.rejects(pending, (err: unknown) => {
+    assert.ok(err instanceof AgentCallError)
+    assert.equal(err.failure?.class, "quota", "0-progress re-failure must be promoted to quota")
+    assert.equal(err.noProgress, true)
+    assert.match(err.message, /promoted to quota/)
+    assert.equal(err.failure?.status, 429, "original status survives promotion")
+    return true
+  })
+  assert.equal(calls.length, 2, "promotion beats the configured retry budget (attempts=3)")
+})
+
+test("AgentRunner retry: an unclassified probe that produced work stops after ONE probe (no blind loop)", async () => {
+  const { calls, runner } = makeRunner({ retryAttempts: 3, retryBackoffMs: 0 })
+  const pending = runner.call("guarded", {})
+  await tick()
+  registerSession(calls[0]!, "ses_guarded")
+  calls[0]!.reject(new AgentCallError("outcome", 'agent session outcome "failed"'))
+  await tick()
+  assert.equal(calls.length, 2)
+  // The probe did work (failure carried text) but had no burst classification:
+  // the one-probe allowance is spent, so the error surfaces.
+  calls[1]!.reject(new AgentCallError("outcome", 'agent session outcome "failed"', "partial output", undefined, false))
+  await assert.rejects(pending, /outcome "failed"/)
+  assert.equal(calls.length, 2, "unclassified failures never get a second probe")
 })
 
 test("AgentRunner retry: abort and schema errors are never retried", async () => {
@@ -620,10 +751,12 @@ test("AgentRunner retry: attempts exhausted -> failure surfaces", async () => {
   const { registry, run, calls, runner } = makeRunner({ retryAttempts: 1, retryBackoffMs: 0 })
   const pending = runner.call("c", {})
   await tick()
+  registerSession(calls[0]!, "ses_c")
   calls[0]!.reject(new AgentCallError("outcome", 'agent session outcome "failed"'))
   await tick()
-  calls[1]!.reject(new AgentCallError("outcome", 'agent session outcome "failed"'))
+  calls[1]!.reject(new AgentCallError("outcome", 'agent session outcome "failed"', "", { class: "burst", reason: "rate-limit" }))
   await assert.rejects(pending, /outcome "failed"/)
+  assert.equal(calls.length, 2)
   assert.equal(registry.getAgent(run.id, "a1")!.status, "failed")
 })
 
@@ -631,11 +764,56 @@ test("AgentRunner retry: per-call opts.retry overrides plugin default", async ()
   const { calls, runner } = makeRunner({ retryAttempts: 0, retryBackoffMs: 0 })
   const pending = runner.call("d", { retry: { attempts: 1 } })
   await tick()
+  registerSession(calls[0]!, "ses_d")
   calls[0]!.reject(new AgentCallError("outcome", "down"))
   await tick()
   assert.equal(calls.length, 2, "per-call retry must apply when plugin default is 0")
-  calls[1]!.resolve(okResult("ses_x"))
-  assert.equal((await pending).sessionID, "ses_x")
+  assert.equal(calls[1]!.kind, "continue")
+  calls[1]!.resolve(okResult("ses_d"))
+  assert.equal((await pending).sessionID, "ses_d")
+})
+
+test("AgentRunner retry: outcome failure without a registered session surfaces (no fresh spawn)", async () => {
+  const { calls, runner } = makeRunner({ retryAttempts: 2, retryBackoffMs: 0 })
+  const pending = runner.call("no session", {})
+  await tick()
+  // The driver violates its contract (outcome failure before onSessionID):
+  // there is nothing to continue, so the error must surface instead of a
+  // fresh session being spawned.
+  calls[0]!.reject(new AgentCallError("outcome", 'agent session outcome "failed"'))
+  await assert.rejects(pending, /outcome "failed"/)
+  assert.equal(calls.filter((c) => c.kind === "run").length, 1)
+})
+
+test("AgentRunner retry: keyed warm-list row still persists replay identity after a continue", async () => {
+  const { registry, run, calls, runner } = makeRunner({ retryAttempts: 1, retryBackoffMs: 0 })
+  const pending = runner.call("keyed work", { key: "lane" })
+  await tick()
+  registerSession(calls[0]!, "ses_keyed")
+  calls[0]!.reject(new AgentCallError("outcome", 'agent session outcome "failed"'))
+  await tick()
+  calls[1]!.resolve({ ...okResult("ses_keyed"), text: "recovered" })
+  await pending
+  const rec = registry.getAgent(run.id, "a1")!
+  assert.equal(rec.status, "succeeded")
+  assert.equal(rec.key, "lane")
+  assert.equal(rec.promptDigest, agentCacheDigest("keyed work", {}, "general"))
+  assert.equal(rec.resultText, "recovered")
+})
+
+test("jitteredDelay: exponential with ±50% bounds, never negative, capped, deterministic under injected rand", () => {
+  assert.equal(jitteredDelay(0, 2_000, 30_000, () => 0.5), 2_000) // no jitter at rand 0.5
+  assert.equal(jitteredDelay(1, 2_000, 30_000, () => 0.5), 4_000)
+  assert.equal(jitteredDelay(3, 2_000, 30_000, () => 0.5), 16_000)
+  assert.equal(jitteredDelay(10, 2_000, 30_000, () => 0.5), 30_000, "capped at capMs")
+  assert.equal(jitteredDelay(0, 2_000, 30_000, () => 1), 3_000, "+50% upper bound")
+  assert.equal(jitteredDelay(0, 2_000, 30_000, () => 0), 1_000, "-50% lower bound")
+  assert.equal(jitteredDelay(0, 2_000, 30_000, () => -5), 0, "never negative")
+  assert.equal(jitteredDelay(0, 2_000, 30_000, () => 99), 30_000, "rand above 1 cannot overshoot the cap")
+  assert.equal(jitteredDelay(-3, 2_000, 30_000, () => 0.5), 2_000, "negative attempt clamps to 0")
+  assert.equal(jitteredDelay(0, 0, 30_000, () => 0.5), 0)
+  assert.equal(jitteredDelay(0, RETRY_BACKOFF_BASE_MS, RETRY_BACKOFF_CAP_MS, () => 0.5), 2_000)
+  assert.equal(jitteredDelay(20, 60_000, RETRY_BACKOFF_CAP_MS, () => 1), RETRY_BACKOFF_CAP_MS)
 })
 
 test("AgentRunner spawnModel: resolved pin recorded on the agent record (with source)", async () => {

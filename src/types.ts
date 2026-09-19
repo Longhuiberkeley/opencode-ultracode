@@ -61,11 +61,18 @@ export interface UltracodeOptions {
   agentScope?: AgentScope
   /**
    * Extra attempts for a child whose session fails at the provider level
-   * (outcome "failed" — outage/rate-limit shaped). Only outcome failures are
-   * retried; aborts and schema errors never are. Default 1. 0 disables.
+   * (outcome "failed" — outage/rate-limit shaped). Retries CONTINUE the same
+   * session on the same model (a failed session that did work is never
+   * replaced); quota-shaped failures are never retried (same-model and
+   * same-provider retries are guaranteed instant deaths). Aborts and schema
+   * errors never retry. Default 1. 0 disables.
    */
   agentRetryAttempts?: number
-  /** Backoff before each retry attempt. Default 5_000 ms. */
+  /**
+   * Base of the jittered exponential retry backoff: attempt n waits
+   * base * 2^n with +/-50% jitter, capped at 30_000 ms. 0 retries with no
+   * wait. Default 5_000 ms. A stopping run never waits out a backoff.
+   */
   agentRetryBackoffMs?: number
   /**
    * Mark a running child failed when it produces no activity for this many
@@ -551,8 +558,10 @@ export interface AgentOpts {
   key?: string
   /**
    * Per-call retry override for provider-shaped (outcome) failures.
-   * attempts clamped 0..3, backoffMs clamped 0..120_000. Falls back to the
-   * plugin-level agentRetryAttempts / agentRetryBackoffMs.
+   * attempts clamped 0..3, backoffMs clamped 0..120_000 (base of the jittered
+   * exponential schedule, capped at 30_000). Falls back to the plugin-level
+   * agentRetryAttempts / agentRetryBackoffMs. Retries continue the SAME
+   * session on the same model; quota-shaped failures never retry.
    */
   retry?: { attempts?: number; backoffMs?: number }
 }
@@ -1050,6 +1059,17 @@ export interface SessionCtx {
   wait(input: { sessionID: string }): Promise<void>
   context(input: { sessionID: string }): Promise<ReadonlyArray<ContextMessage>>
   interrupt(input: { sessionID: string; continue: boolean }): Promise<void>
+  /**
+   * Switch a session's model IN PLACE (the verified host session domain
+   * exposes it; fork/compact do not exist there). Used by same-session
+   * continuations after a provider failure. Optional and feature-detected:
+   * hand-built doubles may omit it, and the driver fails a requested switch
+   * typed rather than silently continuing on the dead model.
+   */
+  switchModel?(input: {
+    sessionID: string
+    model: { providerID: string; id: string; variant?: string }
+  }): Promise<void>
 }
 
 /**

@@ -168,7 +168,7 @@ export class SupervisorImpl implements Supervisor {
   private readonly isProviderDisabled: ((providerID: string) => Promise<boolean>) | undefined
   private readonly settleGraceMs: number
   private readonly stopKillMs: number
-  private readonly driver: SessionDriver
+  private readonly driver: Required<SessionDriver>
   private readonly workflowLoader: WorkflowLoader
   private readonly runs = new Map<string, RunState>()
   private disposed = false
@@ -365,6 +365,21 @@ export class SupervisorImpl implements Supervisor {
                 // from the live set so later interrupts never touch them.
                 if (created !== undefined) state.live.delete(created)
               })
+          },
+          continueAgent: async (continueInput, hooks) => {
+            // Same-session retry/failover: re-check pause (a run paused while
+            // the probe was backing off must not keep prompting), and keep the
+            // child in the LIVE set for the duration so a stop's delayed kill
+            // still interrupts it. No new session, no new registry row.
+            await this.waitIfPaused(state)
+            const sessionID = continueInput.sessionID
+            state.live.add(sessionID)
+            state.childLastActivity.set(sessionID, Date.now())
+            try {
+              return await this.driver.continueAgent(continueInput, hooks)
+            } finally {
+              state.live.delete(sessionID)
+            }
           },
         },
         registry: this.registry,

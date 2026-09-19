@@ -5,7 +5,7 @@
  */
 import test from "node:test"
 import assert from "node:assert/strict"
-import { createSessionDriver, buildChildTitle, parseChildTitle, describeSessionFailure } from "../src/sessions.ts"
+import { createSessionDriver, buildChildTitle, parseChildTitle, describeSessionFailure, buildContinuationPrompt } from "../src/sessions.ts"
 import { AgentCallError, RunClosedError } from "../src/sessions.ts"
 import { FakeSessionCtx } from "./fakes.ts"
 import type { ScriptedReply } from "./fakes.ts"
@@ -16,7 +16,7 @@ const tick = (ms = 5): Promise<void> => new Promise((r) => setTimeout(r, ms))
 
 const TOKENS: TokenUsage = { input: 100, output: 20, reasoning: 3, cache: { read: 40, write: 0 } }
 
-function makeDriver(replies: ScriptedReply[] = []): { fake: FakeSessionCtx; driver: SessionDriver } {
+function makeDriver(replies: ScriptedReply[] = []): { fake: FakeSessionCtx; driver: Required<SessionDriver> } {
   const fake = new FakeSessionCtx()
   for (const reply of replies) fake.push(reply)
   const driver = createSessionDriver(fake)
@@ -609,4 +609,177 @@ test("runAgent: schema-repair outcome failure carries the classification too", a
       return true
     },
   )
+})
+
+// ---------------------------------------------------------------------------
+// continueAgent — same-session continue (burst retry / failover)
+// ---------------------------------------------------------------------------
+
+const CONTINUE_SIGNAL = new AbortController().signal
+
+test("continueAgent: continues the SAME session — no create, history reused, new reply extracted", async () => {
+  const { fake, driver } = makeDriver([
+    {
+      text: "",
+      outcome: "failed",
+      finish: "error",
+      failure: { type: "provider.rate-limit", message: "Rate limit reached for requests", status: 429 },
+    },
+    { text: "recovered", model: { providerID: "openrouter", id: "m/1" }, tokens: TOKENS },
+  ])
+  await assert.rejects(driver.runAgent(input({ prompt: "do it" }), ["general"], hooks()), /outcome "failed"/)
+  const sessionID = [...fake.sessions.keys()][0]!
+  const result = await driver.continueAgent(
+    { sessionID, continuationPrompt: buildContinuationPrompt("do it", "transient provider rate limit (burst)") },
+    { signal: CONTINUE_SIGNAL },
+  )
+  assert.equal(fake.sessions.size, 1, "continue must never create a session")
+  assert.equal(result.sessionID, sessionID)
+  assert.equal(result.text, "recovered")
+  assert.deepEqual(result.model, { providerID: "openrouter", id: "m/1" })
+  const session = fake.sessions.get(sessionID)!
+  assert.equal(session.prompts, 2)
+  const userMsgs = session.messages.filter((m) => m.type === "user")
+  assert.match(userMsgs[1]!.text ?? "", /interrupted by a provider failure/)
+  assert.match(userMsgs[1]!.text ?? "", /may be EMPTY/)
+  assert.match(userMsgs[1]!.text ?? "", /Original request:\ndo it/)
+})
+
+test("continueAgent: requested model is switched BEFORE the continuation prompt", async () => {
+  const { fake, driver } = makeDriver([
+    {
+      text: "",
+      outcome: "failed",
+      failure: { type: "provider.rate-limit", message: "Usage limit reached for 5 hour", status: 429 },
+    },
+    { text: "on the fallback", model: { providerID: "anthropic", id: "claude-x" } },
+  ])
+  await assert.rejects(driver.runAgent(input(), ["general"], hooks()))
+  const sessionID = [...fake.sessions.keys()][0]!
+  const result = await driver.continueAgent(
+    { sessionID, continuationPrompt: "continue", model: { providerID: "anthropic", id: "claude-x" } },
+    { signal: CONTINUE_SIGNAL },
+  )
+  assert.deepEqual(fake.switches, [
+    { sessionID, model: { providerID: "anthropic", id: "claude-x" }, beforePrompt: 1 },
+  ])
+  assert.equal(result.text, "on the fallback")
+  assert.equal(fake.sessions.get(sessionID)!.prompts, 2)
+})
+
+test("continueAgent: a requested model without switchModel support fails typed and never prompts", async () => {
+  let prompts = 0
+  const sessions: SessionCtx = {
+    create: async () => ({ id: "ses_min" }),
+    get: async () => ({ id: "ses_min", outcome: "succeeded" }),
+    prompt: async () => {
+      prompts++
+      return { id: "msg_min" }
+    },
+    wait: async () => {},
+    context: async () => [],
+    interrupt: async () => {},
+  }
+  const driver = createSessionDriver(sessions)
+  await assert.rejects(
+    driver.continueAgent(
+      { sessionID: "ses_min", continuationPrompt: "x", model: { providerID: "p", id: "m" } },
+      { signal: CONTINUE_SIGNAL },
+    ),
+    (err: unknown) =>
+      err instanceof AgentCallError &&
+      err.kind === "agent" &&
+      /switchModel is unavailable/.test(err.message) &&
+      /cannot continue session ses_min/.test(err.message),
+  )
+  assert.equal(prompts, 0)
+})
+
+test("continueAgent: same-model continue never calls switchModel", async () => {
+  const { fake, driver } = makeDriver([
+    { text: "first" },
+    { text: "second" },
+  ])
+  const first = await driver.runAgent(input(), ["general"], hooks())
+  await driver.continueAgent({ sessionID: first.sessionID, continuationPrompt: "keep going" }, { signal: CONTINUE_SIGNAL })
+  assert.equal(fake.switches.length, 0)
+})
+
+test("continueAgent: an empty re-failure reports noProgress; a turn with tokens reads as progress", async () => {
+  const empty = makeDriver([
+    { text: "", outcome: "failed", failure: { type: "provider.rate-limit", message: "Rate limit reached", status: 429 } },
+    { text: "", outcome: "failed", failure: { type: "provider.rate-limit", message: "Rate limit reached", status: 429 } },
+  ])
+  await assert.rejects(empty.driver.runAgent(input(), ["general"], hooks()))
+  const emptySession = [...empty.fake.sessions.keys()][0]!
+  await assert.rejects(
+    empty.driver.continueAgent({ sessionID: emptySession, continuationPrompt: "go" }, { signal: CONTINUE_SIGNAL }),
+    (err: unknown) => {
+      assert.ok(err instanceof AgentCallError)
+      assert.equal(err.noProgress, true, "empty turn with no token growth is the 0-token instant-death shape")
+      assert.equal(err.failure?.class, "burst")
+      return true
+    },
+  )
+
+  const worked = makeDriver([
+    { text: "", outcome: "failed", failure: { type: "provider.rate-limit", message: "Rate limit reached", status: 429 } },
+    { text: "", outcome: "failed", tokens: TOKENS, failure: { type: "provider.rate-limit", message: "Rate limit reached", status: 429 } },
+  ])
+  await assert.rejects(worked.driver.runAgent(input(), ["general"], hooks()))
+  const workedSession = [...worked.fake.sessions.keys()][0]!
+  await assert.rejects(
+    worked.driver.continueAgent({ sessionID: workedSession, continuationPrompt: "go" }, { signal: CONTINUE_SIGNAL }),
+    (err: unknown) => {
+      assert.ok(err instanceof AgentCallError)
+      assert.equal(err.noProgress, false, "token growth proves the turn did work")
+      return true
+    },
+  )
+})
+
+test("continueAgent: the first turn never carries noProgress", async () => {
+  const { driver } = makeDriver([{ text: "", outcome: "failed", failure: { status: 429, message: "Rate limit reached" } }])
+  await assert.rejects(
+    driver.runAgent(input(), ["general"], hooks()),
+    (err: unknown) => {
+      assert.ok(err instanceof AgentCallError)
+      assert.equal(err.noProgress, undefined)
+      return true
+    },
+  )
+})
+
+test("continueAgent: schema mode reuses structured extraction (repair round included)", async () => {
+  const { fake, driver } = makeDriver([
+    { text: "died", outcome: "failed", failure: { status: 429, message: "Rate limit reached" } },
+    { text: "not json" },
+    { text: '{"answer": "42"}' },
+  ])
+  await assert.rejects(driver.runAgent(input({ schema: SCHEMA }), ["general"], hooks()))
+  const sessionID = [...fake.sessions.keys()][0]!
+  const result = await driver.continueAgent(
+    { sessionID, continuationPrompt: "continue", schema: SCHEMA },
+    { signal: CONTINUE_SIGNAL },
+  )
+  assert.deepEqual(result.data, { answer: "42" })
+  assert.equal(fake.sessions.get(sessionID)!.prompts, 3, "continue prompt + one repair round")
+})
+
+test("continueAgent: abort mid-wait interrupts the SAME session", async () => {
+  const { fake, driver } = makeDriver([{ text: "first" }])
+  const first = await driver.runAgent(input(), ["general"], hooks())
+  fake.hangWait = true
+  const ctrl = new AbortController()
+  const pending = driver.continueAgent(
+    { sessionID: first.sessionID, continuationPrompt: "slow continuation" },
+    { signal: ctrl.signal },
+  )
+  await tick(20)
+  ctrl.abort()
+  await assert.rejects(
+    pending,
+    (err: unknown) => err instanceof AgentCallError && err.kind === "abort" && /run stopping/.test(err.message),
+  )
+  assert.deepEqual(fake.interrupts, [first.sessionID])
 })

@@ -27,13 +27,28 @@ export class AgentCallError extends Error {
    * src/failure-classify.ts).
    */
   readonly failure?: FailureClassification
+  /**
+   * CONTINUATION-ONLY signal: the continued turn produced no usable progress —
+   * empty assistant text and no token growth (production: instant 0-token
+   * provider deaths). The runner promotes such a re-failure to quota-shaped
+   * handling instead of burning more same-model probes. Undefined on the
+   * first (created-session) turn.
+   */
+  readonly noProgress?: boolean
 
-  constructor(kind: AgentErrorKind, message: string, text?: string, failure?: FailureClassification) {
+  constructor(
+    kind: AgentErrorKind,
+    message: string,
+    text?: string,
+    failure?: FailureClassification,
+    noProgress?: boolean,
+  ) {
     super(message)
     this.name = "AgentCallError"
     this.kind = kind
     this.text = text
     this.failure = failure
+    this.noProgress = noProgress
   }
 }
 
@@ -91,6 +106,38 @@ export interface SessionDriver {
     availableAgents: string[] | undefined,
     hooks: AgentRunHooks,
   ): Promise<AgentResult>
+  /**
+   * Continue an EXISTING session (same-session burst retry; later: quota
+   * failover). Shares runAgent's step 3-5 code (prompt -> wait -> outcome ->
+   * structured extraction) but NEVER calls session.create: a failed session
+   * that already did work is never replaced by a fresh one. `model` is applied
+   * via session.switchModel BEFORE the prompt (feature-detected).
+   *
+   * Optional and feature-detected: hand-built drivers may omit it, and the
+   * runner then refuses to retry (surfacing the typed error) instead of
+   * spawning a fresh session.
+   */
+  continueAgent?(input: AgentContinueInput, hooks: AgentContinueHooks): Promise<AgentResult>
+}
+
+/**
+ * Continue an existing child session in place. The session keeps its sessionID,
+ * message history and registry ownership; only the prompt (and optionally the
+ * model) changes.
+ */
+export interface AgentContinueInput {
+  sessionID: string
+  /** Instruction for the continued turn — see buildContinuationPrompt. */
+  continuationPrompt: string
+  /** Applied via session.switchModel before prompting; absent = same model. */
+  model?: { providerID: string; id: string; variant?: string }
+  /** Same structured-output contract as the original call (repair round included). */
+  schema?: Json
+}
+
+export interface AgentContinueHooks {
+  /** Abort: prompt/wait race an abort-driven rejection + best-effort interrupt. */
+  signal: AbortSignal
 }
 
 export interface SessionDriverOptions {
@@ -111,7 +158,12 @@ interface StructuredOutcome {
 // Implementation
 // ---------------------------------------------------------------------------
 
-export function createSessionDriver(sessions: SessionCtx, options: SessionDriverOptions = {}): SessionDriver {
+/**
+ * Build the session driver. The returned driver ALWAYS supports
+ * `continueAgent` (`Required<SessionDriver>`): the optional seam on
+ * SessionDriver exists only so hand-built doubles can stay small.
+ */
+export function createSessionDriver(sessions: SessionCtx, options: SessionDriverOptions = {}): Required<SessionDriver> {
   const snippetChars = options.errorTextSnippetChars ?? 500
 
   async function runAgent(
@@ -148,22 +200,68 @@ export function createSessionDriver(sessions: SessionCtx, options: SessionDriver
       throw new AgentCallError("abort", `agent aborted before prompt (session ${sessionID})`)
     }
 
-    // 3. Prompt -> wait (racing the abort signal).
-    await promptAndWait(sessions, sessionID, buildPromptText(input.prompt, input.schema), hooks.signal)
+    // 3.-5. Prompt -> wait -> outcome -> structured extraction. Shared with
+    // continueAgent so run and continue can never diverge.
+    return completeTurn(sessionID, buildPromptText(input.prompt, input.schema), input.schema, hooks.signal)
+  }
 
-    // 4. Outcome + last assistant message. A failed outcome is the primary
+  /**
+   * Continue an existing session with a new prompt (same-session retry or
+   * failover): optional model switch BEFORE the prompt, then the exact same
+   * prompt -> wait -> outcome -> structured extraction sequence as runAgent.
+   * Never creates, interrupts-before-prompt or re-registers a session.
+   */
+  async function continueAgent(input: AgentContinueInput, hooks: AgentContinueHooks): Promise<AgentResult> {
+    if (input.model !== undefined) await applyModelSwitch(input.sessionID, input.model)
+    // Snapshot the session token total BEFORE prompting so a re-failure can be
+    // recognized as a 0-work instant death (AgentCallError.noProgress).
+    const beforeTokens = await readTokenTotal(input.sessionID)
+    return completeTurn(
+      input.sessionID,
+      buildPromptText(input.continuationPrompt, input.schema),
+      input.schema,
+      hooks.signal,
+      { beforeTokens, continuation: true },
+    )
+  }
+
+  interface TurnContext {
+    /** Token total observed just before this turn (continue only). */
+    beforeTokens?: number
+    /** True for a continued turn — outcome failures carry the noProgress signal. */
+    continuation?: boolean
+  }
+
+  /**
+   * Steps 3-5, shared by runAgent and continueAgent: prompt -> wait (racing
+   * the abort signal) -> outcome + last assistant message -> optional schema
+   * resolution. A non-succeeded outcome throws the typed outcome error; a
+   * CONTINUED turn additionally reports whether the turn produced any work.
+   */
+  async function completeTurn(
+    sessionID: string,
+    promptText: string,
+    schema: Json | undefined,
+    signal: AbortSignal,
+    turn: TurnContext = {},
+  ): Promise<AgentResult> {
+    await promptAndWait(sessions, sessionID, promptText, signal)
+
+    // Outcome + last assistant message. A failed outcome is the primary
     // error; a succeeded outcome with a missing/unreadable assistant message
     // is a typed extraction error (never an empty successful reply).
     const info = await sessions.get({ sessionID })
     const first = await readAssistantReply(sessions, sessionID, info.outcome)
     if (info.outcome !== "succeeded") {
       const detail = describeSessionFailure(info, first.message)
+      const tokens = info.tokens ?? first.message?.tokens
       throw new AgentCallError(
         "outcome",
         `agent session outcome "${info.outcome ?? "unknown"}"${detail ? `: ${snippet(detail, snippetChars)}` : ""}` +
           (first.text ? `${detail ? " | " : ": "}${snippet(first.text, snippetChars)}` : ""),
         first.text,
         classifySessionFailure(info, first.message, first.text),
+        turn.continuation === true ? !turnProgressed(turn.beforeTokens, tokenTotal(tokens), first.text) : undefined,
       )
     }
     const result: AgentResult = {
@@ -174,11 +272,11 @@ export function createSessionDriver(sessions: SessionCtx, options: SessionDriver
       tokens: info.tokens ?? first.message?.tokens,
     }
 
-    // 5. Schema mode: tolerant extraction + validate + ONE repair round.
+    // Schema mode: tolerant extraction + validate + ONE repair round.
     // After a successful repair, .text/.model/.tokens describe the REPAIRED
     // response (attempt 2), consistent with .data.
-    if (input.schema !== undefined) {
-      const structured = await resolveStructured(sessions, sessionID, input.schema, first, hooks.signal)
+    if (schema !== undefined) {
+      const structured = await resolveStructured(sessions, sessionID, schema, first, signal)
       result.data = structured.data
       if (structured.repaired) {
         result.text = structured.text ?? first.text
@@ -187,6 +285,37 @@ export function createSessionDriver(sessions: SessionCtx, options: SessionDriver
       }
     }
     return result
+  }
+
+  /**
+   * Apply a requested model switch before a continuation prompt.
+   * Feature-detected: the verified host session domain exposes switchModel,
+   * but the narrow SessionCtx (verified doubles included) may omit it. A
+   * requested switch that cannot be applied is a typed failure — silently
+   * continuing on the dead model would guarantee another instant failure.
+   */
+  async function applyModelSwitch(
+    sessionID: string,
+    model: { providerID: string; id: string; variant?: string },
+  ): Promise<void> {
+    const switchModel = sessions.switchModel
+    if (typeof switchModel !== "function") {
+      throw new AgentCallError(
+        "agent",
+        `session.switchModel is unavailable — cannot continue session ${sessionID} on ${model.providerID}/${model.id}`,
+      )
+    }
+    await switchModel.call(sessions, { sessionID, model })
+  }
+
+  /** Best-effort session token total; undefined when unavailable. Never throws. */
+  async function readTokenTotal(sessionID: string): Promise<number | undefined> {
+    try {
+      const info = await sessions.get({ sessionID })
+      return tokenTotal(info.tokens)
+    } catch {
+      return undefined
+    }
   }
 
   interface AssistantReply {
@@ -284,7 +413,7 @@ export function createSessionDriver(sessions: SessionCtx, options: SessionDriver
     }
   }
 
-  return { runAgent }
+  return { runAgent, continueAgent }
 }
 
 // ---------------------------------------------------------------------------
@@ -379,6 +508,45 @@ export function buildPromptText(prompt: string, schema?: Json): string {
     "\n\nRespond with ONLY a JSON value matching this JSON schema — no prose, no markdown fences:\n" +
     JSON.stringify(schema)
   )
+}
+
+/**
+ * Continuation instruction for a same-session retry/failover. WHY it embeds
+ * the ORIGINAL request: production rate-limit deaths returned 0 tokens with no
+ * assistant text, so a bare "continue" would ask the model to continue
+ * nothing. Re-anchoring the request makes the retry correct whether or not the
+ * failed turn produced partial work, and the "don't repeat" clause keeps a
+ * partial turn from being redone wholesale.
+ */
+export function buildContinuationPrompt(originalPrompt: string, reason: string): string {
+  return [
+    "The previous turn of this session was interrupted by a provider failure before it completed.",
+    `Reason: ${reason}`,
+    "Your previous turn may be EMPTY — if it produced no usable output, do the original task now from the start.",
+    "If you already produced partial work, do not repeat it; finish the task and reply with the final result only.",
+    "",
+    "Original request:",
+    originalPrompt,
+  ].join("\n")
+}
+
+/** Sum of a token usage, or undefined when no usage was exposed. */
+function tokenTotal(tokens: TokenUsage | undefined): number | undefined {
+  if (tokens === undefined) return undefined
+  return (tokens.input ?? 0) + (tokens.output ?? 0) + (tokens.reasoning ?? 0)
+}
+
+/**
+ * Did a continued turn produce usable work? Assistant text is authoritative;
+ * with none, token growth decides. An empty turn with no measurable growth
+ * (both totals equal, or no usage exposed at all) is the 0-token instant-death
+ * shape (see AgentCallError.noProgress). A reported positive total without a
+ * baseline still reads as progress, so a genuine burst keeps its bounded probe.
+ */
+function turnProgressed(before: number | undefined, after: number | undefined, text: string): boolean {
+  if (text.length > 0) return true
+  if (before !== undefined && after !== undefined) return after > before
+  return after !== undefined && after > 0
 }
 
 async function promptAndWait(sessions: SessionCtx, sessionID: string, text: string, signal: AbortSignal): Promise<void> {

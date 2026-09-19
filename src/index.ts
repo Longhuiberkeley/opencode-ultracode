@@ -565,6 +565,19 @@ export default Plugin.define({
       interrupt: async (input) => {
         await ctx.session.interrupt({ sessionID: input.sessionID, continue: false })
       },
+      // Optional in the narrow interface (verified present on the host domain):
+      // feature-detected so an older host degrades to a typed continue failure
+      // instead of crashing adapter construction.
+      ...(typeof ctx.session.switchModel === "function"
+        ? {
+            switchModel: async (input: {
+              sessionID: string
+              model: { providerID: string; id: string; variant?: string }
+            }) => {
+              await ctx.session.switchModel({ sessionID: input.sessionID, model: input.model })
+            },
+          }
+        : {}),
     }
 
     const storage = new StorageImpl({ kv, fs, projectRoot, personalWorkflowDir, projectID })

@@ -197,6 +197,16 @@ export class FakeSessionCtx implements SessionCtx {
   >()
   /** Records interrupt calls for abort tests. */
   interrupts: string[] = []
+  /**
+   * Records switchModel calls in order (additive — same-session
+   * continue/failover tests). `beforePrompt` is the session's prompt count at
+   * switch time, so tests can assert the switch landed BEFORE the continue.
+   */
+  switches: Array<{
+    sessionID: string
+    model: { providerID: string; id: string; variant?: string }
+    beforePrompt: number
+  }> = []
   /** The `model` each create() received, in order (model-override tests). */
   createdModels: Array<{ providerID: string; id: string; variant?: string } | undefined> = []
   /** When true, `wait` never resolves on its own (tests must abort). */
@@ -299,6 +309,19 @@ export class FakeSessionCtx implements SessionCtx {
     this.interrupts.push(input.sessionID)
     const s = this.sessions.get(input.sessionID)
     if (s) s.interrupted = true
+  }
+
+  async switchModel(input: {
+    sessionID: string
+    model: { providerID: string; id: string; variant?: string }
+  }): Promise<void> {
+    const s = this.sessions.get(input.sessionID)
+    if (!s) throw new Error(`unknown session ${input.sessionID}`)
+    this.switches.push({
+      sessionID: input.sessionID,
+      model: { ...input.model },
+      beforePrompt: s.prompts,
+    })
   }
 }
 
