@@ -263,7 +263,7 @@ agent(prompt: string, opts?: {
   tokens?: TokenUsage
   data?: Json       // present iff opts.schema was given and validation succeeded
   cachedFrom?: string  // source runID when this result was warm-replayed
-  failover?: { from: ModelRef; to: ModelRef; class: "quota"; reason: string }
+  failover?: { from: ModelRef; to: ModelRef; class: "quota" | "burst"; reason: string }
 }>
 ```
 
@@ -313,10 +313,22 @@ quota windows are hours).
   typed quota error.
 
 When the child finishes on a different model than it was spawned on, the result carries
-`failover: { from, to, class: "quota", reason }`. Typed errors (`AgentCallError`) carry
-`failure.class` so a catch can see *why* without parsing strings. `opts.fallbacks` is the
-per-call ladder (beats `modelFallbacks`); do not hard-code provider lists in saved workflows —
-the user's pins and the plugin option own routing.
+`failover: { from, to, class: "quota" | "burst", reason }` (`class` is the triggering
+failure: quota/quarantine routing, or a burst budget that was exhausted onto the ladder).
+Typed errors (`AgentCallError`) carry `failure.class` so a catch can see *why* without
+parsing strings. `opts.fallbacks` is the per-call ladder (beats `modelFallbacks`); do not
+hard-code provider lists in saved workflows — the user's pins and the plugin option own
+routing.
+
+**Effective ladder today.** Catalog inference (read-only children: run `noEditTools` or
+the `explore` agent) and the tier-gate price proxy are inactive until model catalog
+metadata becomes available to the plugin. The live ladder is per-call `opts.fallbacks` >
+the ask-mode run override > `modelFallbacks` > your agent-config pin pool. Failover-down
+for edit-capable children is blocked by construction: pin-pool and explicit candidates
+are the user's own choices. Children **without a resolved model** (no per-call / run
+override, no agent pin — the server default) cannot be provider-routed by the breaker
+(fail-closed: they never fail over, and they bypass provider admission). Pin your agents
+on coding plans.
 
 ### `parallel(thunks) -> Promise<Array<T | null>>`
 

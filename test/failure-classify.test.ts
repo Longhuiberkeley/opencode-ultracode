@@ -124,6 +124,23 @@ test("classify: a stray future date without reset wording does not quarantine", 
   assert.equal(c.resetAt, undefined)
 })
 
+test("classify: quota marker + unrelated future date in prose => quota, no resetAt", () => {
+  const c = classifyFailure(
+    undefined,
+    `Usage limit reached for 5 hour. See you on ${utcIso(Date.now() + 10 * HOUR)} at the standup.`,
+  )
+  assert.equal(c.class, "quota")
+  assert.equal(c.resetAt, undefined)
+})
+
+test("classify: quota marker with a contextual reset date still parses resetAt", () => {
+  const reset = Date.now() + 5 * HOUR
+  const c = classifyFailure(undefined, `Usage limit reached. Your limit will reset at ${utcIso(reset)}`)
+  assert.equal(c.class, "quota")
+  assert.ok(c.resetAt !== undefined)
+  assert.ok(Math.abs(c.resetAt! - reset) < 2_000, `resetAt ${c.resetAt} vs ${reset}`)
+})
+
 test("classify: tolerates a numeric-string status from untrusted JSON", () => {
   const c = classifyFailure({ status: "429" as unknown as number })
   assert.equal(c.class, "burst")

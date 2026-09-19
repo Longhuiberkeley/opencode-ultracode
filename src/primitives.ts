@@ -144,12 +144,12 @@ export class Semaphore {
         onAbort: () => {
           const idx = this.queue.indexOf(waiter)
           if (idx >= 0) this.queue.splice(idx, 1)
-          reject(new Error("run stopping"))
+          reject(new AgentCallError("abort", "agent aborted: run stopping"))
         },
         signal,
       }
       if (signal?.aborted) {
-        reject(new Error("run stopping"))
+        reject(new AgentCallError("abort", "agent aborted: run stopping"))
         return
       }
       if (this.active < this.limit) {
@@ -295,6 +295,12 @@ interface FailoverContext {
   recordID: string
   /** Per-call opts.fallbacks (top ladder rung). */
   callFallbacks: ReadonlyArray<string> | undefined
+}
+
+/** Mutable provider-permit box so mid-flight failover can swap without nesting. */
+interface ProviderHold {
+  permit: ProviderPermit | undefined
+  providerID: string | undefined
 }
 
 /** Clamp per-call/plugin retry attempts (0..3). */
@@ -503,7 +509,7 @@ export class AgentRunner {
     }
     this.maybeReport()
 
-    let providerPermit: ProviderPermit | undefined
+    const providerHold: ProviderHold = { permit: undefined, providerID: undefined }
     try {
       const titlePhase = opts.phase ?? this.ambientPhase()
       const requestedAgent = opts.agent ?? this.defaultAgent
@@ -595,6 +601,9 @@ export class AgentRunner {
           const candidate = await this.routeAroundQuarantine(failoverContext)
           if (candidate === undefined) throw this.quarantineFailure(model)
           activeModel = candidate.model
+          // The model actually used is B, not the original A: ladder keys,
+          // dead-provider exclusion, and failover.from must follow B.
+          failoverContext.dead = { ...candidate.model }
           routedFrom = model
           routedReason =
             `provider ${model.providerID} is quarantined after a quota failure — routed to ` +
@@ -604,18 +613,12 @@ export class AgentRunner {
       }
       // Provider concurrency: AFTER the run semaphore (already held) and AFTER
       // model resolution / quarantine routing, BEFORE sessions.create. One
-      // permit per child; failover keeps this hold (never nested). Unconfigured
-      // providers skip both the instance semaphore and the machine slot dir.
-      const providerID = activeModel?.providerID
-      const providerCap = providerID !== undefined ? this.providerConcurrency?.[providerID] : undefined
-      if (
-        this.providerLimiter !== undefined &&
-        providerID !== undefined &&
-        typeof providerCap === "number" &&
-        providerCap >= 1
-      ) {
-        providerPermit = await this.providerLimiter.acquire(providerID, providerCap, this.signal)
-      }
+      // permit per child. Mid-flight failover that switches providers releases
+      // the dead permit FIRST, then acquires the fallback (never nested, never
+      // two provider permits). Unconfigured providers skip both the instance
+      // semaphore and the machine slot dir.
+      providerHold.providerID = activeModel?.providerID
+      providerHold.permit = await this.acquireConfiguredPermit(providerHold.providerID, abortSignal)
       for (let attempt = 0; ; attempt++) {
         try {
           if (attempt === 0) {
@@ -675,7 +678,7 @@ export class AgentRunner {
           // same-provider retry, ever. Fail over on the SAME session instead.
           if (err.failure?.class === "quota") {
             const failedOver = failoverOn
-              ? await this.tryFailover(err, "quota", failoverContext, continuedSessionID)
+              ? await this.tryFailover(err, "quota", failoverContext, continuedSessionID, providerHold)
               : undefined
             if (failedOver !== undefined) {
               result = failedOver
@@ -689,7 +692,7 @@ export class AgentRunner {
             const promoted = promoteQuotaFailure(err)
             this.reportProviderFailure(activeModel, promoted.failure)
             const failedOver = failoverOn
-              ? await this.tryFailover(promoted, "quota", failoverContext, continuedSessionID)
+              ? await this.tryFailover(promoted, "quota", failoverContext, continuedSessionID, providerHold)
               : undefined
             if (failedOver !== undefined) {
               result = failedOver
@@ -706,7 +709,7 @@ export class AgentRunner {
             // The ordered fallback ladder is the last resort before the typed
             // error surfaces; unclassified failures stay fail-closed.
             if (err.failure?.class === "burst" && failoverOn) {
-              const failedOver = await this.tryFailover(err, "burst", failoverContext, continuedSessionID)
+              const failedOver = await this.tryFailover(err, "burst", failoverContext, continuedSessionID, providerHold)
               if (failedOver !== undefined) {
                 result = failedOver
                 break
@@ -764,9 +767,9 @@ export class AgentRunner {
       this.maybeReport(true)
       throw err
     } finally {
-      if (providerPermit !== undefined) {
+      if (providerHold.permit !== undefined) {
         try {
-          await providerPermit.release()
+          await providerHold.permit.release()
         } catch {
           // slot release is best-effort; the instance permit must still drop
         }
@@ -797,6 +800,7 @@ export class AgentRunner {
     failureClass: "quota" | "burst",
     context: FailoverContext,
     sessionID: string | undefined,
+    hold: ProviderHold,
   ): Promise<AgentResult | undefined> {
     const continueFn = this.driver.continueAgent
     if (sessionID === undefined || continueFn === undefined || context.dead === undefined) return undefined
@@ -826,6 +830,10 @@ export class AgentRunner {
         `${context.phase} — ${context.label ?? context.recordID} failover ${index + 1}/${eligible.length} (${failureClass}): ` +
           `${from.providerID}/${from.id} → ${candidate.model.providerID}/${candidate.model.id} [${candidate.source}]`,
       )
+      // Permit swap BEFORE the continuation: never hold the dead provider and
+      // the fallback at once. Release-then-acquire is abort-aware; a thrown
+      // abort leaves nothing held.
+      await this.swapProviderPermit(hold, candidate.model.providerID, signal)
       try {
         const continued = await continueFn.call(
           this.driver,
@@ -842,10 +850,7 @@ export class AgentRunner {
           failover: {
             from,
             to: { ...candidate.model },
-            // Always quota-shaped: quota itself, or a burst budget exhausted
-            // after the same-model probes (the observed 0-token death shape is
-            // promoted upstream). The reason names the real provider signal.
-            class: "quota",
+            class: failureClass,
             reason: `provider ${failureClass} failure on ${from.providerID}/${from.id}: ${lastReason}`.slice(0, 300),
           },
         }
@@ -868,6 +873,44 @@ export class AgentRunner {
       }
     }
     return undefined
+  }
+
+  /** Configured providerConcurrency cap for a provider, or undefined if unconfigured. */
+  private permitCap(providerID: string | undefined): number | undefined {
+    if (providerID === undefined) return undefined
+    const cap = this.providerConcurrency?.[providerID]
+    return typeof cap === "number" && cap >= 1 ? cap : undefined
+  }
+
+  private async acquireConfiguredPermit(
+    providerID: string | undefined,
+    signal: AbortSignal,
+  ): Promise<ProviderPermit | undefined> {
+    const cap = this.permitCap(providerID)
+    if (this.providerLimiter === undefined || providerID === undefined || cap === undefined) return undefined
+    return await this.providerLimiter.acquire(providerID, cap, signal)
+  }
+
+  /**
+   * Move a child's provider permit to `toProvider`: release the currently held
+   * permit FIRST, then acquire the fallback. Never holds two provider permits
+   * (deadlock-free). Same-provider continues keep the existing hold. An abort
+   * during acquire leaves nothing held and surfaces as AgentCallError("abort").
+   */
+  private async swapProviderPermit(hold: ProviderHold, toProvider: string | undefined, signal: AbortSignal): Promise<void> {
+    const toCap = this.permitCap(toProvider)
+    if (hold.providerID === toProvider && (hold.permit !== undefined) === (toCap !== undefined)) return
+    if (hold.permit !== undefined) {
+      try {
+        await hold.permit.release()
+      } catch {
+        // best-effort; must not keep a stale permit while acquiring the next
+      }
+      hold.permit = undefined
+    }
+    hold.providerID = toProvider
+    if (toCap === undefined) return
+    hold.permit = await this.acquireConfiguredPermit(toProvider, signal)
   }
 
   /**

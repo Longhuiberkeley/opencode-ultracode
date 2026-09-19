@@ -639,13 +639,13 @@ export interface AgentResult {
    * spawned on (provider quota failover): the spawn model, the model that
    * actually finished, and why. Informational — the registry row keeps
    * spawnModel (intended) and effectiveModel (what ran) alongside it. `class`
-   * is always "quota": a burst-exhausted failover is recorded through the same
-   * quota-shaped routing constraint.
+   * is the triggering failure class: `"quota"` for quota/quarantine routing,
+   * `"burst"` when the same-model burst budget was exhausted and the ladder ran.
    */
   failover?: {
     from: ModelRef
     to: ModelRef
-    class: "quota"
+    class: "quota" | "burst"
     reason: string
   }
 }

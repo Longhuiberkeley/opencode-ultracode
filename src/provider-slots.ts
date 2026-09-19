@@ -21,10 +21,11 @@
  * under-admission. Heartbeat 10 s vs stale 30 s keeps a live holder well
  * inside the window, so the observed failure mode is under-admission.
  */
-import { mkdir, rm, stat, utimes, writeFile } from "node:fs/promises"
+import { mkdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { delayAbortable, Semaphore } from "./primitives.ts"
+import { AgentCallError } from "./sessions.ts"
 
 export const PROVIDER_SLOT_HEARTBEAT_MS = 10_000
 export const PROVIDER_SLOT_STALE_MS = 30_000
@@ -68,8 +69,8 @@ function slotWaitMs(rand: () => number): number {
   return PROVIDER_SLOT_WAIT_MIN_MS + Math.floor(rand() * (span + 1))
 }
 
-function abortError(): Error {
-  return new Error("run stopping")
+function abortError(): AgentCallError {
+  return new AgentCallError("abort", "agent aborted: run stopping")
 }
 
 export interface ProviderPermit {
@@ -104,22 +105,22 @@ export class ProviderSlotHold {
   readonly providerID: string
   readonly index: number
   private readonly heartbeatMs: number
+  private readonly pid: number
   private timer: ReturnType<typeof setInterval> | undefined
   private released = false
 
-  constructor(dir: string, providerID: string, index: number, heartbeatMs: number) {
+  constructor(dir: string, providerID: string, index: number, heartbeatMs: number, pid: number) {
     this.dir = dir
     this.providerID = providerID
     this.index = index
     this.heartbeatMs = heartbeatMs
+    this.pid = pid
   }
 
   startHeartbeat(): void {
     if (this.heartbeatMs <= 0 || this.timer !== undefined) return
     this.timer = setInterval(() => {
-      void utimes(this.dir, new Date(), new Date()).catch(() => {
-        // Best-effort: a vanished dir means we were reclaimed; next release is a no-op.
-      })
+      void this.touchIfOwned()
     }, this.heartbeatMs)
   }
 
@@ -136,7 +137,28 @@ export class ProviderSlotHold {
     if (this.released) return
     this.released = true
     this.stopHeartbeat()
+    // Only remove the dir when hold.json still names our pid: a stale reclaim
+    // may have handed this path to another process, and deleting it would
+    // drop the NEW holder's lock. Foreign pid (or unreadable metadata) → skip.
+    if (!(await this.isOwned())) return
     await rm(this.dir, { recursive: true, force: true })
+  }
+
+  private async touchIfOwned(): Promise<void> {
+    if (!(await this.isOwned())) return
+    await utimes(this.dir, new Date(), new Date()).catch(() => {
+      // Vanished dir or lost the race with a reclaim; next release checks pid.
+    })
+  }
+
+  private async isOwned(): Promise<boolean> {
+    try {
+      const raw = await readFile(path.join(this.dir, "hold.json"), "utf8")
+      const parsed = JSON.parse(raw) as { pid?: unknown }
+      return parsed.pid === this.pid
+    } catch {
+      return false
+    }
   }
 
   private stopHeartbeat(): void {
@@ -195,7 +217,7 @@ export class ProviderSlotPool {
     const slotDir = path.join(this.baseDir, providerID, `slot-${index}`)
     const owned = await this.mkdirExclusive(slotDir)
     if (!owned) return undefined
-    const hold = new ProviderSlotHold(slotDir, providerID, index, this.heartbeatMs)
+    const hold = new ProviderSlotHold(slotDir, providerID, index, this.heartbeatMs, this.pid)
     try {
       await writeFile(
         path.join(slotDir, "hold.json"),
@@ -219,6 +241,9 @@ export class ProviderSlotPool {
     } catch (err) {
       if (errCode(err) !== "EEXIST") throw err
     }
+    if (!(await this.isStale(slotDir))) return false
+    // Re-verify immediately prior to rm: a concurrent reclaim can refresh
+    // mtime in the isStale→rm window and we must not steal a live holder.
     if (!(await this.isStale(slotDir))) return false
     await rm(slotDir, { recursive: true, force: true })
     try {

@@ -375,6 +375,53 @@ test("ask mode: askTimeoutMs > 0 auto-resumes in auto-mode policy after the time
   assert.deepEqual(ctx.sessions.switches.map((s) => `${s.model.providerID}/${s.model.id}`), ["google/gemini-3.7-flash"])
 })
 
+test("ask mode: burst throttle does not pause the run", async () => {
+  const ctx = makeSupervisor({ failover: "ask", agentRetryAttempts: 2, agentRetryBackoffMs: 0 })
+  // Token growth on continues so they stay burst-class (0-token re-failures
+  // promote to quota, which WOULD pause). Three strikes engage the throttle.
+  const burstWork = {
+    ...BURST_REPLY,
+    tokens: { input: 5, output: 2, reasoning: 0, cache: { read: 0, write: 0 } },
+  }
+  ctx.sessions.push(BURST_REPLY)
+  ctx.sessions.push(burstWork)
+  ctx.sessions.push({
+    ...burstWork,
+    tokens: { input: 10, output: 4, reasoning: 0, cache: { read: 0, write: 0 } },
+  })
+  const { runID, done } = ctx.supervisor.startDetached(
+    { script: `await agent("one", { model: "xai/grok-4.6" }); return "nope"` },
+    ctx.parent,
+  )
+  const outcome = await done
+  assert.equal(outcome.envelope.status, "failed")
+  assert.notEqual(ctx.registry.get(runID)?.status, "paused")
+  assert.equal(ctx.reports.some((r) => r.includes("provider ask —")), false)
+})
+
+test("ask mode: explore-agent child in autoEditsWorkflow gets a proposal", async () => {
+  const ctx = makeSupervisor({
+    failover: "ask",
+    permissions: "autoEditsWorkflow",
+    modelFallbacks: { "xai/grok-4.6": ["google/gemini-3.7-flash"] },
+  })
+  ctx.sessions.push(QUOTA_REPLY)
+  ctx.sessions.push(ok("RECOVERED", "google", "gemini-3.7-flash"))
+  const { runID, done } = ctx.supervisor.startDetached(
+    {
+      script: `const r = await agent("one", { agent: "explore", model: "xai/grok-4.6", label: "scout" }); return r.text;`,
+    },
+    ctx.parent,
+  )
+  await waitFor(() => ctx.reports.some((r) => r.includes("provider ask —")), "ask report")
+  const asks = ctx.reports.filter((r) => r.includes("provider ask —"))
+  assert.equal(asks.length, 1)
+  assert.match(asks[0]!, /proposed fallback: google\/gemini-3.7-flash/)
+  assert.equal(ctx.supervisor.resume(runID), true)
+  const outcome = await done
+  assert.equal(outcome.envelope.status, "succeeded", outcome.run.error ?? "")
+})
+
 test("ask mode: off-mode-like auto runs never pause; failover off fails typed without switching", async () => {
   // auto (default): no ask pause for the same failure.
   const auto = makeSupervisor({ modelFallbacks: { "xai/grok-4.6": ["google/gemini-3.7-flash"] } })

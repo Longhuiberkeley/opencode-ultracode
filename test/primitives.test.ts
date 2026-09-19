@@ -1181,7 +1181,7 @@ test("AgentRunner failover: burst budget exhausted fails over on the same sessio
   })
   const res = await runner.call("go", { model: { providerID: "xai", id: "grok-4.6" } })
   assert.equal(res.text, "burst recovered")
-  assert.equal(res.failover?.class, "quota")
+  assert.equal(res.failover?.class, "burst")
   assert.match(res.failover?.reason ?? "", /burst/)
   assert.deepEqual(
     fake.switches.map((s) => `${s.model.providerID}/${s.model.id}`),
@@ -1421,4 +1421,173 @@ test("AgentRunner breaker: admission is consulted once and classified failures a
   const otherRun = makeRunner({ driver: createSessionDriver(otherFake), providerHealth: health, retryAttempts: 0 })
   await assert.rejects(otherRun.runner.call("o", { model: { providerID: "xai", id: "grok-4.6" } }))
   assert.equal(reported.length, 2)
+})
+
+test("AgentRunner breaker: quarantine routing refreshes dead so the next quota ladder keys on B", async () => {
+  const fake = fakeFailoverSession([
+    quotaReply(),
+    { text: "on C", model: { providerID: "anthropic", id: "claude-x" } },
+  ])
+  const { runner } = makeRunner({
+    driver: createSessionDriver(fake),
+    providerHealth: quarantinedXai(),
+    modelFallbacks: {
+      "xai/grok-4.6": ["google/gemini-3.7-flash"],
+      "google/gemini-3.7-flash": ["google/gemini-other", "anthropic/claude-x"],
+    },
+    retryAttempts: 0,
+  })
+  const res = await runner.call("routed then dies", { model: { providerID: "xai", id: "grok-4.6" } })
+  assert.equal(res.text, "on C")
+  assert.equal(res.failover?.from.providerID, "google", "ladder keys on B, the model that actually died")
+  assert.equal(res.failover?.from.id, "gemini-3.7-flash")
+  assert.equal(res.failover?.to.providerID, "anthropic")
+  assert.equal(res.failover?.to.id, "claude-x")
+  assert.equal(fake.createdModels[0]?.providerID, "google")
+  assert.deepEqual(
+    fake.switches.map((s) => `${s.model.providerID}/${s.model.id}`),
+    ["anthropic/claude-x"],
+    "B's provider is excluded; google/gemini-other must not be attempted",
+  )
+})
+
+test("agent runner: abort during queued breaker admission records interrupted", async () => {
+  const ctrl = new AbortController()
+  const health: ProviderHealth = {
+    isQuarantined: () => false,
+    quarantinedUntil: () => undefined,
+    isThrottled: () => true,
+    admit: async (_id, signal) => {
+      await delayAbortable(60_000, signal)
+    },
+    report: () => {},
+  }
+  const { runner, run, registry } = makeRunner({
+    providerHealth: health,
+    signal: ctrl.signal,
+  })
+  const pending = runner.call("queued-admit", { model: { providerID: "xai", id: "grok-4.6" } })
+  await tick()
+  ctrl.abort()
+  await assert.rejects(pending, (err: unknown) => err instanceof AgentCallError && err.kind === "abort")
+  assert.equal(registry.getAgent(run.id, "a1")!.status, "interrupted")
+})
+
+test("agent runner: abort during slot wait records interrupted", async () => {
+  const ctrl = new AbortController()
+  let held = 0
+  const limiter: ProviderLimiter = {
+    async acquire(_providerID, _cap, signal) {
+      if (held >= 1) {
+        await new Promise<void>((_resolve, reject) => {
+          const onAbort = () => reject(new AgentCallError("abort", "agent aborted: run stopping"))
+          if (signal?.aborted) {
+            onAbort()
+            return
+          }
+          signal?.addEventListener("abort", onAbort, { once: true })
+        })
+      }
+      held++
+      return {
+        release: async () => {
+          held--
+        },
+      }
+    },
+  }
+  const { runner, run, registry, calls } = makeRunner({
+    signal: ctrl.signal,
+    providerLimiter: limiter,
+    providerConcurrency: { xai: 1 },
+  })
+  const first = runner.call("holder", { model: { providerID: "xai", id: "grok-4.6" } })
+  await tick()
+  assert.equal(calls.length, 1)
+  const second = runner.call("waiter", { model: { providerID: "xai", id: "grok-4.6" } })
+  await tick()
+  ctrl.abort()
+  await assert.rejects(second, (err: unknown) => err instanceof AgentCallError && err.kind === "abort")
+  assert.equal(registry.getAgent(run.id, "a2")!.status, "interrupted")
+  calls[0]!.hooks.onSessionID("ses_hold")
+  calls[0]!.resolve(okResult("ses_hold"))
+  await first
+  assert.equal(held, 0)
+})
+
+test("AgentRunner failover: swapping providers releases A's slot and holds B's", async () => {
+  const held = new Map<string, number>()
+  const limiter: ProviderLimiter = {
+    async acquire(providerID) {
+      held.set(providerID, (held.get(providerID) ?? 0) + 1)
+      return {
+        release: async () => {
+          const n = held.get(providerID) ?? 0
+          if (n <= 1) held.delete(providerID)
+          else held.set(providerID, n - 1)
+        },
+      }
+    },
+  }
+  const { runner, calls } = makeRunner({
+    providerLimiter: limiter,
+    providerConcurrency: { xai: 1, google: 1 },
+    modelFallbacks: { "xai/grok-4.6": ["google/gemini-3.7-flash"] },
+    retryAttempts: 0,
+  })
+  const pending = runner.call("go", { model: { providerID: "xai", id: "grok-4.6" } })
+  await tick()
+  assert.equal(held.get("xai"), 1)
+  calls[0]!.hooks.onSessionID("ses_1")
+  calls[0]!.reject(
+    new AgentCallError("outcome", "quota", "", { class: "quota", reason: "quota marker" }),
+  )
+  await tick()
+  assert.equal(calls.length, 2)
+  assert.equal(calls[1]!.kind, "continue")
+  assert.equal(held.get("xai"), undefined, "dead provider's slot is released before the fallback runs")
+  assert.equal(held.get("google"), 1, "fallback provider's slot is held")
+  calls[1]!.resolve(okResult("ses_1"))
+  const res = await pending
+  assert.equal(res.failover?.from.providerID, "xai")
+  assert.equal(res.failover?.to.providerID, "google")
+  assert.equal(held.size, 0)
+})
+
+test("AgentRunner failover: abort during permit swap leaves no partial holds", async () => {
+  const ctrl = new AbortController()
+  const held = new Map<string, number>()
+  const limiter: ProviderLimiter = {
+    async acquire(providerID, _cap, signal) {
+      if (providerID === "google") {
+        await delayAbortable(60_000, signal)
+      }
+      held.set(providerID, (held.get(providerID) ?? 0) + 1)
+      return {
+        release: async () => {
+          const n = held.get(providerID) ?? 0
+          if (n <= 1) held.delete(providerID)
+          else held.set(providerID, n - 1)
+        },
+      }
+    },
+  }
+  const { runner, calls, run, registry } = makeRunner({
+    signal: ctrl.signal,
+    providerLimiter: limiter,
+    providerConcurrency: { xai: 1, google: 1 },
+    modelFallbacks: { "xai/grok-4.6": ["google/gemini-3.7-flash"] },
+    retryAttempts: 0,
+  })
+  const pending = runner.call("go", { model: { providerID: "xai", id: "grok-4.6" } })
+  await tick()
+  calls[0]!.hooks.onSessionID("ses_1")
+  calls[0]!.reject(new AgentCallError("outcome", "quota", "", { class: "quota", reason: "quota" }))
+  await tick(20)
+  assert.equal(held.get("xai"), undefined, "A released before B's acquire")
+  assert.equal(held.get("google"), undefined, "B not yet acquired")
+  ctrl.abort()
+  await assert.rejects(pending, (err: unknown) => err instanceof AgentCallError && err.kind === "abort")
+  assert.equal(registry.getAgent(run.id, "a1")!.status, "interrupted")
+  assert.equal(held.size, 0, "run stop during the swap leaves no partial holds")
 })

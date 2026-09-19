@@ -3,7 +3,8 @@
  */
 import test from "node:test"
 import assert from "node:assert/strict"
-import { mkdtemp, readdir, readFile, rm, stat, utimes } from "node:fs/promises"
+import { utimesSync } from "node:fs"
+import { mkdtemp, readdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import {
@@ -157,6 +158,67 @@ test("gate: cap 1 serializes two acquires; abort of waiter holds nothing extra",
     await second.release()
     assert.equal(gate.running("anthropic"), 0)
     assert.deepEqual(await listSlots(dir, "anthropic"), [])
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("machine slot: release after foreign re-claim does not delete the foreign dir", async () => {
+  const dir = await tempSlotsDir()
+  try {
+    const pool = new ProviderSlotPool({ baseDir: dir, heartbeatMs: 0, pid: 111 })
+    const hold = await pool.claim("anthropic", 1)
+    await writeFile(path.join(hold.dir, "hold.json"), JSON.stringify({ pid: 222, claimedAt: Date.now() }))
+    await hold.release()
+    assert.deepEqual(await listSlots(dir, "anthropic"), ["slot-0"])
+    const meta = JSON.parse(await readFile(path.join(hold.dir, "hold.json"), "utf8")) as { pid: number }
+    assert.equal(meta.pid, 222)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("machine slot: stale reclaim does not steal a dir whose mtime was just refreshed", async () => {
+  const dir = await tempSlotsDir()
+  try {
+    const clock = { t: 1_000 }
+    const holder = new ProviderSlotPool({
+      baseDir: dir,
+      heartbeatMs: 0,
+      staleMs: 100,
+      now: () => clock.t,
+      pid: 1,
+    })
+    const live = await holder.claim("xai", 1)
+    const past = new Date(800)
+    await utimes(live.dir, past, past)
+    let nowCalls = 0
+    const racing = new ProviderSlotPool({
+      baseDir: dir,
+      heartbeatMs: 0,
+      staleMs: 100,
+      pid: 2,
+      now: () => {
+        nowCalls++
+        if (nowCalls === 1) {
+          queueMicrotask(() => {
+            const fresh = new Date(950)
+            utimesSync(live.dir, fresh, fresh)
+          })
+        }
+        return clock.t
+      },
+      rand: () => 0,
+    })
+    const ctrl = new AbortController()
+    const claiming = racing.claim("xai", 1, ctrl.signal)
+    await tick(40)
+    ctrl.abort()
+    await assert.rejects(claiming, /run stopping/)
+    assert.deepEqual(await listSlots(dir, "xai"), ["slot-0"])
+    const meta = JSON.parse(await readFile(path.join(live.dir, "hold.json"), "utf8")) as { pid: number }
+    assert.equal(meta.pid, 1, "the refreshed dir must not have been reclaimed")
+    await live.release()
   } finally {
     await rm(dir, { recursive: true, force: true })
   }

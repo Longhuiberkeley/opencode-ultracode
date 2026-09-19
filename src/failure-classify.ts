@@ -112,16 +112,9 @@ export function classifyFailure(error?: ContextMessageError, text?: string): Fai
 
   // Reset parsing is deliberately scoped: assistant prose can contain
   // unrelated dates (a workflow about dates, for example), so a timestamp is
-  // trusted only when reset-shaped wording precedes it, when the text is
-  // otherwise quota-shaped, or when the structured provider error names it.
-  // A stray date must never quarantine a healthy provider.
-  let parsedReset = findContextualReset(freeText, now)
-  if (parsedReset === undefined && (quotaMarker !== undefined || RESET_KEYWORD.test(freeText))) {
-    parsedReset = firstTimestamp(freeText, now)
-  }
-  if (parsedReset === undefined && structuredMessage.length > 0) {
-    parsedReset = firstTimestamp(structuredMessage, now)
-  }
+  // trusted only when reset-shaped wording precedes it. A stray date — even
+  // next to a quota marker — must never quarantine a healthy provider.
+  const parsedReset = findContextualReset(haystack, now)
 
   let resetAt: number | undefined
   let resetIgnored = false

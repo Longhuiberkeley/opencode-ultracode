@@ -45,7 +45,7 @@ import {
   storageWorkflowLoader,
 } from "./primitives.ts"
 import type { WarmCacheEntry, WorkflowLoader } from "./primitives.ts"
-import { resolveFallbacks } from "./failover.ts"
+import { isReadOnlyChild, resolveFallbacks } from "./failover.ts"
 import type { PinPoolEntry } from "./failover.ts"
 import { defaultProviderSlotsDir, ProviderConcurrencyGate, ProviderSlotPool } from "./provider-slots.ts"
 import { validateScriptSource } from "./worker-script.ts"
@@ -1251,17 +1251,20 @@ export class SupervisorImpl implements Supervisor {
   // -------------------------------------------------------------------------
 
   /**
-   * Breaker event hook. Ask mode only: when a provider crosses into
-   * quarantine (or its burst throttle engages) and an active run has children
-   * on it, pause that run through the existing pause machinery (watchdog
+   * Breaker event hook. Ask mode only: when a provider is QUOTA-quarantined
+   * and an active run has pending/at-risk children that would actually fail
+   * over, pause that run through the existing pause machinery (watchdog
    * suspended — paused runs do not burn timeoutMs) and emit ONE coalesced
    * report per (run, provider, kind): provider, class, reset time, affected
-   * child count, proposed fallback and the exact resume invocation. Children
+   * child count, proposed fallback and the exact resume invocation. Burst
+   * throttle never pauses — it throttles admission only; burst children same-
+   * model-retry with backoff and make progress under auto policy. Children
    * already inside a failover park in the driver's pause gate until the run is
    * resumed, so the ask really does gate the failover. "off"/"auto" modes
    * never take this path.
    */
   private handleProviderEvent(event: ProviderBreakerEvent): void {
+    if (event.kind !== "quota") return // burst throttle admits; it does not pause
     for (const state of [...this.runs.values()]) {
       if (state.effective.failover !== "ask") continue
       const key = `${event.kind}:${event.providerID}`
@@ -1288,6 +1291,27 @@ export class SupervisorImpl implements Supervisor {
       if (model?.providerID === providerID) count++
     }
     return count
+  }
+
+  /**
+   * Requested agent id for the ask-mode proposal, matching the runner's
+   * isReadOnlyChild rule (noEditTools OR the explore agent). Prefers an
+   * at-risk child on `dead` that is already read-only so explore children in
+   * non-noEditTools runs still unlock catalog/down-tier proposals.
+   */
+  private affectedRequestedAgent(state: RunState, dead: ModelRef): string {
+    const fallback = state.effective.agent
+    const run = this.registry.get(state.runID)
+    if (!run) return fallback
+    let requested = fallback
+    for (const agent of run.agents as AgentRecord[]) {
+      if (agent.status !== "running" && agent.status !== "pending") continue
+      const model = agent.effectiveModel ?? agent.spawnModel
+      if (model?.providerID !== dead.providerID || model?.id !== dead.id) continue
+      requested = agent.requestedAgent ?? requested
+      if (isReadOnlyChild(state.effective.permissions, requested)) return requested
+    }
+    return requested
   }
 
   /**
@@ -1351,7 +1375,7 @@ export class SupervisorImpl implements Supervisor {
       modelFallbacks: state.effective.modelFallbacks,
       pinPool,
       ...(disabledProviders !== undefined ? { disabledProviders } : {}),
-      readOnly: state.effective.permissions === "noEditTools",
+      readOnly: isReadOnlyChild(state.effective.permissions, this.affectedRequestedAgent(state, dead)),
     })
     return candidates.find((candidate) => !this.providerHealth.isQuarantined(candidate.model.providerID))?.model
   }

@@ -244,6 +244,7 @@ test("resolveFallbacks: the run-level override sits after per-call fallbacks and
 test("isReadOnlyChild: noEditTools mode or the explore agent", () => {
   assert.equal(isReadOnlyChild("noEditTools", "general"), true)
   assert.equal(isReadOnlyChild("ask", "explore"), true)
+  assert.equal(isReadOnlyChild("autoEditsWorkflow", "explore"), true)
   assert.equal(isReadOnlyChild("ask", "general"), false)
   assert.equal(isReadOnlyChild("autoEditsWorkflow", "build"), false)
   assert.equal(isReadOnlyChild(undefined, "general"), false)
