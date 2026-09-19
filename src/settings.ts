@@ -90,25 +90,32 @@ export function applyOverlay(
   if (overlay.maxAgents !== undefined) next.maxAgents = overlay.maxAgents
   if (overlay.timeoutMs !== undefined) next.timeoutMs = overlay.timeoutMs
   if (overlay.permissions !== undefined) next.permissions = overlay.permissions
-  // Remembered failover entries: the overlay map replaces the option map (it
-  // is the persisted, user-approved state — never a partial merge).
-  if (overlay.modelFallbacks !== undefined) next.modelFallbacks = { ...overlay.modelFallbacks }
+  // Overlay keys win; plugin keys the overlay does not mention stay. Replacing
+  // the whole map would drop every other opencode.json ladder key the first
+  // time `remember: true` writes a one-key overlay.
+  if (overlay.modelFallbacks !== undefined) {
+    next.modelFallbacks = { ...base.modelFallbacks, ...overlay.modelFallbacks }
+  }
   return next
 }
 
 /**
  * Persist one remembered fallback entry into an overlay (ask-mode resume with
  * `remember: true`): the chosen pin becomes the FIRST rung for the dead model's
- * key, preserving existing rungs (deduped). Pure; never touches agent pin
- * files — the caller saves the overlay through the settings path `/ultracode
- * set` uses.
+ * key, preserving existing rungs (deduped). Seeds from the plugin option map
+ * first so a first remember cannot drop other opencode.json ladder keys, then
+ * overlay rungs (overlay wins per key). Pure; never touches agent pin files —
+ * the caller saves the overlay through the settings path `/ultracode set` uses.
  */
 export function rememberModelFallback(
   overlay: SettingsOverlay,
   key: string,
   pin: string,
+  pluginFallbacks?: Readonly<Record<string, readonly string[]>>,
 ): SettingsOverlay {
-  const current = { ...(overlay.modelFallbacks ?? {}) }
+  const current: Record<string, string[]> = {}
+  for (const [k, v] of Object.entries(pluginFallbacks ?? {})) current[k] = [...v]
+  for (const [k, v] of Object.entries(overlay.modelFallbacks ?? {})) current[k] = [...v]
   const existing = current[key] ?? []
   current[key] = [pin, ...existing.filter((p) => p !== pin)]
   return { ...overlay, modelFallbacks: current }

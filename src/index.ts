@@ -881,7 +881,7 @@ export default Plugin.define({
       if (key === undefined) {
         return { ok: false, error: "no quarantined provider recorded for this run — nothing to key the remembered fallback to" }
       }
-      const next = rememberModelFallback(overlay, key, input.pin)
+      const next = rememberModelFallback(overlay, key, input.pin, options.modelFallbacks)
       storage.saveSettingsOverlay(next)
       refreshDefaults(next)
       return { ok: true, key }

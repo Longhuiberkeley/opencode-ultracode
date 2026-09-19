@@ -326,6 +326,44 @@ test("rememberModelFallback: the chosen pin becomes the first rung, existing run
   assert.deepEqual(withPanel.modelFallbacks, { "a/m": ["b/n"] })
 })
 
+test("rememberModelFallback: first remember copies plugin ladder keys so applyOverlay cannot drop them", () => {
+  const plugin = {
+    "xai/a": ["google/g"],
+    "openai/c": ["anthropic/claude"],
+  }
+  // Overlay starts empty (no prior remember). Seeding from overlay-only would
+  // persist `{ xai/a: [chosen] }` and wipe openai/c on applyOverlay replace.
+  const overlay = rememberModelFallback({}, "xai/a", "chosen/m", plugin)
+  assert.deepEqual(overlay.modelFallbacks, {
+    "xai/a": ["chosen/m", "google/g"],
+    "openai/c": ["anthropic/claude"],
+  })
+  const applied = applyOverlay({ ...DEFAULT_OPTIONS, modelFallbacks: plugin }, overlay)
+  assert.deepEqual(applied.modelFallbacks, {
+    "xai/a": ["chosen/m", "google/g"],
+    "openai/c": ["anthropic/claude"],
+  })
+})
+
+test("applyOverlay: overlay modelFallbacks merge per key, do not replace the plugin map", () => {
+  const base = {
+    ...DEFAULT_OPTIONS,
+    modelFallbacks: {
+      "xai/a": ["google/g"],
+      "openai/c": ["anthropic/claude"],
+    },
+  }
+  const merged = applyOverlay(base, { modelFallbacks: { "xai/a": ["chosen/m"] } })
+  assert.deepEqual(merged.modelFallbacks, {
+    "xai/a": ["chosen/m"],
+    "openai/c": ["anthropic/claude"],
+  })
+  assert.deepEqual(base.modelFallbacks, {
+    "xai/a": ["google/g"],
+    "openai/c": ["anthropic/claude"],
+  })
+})
+
 test("remembered modelFallbacks survive the KV overlay round-trip and reach the next run's options", () => {
   const storage = new FakeStorage()
   storage.saveSettingsOverlay(rememberModelFallback({ concurrency: 4 }, "xai/grok-4.6", "openai/gpt-6"))
