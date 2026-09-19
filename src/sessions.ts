@@ -5,8 +5,9 @@
  * Builder B module. Never called from plugin setup() — only from tool/command
  * executors (deadlock rule).
  */
-import type { AgentResult, ContextMessage, Json, SessionCtx, TokenUsage } from "./types.ts"
+import type { AgentResult, ContextMessage, ContextMessageError, Json, SessionCtx, TokenUsage } from "./types.ts"
 import { extractJson, validateJsonSchemaValue } from "./serialize.ts"
+import { classifyFailure, readFailureStatus, type FailureClassification } from "./failure-classify.ts"
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -19,12 +20,20 @@ export class AgentCallError extends Error {
   readonly kind: AgentErrorKind
   /** Assistant text extracted alongside the failure, when any. */
   readonly text?: string
+  /**
+   * Structured provider-failure classification on outcome failures, when the
+   * failed turn exposed an error signal. Retry/failover policy branches on
+   * `.failure.class` instead of re-parsing error strings (see
+   * src/failure-classify.ts).
+   */
+  readonly failure?: FailureClassification
 
-  constructor(kind: AgentErrorKind, message: string, text?: string) {
+  constructor(kind: AgentErrorKind, message: string, text?: string, failure?: FailureClassification) {
     super(message)
     this.name = "AgentCallError"
     this.kind = kind
     this.text = text
+    this.failure = failure
   }
 }
 
@@ -154,6 +163,7 @@ export function createSessionDriver(sessions: SessionCtx, options: SessionDriver
         `agent session outcome "${info.outcome ?? "unknown"}"${detail ? `: ${snippet(detail, snippetChars)}` : ""}` +
           (first.text ? `${detail ? " | " : ": "}${snippet(first.text, snippetChars)}` : ""),
         first.text,
+        classifySessionFailure(info, first.message, first.text),
       )
     }
     const result: AgentResult = {
@@ -248,10 +258,13 @@ export function createSessionDriver(sessions: SessionCtx, options: SessionDriver
     const info = await sessions.get({ sessionID })
     const reply = await readAssistantReply(sessions, sessionID, info.outcome)
     if (info.outcome !== "succeeded") {
+      const detail = describeSessionFailure(info, reply.message)
       throw new AgentCallError(
         "outcome",
-        `agent session outcome "${info.outcome ?? "unknown"}" during schema repair${reply.text ? `: ${snippet(reply.text, snippetChars)}` : ""}`,
+        `agent session outcome "${info.outcome ?? "unknown"}" during schema repair${detail ? `: ${snippet(detail, snippetChars)}` : ""}` +
+          (reply.text ? `${detail ? " | " : ": "}${snippet(reply.text, snippetChars)}` : ""),
         reply.text,
+        classifySessionFailure(info, reply.message, reply.text),
       )
     }
     const second = extractJson(reply.text)
@@ -280,19 +293,25 @@ export function createSessionDriver(sessions: SessionCtx, options: SessionDriver
 
 /**
  * Best-effort failure detail for a non-succeeded outcome: the server-side
- * error text (when exposed) plus any error part on the last message. Empty
- * string when nothing is available — never throws.
+ * error text (when exposed), the structured provider error on the last
+ * message, any error part on that message, and — only when nothing else is
+ * available — the finish reason. Empty string when nothing is available —
+ * never throws.
  */
 export function describeSessionFailure(
   info: { error?: string },
   last: ContextMessage | undefined,
 ): string {
   const parts: string[] = []
-  if (typeof info.error === "string" && info.error.length > 0) parts.push(info.error)
+  const pushUnique = (value: string) => {
+    if (value.length > 0 && !parts.includes(value)) parts.push(value)
+  }
+  if (typeof info.error === "string" && info.error.length > 0) pushUnique(info.error)
+  pushUnique(structuredFailureText(last?.error))
   if (last?.content) {
     for (const part of last.content) {
       if (part.type === "error" && typeof part.text === "string" && part.text.length > 0) {
-        parts.push(part.text)
+        pushUnique(part.text)
         break // one error part is enough signal
       }
     }
@@ -301,6 +320,35 @@ export function describeSessionFailure(
     parts.push(`finish: ${last.finish}`)
   }
   return parts.join(" | ")
+}
+
+/**
+ * Human-readable form of the structured provider error on a failed assistant
+ * message: `message (type, status)`. Empty when nothing usable is present.
+ */
+function structuredFailureText(err: ContextMessageError | undefined): string {
+  if (err === undefined) return ""
+  const message = typeof err.message === "string" ? err.message.trim() : ""
+  const bits: string[] = []
+  if (typeof err.type === "string" && err.type.trim().length > 0) bits.push(err.type.trim())
+  const status = readFailureStatus(err)
+  if (status !== undefined) bits.push(String(status))
+  const suffix = bits.length > 0 ? ` (${bits.join(", ")})` : ""
+  return message.length > 0 ? `${message}${suffix}` : bits.join(", ")
+}
+
+/**
+ * Classify a non-succeeded turn from its structured error plus the failure
+ * detail and assistant text. Never throws; callers branch on `.class`.
+ */
+function classifySessionFailure(
+  info: { error?: string },
+  last: ContextMessage | undefined,
+  text: string,
+): FailureClassification {
+  const detail = describeSessionFailure(info, last)
+  const signal = detail.length > 0 && text.length > 0 ? `${detail}\n${text}` : detail.length > 0 ? detail : text
+  return classifyFailure(last?.error, signal)
 }
 
 function resolveAgent(input: AgentRunInput, availableAgents: string[] | undefined): string {

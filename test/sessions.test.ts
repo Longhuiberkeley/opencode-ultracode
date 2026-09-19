@@ -502,3 +502,111 @@ test("describeSessionFailure: server error text, error parts, finish reason — 
   assert.equal(describeSessionFailure({}, { id: "m", type: "assistant", finish: "length" }), "finish: length")
   assert.equal(describeSessionFailure({}, { id: "m", type: "assistant", finish: "stop" }), "")
 })
+
+test("describeSessionFailure: structured message error is surfaced with type/status", () => {
+  const structured: ContextMessage = {
+    id: "m",
+    type: "assistant",
+    finish: "error",
+    error: { type: "provider.rate-limit", message: "Rate limit reached for requests", status: 429 },
+  }
+  assert.equal(
+    describeSessionFailure({}, structured),
+    "Rate limit reached for requests (provider.rate-limit, 429)",
+  )
+  // Type/status only (no message) still surfaces something usable.
+  assert.equal(
+    describeSessionFailure({}, { id: "m", type: "assistant", error: { type: "provider.rate-limit", status: 429 } }),
+    "provider.rate-limit, 429",
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Structured failure classification on thrown AgentCallError
+// ---------------------------------------------------------------------------
+
+test("runAgent: failed outcome attaches the burst classification", async () => {
+  const { driver } = makeDriver([
+    {
+      text: "",
+      outcome: "failed",
+      finish: "error",
+      failure: { type: "provider.rate-limit", message: "Rate limit reached for requests", status: 429 },
+    },
+  ])
+  await assert.rejects(
+    driver.runAgent(input(), ["general"], hooks()),
+    (err: unknown) => {
+      assert.ok(err instanceof AgentCallError)
+      assert.equal(err.kind, "outcome")
+      assert.equal(err.failure?.class, "burst")
+      assert.equal(err.failure?.status, 429)
+      assert.equal(err.failure?.message, "Rate limit reached for requests")
+      assert.equal(err.failure?.resetAt, undefined)
+      assert.match(err.message, /Rate limit reached for requests/)
+      assert.match(err.message, /provider\.rate-limit/)
+      return true
+    },
+  )
+})
+
+test("runAgent: failed outcome classifies a quota message and surfaces resetAt", async () => {
+  const reset = Date.now() + 5 * 60 * 60_000
+  const stamp = new Date(reset).toISOString().slice(0, 19).replace("T", " ")
+  const { driver } = makeDriver([
+    {
+      text: "",
+      outcome: "failed",
+      finish: "error",
+      failure: {
+        type: "provider.rate-limit",
+        message: `Usage limit reached for 5 hour. Your limit will reset at ${stamp}`,
+        status: 429,
+      },
+    },
+  ])
+  await assert.rejects(
+    driver.runAgent(input(), ["general"], hooks()),
+    (err: unknown) => {
+      assert.ok(err instanceof AgentCallError)
+      assert.equal(err.kind, "outcome")
+      assert.equal(err.failure?.class, "quota")
+      assert.ok(err.failure?.resetAt !== undefined && err.failure.resetAt > Date.now() + 60_000)
+      return true
+    },
+  )
+})
+
+test("runAgent: outcome without an error signal is classified 'other' (no string parsing downstream)", async () => {
+  const { driver } = makeDriver([{ text: "no output", outcome: "failed" }])
+  await assert.rejects(
+    driver.runAgent(input(), ["general"], hooks()),
+    (err: unknown) => {
+      assert.ok(err instanceof AgentCallError)
+      assert.equal(err.failure?.class, "other")
+      return true
+    },
+  )
+})
+
+test("runAgent: schema-repair outcome failure carries the classification too", async () => {
+  const { driver } = makeDriver([
+    { text: "not json at all" },
+    {
+      text: "",
+      outcome: "failed",
+      finish: "error",
+      failure: { type: "provider.rate-limit", message: "Rate limit reached for requests", status: 429 },
+    },
+  ])
+  await assert.rejects(
+    driver.runAgent(input({ schema: SCHEMA }), ["general"], hooks()),
+    (err: unknown) => {
+      assert.ok(err instanceof AgentCallError)
+      assert.equal(err.kind, "outcome")
+      assert.equal(err.failure?.class, "burst")
+      assert.match(err.message, /during schema repair/)
+      return true
+    },
+  )
+})

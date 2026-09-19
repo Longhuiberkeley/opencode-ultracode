@@ -163,6 +163,12 @@ export interface ScriptedReply {
   tokens?: TokenUsage
   /** Throw from prompt/wait instead of replying. */
   error?: Error
+  /**
+   * Structured provider error attached to the assistant message (additive,
+   * Builder classify) — the production signal a failed turn exposes on its
+   * last message (`error: { type, message, status }`).
+   */
+  failure?: { type?: string; message?: string; status?: number }
 }
 
 let sessionCounter = 0
@@ -253,6 +259,7 @@ export class FakeSessionCtx implements SessionCtx {
       content: [{ type: "text", text: reply.text ?? "" }],
       finish: reply.finish ?? "stop",
       tokens: reply.tokens,
+      ...(reply.failure !== undefined ? { error: reply.failure } : {}),
     }
     s.messages.push(assistant)
     s.outcome = reply.outcome ?? "succeeded"

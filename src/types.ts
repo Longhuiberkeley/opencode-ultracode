@@ -1052,6 +1052,19 @@ export interface SessionCtx {
   interrupt(input: { sessionID: string; continue: boolean }): Promise<void>
 }
 
+/**
+ * Structured provider error carried on a failed assistant message. Production
+ * shape observed on rate-limited turns: finish "error" plus
+ * `{ type: "provider.rate-limit", message: "Rate limit reached for requests",
+ * status: 429 }`. Read-only passthrough from the server's message JSON — the
+ * only error signal a failed session exposes (SessionInfo has no error field).
+ */
+export interface ContextMessageError {
+  type?: string
+  message?: string
+  status?: number
+}
+
 /** Verified context message shapes. */
 export interface ContextMessage {
   id: string
@@ -1061,6 +1074,8 @@ export interface ContextMessage {
   model?: { providerID: string; id: string } | null
   content?: ReadonlyArray<{ type: string; text?: string }>
   finish?: string
+  /** Structured provider error on a failed turn (see ContextMessageError). */
+  error?: ContextMessageError
   tokens?: TokenUsage
 }
 
