@@ -4,6 +4,9 @@
  */
 import test from "node:test"
 import assert from "node:assert/strict"
+import { mkdtemp, readdir, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import path from "node:path"
 import { SupervisorImpl } from "../src/supervisor.ts"
 import { RegistryImpl } from "../src/registry.ts"
 import type { Json, ParentContext, RunRecord, SessionCtx, UltracodeOptions } from "../src/types.ts"
@@ -21,6 +24,8 @@ function makeSupervisor(
     isProviderDisabled?: (providerID: string) => Promise<boolean>
     pinPool?: (agentIDs: readonly string[]) => Promise<ReadonlyArray<{ agentID: string; pin: string }>>
     disabledProviders?: () => Promise<ReadonlySet<string>>
+    providerSlotsDir?: string
+    providerSlotHeartbeatMs?: number
   } = {},
 ) {
   const registry = new FakeRegistry()
@@ -1182,4 +1187,143 @@ return { iterations: summary.iterations, stopReason: summary.stopReason }`
   )
   assert.deepEqual(warm.agents.map((a) => a.cached), [true, true], "both iterations replay from the source run")
   assert.equal(ctx.sessions.sessions.size, sessionsAfterFirst, "warm loop replay spawned no new sessions")
+})
+
+async function listProviderSlots(baseDir: string, providerID: string): Promise<string[]> {
+  try {
+    return (await readdir(path.join(baseDir, providerID))).filter((n) => n.startsWith("slot-")).sort()
+  } catch (err) {
+    if (err !== null && typeof err === "object" && "code" in err && (err as { code: unknown }).code === "ENOENT") {
+      return []
+    }
+    throw err
+  }
+}
+
+test("supervisor: two concurrent runs share the instance provider cap", async () => {
+  const slotsDir = await mkdtemp(path.join(tmpdir(), "uc-sup-slots-"))
+  try {
+    const registry = new FakeRegistry()
+    const storage = new FakeStorage()
+    const sessions = new FakeSessionCtx()
+    sessions.hangWait = true
+    sessions.push({ text: "one" }).push({ text: "two" })
+    const supervisor = new SupervisorImpl({
+      registry,
+      storage,
+      sessions,
+      options: {
+        ...DEFAULT_OPTIONS,
+        timeoutMs: 15_000,
+        concurrency: 8,
+        providerConcurrency: { anthropic: 1 },
+      },
+      providerSlotsDir: slotsDir,
+      providerSlotHeartbeatMs: 0,
+      pinForAgent: async () => ({ providerID: "anthropic", id: "claude" }),
+      settleGraceMs: 300,
+      stopKillGraceMs: 80,
+    })
+    const script = `const r = await agent("work"); return { sessionID: r.sessionID };`
+    const a = supervisor.startDetached({ script }, { sessionID: "ses_p1", report: () => {} })
+    const b = supervisor.startDetached({ script }, { sessionID: "ses_p2", report: () => {} })
+    await waitFor(() => sessions.sessions.size === 1, "first child created under cap 1")
+    await tick(80)
+    assert.equal(sessions.sessions.size, 1, "second run must not create a session while the cap is held")
+    assert.deepEqual(await listProviderSlots(slotsDir, "anthropic"), ["slot-0"])
+    sessions.hangWait = false
+    sessions.releaseHangs()
+    const [oa, ob] = await Promise.all([a.done, b.done])
+    assert.equal(oa.envelope.status, "succeeded", oa.envelope.error ?? "run a failed")
+    assert.equal(ob.envelope.status, "succeeded", ob.envelope.error ?? "run b failed")
+    assert.equal(sessions.sessions.size, 2)
+    assert.deepEqual(await listProviderSlots(slotsDir, "anthropic"), [])
+    await supervisor.dispose()
+  } finally {
+    await rm(slotsDir, { recursive: true, force: true })
+  }
+})
+
+test("supervisor: abort of a waiting run releases nothing partially", async () => {
+  const slotsDir = await mkdtemp(path.join(tmpdir(), "uc-sup-abort-"))
+  try {
+    const registry = new FakeRegistry()
+    const storage = new FakeStorage()
+    const sessions = new FakeSessionCtx()
+    sessions.hangWait = true
+    sessions.push({ text: "holder" }).push({ text: "unused" })
+    const supervisor = new SupervisorImpl({
+      registry,
+      storage,
+      sessions,
+      options: {
+        ...DEFAULT_OPTIONS,
+        timeoutMs: 15_000,
+        concurrency: 8,
+        providerConcurrency: { anthropic: 1 },
+      },
+      providerSlotsDir: slotsDir,
+      providerSlotHeartbeatMs: 0,
+      pinForAgent: async () => ({ providerID: "anthropic", id: "claude" }),
+      settleGraceMs: 300,
+      stopKillGraceMs: 80,
+    })
+    const script = `const r = await agent("work"); return { sessionID: r.sessionID };`
+    const holder = supervisor.startDetached({ script }, { sessionID: "ses_hold", report: () => {} })
+    await waitFor(() => sessions.sessions.size === 1, "holder created")
+    const waiter = supervisor.startDetached({ script }, { sessionID: "ses_wait", report: () => {} })
+    await waitFor(() => registry.activeRuns().length === 2, "waiter run active")
+    await tick(80)
+    assert.equal(sessions.sessions.size, 1)
+    assert.deepEqual(await listProviderSlots(slotsDir, "anthropic"), ["slot-0"])
+    assert.equal(supervisor.stop(waiter.runID, "user request"), true)
+    const waited = await waiter.done
+    assert.equal(waited.envelope.status, "stopped")
+    assert.equal(sessions.sessions.size, 1, "stopped waiter must not have created a session")
+    assert.deepEqual(await listProviderSlots(slotsDir, "anthropic"), ["slot-0"])
+    sessions.hangWait = false
+    sessions.releaseHangs()
+    const held = await holder.done
+    assert.equal(held.envelope.status, "succeeded", held.envelope.error ?? "holder failed")
+    assert.deepEqual(await listProviderSlots(slotsDir, "anthropic"), [])
+    await supervisor.dispose()
+  } finally {
+    await rm(slotsDir, { recursive: true, force: true })
+  }
+})
+
+test("supervisor: unconfigured provider does not touch the slots dir", async () => {
+  const tmp = await mkdtemp(path.join(tmpdir(), "uc-sup-unconf-"))
+  const slotsDir = path.join(tmp, "provider-slots")
+  try {
+    const ctx = makeSupervisor(
+      {},
+      {},
+      {
+        providerSlotsDir: slotsDir,
+        pinForAgent: async () => ({ providerID: "anthropic", id: "claude" }),
+      },
+    )
+    ctx.sessions.push({ text: "ok" })
+    const outcome = await ctx.supervisor.start(
+      { script: `return (await agent("x")).text;` },
+      ctx.parent,
+    )
+    assert.equal(outcome.envelope.status, "succeeded", outcome.envelope.error ?? "run failed")
+    assert.equal(outcome.envelope.result, "ok")
+    let names: string[] = []
+    try {
+      names = await readdir(slotsDir)
+    } catch (err) {
+      if (err !== null && typeof err === "object" && "code" in err && (err as { code: unknown }).code === "ENOENT") {
+        names = []
+      } else {
+        throw err
+      }
+    }
+    assert.deepEqual(names, [], "unconfigured provider must not create slot dirs")
+    await ctx.supervisor.dispose()
+  } finally {
+    await rm(tmp, { recursive: true, force: true })
+  }
 })

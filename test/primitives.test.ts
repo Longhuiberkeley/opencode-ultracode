@@ -11,6 +11,7 @@ import type { ProviderHealth } from "../src/types.ts"
 import { compileGraphSpec } from "../src/graph.ts"
 import type { GraphSpec } from "../src/graph.ts"
 import type { AgentRunnerOptions } from "../src/primitives.ts"
+import type { ProviderLimiter, ProviderPermit } from "../src/provider-slots.ts"
 import type { AgentResult } from "../src/types.ts"
 import type { Json, SavedWorkflow, Storage } from "../src/types.ts"
 import type { AgentRunHooks, AgentRunInput, SessionDriver } from "../src/sessions.ts"
@@ -196,6 +197,89 @@ test("agent runner: maxAgents cap rejects with cap message", async () => {
   const res = await first
   assert.equal(res.text, "done")
   void registry
+})
+
+test("agent runner: provider cap serializes after model resolution; released on settle", async () => {
+  let held = 0
+  let maxHeld = 0
+  const waiters: Array<() => void> = []
+  const limiter: ProviderLimiter = {
+    async acquire(_providerID, _cap, signal) {
+      if (held >= 1) {
+        await new Promise<void>((resolve, reject) => {
+          const onAbort = () => {
+            const idx = waiters.indexOf(resolve)
+            if (idx >= 0) waiters.splice(idx, 1)
+            reject(new Error("run stopping"))
+          }
+          if (signal?.aborted) {
+            reject(new Error("run stopping"))
+            return
+          }
+          waiters.push(resolve)
+          signal?.addEventListener("abort", onAbort, { once: true })
+        })
+      }
+      held++
+      maxHeld = Math.max(maxHeld, held)
+      const permit: ProviderPermit = {
+        release: async () => {
+          held--
+          waiters.shift()?.()
+        },
+      }
+      return permit
+    },
+  }
+  const { runner, calls } = makeRunner({
+    concurrency: 4,
+    pinForAgent: async () => ({ providerID: "anthropic", id: "claude" }),
+    providerLimiter: limiter,
+    providerConcurrency: { anthropic: 1 },
+  })
+  const first = runner.call("a")
+  await tick()
+  assert.equal(calls.length, 1, "first child creates after acquiring the provider permit")
+  assert.equal(held, 1)
+  const second = runner.call("b")
+  await tick()
+  assert.equal(calls.length, 1, "second child waits on the provider permit")
+  assert.equal(held, 1)
+  assert.equal(maxHeld, 1)
+
+  calls[0]!.hooks.onSessionID("ses_a")
+  calls[0]!.resolve(okResult("ses_a"))
+  await first
+  await tick()
+  assert.equal(calls.length, 2, "holder settle releases the permit for the queued child")
+  calls[1]!.hooks.onSessionID("ses_b")
+  calls[1]!.resolve(okResult("ses_b"))
+  await second
+  assert.equal(held, 0)
+  assert.equal(maxHeld, 1)
+})
+
+test("agent runner: unconfigured provider never acquires a limiter", async () => {
+  let acquired = 0
+  const limiter: ProviderLimiter = {
+    async acquire() {
+      acquired++
+      return { release: async () => {} }
+    },
+  }
+  const { runner, calls } = makeRunner({
+    pinForAgent: async () => ({ providerID: "anthropic", id: "claude" }),
+    providerLimiter: limiter,
+    providerConcurrency: { openai: 1 }, // different provider — unconfigured for this child
+  })
+  const p = runner.call("x")
+  await tick()
+  assert.equal(calls.length, 1)
+  assert.equal(acquired, 0)
+  calls[0]!.hooks.onSessionID("ses_x")
+  calls[0]!.resolve(okResult("ses_x"))
+  await p
+  assert.equal(acquired, 0)
 })
 
 test("agent runner: ninth call stays queued at configured concurrency 8", async () => {

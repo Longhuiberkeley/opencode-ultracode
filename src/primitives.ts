@@ -24,6 +24,7 @@ import type {
 import { clampConcurrency } from "./types.ts"
 import type { SessionDriver } from "./sessions.ts"
 import { AgentCallError, buildContinuationPrompt } from "./sessions.ts"
+import type { ProviderLimiter, ProviderPermit } from "./provider-slots.ts"
 import type { FailureClassification } from "./failure-classify.ts"
 import { isReadOnlyChild, resolveFallbacks } from "./failover.ts"
 import type { FallbackCandidate, PinPoolEntry } from "./failover.ts"
@@ -266,6 +267,17 @@ export interface AgentRunnerOptions {
   retryBackoffMs?: number
   /** Clock injection for throttle tests. */
   now?: () => number
+  /**
+   * Instance+machine provider concurrency limiter (supervisor-owned, shared
+   * across its runs). Acquired AFTER the run semaphore and AFTER model
+   * resolution, released on settle. Absent => no provider slots.
+   */
+  providerLimiter?: ProviderLimiter
+  /**
+   * Frozen run snapshot of plugin option providerConcurrency. A provider
+   * missing from the map is unconfigured — no instance permit, no slot dir.
+   */
+  providerConcurrency?: Readonly<Record<string, number>>
 }
 
 /** Inputs shared by the runner's failover attempts (built once per agent call). */
@@ -385,6 +397,8 @@ export class AgentRunner {
   private readonly retryAttempts: number
   private readonly retryBackoffMs: number
   private readonly now: () => number
+  private readonly providerLimiter: ProviderLimiter | undefined
+  private readonly providerConcurrency: Readonly<Record<string, number>> | undefined
   private started = 0
   private lastReportAt = 0
 
@@ -414,6 +428,8 @@ export class AgentRunner {
     this.digestFn =
       options.digest ?? ((prompt, opts) => agentCacheDigest(prompt, opts, this.defaultAgent))
     this.now = options.now ?? Date.now
+    this.providerLimiter = options.providerLimiter
+    this.providerConcurrency = options.providerConcurrency
   }
 
   get agentsStarted(): number {
@@ -487,6 +503,7 @@ export class AgentRunner {
     }
     this.maybeReport()
 
+    let providerPermit: ProviderPermit | undefined
     try {
       const titlePhase = opts.phase ?? this.ambientPhase()
       const requestedAgent = opts.agent ?? this.defaultAgent
@@ -584,6 +601,20 @@ export class AgentRunner {
             `${candidate.model.providerID}/${candidate.model.id} before any session was created`
           await health.admit(activeModel.providerID, abortSignal)
         }
+      }
+      // Provider concurrency: AFTER the run semaphore (already held) and AFTER
+      // model resolution / quarantine routing, BEFORE sessions.create. One
+      // permit per child; failover keeps this hold (never nested). Unconfigured
+      // providers skip both the instance semaphore and the machine slot dir.
+      const providerID = activeModel?.providerID
+      const providerCap = providerID !== undefined ? this.providerConcurrency?.[providerID] : undefined
+      if (
+        this.providerLimiter !== undefined &&
+        providerID !== undefined &&
+        typeof providerCap === "number" &&
+        providerCap >= 1
+      ) {
+        providerPermit = await this.providerLimiter.acquire(providerID, providerCap, this.signal)
       }
       for (let attempt = 0; ; attempt++) {
         try {
@@ -733,6 +764,13 @@ export class AgentRunner {
       this.maybeReport(true)
       throw err
     } finally {
+      if (providerPermit !== undefined) {
+        try {
+          await providerPermit.release()
+        } catch {
+          // slot release is best-effort; the instance permit must still drop
+        }
+      }
       this.semaphore.release()
     }
   }

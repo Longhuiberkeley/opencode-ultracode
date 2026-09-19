@@ -47,6 +47,7 @@ import {
 import type { WarmCacheEntry, WorkflowLoader } from "./primitives.ts"
 import { resolveFallbacks } from "./failover.ts"
 import type { PinPoolEntry } from "./failover.ts"
+import { defaultProviderSlotsDir, ProviderConcurrencyGate, ProviderSlotPool } from "./provider-slots.ts"
 import { validateScriptSource } from "./worker-script.ts"
 import { spawnWorker } from "./worker-host.ts"
 import type { WorkerHandle, WorkerResult } from "./worker-host.ts"
@@ -323,6 +324,13 @@ export interface SupervisorDeps {
   now?: () => number
   /** Throttle stagger override for breaker tests (default 200 ms). */
   breakerStaggerMs?: number
+  /**
+   * Override the machine-level provider-slot base dir (tests inject a temp
+   * dir). Production uses ~/.local/share/opencode/ultracode/provider-slots.
+   */
+  providerSlotsDir?: string
+  /** Heartbeat interval override for slot tests (default 10 s; 0 disables). */
+  providerSlotHeartbeatMs?: number
 }
 
 interface PauseWaiter {
@@ -430,6 +438,12 @@ export class SupervisorImpl implements Supervisor {
   private readonly workflowLoader: WorkflowLoader
   /** Run-level breaker, shared across every run this supervisor owns. */
   private readonly providerHealth: ProviderBreaker
+  /**
+   * Instance + machine provider slots, shared across every run this supervisor
+   * owns. Acquire order is run-semaphore -> provider permit (the runner
+   * enforces that); abort rejects queued waits.
+   */
+  private readonly providerLimiter: ProviderConcurrencyGate
   private readonly runs = new Map<string, RunState>()
   private disposed = false
 
@@ -456,6 +470,12 @@ export class SupervisorImpl implements Supervisor {
       ...(deps.now ? { now: deps.now } : {}),
       ...(deps.breakerStaggerMs !== undefined ? { staggerMs: deps.breakerStaggerMs } : {}),
       onEvent: (event) => this.handleProviderEvent(event),
+    })
+    this.providerLimiter = new ProviderConcurrencyGate({
+      slotPool: new ProviderSlotPool({
+        baseDir: deps.providerSlotsDir ?? defaultProviderSlotsDir(),
+        ...(deps.providerSlotHeartbeatMs !== undefined ? { heartbeatMs: deps.providerSlotHeartbeatMs } : {}),
+      }),
     })
   }
 
@@ -690,6 +710,8 @@ export class SupervisorImpl implements Supervisor {
         ...(state.runModel !== undefined ? { runModel: state.runModel } : {}),
         signal: state.controller.signal,
         ...(warmCache ? { warmCache } : {}),
+        providerLimiter: this.providerLimiter,
+        providerConcurrency: state.effective.providerConcurrency,
       })
 
       // 5. Spawn the worker with bridge dispatch.

@@ -403,3 +403,11 @@ test("freezeEffective snapshots failover mode and askTimeoutMs", () => {
   assert.equal(snap.askTimeoutMs, 5_000)
   assert.equal(Object.isFrozen(snap), true)
 })
+
+test("freezeEffective copies providerConcurrency so later mutation cannot leak", () => {
+  const shared: Record<string, number> = { anthropic: 2 }
+  const snap = freezeEffective({ ...DEFAULT_OPTIONS, providerConcurrency: shared })
+  assert.deepEqual(snap.providerConcurrency, { anthropic: 2 })
+  shared.openai = 1
+  assert.deepEqual(snap.providerConcurrency, { anthropic: 2 })
+})

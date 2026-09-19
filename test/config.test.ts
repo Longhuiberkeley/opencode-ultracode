@@ -41,6 +41,7 @@ test("loadOptions: empty object gives all defaults", () => {
     modelFallbacks: {},
     failover: "auto",
     askTimeoutMs: 0,
+    providerConcurrency: {},
   })
   assert.deepEqual(warnings, [])
 })
@@ -62,6 +63,7 @@ test("loadOptions: fully valid options round-trip", () => {
     modelFallbacks: { "xai/grok-4.6": ["google/gemini-3.7-flash#lite", "anthropic/claude-x"] },
     failover: "ask",
     askTimeoutMs: 900_000,
+    providerConcurrency: { anthropic: 2, openai: 1 },
   }
   const { options, warnings } = loadOptions(raw)
   assert.deepEqual(options, raw)
@@ -221,6 +223,35 @@ test("loadOptions: failover enum and askTimeoutMs range", () => {
     assert.equal(options.askTimeoutMs, DEFAULT_OPTIONS.askTimeoutMs)
     assert.equal(warnings.length, 1)
     assert.match(warnings[0]!, /askTimeoutMs/)
+  }
+})
+
+test("loadOptions: providerConcurrency validates per entry", () => {
+  const { options, warnings } = loadOptions({
+    providerConcurrency: {
+      anthropic: 2,
+      openai: 1,
+      "not/a/provider": 3, // slash — dropped
+      "..": 1, // parent segment — dropped
+      xai: 0, // below min
+      google: 17, // above max
+      deepseek: 1.5, // non-integer
+      foo: "2", // wrong type
+    },
+  })
+  assert.deepEqual(options.providerConcurrency, { anthropic: 2, openai: 1 })
+  assert.equal(warnings.length, 6, warnings.join(" | "))
+  assert.ok(warnings.some((w) => /not\/a\/provider/.test(w)))
+  assert.ok(warnings.some((w) => /"\.\."/.test(w)))
+  assert.ok(warnings.filter((w) => /must be an integer 1\.\.16/.test(w)).length === 4)
+})
+
+test("loadOptions: non-object providerConcurrency falls back to the empty default", () => {
+  for (const bad of [42, "anthropic", [], null]) {
+    const { options, warnings } = loadOptions({ providerConcurrency: bad })
+    assert.deepEqual(options.providerConcurrency, {})
+    assert.equal(warnings.length, 1)
+    assert.match(warnings[0]!, /providerConcurrency/)
   }
 })
 

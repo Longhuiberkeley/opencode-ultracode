@@ -124,6 +124,15 @@ export interface UltracodeOptions {
    * auto-mode policy after that many ms, even without an answer.
    */
   askTimeoutMs?: number
+  /**
+   * Per-provider in-flight cap (providerID → N, each N 1..16). Adds an
+   * instance-level FIFO semaphore per provider (supervisor-owned, shared
+   * across every run it owns) AND machine-level slot dirs under
+   * ~/.local/share/opencode/ultracode/provider-slots/<providerID>/slot-<i>
+   * (atomic mkdir; stale mtime >30s is reclaimable). Unconfigured providers
+   * are unchanged. Default {} (no provider slots).
+   */
+  providerConcurrency?: Record<string, number>
 }
 
 export const DEFAULT_OPTIONS: Required<UltracodeOptions> = {
@@ -142,6 +151,7 @@ export const DEFAULT_OPTIONS: Required<UltracodeOptions> = {
   modelFallbacks: {},
   failover: "auto",
   askTimeoutMs: 0,
+  providerConcurrency: {},
 }
 
 /** Local admission clamp (this repo default). Not a host API. */

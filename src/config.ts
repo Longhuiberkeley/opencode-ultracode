@@ -8,6 +8,16 @@ import type { AgentScope, FailoverMode, PermissionMode, UltracodeOptions } from 
 import { DEFAULT_OPTIONS, MAX_LOOP_DEPTH, MAX_RUN_TIMEOUT_MS, MIN_LOOP_DEPTH, MIN_RUN_TIMEOUT_MS } from "./types.ts"
 import { parseModelPin } from "./agent-pins.ts"
 
+/** Same charset as pin providerIDs; also rejects ".." / "/" so keys are slot-path-safe. */
+const PROVIDER_CONCURRENCY_KEY = /^[A-Za-z0-9._-]+$/
+const PROVIDER_CONCURRENCY_MIN = 1
+const PROVIDER_CONCURRENCY_MAX = 16
+
+function isProviderConcurrencyKey(id: string): boolean {
+  if (id.includes("/") || id.includes("\\") || id.includes("\0") || id.includes("..")) return false
+  return PROVIDER_CONCURRENCY_KEY.test(id)
+}
+
 export interface LoadedOptions {
   options: Required<UltracodeOptions>
   warnings: string[]
@@ -121,6 +131,45 @@ export function parseModelFallbacks(raw: unknown, warnings: string[] = []): Reco
 }
 
 /**
+ * Parse the `providerConcurrency` option: `{ providerID: N }` with N in 1..16.
+ * Fail-closed per entry (bad values fall back, never throw): an unsafe key
+ * (not a provider-id charset, or containing "/" / "..") or a non-integer /
+ * out-of-range value is dropped with a warning — the valid remainder still
+ * applies. Returns undefined when the whole option is absent (caller keeps
+ * the default) or when the value is not an object.
+ */
+export function parseProviderConcurrency(raw: unknown, warnings: string[] = []): Record<string, number> | undefined {
+  if (raw === undefined) return undefined
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    warnings.push(
+      `option "providerConcurrency" must be an object mapping providerID to an integer ${PROVIDER_CONCURRENCY_MIN}..${PROVIDER_CONCURRENCY_MAX}, got ${JSON.stringify(raw) ?? String(raw)} — using default {}`,
+    )
+    return undefined
+  }
+  const out: Record<string, number> = {}
+  for (const [rawKey, rawCap] of Object.entries(raw as Record<string, unknown>)) {
+    if (!isProviderConcurrencyKey(rawKey)) {
+      warnings.push(`option "providerConcurrency" key ${JSON.stringify(rawKey)} is not a valid provider id — entry ignored`)
+      continue
+    }
+    if (
+      typeof rawCap !== "number" ||
+      !Number.isFinite(rawCap) ||
+      !Number.isInteger(rawCap) ||
+      rawCap < PROVIDER_CONCURRENCY_MIN ||
+      rawCap > PROVIDER_CONCURRENCY_MAX
+    ) {
+      warnings.push(
+        `option "providerConcurrency" value for "${rawKey}" must be an integer ${PROVIDER_CONCURRENCY_MIN}..${PROVIDER_CONCURRENCY_MAX}, got ${JSON.stringify(rawCap) ?? String(rawCap)} — entry ignored`,
+      )
+      continue
+    }
+    out[rawKey] = rawCap
+  }
+  return out
+}
+
+/**
  * Parse `ctx.options` into validated options. Always returns a fully-populated
  * `Required<UltracodeOptions>` plus warnings for every value that was rejected.
  */
@@ -128,7 +177,7 @@ export function loadOptions(raw: unknown): LoadedOptions {
   const warnings: string[] = []
   // Fresh map (never the shared DEFAULT_OPTIONS reference): callers may mutate
   // the returned options, and a shared nested object would leak across loads.
-  const options: Required<UltracodeOptions> = { ...DEFAULT_OPTIONS, modelFallbacks: {} }
+  const options: Required<UltracodeOptions> = { ...DEFAULT_OPTIONS, modelFallbacks: {}, providerConcurrency: {} }
 
   if (raw === null || raw === undefined) return { options, warnings }
   if (typeof raw !== "object" || Array.isArray(raw)) {
@@ -177,6 +226,9 @@ export function loadOptions(raw: unknown): LoadedOptions {
 
   const modelFallbacks = parseModelFallbacks(record["modelFallbacks"], warnings)
   if (modelFallbacks !== undefined) options.modelFallbacks = modelFallbacks
+
+  const providerConcurrency = parseProviderConcurrency(record["providerConcurrency"], warnings)
+  if (providerConcurrency !== undefined) options.providerConcurrency = providerConcurrency
 
   const failover = record["failover"]
   if (failover !== undefined) {
