@@ -36,6 +36,20 @@ export type PermissionMode = "ask" | "autoEditsWorkflow" | "noEditTools"
  */
 export type AgentScope = "host" | "configured"
 
+/**
+ * Provider-failover policy:
+ * - "auto" (default): classify failures and fail over immediately — burst with
+ *   jittered same-model backoff, quota by switching the SAME session to the
+ *   first eligible ladder candidate.
+ * - "ask": same as auto, but when a provider is quarantined (quota) or
+ *   burst-throttled in a way that would fail over pending children, the run is
+ *   PAUSED and one coalesced report is emitted to the parent; the run resumes
+ *   via `ultracode_control { action: "resume", model?, remember? }`.
+ * - "off": no failover at all — children fail with the typed provider error,
+ *   exactly the pre-failover behavior. Retry policy is unaffected.
+ */
+export type FailoverMode = "auto" | "ask" | "off"
+
 export interface UltracodeOptions {
   /** Default agent id for spawned agent() calls. Validated at run start (fail fast). Default "general". */
   agent?: string
@@ -98,6 +112,18 @@ export interface UltracodeOptions {
    * `session.switchModel` — never a fresh session. Default {} (no ladder).
    */
   modelFallbacks?: Record<string, string[]>
+  /**
+   * Provider-failover policy: "auto" (default), "ask" (pause + one coalesced
+   * report when a quarantine would fail over pending children; resume via
+   * `ultracode_control`), or "off" (children fail typed — no failover).
+   */
+  failover?: FailoverMode
+  /**
+   * Ask-mode auto-proceed timeout: 0 (default) waits indefinitely while the
+   * ask pause holds (paused runs do not burn timeoutMs); >0 resumes the run in
+   * auto-mode policy after that many ms, even without an answer.
+   */
+  askTimeoutMs?: number
 }
 
 export const DEFAULT_OPTIONS: Required<UltracodeOptions> = {
@@ -114,6 +140,8 @@ export const DEFAULT_OPTIONS: Required<UltracodeOptions> = {
   childStallMs: 900_000,
   maxLoopDepth: 2,
   modelFallbacks: {},
+  failover: "auto",
+  askTimeoutMs: 0,
 }
 
 /** Local admission clamp (this repo default). Not a host API. */
@@ -1002,6 +1030,8 @@ export type SettingsOverlayLike = {
   maxAgents?: number
   timeoutMs?: number
   permissions?: PermissionMode
+  /** Remembered failover entries (see settings.SettingsOverlay; not a panel key). */
+  modelFallbacks?: Record<string, string[]>
 }
 
 // ---------------------------------------------------------------------------
@@ -1029,6 +1059,60 @@ export interface RunOutcome {
   envelope: RunEnvelope
 }
 
+/**
+ * Provider-failure class as the run-level breaker consumes it (a mirror of
+ * `FailureClassification.class` values that matter to admission — "other" is
+ * never reported).
+ */
+export type ProviderFailureClass = "quota" | "burst"
+
+/**
+ * Read-only snapshot of one quarantined provider (orchestrator surfaces: the
+ * `ultracode_control` resume path keys a remembered fallback on `models`).
+ */
+export interface ProviderQuarantineSnapshot {
+  providerID: string
+  /** Parsed reset time (epoch ms) when the failure exposed one; undefined = run-lifetime. */
+  resetAt?: number
+  /** "provider/id" keys whose failures triggered the quarantine (bounded, deduped). */
+  models: string[]
+}
+
+/**
+ * Run-level provider breaker seam (implemented by src/supervisor.ts, consumed
+ * by src/primitives.ts AgentRunner). ONE instance belongs to a supervisor and
+ * is shared across its runs: a quota strike quarantines the provider (until
+ * the parsed reset, else for the supervisor's lifetime) so later children
+ * resolving to it never create a session; three burst strikes within 60 s
+ * throttle admission (serialize + stagger) until a 60 s quiet window — never
+ * an abort. The runner reports every classified child failure here and
+ * consults it before `session.create`.
+ */
+export interface ProviderHealth {
+  /** True while providerID is quota-quarantined (account-level, hours long). */
+  isQuarantined(providerID: string): boolean
+  /** Quarantine expiry (epoch ms) when the parsed reset is known; undefined = run-lifetime. */
+  quarantinedUntil(providerID: string): number | undefined
+  /** True while the burst throttle is engaged (>=3 strikes in the last 60 s). */
+  isThrottled(providerID: string): boolean
+  /**
+   * Admission gate: no-op unless the provider is burst-throttled. When
+   * throttled, admissions for that provider are serialized and staggered
+   * (default 200 ms apart); abort-aware (rejects with an abort AgentCallError).
+   */
+  admit(providerID: string, signal?: AbortSignal): Promise<void>
+  /** Report one classified child failure (quota quarantines; burst strikes/throttles). */
+  report(input: {
+    runID: string
+    providerID: string
+    class: ProviderFailureClass
+    /** Parsed reset time from the classification, when any. */
+    resetAt?: number
+    /** "provider/id" of the failing model (ask-report key resolution). */
+    model?: string
+  }): void
+}
+
 export interface Supervisor {
   /**
    * Execute a resolved run. Resolves only after all children are settled
@@ -1046,9 +1130,15 @@ export interface Supervisor {
   stop(runID: string, reason: string): boolean
   /** Close admission of new agent() calls. Returns false if not running. */
   pause(runID: string): boolean
-  /** Reopen admission. Returns false if not paused. */
-  resume(runID: string): boolean
+  /**
+   * Reopen admission. Returns false if not paused. Ask mode: the optional
+   * `model` pin becomes the run-level fallback OVERRIDE — failovers (and
+   * quarantine routing) for this run prefer it over the configured ladder.
+   */
+  resume(runID: string, opts?: { model?: ModelRef }): boolean
   stopAll(reason: string): void
+  /** Currently quarantined providers (ask-mode diagnostics + remember keying). */
+  providerQuarantines(): ProviderQuarantineSnapshot[]
   isOwnedSession(sessionID: string): boolean
   /**
    * Bump a child session's last-activity timestamp (called from the host

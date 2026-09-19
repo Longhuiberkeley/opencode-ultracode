@@ -25,6 +25,32 @@ const PANEL_SETTINGS_SCHEMA = {
 export const ULTRACODE_RPC = {
   id: ULTRACODE_RPC_ID,
   methods: {
+    control: {
+      input: {
+        type: "object" as const,
+        additionalProperties: false,
+        required: ["action"],
+        properties: {
+          action: { type: "string" as const },
+          runID: RUN_ID,
+          // Ask mode: validated pin, applied as the run-level fallback override.
+          model: { type: "string" as const },
+          remember: { type: "boolean" as const },
+        },
+      },
+      output: {
+        type: "object" as const,
+        required: ["runID", "action", "status"],
+        properties: {
+          runID: RUN_ID,
+          action: { type: "string" as const },
+          status: RUN_STATUS,
+          model: { type: "string" as const },
+          remembered: { type: "string" as const },
+          rememberError: { type: "string" as const },
+        },
+      },
+    },
     runStatus: {
       input: {
         type: "object" as const,

@@ -4,6 +4,7 @@
  */
 import type { PermissionMode, UltracodeOptions } from "./types.ts"
 import { CONCURRENCY_CAP, DEFAULT_OPTIONS, MAX_RUN_TIMEOUT_MS, MIN_RUN_TIMEOUT_MS, clampConcurrency } from "./types.ts"
+import { parseModelFallbacks } from "./config.ts"
 
 export type PanelSettings = {
   concurrency: number
@@ -17,6 +18,13 @@ export type SettingsOverlay = {
   maxAgents?: number
   timeoutMs?: number
   permissions?: PermissionMode
+  /**
+   * Remembered failover entries (ask-mode `ultracode_control resume …
+   * remember: true`). NOT a panel setting: the panel never edits or clears it,
+   * and `overlayFromPanel` deliberately omits it so a panel save merges over
+   * the stored map instead of replacing it.
+   */
+  modelFallbacks?: Record<string, string[]>
 }
 
 export type SettingsKey = keyof PanelSettings
@@ -67,6 +75,8 @@ export function freezeEffective(options: Required<UltracodeOptions>): Required<U
     // Copy the map so a later mutation of the shared options can never change
     // what an in-flight run's failover ladder resolves.
     modelFallbacks: { ...options.modelFallbacks },
+    failover: options.failover,
+    askTimeoutMs: options.askTimeoutMs,
   })
 }
 
@@ -80,7 +90,28 @@ export function applyOverlay(
   if (overlay.maxAgents !== undefined) next.maxAgents = overlay.maxAgents
   if (overlay.timeoutMs !== undefined) next.timeoutMs = overlay.timeoutMs
   if (overlay.permissions !== undefined) next.permissions = overlay.permissions
+  // Remembered failover entries: the overlay map replaces the option map (it
+  // is the persisted, user-approved state — never a partial merge).
+  if (overlay.modelFallbacks !== undefined) next.modelFallbacks = { ...overlay.modelFallbacks }
   return next
+}
+
+/**
+ * Persist one remembered fallback entry into an overlay (ask-mode resume with
+ * `remember: true`): the chosen pin becomes the FIRST rung for the dead model's
+ * key, preserving existing rungs (deduped). Pure; never touches agent pin
+ * files — the caller saves the overlay through the settings path `/ultracode
+ * set` uses.
+ */
+export function rememberModelFallback(
+  overlay: SettingsOverlay,
+  key: string,
+  pin: string,
+): SettingsOverlay {
+  const current = { ...(overlay.modelFallbacks ?? {}) }
+  const existing = current[key] ?? []
+  current[key] = [pin, ...existing.filter((p) => p !== pin)]
+  return { ...overlay, modelFallbacks: current }
 }
 
 function intInRange(value: unknown, min: number, max: number): number | undefined {
@@ -105,6 +136,10 @@ export function parseSettingsOverlay(raw: unknown): SettingsOverlay {
   const permissions = record.permissions
   if (typeof permissions === "string" && PERMISSION_MODES.has(permissions)) {
     overlay.permissions = permissions as PermissionMode
+  }
+  const modelFallbacks = parseModelFallbacks(record.modelFallbacks)
+  if (modelFallbacks !== undefined && Object.keys(modelFallbacks).length > 0) {
+    overlay.modelFallbacks = modelFallbacks
   }
   return overlay
 }

@@ -575,12 +575,18 @@ export function validateStatusToolInput(
   return { ok: true, runID }
 }
 
-/** Input for the orchestrator `ultracode_control` tool. */
+/**
+ * Input for the orchestrator `ultracode_control` tool. Resume accepts an
+ * optional ask-mode answer: `model` (a "provider/id" or "provider/id#variant"
+ * pin applied as the run-level fallback override) and `remember` (persist the
+ * model→modelFallbacks entry through the settings path). Both are resume-only:
+ * a model on stop/pause is a caller mistake, not a silent no-op.
+ */
 export function validateControlToolInput(
   raw: unknown,
-): { ok: true; action: ControlAction; runID?: string } | { ok: false; error: string } {
+): { ok: true; action: ControlAction; runID?: string; model?: string; remember?: boolean } | { ok: false; error: string } {
   if (!isObj(raw)) return { ok: false, error: `input must be an object, got ${typeOf(raw)}` }
-  const extra = rejectExtras(raw, new Set(["action", "runID"]))
+  const extra = rejectExtras(raw, new Set(["action", "runID", "model", "remember"]))
   if (extra) return { ok: false, error: extra }
   const action = raw["action"]
   if (typeof action !== "string" || !CONTROL_ACTIONS.includes(action as ControlAction)) {
@@ -589,15 +595,49 @@ export function validateControlToolInput(
       error: `"action" must be one of ${CONTROL_ACTIONS.join(" | ")}, got ${typeof action === "string" ? `"${action}"` : typeOf(action)}`,
     }
   }
-  if (!has(raw, "runID")) return { ok: true, action: action as ControlAction }
-  const runID = raw["runID"]
-  if (typeof runID !== "string" || runID.trim() === "") {
-    return {
-      ok: false,
-      error: `"runID" must be a non-empty string, got ${typeOf(runID) === "string" ? "empty string" : typeOf(runID)}`,
+  let runID: string | undefined
+  if (has(raw, "runID")) {
+    const value = raw["runID"]
+    if (typeof value !== "string" || value.trim() === "") {
+      return {
+        ok: false,
+        error: `"runID" must be a non-empty string, got ${typeOf(value) === "string" ? "empty string" : typeOf(value)}`,
+      }
     }
+    runID = value
   }
-  return { ok: true, action: action as ControlAction, runID }
+  let model: string | undefined
+  if (has(raw, "model")) {
+    const value = raw["model"]
+    if (typeof value !== "string" || parseModelPin(value) === undefined) {
+      return {
+        ok: false,
+        error: `"model" must be a "provider/id" or "provider/id#variant" string, got ${typeof value === "string" ? JSON.stringify(value) : typeOf(value)}`,
+      }
+    }
+    if (action !== "resume") {
+      return { ok: false, error: `"model" is only valid with action "resume" (got "${action}")` }
+    }
+    model = value.trim()
+  }
+  let remember: boolean | undefined
+  if (has(raw, "remember")) {
+    const value = raw["remember"]
+    if (typeof value !== "boolean") {
+      return { ok: false, error: `"remember" must be a boolean, got ${typeOf(value)}` }
+    }
+    if (action !== "resume" || model === undefined) {
+      return { ok: false, error: `"remember" requires action "resume" with a "model" pin (got "${action}"${model === undefined ? ", no model" : ""})` }
+    }
+    remember = value
+  }
+  return {
+    ok: true,
+    action: action as ControlAction,
+    ...(runID !== undefined ? { runID } : {}),
+    ...(model !== undefined ? { model } : {}),
+    ...(remember !== undefined ? { remember } : {}),
+  }
 }
 
 /** Input for the read-only `ultracode_result` tool (full-result paging). */

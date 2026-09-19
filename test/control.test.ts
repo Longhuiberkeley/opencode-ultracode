@@ -139,6 +139,19 @@ test("validateControlToolInput: action required, enum-checked, runID optional", 
   assert.deepEqual(CONTROL_ACTIONS, ["stop", "pause", "resume"])
 })
 
+test("validateControlToolInput: ask-mode resume model/remember shapes", () => {
+  assert.deepEqual(
+    validateControlToolInput({ action: "resume", model: "openai/gpt-6#high", remember: true }),
+    { ok: true, action: "resume", model: "openai/gpt-6#high", remember: true },
+  )
+  // model is resume-only; remember needs a model; malformed pins are refused.
+  assert.match((validateControlToolInput({ action: "stop", model: "openai/gpt-6" }) as { error: string }).error, /resume/)
+  assert.match((validateControlToolInput({ action: "resume", model: "not a pin" }) as { error: string }).error, /provider\/id/)
+  assert.match((validateControlToolInput({ action: "resume", remember: true }) as { error: string }).error, /remember/)
+  assert.match((validateControlToolInput({ action: "pause", remember: true }) as { error: string }).error, /remember/)
+  assert.equal(validateControlToolInput({ action: "resume", remember: "yes" }).ok, false)
+})
+
 // ---------------------------------------------------------------------------
 // controlToolContent: the tool executor wiring (ownership filter, supervisor
 // availability, reconciliation wait) — security-critical, so pinned by fakes.
@@ -215,4 +228,112 @@ test("controlToolContent: validator failures surface as error content", async ()
     activeRuns: () => [],
   })
   assert.match(out.content, /error: "action" must be one of/)
+})
+
+// ---------------------------------------------------------------------------
+// Ask-mode resume: fallback override + remember
+// ---------------------------------------------------------------------------
+
+test("controlRun resume-with-model passes the override to the supervisor and echoes the pin", () => {
+  const calls: Array<{ runID: string; model?: { providerID: string; id: string; variant?: string } }> = []
+  const impl: ControlImpl = {
+    stop: () => true,
+    pause: () => true,
+    resume: (runID, opts) => {
+      calls.push({ runID, ...(opts?.model !== undefined ? { model: opts.model } : {}) })
+      return true
+    },
+  }
+  const result = controlRun(
+    {
+      run: run({ status: "paused" }),
+      parentSessionID: "ses_parent",
+      action: "resume",
+      activeOwned: [],
+      model: { providerID: "google", id: "gemini-3.7-flash", variant: "lite" },
+    },
+    impl,
+  )
+  assert.deepEqual(result, {
+    runID: "run_test",
+    action: "resume",
+    status: "running",
+    model: "google/gemini-3.7-flash#lite",
+  })
+  assert.deepEqual(calls, [
+    { runID: "run_test", model: { providerID: "google", id: "gemini-3.7-flash", variant: "lite" } },
+  ])
+})
+
+test("controlToolContent: resume remember persists through the settings callback", async () => {
+  const { supervisor } = recording()
+  const seen: Array<{ runID: string; pin: string }> = []
+  const paused = run({ status: "paused" })
+  const out = await controlToolContent(
+    { ok: true, action: "resume", runID: "run_test", model: "openai/gpt-6", remember: true },
+    "ses_parent",
+    {
+      getRun: () => paused,
+      activeRuns: () => [paused],
+      supervisor,
+      rememberFallback: async (input) => {
+        seen.push(input)
+        return { ok: true, key: "xai/grok-4.6" }
+      },
+    },
+  )
+  assert.deepEqual(JSON.parse(out.content), {
+    runID: "run_test",
+    action: "resume",
+    status: "running",
+    model: "openai/gpt-6",
+    remembered: "xai/grok-4.6",
+  })
+  assert.deepEqual(seen, [{ runID: "run_test", pin: "openai/gpt-6" }])
+})
+
+test("controlToolContent: remember failure and missing persistence are visible, resume still applied", async () => {
+  const { supervisor } = recording()
+  const paused = run({ status: "paused" })
+  const failed = await controlToolContent(
+    { ok: true, action: "resume", runID: "run_test", model: "openai/gpt-6", remember: true },
+    "ses_parent",
+    {
+      getRun: () => paused,
+      activeRuns: () => [paused],
+      supervisor,
+      rememberFallback: async () => ({ ok: false, error: "no quarantined provider recorded for this run" }),
+    },
+  )
+  assert.match(failed.content, /rememberError/)
+  assert.match(failed.content, /no quarantined provider/)
+
+  const unavailable = await controlToolContent(
+    { ok: true, action: "resume", runID: "run_test", model: "openai/gpt-6", remember: true },
+    "ses_parent",
+    { getRun: () => paused, activeRuns: () => [paused], supervisor },
+  )
+  assert.match(unavailable.content, /settings persistence unavailable/)
+})
+
+test("controlToolContent: a malformed model pin fails closed before the supervisor call", async () => {
+  const calls: string[] = []
+  const out = await controlToolContent(
+    { ok: true, action: "resume", runID: "run_test", model: "not a pin" },
+    "ses_parent",
+    {
+      getRun: () => run({ status: "paused" }),
+      activeRuns: () => [run({ status: "paused" })],
+      supervisor: {
+        stop: () => true,
+        pause: () => true,
+        resume: () => {
+          calls.push("resume")
+          return true
+        },
+      },
+    },
+  )
+  assert.match(out.content, /model must be/)
+  assert.deepEqual(calls, [], "no resume attempt with an invalid pin")
 })

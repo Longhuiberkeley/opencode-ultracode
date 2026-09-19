@@ -36,7 +36,7 @@ import type { FailureClass } from "./failure-classify.ts"
 import { normalizeModelRef } from "./agent-pins.ts"
 
 /** Where a fallback candidate came from (precedence order = this order). */
-export type FallbackSource = "call" | "option" | "pin" | "catalog"
+export type FallbackSource = "call" | "run" | "option" | "pin" | "catalog"
 
 /** One eligible fallback in ladder order (the runner tries them in order). */
 export interface FallbackCandidate {
@@ -84,6 +84,12 @@ export interface ResolveFallbacksInput {
    * Invalid entries are dropped — the CALLER owns admission-time validation.
    */
   callFallbacks?: ReadonlyArray<string>
+  /**
+   * Run-level fallback override (ask-mode `ultracode_control resume { model }`):
+   * ONE pin string, placed after the per-call rung (a child's explicit list
+   * stays more specific) and before the plugin option map. Absent = no override.
+   */
+  runFallback?: string
   /**
    * Plugin option modelFallbacks: keyed by the dead model's "provider/id" pin
    * string (no variant), value = ordered pin strings.
@@ -158,6 +164,12 @@ export function resolveFallbacks(input: ResolveFallbacksInput): FallbackCandidat
   for (const pin of input.callFallbacks ?? []) {
     const model = parsePin(pin)
     if (model !== undefined) push(model, "call", { pin })
+  }
+  // 1b. Run-level fallback override (ask-mode resume): one rung, after the
+  //     child's explicit list and before the plugin option map.
+  if (input.runFallback !== undefined) {
+    const model = parsePin(input.runFallback)
+    if (model !== undefined) push(model, "run", { pin: input.runFallback })
   }
   // 2. Plugin option modelFallbacks[<dead provider>/<dead id>].
   for (const pin of input.modelFallbacks?.[deadKey] ?? []) {

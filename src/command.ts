@@ -2,6 +2,7 @@
  * Slash-command parsing, /ultracode verb surface, tool-description contract,
  * and session.tool.* → toolCalls wiring. Plugin-free so unit tests cover it.
  */
+import { normalizeModelRef } from "./agent-pins.ts"
 import { agentCells, compactCount, compactElapsed, compactTokens, runHeaderCells } from "./run-format.ts"
 import { canonicalGraphSpec, graphNodeCount, graphToAscii, graphToMermaid, validateGraphSpec } from "./graph.ts"
 import type { GraphNode, GraphSpec } from "./graph.ts"
@@ -12,6 +13,7 @@ import { GRAPH_ARTIFACT_SUFFIX, normalizePath, sha256 } from "./storage.ts"
 import { paramsFromArgs, paramsValue } from "./params.ts"
 import type {
   Json,
+  ModelRef,
   ParentContext,
   Registry,
   RunEnvelope,
@@ -106,7 +108,7 @@ export function helpText(): string {
     "- `/ultracode graph <name|runID>` — render a graph workflow's DAG (waves + mermaid); works before trust, so you can review what you are approving",
     "- `/ultracode stop [runID]` — stop an active run (explicit runID required when several are active)",
     "- `/ultracode pause [runID]` — pause an active run (close admission of new agent() calls)",
-    "- `/ultracode resume [runID]` — resume a paused run",
+    "- `/ultracode resume [runID] [--model provider/id#variant] [--remember]` — resume a paused run; in ask mode `--model` answers the quarantine ask (run-level fallback override) and `--remember` persists it into `modelFallbacks`",
     "- `/ultracode rerun [runID] [argsJSON]` — start a new run from a finished run's script",
     "- `/ultracode save` `<name>` (from a project `<name>.js` or `<name>.graph.json` file) or `<runID> <name>` (from a run — a graph run saves its spec, not the compiled script)",
     "- `/ultracode trust <name>` — approve the current version of a saved workflow",
@@ -790,7 +792,8 @@ export interface CommandStorage {
 
 export interface CommandSupervisor {
   pause(runID: string): boolean
-  resume(runID: string): boolean
+  /** Ask-mode resume: an optional model becomes the run-level fallback override. */
+  resume(runID: string, opts?: { model?: ModelRef }): boolean
   stop(runID: string, reason: string): boolean
   startDetached(
     input: Parameters<Supervisor["startDetached"]>[0],
@@ -860,6 +863,13 @@ export interface CommandDeps {
   /** Next-run defaults after overlay merge (required for set/settings). */
   nextRunSettings?: () => PanelSettings
   persistAndRefreshSettings?: (overlay: ReturnType<typeof overlayFromPanel>) => Promise<PanelSettings>
+  /**
+   * Ask-mode `/ultracode resume --remember`: persist the model→modelFallbacks
+   * entry through the settings path (never agent pin files).
+   */
+  rememberFallback?: (
+    input: { runID: string; pin: string },
+  ) => Promise<{ ok: true; key: string } | { ok: false; error: string }>
   /** `/ultracode doctor` — plugin wiring diagnostics. */
   doctor?: () => string | Promise<string>
 }
@@ -1061,12 +1071,17 @@ export async function handleUltracodeCommand(invocation: CommandInvocation, deps
   }
 
   if (sub === "resume") {
-    const target = resolveActiveTarget(rest, activeList(deps))
+    const parsed = parseResumeArgs(rest)
+    if (!parsed.ok) {
+      await deps.say(sessionID, parsed.error)
+      return
+    }
+    const target = resolveActiveTarget(parsed.target, activeList(deps))
     if (!target.ok) {
       await deps.say(sessionID, target.error)
       return
     }
-    await resumeRun(deps, sessionID, target.runID)
+    await resumeRun(deps, sessionID, target.runID, { remember: parsed.remember, ...(parsed.model !== undefined ? { model: parsed.model } : {}) })
     return
   }
 
@@ -1289,6 +1304,48 @@ async function renderGraph(deps: CommandDeps, sessionID: string, rest: string): 
   )
 }
 
+/**
+ * Ask-mode resume flags: `/ultracode resume [runID] [--model provider/id#variant] [--remember]`.
+ * A malformed `--model` value is an explicit error (never silently dropped),
+ * and `--remember` without a model is refused by the caller.
+ */
+export function parseResumeArgs(
+  rest: string,
+): { ok: true; target: string; model?: string; remember: boolean } | { ok: false; error: string } {
+  let target = ""
+  let model: string | undefined
+  let remember = false
+  const tokens = rest.trim().split(/\s+/).filter((token) => token.length > 0)
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i]!
+    if (token === "--remember") {
+      remember = true
+      continue
+    }
+    if (token === "--model") {
+      const value = tokens[i + 1]
+      if (value === undefined) {
+        return { ok: false, error: "--model needs a value: /ultracode resume [runID] --model provider/id#variant" }
+      }
+      if (!normalizeModelRef(value).ok) {
+        return { ok: false, error: `--model must be a "provider/id" or "provider/id#variant" pin, got ${JSON.stringify(value)}` }
+      }
+      model = value.trim()
+      i++
+      continue
+    }
+    if (target === "") {
+      target = token
+      continue
+    }
+    return {
+      ok: false,
+      error: `unexpected argument ${JSON.stringify(token)}: /ultracode resume [runID] [--model provider/id#variant] [--remember]`,
+    }
+  }
+  return { ok: true, target, ...(model !== undefined ? { model } : {}), remember }
+}
+
 async function pauseRun(deps: CommandDeps, sessionID: string, runID: string): Promise<void> {
   const run = deps.registry.get(runID)
   if (!run) {
@@ -1312,7 +1369,12 @@ async function pauseRun(deps: CommandDeps, sessionID: string, runID: string): Pr
   await deps.say(sessionID, `Paused run \`${runID}\` — status: ${next?.status ?? "paused"}`)
 }
 
-async function resumeRun(deps: CommandDeps, sessionID: string, runID: string): Promise<void> {
+async function resumeRun(
+  deps: CommandDeps,
+  sessionID: string,
+  runID: string,
+  opts: { model?: string; remember: boolean } = { remember: false },
+): Promise<void> {
   const run = deps.registry.get(runID)
   if (!run) {
     await deps.say(sessionID, `Run \`${runID}\` not found. See /ultracode for known runs.`)
@@ -1326,13 +1388,42 @@ async function resumeRun(deps: CommandDeps, sessionID: string, runID: string): P
     await deps.say(sessionID, `error: ${deps.supervisorError ?? "supervisor unavailable"}`)
     return
   }
-  const ok = deps.supervisor.resume(runID)
+  // Ask-mode answer: the model pin (validated again here for direct callers)
+  // becomes the run-level fallback override; --remember additionally persists
+  // it through the settings path (never agent pin files).
+  let model: ModelRef | undefined
+  if (opts.model !== undefined) {
+    const normalized = normalizeModelRef(opts.model)
+    if (!normalized.ok) {
+      await deps.say(sessionID, `error: ${normalized.error}`)
+      return
+    }
+    model = normalized.model
+  }
+  if (opts.remember && model === undefined) {
+    await deps.say(sessionID, "error: --remember requires --model <pin> — nothing to remember without one")
+    return
+  }
+  const ok = deps.supervisor.resume(runID, model !== undefined ? { model } : undefined)
   if (!ok) {
     await deps.say(sessionID, `cannot resume run \`${runID}\` (status: ${run.status})`)
     return
   }
-  const next = deps.registry.get(runID)
-  await deps.say(sessionID, `Resumed run \`${runID}\` — status: ${next?.status ?? "running"}`)
+  let line = `Resumed run \`${runID}\` — status: ${deps.registry.get(runID)?.status ?? "running"}`
+  if (opts.model !== undefined) line += ` (fallback override ${opts.model})`
+  if (opts.remember && opts.model !== undefined) {
+    if (!deps.rememberFallback) {
+      line += "; remember unavailable (no settings persistence wired)"
+    } else {
+      try {
+        const stored = await deps.rememberFallback({ runID, pin: opts.model })
+        line += stored.ok ? `; remembered fallback for \`${stored.key}\`` : `; remember failed: ${stored.error}`
+      } catch (err) {
+        line += `; remember failed: ${err instanceof Error ? err.message : String(err)}`
+      }
+    }
+  }
+  await deps.say(sessionID, line)
 }
 
 async function rerunRun(deps: CommandDeps, sessionID: string, rest: string): Promise<void> {

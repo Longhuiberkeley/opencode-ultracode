@@ -6,6 +6,8 @@
 import test from "node:test"
 import assert from "node:assert/strict"
 import { AgentRunner, Semaphore, getWorkflowComposer, parallelHelper, pipelineHelper, storageWorkflowLoader, buildWarmCache, agentCacheDigest, agentCacheKey, clampRetryAttempts, clampRetryBackoffMs, delayAbortable, jitteredDelay, RETRY_BACKOFF_BASE_MS, RETRY_BACKOFF_CAP_MS } from "../src/primitives.ts"
+import { ProviderBreaker } from "../src/supervisor.ts"
+import type { ProviderHealth } from "../src/types.ts"
 import { compileGraphSpec } from "../src/graph.ts"
 import type { GraphSpec } from "../src/graph.ts"
 import type { AgentRunnerOptions } from "../src/primitives.ts"
@@ -1199,4 +1201,140 @@ test("buildWarmCache: a row whose effectiveModel differs from spawnModel is not 
   assert.equal(calls.length, 1, "no replay for the failed-over row")
   calls[0]!.resolve(okResult("ses_redone"))
   await pending
+})
+
+// ---------------------------------------------------------------------------
+// Run-level breaker admission (quarantine skips create; burst throttle)
+// ---------------------------------------------------------------------------
+
+function quarantinedXai(): ProviderBreaker {
+  const breaker = new ProviderBreaker()
+  breaker.report({
+    runID: "run_seed",
+    providerID: "xai",
+    class: "quota",
+    resetAt: Date.now() + 3_600_000,
+    model: "xai/grok-4.6",
+  })
+  return breaker
+}
+
+test("AgentRunner breaker: a quarantined provider is never created on — the ladder candidate rides session.create", async () => {
+  const { registry, run, calls, runner } = makeRunner({
+    providerHealth: quarantinedXai(),
+    modelFallbacks: { "xai/grok-4.6": ["google/gemini-3.7-flash"] },
+  })
+  const pending = runner.call("routed", { model: { providerID: "xai", id: "grok-4.6" } })
+  await tick()
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0]!.kind, "run", "the routed child is a fresh create, not a continue")
+  assert.deepEqual(calls[0]!.input.model, { providerID: "google", id: "gemini-3.7-flash" })
+  calls[0]!.resolve(okResult("ses_routed"))
+  const res = await pending
+  assert.equal(res.failover?.from.providerID, "xai")
+  assert.equal(res.failover?.to.providerID, "google")
+  assert.equal(res.failover?.to.id, "gemini-3.7-flash")
+  assert.equal(res.failover?.class, "quota")
+  assert.match(res.failover?.reason ?? "", /quarantined/)
+  const rec = registry.getAgent(run.id, "a1")!
+  assert.equal(run.agents.length, 1, "one registry row per agent() call")
+  assert.equal(rec.spawnModel?.providerID, "xai", "the intended pin stays on the row")
+  assert.equal(rec.status, "succeeded")
+})
+
+test("AgentRunner breaker: a quarantined provider with no eligible candidate fails typed BEFORE session.create", async () => {
+  const { registry, run, calls, runner } = makeRunner({ providerHealth: quarantinedXai() })
+  await assert.rejects(
+    runner.call("doomed", { model: { providerID: "xai", id: "grok-4.6" } }),
+    (err: unknown) => {
+      assert.ok(err instanceof AgentCallError)
+      assert.equal(err.kind, "outcome")
+      assert.equal(err.failure?.class, "quota")
+      assert.match(err.message, /is quarantined/)
+      return true
+    },
+  )
+  assert.equal(calls.length, 0, "no session.create on the quarantined provider")
+  assert.equal(registry.getAgent(run.id, "a1")!.status, "failed")
+  assert.equal(registry.getAgent(run.id, "a1")!.spawnModel?.providerID, "xai")
+})
+
+test("AgentRunner breaker: the run fallback override routes, per-call fallbacks still win", async () => {
+  const { calls, runner } = makeRunner({
+    providerHealth: quarantinedXai(),
+    modelFallbacks: { "xai/grok-4.6": ["google/gemini-3.7-flash"] },
+    fallbackOverride: () => ({ providerID: "openai", id: "gpt-6" }),
+  })
+  const first = runner.call("routed", { model: { providerID: "xai", id: "grok-4.6" } })
+  await tick()
+  assert.deepEqual(calls[0]!.input.model, { providerID: "openai", id: "gpt-6" }, "ask-mode override beats the option map")
+  calls[0]!.resolve(okResult("ses_override"))
+  const res = await first
+  assert.equal(res.failover?.to.providerID, "openai")
+
+  const second = runner.call("routed again", {
+    model: { providerID: "xai", id: "grok-4.6" },
+    fallbacks: ["anthropic/claude-x"],
+  })
+  await tick()
+  assert.deepEqual(calls[1]!.input.model, { providerID: "anthropic", id: "claude-x" }, "per-call fallbacks stay most specific")
+  calls[1]!.resolve(okResult("ses_call"))
+  await second
+})
+
+test("AgentRunner breaker: failover off fails typed — no routing, no switch, no override", async () => {
+  const fake = fakeFailoverSession([quotaReply()])
+  const { runner } = makeRunner({
+    driver: createSessionDriver(fake),
+    providerHealth: quarantinedXai(),
+    modelFallbacks: { "xai/grok-4.6": ["google/gemini-3.7-flash"] },
+    fallbackOverride: () => ({ providerID: "openai", id: "gpt-6" }),
+    failover: "off",
+    retryAttempts: 0,
+  })
+  await assert.rejects(
+    runner.call("go", { model: { providerID: "xai", id: "grok-4.6" } }),
+    (err: unknown) => err instanceof AgentCallError && err.failure?.class === "quota",
+  )
+  assert.equal(fake.sessions.size, 1, "off mode keeps the pre-failover behavior (create, then typed failure)")
+  assert.equal(fake.switches.length, 0)
+  assert.equal([...fake.sessions.values()][0]!.prompts, 1, "no same-model retry on quota either")
+})
+
+test("AgentRunner breaker: admission is consulted once and classified failures are reported", async () => {
+  const reported: Array<{ providerID: string; class: string; runID: string }> = []
+  let admits = 0
+  const health: ProviderHealth = {
+    isQuarantined: () => false,
+    quarantinedUntil: () => undefined,
+    isThrottled: () => false,
+    admit: async () => {
+      admits++
+    },
+    report: (input) => reported.push({ providerID: input.providerID, class: input.class, runID: input.runID }),
+  }
+  // Quota: one report (quota), no ladder configured => typed error surfaces.
+  const quotaFake = fakeFailoverSession([quotaReply()])
+  const quotaRun = makeRunner({ driver: createSessionDriver(quotaFake), providerHealth: health, retryAttempts: 0 })
+  await assert.rejects(quotaRun.runner.call("q", { model: { providerID: "xai", id: "grok-4.6" } }))
+  assert.deepEqual(reported, [{ providerID: "xai", class: "quota", runID: quotaRun.run.id }])
+  assert.equal(admits, 1, "admission consults the breaker before create")
+
+  // Burst: strikes are reported too (attempts 0 => the failure surfaces).
+  const burstReply = {
+    text: "",
+    outcome: "failed",
+    finish: "error",
+    failure: { type: "provider.rate-limit", message: "Rate limit reached for requests", status: 429 },
+  }
+  const burstFake = fakeFailoverSession([burstReply])
+  const burstRun = makeRunner({ driver: createSessionDriver(burstFake), providerHealth: health, retryAttempts: 0 })
+  await assert.rejects(burstRun.runner.call("b", { model: { providerID: "xai", id: "grok-4.6" } }))
+  assert.deepEqual(reported[1], { providerID: "xai", class: "burst", runID: burstRun.run.id })
+
+  // Unclassified failures contribute nothing.
+  const otherFake = fakeFailoverSession([{ text: "", outcome: "failed", finish: "error" }])
+  const otherRun = makeRunner({ driver: createSessionDriver(otherFake), providerHealth: health, retryAttempts: 0 })
+  await assert.rejects(otherRun.runner.call("o", { model: { providerID: "xai", id: "grok-4.6" } }))
+  assert.equal(reported.length, 2)
 })

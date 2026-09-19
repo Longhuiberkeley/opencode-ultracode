@@ -147,6 +147,15 @@ async function readPin(fs: FsLike, path: string): Promise<string | undefined> {
 }
 
 /**
+ * Format a model ref back into a "provider/id#variant" pin string — the shape
+ * the failover ladder consumes (and the shape users type in `/ultracode`
+ * commands). Variant omitted when absent.
+ */
+export function modelPinString(model: { providerID: string; id: string; variant?: string }): string {
+  return `${model.providerID}/${model.id}${model.variant !== undefined && model.variant !== "" ? `#${model.variant}` : ""}`
+}
+
+/**
  * Resolve the pinned model for an agent id: project `.opencode/agents/`
  * beats `~/.config/opencode/agents/`. Returns undefined when unpinned.
  * A project file that exists but is `disabled: true` WINS over the global

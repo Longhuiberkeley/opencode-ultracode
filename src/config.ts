@@ -4,7 +4,7 @@
  * Rules (CONTRACTS.md): unknown keys ignored; bad values fall back to defaults
  * and collect a human-readable warning. Never throws.
  */
-import type { AgentScope, PermissionMode, UltracodeOptions } from "./types.ts"
+import type { AgentScope, FailoverMode, PermissionMode, UltracodeOptions } from "./types.ts"
 import { DEFAULT_OPTIONS, MAX_LOOP_DEPTH, MAX_RUN_TIMEOUT_MS, MIN_LOOP_DEPTH, MIN_RUN_TIMEOUT_MS } from "./types.ts"
 import { parseModelPin } from "./agent-pins.ts"
 
@@ -28,7 +28,8 @@ const RANGES: Record<
   | "agentRetryAttempts"
   | "agentRetryBackoffMs"
   | "childStallMs"
-  | "maxLoopDepth",
+  | "maxLoopDepth"
+  | "askTimeoutMs",
   NumRange
 > = {
   concurrency: { min: 1, max: 64 },
@@ -45,11 +46,15 @@ const RANGES: Record<
   // loop() nesting depth inside one run (engine-owned preflight; shared with
   // the per-run maxLoopDepth run input — src/types.ts).
   maxLoopDepth: { min: MIN_LOOP_DEPTH, max: MAX_LOOP_DEPTH },
+  // Ask-mode auto-proceed timeout: 0 = wait indefinitely while paused.
+  askTimeoutMs: { min: 0, max: 86_400_000 },
 }
 
 const PERMISSION_MODES: ReadonlySet<string> = new Set(["ask", "autoEditsWorkflow", "noEditTools"])
 
 const AGENT_SCOPES: ReadonlySet<string> = new Set(["host", "configured"])
+
+const FAILOVER_MODES: ReadonlySet<string> = new Set(["auto", "ask", "off"])
 
 function num(warnings: string[], raw: Record<string, unknown>, key: keyof typeof RANGES): number | undefined {
   const range = RANGES[key]
@@ -78,9 +83,10 @@ function num(warnings: string[], raw: Record<string, unknown>, key: keyof typeof
  * through the SAME pin parser the failover ladder uses, so lookups key on the
  * exact `provider/id` the policy produces. Returns undefined when the whole
  * option is absent (caller keeps the default), an empty-but-valid map when
- * every entry was dropped.
+ * every entry was dropped. Exported: the KV settings overlay (remembered
+ * ask-mode fallbacks) parses through this same function, warnings optional.
  */
-function modelFallbacksOption(warnings: string[], raw: unknown): Record<string, string[]> | undefined {
+export function parseModelFallbacks(raw: unknown, warnings: string[] = []): Record<string, string[]> | undefined {
   if (raw === undefined) return undefined
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
     warnings.push(
@@ -169,8 +175,19 @@ export function loadOptions(raw: unknown): LoadedOptions {
     }
   }
 
-  const modelFallbacks = modelFallbacksOption(warnings, record["modelFallbacks"])
+  const modelFallbacks = parseModelFallbacks(record["modelFallbacks"], warnings)
   if (modelFallbacks !== undefined) options.modelFallbacks = modelFallbacks
+
+  const failover = record["failover"]
+  if (failover !== undefined) {
+    if (typeof failover === "string" && FAILOVER_MODES.has(failover)) {
+      options.failover = failover as FailoverMode
+    } else {
+      warnings.push(
+        `option "failover" must be one of auto | ask | off, got ${JSON.stringify(failover) ?? String(failover)} — using default "${DEFAULT_OPTIONS.failover}"`,
+      )
+    }
+  }
 
   // Unknown keys intentionally ignored (forward compatibility).
   return { options, warnings }

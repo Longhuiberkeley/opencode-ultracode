@@ -13,7 +13,11 @@ import type {
   AgentOpts,
   AgentRecord,
   Json,
+  ModelRef,
   ParentContext,
+  ProviderFailureClass,
+  ProviderHealth,
+  ProviderQuarantineSnapshot,
   Registry,
   RunLaunchInput,
   RunOutcome,
@@ -27,13 +31,21 @@ import type {
   WorkflowMeta,
 } from "./types.ts"
 import { addTokens, emptyTokens, isActiveRunStatus } from "./types.ts"
-import { normalizeModelRef } from "./agent-pins.ts"
+import { modelPinString, normalizeModelRef } from "./agent-pins.ts"
 import { freezeEffective, panelSettingsFrom, remainingTimeoutMs } from "./settings.ts"
 import { buildEnvelope, resultFits } from "./serialize.ts"
 import { createSessionDriver } from "./sessions.ts"
 import type { SessionDriver } from "./sessions.ts"
-import { AgentRunner, buildWarmCache, getWorkflowComposer, storageWorkflowLoader } from "./primitives.ts"
+import {
+  AgentRunner,
+  Semaphore,
+  buildWarmCache,
+  delayAbortable,
+  getWorkflowComposer,
+  storageWorkflowLoader,
+} from "./primitives.ts"
 import type { WarmCacheEntry, WorkflowLoader } from "./primitives.ts"
+import { resolveFallbacks } from "./failover.ts"
 import type { PinPoolEntry } from "./failover.ts"
 import { validateScriptSource } from "./worker-script.ts"
 import { spawnWorker } from "./worker-host.ts"
@@ -45,6 +57,227 @@ export const SETTLE_GRACE_MS = 15_000
 export const STOP_KILL_GRACE_MS = 5_000
 /** Hard cap on dispose() waiting for run finalization. */
 export const DISPOSE_TIMEOUT_MS = 30_000
+/** Burst strikes inside this window engage the throttle; a quiet window this long lifts it. */
+export const PROVIDER_BURST_WINDOW_MS = 60_000
+/** Strikes within the window that engage admission throttling for a provider. */
+export const PROVIDER_BURST_STRIKE_LIMIT = 3
+/** Minimum gap between admissions for a throttled provider (serialize + stagger). */
+export const PROVIDER_THROTTLE_STAGGER_MS = 200
+/** Bounded per-provider memory of the model keys that triggered a quarantine. */
+export const PROVIDER_QUARANTINE_MODELS_CAP = 4
+
+/**
+ * What the breaker reports when a provider crosses into quarantine (quota) or
+ * the throttle engages (3 burst strikes in 60 s). The supervisor consumes it
+ * for ask mode; the runner does not branch on events.
+ */
+export interface ProviderBreakerEvent {
+  /** Run whose child reported the failure (ask-mode pause target). */
+  runID: string
+  providerID: string
+  /** "quota" quarantines; "burst" fires only when the throttle first engages. */
+  kind: ProviderFailureClass
+  /** Parsed reset time when the classification exposed one. */
+  resetAt?: number
+  /** "provider/id" of the failing model (ask-report key resolution). */
+  model?: string
+  /** Strikes inside the window at engagement time (burst events). */
+  strikes?: number
+}
+
+interface ProviderHealthState {
+  /** Epoch ms; Infinity = quarantined for this supervisor's lifetime. */
+  quarantinedUntil: number | undefined
+  /** Model keys whose failures triggered the current quarantine (bounded). */
+  quarantineModels: string[]
+  /** Burst strike timestamps (pruned to PROVIDER_BURST_WINDOW_MS). */
+  burstStrikes: number[]
+  /** Last admission timestamp for the throttle stagger (0 = never). */
+  lastAdmissionAt: number
+}
+
+/**
+ * Supervisor-owned provider breaker (the run-level breaker of the failover
+ * policy). ONE instance per supervisor, shared across every run it owns.
+ *
+ * WHY supervisor-scoped and in-memory: quota is account-level and hours long,
+ * so a single strike must stop EVERY subsequent child of EVERY run this
+ * instance supervises from creating a session on that provider. Persisting the
+ * state would resurrect hours-old strikes after an unrelated plan reset, so
+ * the knowledge is deliberately process-local — a restart re-observes.
+ *
+ * Two signals:
+ * - QUOTA (classified account/plan quota): quarantine the provider until the
+ *   parsed reset time (Infinity when unknown). No second event for the same
+ *   quarantine — ask mode reports once, not per child.
+ * - BURST: strikes accumulate; the 3rd within 60 s engages admission
+ *   throttling (serialize + stagger). The throttle lifts after a 60 s quiet
+ *   window (strike pruning) — never an abort.
+ *
+ * Admission waiting is abort-aware: a stopping run rejects instead of waiting.
+ */
+export class ProviderBreaker implements ProviderHealth {
+  private readonly states = new Map<string, ProviderHealthState>()
+  private readonly gates = new Map<string, Semaphore>()
+  private readonly now: () => number
+  private readonly staggerMs: number
+  private readonly onEvent: ((event: ProviderBreakerEvent) => void) | undefined
+
+  constructor(
+    options: {
+      /** Clock injection (tests). */
+      now?: () => number
+      /** Override the 200 ms stagger (tests). */
+      staggerMs?: number
+      onEvent?: (event: ProviderBreakerEvent) => void
+    } = {},
+  ) {
+    this.now = options.now ?? Date.now
+    this.staggerMs = Math.max(0, Math.floor(options.staggerMs ?? PROVIDER_THROTTLE_STAGGER_MS))
+    this.onEvent = options.onEvent
+  }
+
+  isQuarantined(providerID: string): boolean {
+    return this.quarantinedUntil(providerID) !== undefined
+  }
+
+  quarantinedUntil(providerID: string): number | undefined {
+    const state = this.states.get(providerID)
+    if (state?.quarantinedUntil === undefined) return undefined
+    if (state.quarantinedUntil <= this.now()) {
+      // The parsed reset passed: the provider is presumed healthy again.
+      state.quarantinedUntil = undefined
+      state.quarantineModels = []
+      return undefined
+    }
+    return state.quarantinedUntil
+  }
+
+  isThrottled(providerID: string): boolean {
+    const state = this.states.get(providerID)
+    return state !== undefined && this.pruneStrikes(state) >= PROVIDER_BURST_STRIKE_LIMIT
+  }
+
+  async admit(providerID: string, signal?: AbortSignal): Promise<void> {
+    if (!this.isThrottled(providerID)) return
+    const gate = this.gateFor(providerID)
+    await gate.acquire(signal)
+    try {
+      if (!this.isThrottled(providerID)) return // lifted while queued: no stagger needed
+      const state = this.stateFor(providerID)
+      const waitMs = this.staggerMs - (this.now() - state.lastAdmissionAt)
+      if (waitMs > 0) await delayAbortable(waitMs, signal)
+      state.lastAdmissionAt = this.now()
+    } finally {
+      gate.release()
+    }
+  }
+
+  report(input: {
+    runID: string
+    providerID: string
+    class: ProviderFailureClass
+    resetAt?: number
+    model?: string
+  }): void {
+    const providerID = input.providerID
+    if (typeof providerID !== "string" || providerID.length === 0) return
+    const now = this.now()
+    const state = this.stateFor(providerID)
+    if (input.class === "quota") {
+      if (state.quarantinedUntil !== undefined && state.quarantinedUntil > now) {
+        // Already quarantined: keep (or extend to) the later known reset and
+        // remember the model. No event — ask mode must report once, not per
+        // child that dies on the same dead provider.
+        if (input.resetAt !== undefined && input.resetAt > state.quarantinedUntil) {
+          state.quarantinedUntil = input.resetAt
+        }
+        this.rememberModel(state, input.model)
+        return
+      }
+      state.quarantinedUntil = input.resetAt !== undefined ? input.resetAt : Number.POSITIVE_INFINITY
+      state.quarantineModels = []
+      this.rememberModel(state, input.model)
+      this.emit({
+        runID: input.runID,
+        providerID,
+        kind: "quota",
+        ...(input.resetAt !== undefined ? { resetAt: input.resetAt } : {}),
+        ...(input.model !== undefined ? { model: input.model } : {}),
+      })
+      return
+    }
+    // Burst: quota dominates — a quarantined provider needs no strike noise.
+    if (state.quarantinedUntil !== undefined && state.quarantinedUntil > now) return
+    const wasThrottled = this.pruneStrikes(state) >= PROVIDER_BURST_STRIKE_LIMIT
+    state.burstStrikes.push(now)
+    const strikes = this.pruneStrikes(state)
+    if (!wasThrottled && strikes >= PROVIDER_BURST_STRIKE_LIMIT) {
+      this.emit({
+        runID: input.runID,
+        providerID,
+        kind: "burst",
+        strikes,
+        ...(input.model !== undefined ? { model: input.model } : {}),
+      })
+    }
+  }
+
+  /** Snapshot for orchestrator surfaces (read-only; prunes expired quarantines). */
+  quarantines(): ProviderQuarantineSnapshot[] {
+    const out: ProviderQuarantineSnapshot[] = []
+    for (const providerID of [...this.states.keys()]) {
+      const until = this.quarantinedUntil(providerID)
+      if (until === undefined) continue
+      const state = this.states.get(providerID)!
+      out.push({
+        providerID,
+        ...(Number.isFinite(until) ? { resetAt: until } : {}),
+        models: [...state.quarantineModels],
+      })
+    }
+    return out
+  }
+
+  private emit(event: ProviderBreakerEvent): void {
+    try {
+      this.onEvent?.(event)
+    } catch {
+      // Breaker diagnostics must never break the child call that reported.
+    }
+  }
+
+  private stateFor(providerID: string): ProviderHealthState {
+    let state = this.states.get(providerID)
+    if (state === undefined) {
+      state = { quarantinedUntil: undefined, quarantineModels: [], burstStrikes: [], lastAdmissionAt: 0 }
+      this.states.set(providerID, state)
+    }
+    return state
+  }
+
+  private gateFor(providerID: string): Semaphore {
+    let gate = this.gates.get(providerID)
+    if (gate === undefined) {
+      gate = new Semaphore(1) // provider-level serialization while throttled
+      this.gates.set(providerID, gate)
+    }
+    return gate
+  }
+
+  /** Drop strikes older than the window; returns the in-window count. */
+  private pruneStrikes(state: ProviderHealthState): number {
+    const cutoff = this.now() - PROVIDER_BURST_WINDOW_MS
+    while (state.burstStrikes.length > 0 && state.burstStrikes[0]! < cutoff) state.burstStrikes.shift()
+    return state.burstStrikes.length
+  }
+
+  private rememberModel(state: ProviderHealthState, model: string | undefined): void {
+    if (typeof model !== "string" || model.length === 0 || state.quarantineModels.includes(model)) return
+    state.quarantineModels.push(model)
+    if (state.quarantineModels.length > PROVIDER_QUARANTINE_MODELS_CAP) state.quarantineModels.shift()
+  }
+}
 
 export interface SupervisorDeps {
   registry: Registry
@@ -86,6 +319,10 @@ export interface SupervisorDeps {
    * failover; absent => no exclusions. Index wiring; optional for tests.
    */
   disabledProviders?: () => Promise<ReadonlySet<string>>
+  /** Clock injection for breaker tests (default Date.now). */
+  now?: () => number
+  /** Throttle stagger override for breaker tests (default 200 ms). */
+  breakerStaggerMs?: number
 }
 
 interface PauseWaiter {
@@ -132,6 +369,12 @@ interface RunState {
   effective: Required<UltracodeOptions>
   /** Explicit run-level model override (run tool input `model`). */
   runModel: { providerID: string; id: string; variant?: string } | undefined
+  /** Ask-mode fallback override (resume { model }): beats the ladder at failover time. */
+  fallbackOverride: ModelRef | undefined
+  /** Ask-mode auto-proceed timer (askTimeoutMs > 0); undefined = no pending timer. */
+  askTimer: ReturnType<typeof setTimeout> | undefined
+  /** Ask reports already emitted for this run (provider+kind coalescing keys). */
+  askNotified: Set<string>
   /** Escape hatch: explicit overrides may target disabled providers. */
   allowDisabledProviders: boolean
   /** Per-run tighten-only loop iteration ceiling (run input `maxLoopIterations`). */
@@ -185,6 +428,8 @@ export class SupervisorImpl implements Supervisor {
   private readonly stopKillMs: number
   private readonly driver: Required<SessionDriver>
   private readonly workflowLoader: WorkflowLoader
+  /** Run-level breaker, shared across every run this supervisor owns. */
+  private readonly providerHealth: ProviderBreaker
   private readonly runs = new Map<string, RunState>()
   private disposed = false
 
@@ -204,6 +449,14 @@ export class SupervisorImpl implements Supervisor {
     // Composition seam: injected fresh loader wins; else prefer
     // Storage.loadWorkflowFresh when present, else the cached loadWorkflow.
     this.workflowLoader = deps.loadWorkflowFresh ?? storageWorkflowLoader(deps.storage)
+    // Run-level breaker: ONE instance shared across this supervisor's runs.
+    // Quota strikes quarantine a provider; burst strikes throttle admission;
+    // ask-mode events pause the affected run and report once.
+    this.providerHealth = new ProviderBreaker({
+      ...(deps.now ? { now: deps.now } : {}),
+      ...(deps.breakerStaggerMs !== undefined ? { staggerMs: deps.breakerStaggerMs } : {}),
+      onEvent: (event) => this.handleProviderEvent(event),
+    })
   }
 
   // -------------------------------------------------------------------------
@@ -393,7 +646,16 @@ export class SupervisorImpl implements Supervisor {
             state.live.add(sessionID)
             state.childLastActivity.set(sessionID, Date.now())
             try {
-              return await this.driver.continueAgent(continueInput, hooks)
+              // Ask-mode answer: a failover continue (model switch) that was
+              // resolved BEFORE the pause picks up the override the run was
+              // resumed with. Same-model continues are untouched — the
+              // override answers a failover, it does not reroute retries.
+              const override = state.fallbackOverride
+              const effective =
+                override !== undefined && continueInput.model !== undefined
+                  ? { ...continueInput, model: override }
+                  : continueInput
+              return await this.driver.continueAgent(effective, hooks)
             } finally {
               state.live.delete(sessionID)
             }
@@ -411,9 +673,15 @@ export class SupervisorImpl implements Supervisor {
         retryBackoffMs: state.effective.agentRetryBackoffMs,
         // Quota failover: the frozen run's ladder + permission mode decide
         // read-only eligibility; pin pool / disabled providers are lazy
-        // index-wired lookups shared across the run's children.
+        // index-wired lookups shared across the run's children. The breaker
+        // is supervisor-owned (shared across runs): quarantined providers are
+        // never created on again; the ask-mode resume override is read at
+        // failover time so a paused run honors the answer it is resumed with.
         modelFallbacks: state.effective.modelFallbacks,
         permissions: state.effective.permissions,
+        failover: state.effective.failover,
+        providerHealth: this.providerHealth,
+        fallbackOverride: () => state.fallbackOverride,
         ...(this.pinPool ? { pinPool: this.pinPool } : {}),
         ...(this.disabledProviders ? { disabledProviders: this.disabledProviders } : {}),
         report: (status) => parent.report(status),
@@ -479,6 +747,7 @@ export class SupervisorImpl implements Supervisor {
       final = { status: "failed", error: errorMessage(err) }
     } finally {
       this.clearWatchdog(state)
+      this.clearAskTimer(state)
       this.cancelKillTimer(state)
       this.runs.delete(runID)
       state.resolveDone()
@@ -499,6 +768,7 @@ export class SupervisorImpl implements Supervisor {
     if (!run || !isActiveRunStatus(run.status) || run.status === "stopping") return false
     if (!this.registry.setStatus(runID, "stopping", { stopReason: reason })) return false
     state.paused = false
+    this.clearAskTimer(state)
     this.clearWatchdog(state)
     // Finality belongs to the run: record the stop reason even when the
     // worker already posted done (a stop accepted during settle must not
@@ -540,7 +810,7 @@ export class SupervisorImpl implements Supervisor {
     return true
   }
 
-  resume(runID: string): boolean {
+  resume(runID: string, opts?: { model?: ModelRef }): boolean {
     const state = this.runs.get(runID)
     if (!state) return false
     const run = this.registry.get(runID)
@@ -551,11 +821,26 @@ export class SupervisorImpl implements Supervisor {
       state.pausedAt = undefined
     }
     state.paused = false
+    // Ask-mode answer: a resume WITH a model becomes this run's fallback
+    // override — later failovers (and quarantine routing) prefer it over the
+    // configured ladder. A resume without one proceeds in auto-mode policy.
+    if (opts?.model !== undefined) state.fallbackOverride = opts.model
+    this.clearAskTimer(state)
     this.armWatchdog(state)
     this.armStallScanner(state)
     this.resumePauseWaiters(state)
-    this.safeParentReport(state, `resumed ${runID}`)
+    this.safeParentReport(
+      state,
+      opts?.model !== undefined
+        ? `resumed ${runID} — fallback override ${modelPinString(opts.model)}`
+        : `resumed ${runID}`,
+    )
     return true
+  }
+
+  /** Currently quarantined providers (ask-mode diagnostics + remember keying). */
+  providerQuarantines(): ProviderQuarantineSnapshot[] {
+    return this.providerHealth.quarantines()
   }
 
   stopAll(reason: string): void {
@@ -623,6 +908,9 @@ export class SupervisorImpl implements Supervisor {
       pauseWaiters: [],
       effective,
       runModel: input.model,
+      fallbackOverride: undefined,
+      askTimer: undefined,
+      askNotified: new Set<string>(),
       allowDisabledProviders: input.allowDisabledProviders === true,
       runLoopIterations: input.maxLoopIterations,
     }
@@ -933,6 +1221,146 @@ export class SupervisorImpl implements Supervisor {
     if (state.stallTimer !== undefined) {
       clearInterval(state.stallTimer)
       state.stallTimer = undefined
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Ask mode (quarantine/throttle -> pause + one coalesced report)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Breaker event hook. Ask mode only: when a provider crosses into
+   * quarantine (or its burst throttle engages) and an active run has children
+   * on it, pause that run through the existing pause machinery (watchdog
+   * suspended — paused runs do not burn timeoutMs) and emit ONE coalesced
+   * report per (run, provider, kind): provider, class, reset time, affected
+   * child count, proposed fallback and the exact resume invocation. Children
+   * already inside a failover park in the driver's pause gate until the run is
+   * resumed, so the ask really does gate the failover. "off"/"auto" modes
+   * never take this path.
+   */
+  private handleProviderEvent(event: ProviderBreakerEvent): void {
+    for (const state of [...this.runs.values()]) {
+      if (state.effective.failover !== "ask") continue
+      const key = `${event.kind}:${event.providerID}`
+      if (state.askNotified.has(key)) continue
+      const affected = this.affectedChildCount(state, event.providerID)
+      if (affected === 0) continue // no child of this run would fail over: nothing to ask
+      if (!state.paused) {
+        if (!this.pause(state.runID)) continue // already stopping/final: cannot hold the run
+      }
+      state.askNotified.add(key)
+      this.emitAskReport(state, event, affected)
+      this.armAskTimeout(state)
+    }
+  }
+
+  /** Children of this run currently running/pending ON providerID. */
+  private affectedChildCount(state: RunState, providerID: string): number {
+    const run = this.registry.get(state.runID)
+    if (!run) return 0
+    let count = 0
+    for (const agent of run.agents as AgentRecord[]) {
+      if (agent.status !== "running" && agent.status !== "pending") continue
+      const model = agent.effectiveModel ?? agent.spawnModel
+      if (model?.providerID === providerID) count++
+    }
+    return count
+  }
+
+  /**
+   * One coalesced ask report. Never throws; the fallback proposal is resolved
+   * lazily through the same ladder inputs the runner uses (pin pool /
+   * disabled providers / run fallback override; read-only inferred from the
+   * run's permission mode).
+   */
+  private emitAskReport(state: RunState, event: ProviderBreakerEvent, affected: number): void {
+    void (async () => {
+      let proposed: ModelRef | undefined
+      if (event.model !== undefined) {
+        const parsed = normalizeModelRef(event.model)
+        if (parsed.ok) proposed = await this.proposeFallback(state, parsed.model)
+      }
+      const when =
+        event.kind === "burst"
+          ? `${event.strikes ?? PROVIDER_BURST_STRIKE_LIMIT} burst strikes within ${Math.round(PROVIDER_BURST_WINDOW_MS / 1000)}s`
+          : event.resetAt !== undefined
+            ? `reset at ${new Date(event.resetAt).toISOString()}`
+            : "reset time unknown — quarantined for this plugin instance"
+      const modelBit = proposed !== undefined ? `, "model": "${modelPinString(proposed)}"` : ""
+      const timeoutBit =
+        state.effective.askTimeoutMs > 0
+          ? `auto-resumes in ${state.effective.askTimeoutMs}ms`
+          : "waits indefinitely (askTimeoutMs 0)"
+      this.safeParentReport(
+        state,
+        `provider ask — ${event.kind === "quota" ? "account quota" : "burst throttle"} on ${event.providerID} (${when}); ` +
+          `affected children: ${affected}; proposed fallback: ${proposed !== undefined ? modelPinString(proposed) : "none"}. ` +
+          `run ${state.runID} is paused — resume with ultracode_control { "action": "resume", "runID": "${state.runID}"${modelBit} } (${timeoutBit})`,
+      )
+    })().catch(() => {
+      // reporting must never break a run
+    })
+  }
+
+  /** First eligible ladder candidate for a dead model (proposal only). */
+  private async proposeFallback(state: RunState, dead: ModelRef): Promise<ModelRef | undefined> {
+    let pinPool: ReadonlyArray<PinPoolEntry> = []
+    if (this.pinPool) {
+      try {
+        pinPool = await this.pinPool(state.parent.availableAgents ?? [])
+      } catch {
+        pinPool = [] // pin collection must never break a run
+      }
+    }
+    let disabledProviders: ReadonlySet<string> | undefined
+    if (this.disabledProviders) {
+      try {
+        disabledProviders = await this.disabledProviders()
+      } catch {
+        disabledProviders = undefined // fail open — mirrors the runner
+      }
+    }
+    const override = state.fallbackOverride
+    const candidates = resolveFallbacks({
+      dead,
+      failureClass: "quota",
+      ...(override !== undefined ? { runFallback: modelPinString(override) } : {}),
+      modelFallbacks: state.effective.modelFallbacks,
+      pinPool,
+      ...(disabledProviders !== undefined ? { disabledProviders } : {}),
+      readOnly: state.effective.permissions === "noEditTools",
+    })
+    return candidates.find((candidate) => !this.providerHealth.isQuarantined(candidate.model.providerID))?.model
+  }
+
+  /**
+   * askTimeoutMs > 0: auto-resume in auto-mode policy after the timeout. The
+   * timer is unref'd (never keeps a process alive) and only fires while the
+   * run is still paused — a manual resume/stop cancels it first.
+   */
+  private armAskTimeout(state: RunState): void {
+    if (state.askTimer !== undefined) return
+    const ms = state.effective.askTimeoutMs
+    if (ms <= 0) return
+    const timer = setTimeout(() => {
+      state.askTimer = undefined
+      if (this.disposed || !state.paused) return
+      const run = this.registry.get(state.runID)
+      if (!run || run.status !== "paused") return
+      this.safeParentReport(state, `ask timeout (${ms}ms) — resuming ${state.runID} in auto mode`)
+      this.resume(state.runID)
+    }, ms)
+    if (typeof (timer as { unref?: () => void }).unref === "function") {
+      ;(timer as { unref: () => void }).unref()
+    }
+    state.askTimer = timer
+  }
+
+  private clearAskTimer(state: RunState): void {
+    if (state.askTimer !== undefined) {
+      clearTimeout(state.askTimer)
+      state.askTimer = undefined
     }
   }
 

@@ -39,6 +39,8 @@ test("loadOptions: empty object gives all defaults", () => {
     childStallMs: 900_000,
     maxLoopDepth: 2,
     modelFallbacks: {},
+    failover: "auto",
+    askTimeoutMs: 0,
   })
   assert.deepEqual(warnings, [])
 })
@@ -58,6 +60,8 @@ test("loadOptions: fully valid options round-trip", () => {
     childStallMs: 600_000,
     maxLoopDepth: 3,
     modelFallbacks: { "xai/grok-4.6": ["google/gemini-3.7-flash#lite", "anthropic/claude-x"] },
+    failover: "ask",
+    askTimeoutMs: 900_000,
   }
   const { options, warnings } = loadOptions(raw)
   assert.deepEqual(options, raw)
@@ -190,6 +194,33 @@ test("loadOptions: agent must be a non-empty string", () => {
     assert.equal(options.agent, "general")
     assert.equal(warnings.length, 1)
     assert.match(warnings[0]!, /agent/)
+  }
+})
+
+test("loadOptions: failover enum and askTimeoutMs range", () => {
+  for (const valid of ["auto", "ask", "off"] as const) {
+    const { options, warnings } = loadOptions({ failover: valid })
+    assert.equal(options.failover, valid)
+    assert.deepEqual(warnings, [])
+  }
+  for (const bad of [" Auto", "manual", 3, null]) {
+    const { options, warnings } = loadOptions({ failover: bad })
+    assert.equal(options.failover, DEFAULT_OPTIONS.failover)
+    assert.equal(warnings.length, 1)
+    assert.match(warnings[0]!, /failover/)
+  }
+
+  const off = loadOptions({ askTimeoutMs: 0 })
+  assert.equal(off.options.askTimeoutMs, 0, "0 waits indefinitely")
+  assert.deepEqual(off.warnings, [])
+  const hi = loadOptions({ askTimeoutMs: 86_400_000 })
+  assert.equal(hi.options.askTimeoutMs, 86_400_000)
+  assert.deepEqual(hi.warnings, [])
+  for (const bad of [-1, 86_400_001, 1.5, "soon"]) {
+    const { options, warnings } = loadOptions({ askTimeoutMs: bad })
+    assert.equal(options.askTimeoutMs, DEFAULT_OPTIONS.askTimeoutMs)
+    assert.equal(warnings.length, 1)
+    assert.match(warnings[0]!, /askTimeoutMs/)
   }
 })
 

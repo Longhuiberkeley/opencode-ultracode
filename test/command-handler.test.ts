@@ -166,6 +166,7 @@ class MemoryStorage implements CommandStorage {
 
 class MemorySupervisor implements CommandSupervisor {
   startCalls: Array<{ input: unknown; parent: ParentContext }> = []
+  resumeCalls: Array<{ runID: string; opts?: { model?: { providerID: string; id: string; variant?: string } } }> = []
   pendingDone: Array<(value: RunOutcome) => void> = []
   private readonly registry: FakeRegistry
   constructor(registry: FakeRegistry) {
@@ -176,7 +177,8 @@ class MemorySupervisor implements CommandSupervisor {
     if (!run || run.status !== "running") return false
     return this.registry.setStatus(runID, "paused")
   }
-  resume(runID: string): boolean {
+  resume(runID: string, opts?: { model?: { providerID: string; id: string; variant?: string } }): boolean {
+    this.resumeCalls.push({ runID, ...(opts !== undefined ? { opts } : {}) })
     const run = this.registry.get(runID)
     if (!run || run.status !== "paused") return false
     return this.registry.setStatus(runID, "running")
@@ -686,6 +688,75 @@ test("set missing value emits usage; unknown keys still ack", async () => {
   texts.length = 0
   await handleUltracodeCommand({ sessionID: "ses_parent", prompt: { text: "set sizeGuideline 1" } }, deps)
   assert.equal(parseSettingsAckPayload(texts[0]!)?.overlay.concurrency, DEFAULT_OPTIONS.concurrency)
+})
+
+test("/ultracode resume asks: --model applies the fallback override and --remember persists it", async () => {
+  const registry = new FakeRegistry()
+  seed(registry, baseRun({ id: "run_paused", status: "paused" }))
+  const supervisor = new MemorySupervisor(registry)
+  const remembered: Array<{ runID: string; pin: string }> = []
+  const texts: string[] = []
+  const deps: CommandDeps = {
+    registry,
+    supervisor,
+    storage: new MemoryStorage(),
+    say: async (_sid, t) => {
+      texts.push(t)
+    },
+    projectRoot: "/project",
+    personalWorkflowDir: "/home/u/.config/opencode/workflows",
+    listAgents: async () => ({ ok: true, agents: [{ id: "general" }] }),
+    defaultAgent: "general",
+    rememberFallback: async (input) => {
+      remembered.push(input)
+      return { ok: true, key: "xai/grok-4.6" }
+    },
+  }
+  await handleUltracodeCommand(
+    { sessionID: "ses_parent", prompt: { text: "resume run_paused --model openai/gpt-6#high --remember" } },
+    deps,
+  )
+  assert.equal(registry.get("run_paused")!.status, "running")
+  assert.deepEqual(supervisor.resumeCalls, [
+    { runID: "run_paused", opts: { model: { providerID: "openai", id: "gpt-6", variant: "high" } } },
+  ])
+  assert.deepEqual(remembered, [{ runID: "run_paused", pin: "openai/gpt-6#high" }])
+  assert.match(texts[0]!, /Resumed run `run_paused`/)
+  assert.match(texts[0]!, /fallback override openai\/gpt-6#high/)
+  assert.match(texts[0]!, /remembered fallback for `xai\/grok-4.6`/)
+})
+
+test("/ultracode resume flag errors are explicit (bad pin, --remember without --model)", async () => {
+  const registry = new FakeRegistry()
+  seed(registry, baseRun({ id: "run_paused", status: "paused" }))
+  const supervisor = new MemorySupervisor(registry)
+  const texts: string[] = []
+  const deps: CommandDeps = {
+    registry,
+    supervisor,
+    storage: new MemoryStorage(),
+    say: async (_sid, t) => {
+      texts.push(t)
+    },
+    projectRoot: "/project",
+    personalWorkflowDir: "/home/u/.config/opencode/workflows",
+    listAgents: async () => ({ ok: true, agents: [{ id: "general" }] }),
+    defaultAgent: "general",
+  }
+  await handleUltracodeCommand(
+    { sessionID: "ses_parent", prompt: { text: "resume run_paused --model not-a-pin" } },
+    deps,
+  )
+  assert.match(texts[0]!, /--model must be a "provider\/id"/)
+  assert.equal(registry.get("run_paused")!.status, "paused")
+  texts.length = 0
+  await handleUltracodeCommand(
+    { sessionID: "ses_parent", prompt: { text: "resume run_paused --remember" } },
+    deps,
+  )
+  assert.match(texts[0]!, /--remember requires --model/)
+  assert.equal(registry.get("run_paused")!.status, "paused")
+  assert.deepEqual(supervisor.resumeCalls, [])
 })
 
 test("two-token save sets savedFromRunID", async () => {

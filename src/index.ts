@@ -34,12 +34,13 @@ import {
 } from "./command.ts"
 import { loadOptions } from "./config.ts"
 import { CATALOG_RUN_LIMIT, CATALOG_RUN_SCAN, buildCatalog } from "./catalog.ts"
-import { controlToolContent } from "./control.ts"
+import { applyResumeRemember, controlRun, controlToolContent } from "./control.ts"
 import {
   applyOverlay,
   capturedFromRecord,
   panelSettingsFrom,
   evaluateOwnedPermission,
+  rememberModelFallback,
   NO_EDIT_TOOLS_MESSAGE,
   permissionStallAction,
   type SettingsOverlay,
@@ -412,6 +413,16 @@ const CONTROL_TOOL_INPUT_SCHEMA: Record<string, unknown> = {
     runID: {
       type: "string",
       description: "Target run. Omit to use the single active run owned by this conversation; an error listing ids when 0 or several.",
+    },
+    model: {
+      type: "string",
+      description:
+        'Resume only (ask mode): a validated "provider/id" or "provider/id#variant" pin applied as this run\'s fallback override — the quarantine ask\'s answer. Children that fail over (or route around a quarantined provider) prefer it over the configured ladder.',
+    },
+    remember: {
+      type: "boolean",
+      description:
+        "Resume only, requires model: persist the model→modelFallbacks entry through the settings path (/ultracode set) so future runs use it. Never touches agent pin files.",
     },
   },
 }
@@ -838,6 +849,44 @@ export default Plugin.define({
       }
     }
 
+    /**
+     * Ask-mode `remember`: persist a chosen fallback pin as the FIRST
+     * `modelFallbacks` rung for the quarantined provider's failing model,
+     * through the SAME settings overlay path `/ultracode set` uses (KV overlay
+     * + refreshDefaults). Never touches agent pin files. The key comes from the
+     * run's own quarantined child rows, falling back to the supervisor's
+     * quarantine snapshot.
+     */
+    const rememberFallbackEntry = async (
+      input: { runID: string; pin: string },
+    ): Promise<{ ok: true; key: string } | { ok: false; error: string }> => {
+      const quarantines = supervisor?.providerQuarantines() ?? []
+      const quarantined = new Set(quarantines.map((q) => q.providerID))
+      let key: string | undefined
+      for (const agent of registry.get(input.runID)?.agents ?? []) {
+        const model = agent.spawnModel
+        if (model !== undefined && quarantined.has(model.providerID)) {
+          key = `${model.providerID}/${model.id}`
+          break
+        }
+      }
+      if (key === undefined) {
+        for (const q of quarantines) {
+          if (q.models.length > 0) {
+            key = q.models[0]
+            break
+          }
+        }
+      }
+      if (key === undefined) {
+        return { ok: false, error: "no quarantined provider recorded for this run — nothing to key the remembered fallback to" }
+      }
+      const next = rememberModelFallback(overlay, key, input.pin)
+      storage.saveSettingsOverlay(next)
+      refreshDefaults(next)
+      return { ok: true, key }
+    }
+
     /** Best-effort pending-permission summary for a child session. */
     async function pendingPermissions(sessionID: string): Promise<string | undefined> {
       try {
@@ -1207,7 +1256,7 @@ export default Plugin.define({
           name: "control",
           options: { namespace: "ultracode" },
           description:
-            "Orchestrator control of runs owned by this conversation. Input { action: \"stop\"|\"pause\"|\"resume\", runID? }. stop is graceful (no new agent calls, children interrupted) and is recorded as the run's stop reason; pause closes admission of new agent() calls; resume reopens a paused run. Implicit target only when exactly one active owned run.",
+            'Orchestrator control of runs owned by this conversation. Input { action: "stop"|"pause"|"resume", runID?, model?, remember? }. stop is graceful (no new agent calls, children interrupted) and is recorded as the run\'s stop reason; pause closes admission of new agent() calls; resume reopens a paused run. Ask mode: a provider quota quarantines it and pauses the affected run with one report naming the proposed fallback — resume with an optional "model" pin ("provider/id#variant", applied as this run\'s fallback override) and "remember": true to persist the model→modelFallbacks entry for future runs. Implicit target only when exactly one active owned run.',
           input: CONTROL_TOOL_INPUT_SCHEMA,
           execute: async (raw: unknown, tool) =>
             controlToolContent(validateControlToolInput(raw), tool.sessionID, {
@@ -1216,6 +1265,7 @@ export default Plugin.define({
               supervisor: supervisor ?? undefined,
               supervisorError,
               reconciled: runsReconciled,
+              rememberFallback: rememberFallbackEntry,
             }),
         })
         editor.add({
@@ -1262,10 +1312,14 @@ export default Plugin.define({
           defaultAgent: options.agent,
           nextRunSettings: () => panelSettingsFrom(options),
           persistAndRefreshSettings: async (nextOverlay) => {
-            storage.saveSettingsOverlay(nextOverlay)
-            const next = refreshDefaults(nextOverlay)
+            // Merge over the stored overlay: panel saves carry only the four
+            // panel keys, so a remembered modelFallbacks map survives them.
+            const merged: SettingsOverlay = { ...overlay, ...nextOverlay }
+            storage.saveSettingsOverlay(merged)
+            const next = refreshDefaults(merged)
             return panelSettingsFrom(next)
           },
+          rememberFallback: rememberFallbackEntry,
           doctor: async () => {
             const diag = storage.kvDiagnostics()
             let marker: { v?: number; version?: string; tui?: number } | undefined
@@ -1347,6 +1401,39 @@ export default Plugin.define({
             ) => Promise<{ events?: { emit?: (...args: unknown[]) => unknown }; dispose?: () => void }>
           }
         ).register(defined, {
+          control: async (
+            input: { action?: unknown; runID?: unknown; model?: unknown; remember?: unknown } | undefined,
+          ) => {
+            await runsReconciled
+            const parsed = validateControlToolInput(input)
+            if (!parsed.ok) throw new Error(parsed.error)
+            if (!supervisor) throw new Error(supervisorError ?? "workflow tool unavailable")
+            let model: { providerID: string; id: string; variant?: string } | undefined
+            if (parsed.action === "resume" && parsed.model !== undefined) {
+              const normalized = normalizeModelRef(parsed.model)
+              if (!normalized.ok) throw new Error(normalized.error)
+              model = normalized.model
+            }
+            // The RPC channel is the local panel, not a conversation: scope
+            // control to runs recorded for THIS project (mirrors runStatus).
+            const activeInProject = supervisor.activeRuns().filter((r) => r.projectID === projectID)
+            const run = parsed.runID !== undefined ? registry.get(parsed.runID) : undefined
+            const result = controlRun(
+              {
+                ...(run !== undefined ? { run } : {}),
+                ...(parsed.runID !== undefined ? { runID: parsed.runID } : {}),
+                parentSessionID: "",
+                action: parsed.action,
+                activeOwned: activeInProject,
+                scope: "project",
+                projectID,
+                ...(model !== undefined ? { model } : {}),
+              },
+              supervisor,
+            )
+            const stored = await applyResumeRemember(result, parsed, { rememberFallback: rememberFallbackEntry })
+            return { ...result, ...stored }
+          },
           runStatus: async (input: {
             runID?: string
             sessionID?: string

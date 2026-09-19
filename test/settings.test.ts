@@ -12,15 +12,17 @@ import {
   evaluateOwnedPermission,
   freezeEffective,
   isShellWriteCommand,
+  overlayFromPanel,
   parseSetArgs,
   parseSettingsOverlay,
   permissionHookDecision,
   permissionStallAction,
   remainingTimeoutMs,
+  rememberModelFallback,
   stepPanelSetting,
   panelSettingsFrom,
 } from "../src/settings.ts"
-import { FakeRegistry } from "./fakes.ts"
+import { FakeRegistry, FakeStorage } from "./fakes.ts"
 import { CONCURRENCY_CAP, DEFAULT_OPTIONS, clampConcurrency } from "../src/types.ts"
 
 test("clampConcurrency: 64 → 8 without changing loadOptions", () => {
@@ -300,5 +302,66 @@ test("evaluateOwnedPermission: question tool denied for owned children in every 
 test("freezeEffective snapshots permissionStallMs", () => {
   const snap = freezeEffective({ ...DEFAULT_OPTIONS, permissionStallMs: 0 })
   assert.equal(snap.permissionStallMs, 0)
+  assert.equal(Object.isFrozen(snap), true)
+})
+
+// ---------------------------------------------------------------------------
+// Ask-mode remembered fallbacks (modelFallbacks in the KV overlay)
+// ---------------------------------------------------------------------------
+
+test("rememberModelFallback: the chosen pin becomes the first rung, existing rungs preserved and deduped", () => {
+  const once = rememberModelFallback({}, "xai/grok-4.6", "openai/gpt-6")
+  assert.deepEqual(once.modelFallbacks, { "xai/grok-4.6": ["openai/gpt-6"] })
+  const twice = rememberModelFallback(once, "xai/grok-4.6", "google/gemini-3.7-flash")
+  assert.deepEqual(twice.modelFallbacks, {
+    "xai/grok-4.6": ["google/gemini-3.7-flash", "openai/gpt-6"],
+  })
+  const again = rememberModelFallback(twice, "xai/grok-4.6", "openai/gpt-6")
+  assert.deepEqual(again.modelFallbacks, {
+    "xai/grok-4.6": ["openai/gpt-6", "google/gemini-3.7-flash"],
+  })
+  // Unrelated overlay keys are preserved untouched.
+  const withPanel = rememberModelFallback({ concurrency: 2 }, "a/m", "b/n")
+  assert.equal(withPanel.concurrency, 2)
+  assert.deepEqual(withPanel.modelFallbacks, { "a/m": ["b/n"] })
+})
+
+test("remembered modelFallbacks survive the KV overlay round-trip and reach the next run's options", () => {
+  const storage = new FakeStorage()
+  storage.saveSettingsOverlay(rememberModelFallback({ concurrency: 4 }, "xai/grok-4.6", "openai/gpt-6"))
+  const reloaded = parseSettingsOverlay(storage.loadSettingsOverlay())
+  assert.deepEqual(reloaded.modelFallbacks, { "xai/grok-4.6": ["openai/gpt-6"] })
+  const options = applyOverlay(loadOptions({}).options, reloaded)
+  assert.deepEqual(options.modelFallbacks, { "xai/grok-4.6": ["openai/gpt-6"] })
+  assert.equal(options.concurrency, 4)
+  assert.deepEqual(freezeEffective(options).modelFallbacks, { "xai/grok-4.6": ["openai/gpt-6"] })
+
+  // A later panel save carries only the four panel keys — the merge the
+  // /ultracode set path performs must keep the remembered map.
+  const panelSave = { ...reloaded, ...overlayFromPanel(stepPanelSetting(panelSettingsFrom(options), "concurrency", 1)) }
+  assert.deepEqual(panelSave.modelFallbacks, { "xai/grok-4.6": ["openai/gpt-6"] })
+  const afterPanel = applyOverlay(loadOptions({}).options, parseSettingsOverlay(panelSave))
+  assert.deepEqual(afterPanel.modelFallbacks, { "xai/grok-4.6": ["openai/gpt-6"] })
+  assert.equal(afterPanel.concurrency, 5)
+})
+
+test("parseSettingsOverlay: modelFallbacks fail closed per entry", () => {
+  const parsed = parseSettingsOverlay({
+    modelFallbacks: {
+      "xai/grok-4.6#medium": ["openai/gpt-6"],
+      "no-slash": ["openai/gpt-6"],
+      "google/gemini-3.7-flash": ["bad pin", 42],
+    },
+  })
+  assert.deepEqual(parsed.modelFallbacks, { "xai/grok-4.6": ["openai/gpt-6"] })
+  assert.equal(parseSettingsOverlay({ modelFallbacks: "nope" }).modelFallbacks, undefined)
+  assert.equal(parseSettingsOverlay({ modelFallbacks: {} }).modelFallbacks, undefined)
+  assert.equal(parseSettingsOverlay({ modelFallbacks: null }).modelFallbacks, undefined)
+})
+
+test("freezeEffective snapshots failover mode and askTimeoutMs", () => {
+  const snap = freezeEffective({ ...DEFAULT_OPTIONS, failover: "ask", askTimeoutMs: 5_000 })
+  assert.equal(snap.failover, "ask")
+  assert.equal(snap.askTimeoutMs, 5_000)
   assert.equal(Object.isFrozen(snap), true)
 })

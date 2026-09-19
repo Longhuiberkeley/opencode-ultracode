@@ -216,6 +216,31 @@ test("resolveFallbacks: pinPool entries carry their agent id (pin-pool cross-pro
   )
 })
 
+test("resolveFallbacks: the run-level override sits after per-call fallbacks and before the option map", () => {
+  const candidates = resolveFallbacks({
+    dead: DEAD,
+    failureClass: "quota",
+    callFallbacks: ["call/first"],
+    runFallback: "openai/gpt-6#high",
+    modelFallbacks: { "xai/grok-4.6": ["option/third"] },
+    pinPool: [{ agentID: "explore", pin: "pin/fourth" }],
+    readOnly: false,
+  })
+  assert.deepEqual(models(candidates), ["call/first", "openai/gpt-6#high", "option/third", "pin/fourth"])
+  assert.deepEqual(sources(candidates), ["call", "run", "option", "pin"])
+  assert.equal(candidates[1]!.pin, "openai/gpt-6#high")
+  // An override equal to the dead model is dropped like any other rung; a
+  // malformed override is ignored (the caller validates at admission).
+  assert.deepEqual(
+    models(resolveFallbacks({ dead: DEAD, failureClass: "quota", runFallback: "xai/grok-4.6", readOnly: false })),
+    [],
+  )
+  assert.deepEqual(
+    models(resolveFallbacks({ dead: DEAD, failureClass: "quota", runFallback: "not a pin", readOnly: false })),
+    [],
+  )
+})
+
 test("isReadOnlyChild: noEditTools mode or the explore agent", () => {
   assert.equal(isReadOnlyChild("noEditTools", "general"), true)
   assert.equal(isReadOnlyChild("ask", "explore"), true)

@@ -13,6 +13,7 @@ import {
   commandArgs,
   helpText,
   matchesUltracodeKeyword,
+  parseResumeArgs,
   parseSubcommand,
   verbsListedInHelp,
 } from "../src/command.ts"
@@ -65,6 +66,28 @@ test("helpText is management-only and points at the keyword", () => {
   assert.match(helpText(), /\/ultracode help/)
   assert.match(helpText(), /no leading slash/)
   assert.doesNotMatch(helpText(), /\/workflows?\b/)
+  assert.match(helpText(), /resume \[runID\] \[--model provider\/id#variant\] \[--remember\]/)
+})
+
+test("parseResumeArgs: runID, --model pin and --remember flags", () => {
+  assert.deepEqual(parseResumeArgs(""), { ok: true, target: "", remember: false })
+  assert.deepEqual(parseResumeArgs("run_ab12cd34ef56"), { ok: true, target: "run_ab12cd34ef56", remember: false })
+  assert.deepEqual(parseResumeArgs("run_x --model openai/gpt-6#high --remember"), {
+    ok: true,
+    target: "run_x",
+    model: "openai/gpt-6#high",
+    remember: true,
+  })
+  assert.deepEqual(parseResumeArgs("--remember --model google/gemini-3.7-flash"), {
+    ok: true,
+    target: "",
+    model: "google/gemini-3.7-flash",
+    remember: true,
+  })
+  // Malformed flags fail loudly instead of being dropped.
+  assert.match((parseResumeArgs("run_x --model") as { error: string }).error, /--model needs a value/)
+  assert.match((parseResumeArgs("run_x --model not-a-pin") as { error: string }).error, /provider\/id/)
+  assert.match((parseResumeArgs("run_x run_y") as { error: string }).error, /unexpected argument/)
 })
 
 test("helpText lists exactly the D2 verb set", () => {

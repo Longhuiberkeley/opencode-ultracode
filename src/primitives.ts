@@ -10,9 +10,11 @@ import type {
   AgentOpts,
   AgentRecord,
   AgentResult,
+  FailoverMode,
   Json,
   ModelRef,
   PermissionMode,
+  ProviderHealth,
   Registry,
   RunRecord,
   SavedWorkflow,
@@ -24,7 +26,8 @@ import type { SessionDriver } from "./sessions.ts"
 import { AgentCallError, buildContinuationPrompt } from "./sessions.ts"
 import type { FailureClassification } from "./failure-classify.ts"
 import { isReadOnlyChild, resolveFallbacks } from "./failover.ts"
-import type { PinPoolEntry } from "./failover.ts"
+import type { FallbackCandidate, PinPoolEntry } from "./failover.ts"
+import { modelPinString } from "./agent-pins.ts"
 import { validateScriptSource } from "./worker-script.ts"
 import { createHash } from "node:crypto"
 
@@ -208,6 +211,25 @@ export interface AgentRunnerOptions {
    */
   modelFallbacks?: Readonly<Record<string, ReadonlyArray<string>>>
   /**
+   * Plugin option failover: "auto" (default), "ask" (supervisor pauses; the
+   * runner behaves like auto — the pause gate holds failovers), or "off"
+   * (no failover at all: children fail with the typed provider error).
+   */
+  failover?: FailoverMode
+  /**
+   * Supervisor-owned run-level breaker. Consulted BEFORE session.create:
+   * a quota-quarantined provider is never created on again (the child routes
+   * around it through the ladder, or fails typed); a burst-throttled provider
+   * serializes admission (stagger) instead of aborting. Every classified
+   * child failure is reported back. Absent => no breaker (tests, bare use).
+   */
+  providerHealth?: ProviderHealth
+  /**
+   * Run-level fallback override (ask-mode resume { model }): read at failover
+   * time and placed after per-call fallbacks, before the option map.
+   */
+  fallbackOverride?: () => ModelRef | undefined
+  /**
    * Run permission mode: `noEditTools` children (and the `explore` agent) are
    * read-only — they may use catalog-inference fallbacks and fail over to a
    * cheaper model. Edit-capable children may only move same-tier-or-better.
@@ -352,6 +374,9 @@ export class AgentRunner {
   private readonly runModel: { providerID: string; id: string; variant?: string } | undefined
   private readonly modelFallbacks: Readonly<Record<string, ReadonlyArray<string>>> | undefined
   private readonly permissions: PermissionMode | undefined
+  private readonly failoverMode: FailoverMode
+  private readonly providerHealth: ProviderHealth | undefined
+  private readonly fallbackOverride: (() => ModelRef | undefined) | undefined
   private readonly pinPool: ((agentIDs: readonly string[]) => Promise<ReadonlyArray<PinPoolEntry>>) | undefined
   private readonly disabledProviders: (() => Promise<ReadonlySet<string>>) | undefined
   private readonly signal?: AbortSignal
@@ -377,6 +402,9 @@ export class AgentRunner {
     this.runModel = options.runModel
     this.modelFallbacks = options.modelFallbacks
     this.permissions = options.permissions
+    this.failoverMode = options.failover ?? "auto"
+    this.providerHealth = options.providerHealth
+    this.fallbackOverride = options.fallbackOverride
     this.pinPool = options.pinPool
     this.disabledProviders = options.disabledProviders
     this.signal = options.signal
@@ -527,6 +555,36 @@ export class AgentRunner {
         recordID: record.id,
         callFallbacks: opts.fallbacks,
       }
+      // Breaker admission, BEFORE any session exists. A quota-quarantined
+      // provider is never created on again: the child routes around it through
+      // the SAME ladder (the candidate rides session.create — one row, zero
+      // sessions on the dead provider) or fails with the typed quarantine error
+      // when nothing eligible remains. A burst-throttled provider serializes
+      // admission (stagger) instead of aborting the run. `failover: "off"`
+      // skips all breaker routing: children behave exactly as before.
+      const failoverOn = this.failoverMode !== "off"
+      const health = this.providerHealth
+      const abortSignal = this.signal ?? NEVER_ABORTED.signal
+      let activeModel = model
+      let routedFrom: ModelRef | undefined
+      let routedReason: string | undefined
+      if (failoverOn && health !== undefined && model !== undefined) {
+        if (!health.isQuarantined(model.providerID)) {
+          await health.admit(model.providerID, abortSignal)
+        }
+        if (health.isQuarantined(model.providerID)) {
+          // Re-checked AFTER the admit wait: a quarantine may have landed while
+          // this child queued behind the burst gate.
+          const candidate = await this.routeAroundQuarantine(failoverContext)
+          if (candidate === undefined) throw this.quarantineFailure(model)
+          activeModel = candidate.model
+          routedFrom = model
+          routedReason =
+            `provider ${model.providerID} is quarantined after a quota failure — routed to ` +
+            `${candidate.model.providerID}/${candidate.model.id} before any session was created`
+          await health.admit(activeModel.providerID, abortSignal)
+        }
+      }
       for (let attempt = 0; ; attempt++) {
         try {
           if (attempt === 0) {
@@ -534,7 +592,7 @@ export class AgentRunner {
               {
                 prompt,
                 agent: opts.agent,
-                ...(model !== undefined ? { model } : {}),
+                ...(activeModel !== undefined ? { model: activeModel } : {}),
                 label: opts.label,
                 phase: titlePhase,
                 schema: opts.schema,
@@ -577,10 +635,17 @@ export class AgentRunner {
           break
         } catch (err) {
           if (!(err instanceof AgentCallError) || err.kind !== "outcome") throw err
+          // Report EVERY classified failure into the run-level breaker before
+          // policy branches: burst strikes accumulate (3 within 60 s engage the
+          // throttle), quota quarantines the provider — which is also where ask
+          // mode pauses the run, so the branch below already sees the pause.
+          this.reportProviderFailure(activeModel, err.failure)
           // Quota-shaped: account-level and hours long — no same-model and no
           // same-provider retry, ever. Fail over on the SAME session instead.
           if (err.failure?.class === "quota") {
-            const failedOver = await this.tryFailover(err, "quota", failoverContext, continuedSessionID)
+            const failedOver = failoverOn
+              ? await this.tryFailover(err, "quota", failoverContext, continuedSessionID)
+              : undefined
             if (failedOver !== undefined) {
               result = failedOver
               break
@@ -591,7 +656,10 @@ export class AgentRunner {
           // instant-death shape: treat it as quota and stop probing.
           if (attempt > 0 && err.noProgress === true) {
             const promoted = promoteQuotaFailure(err)
-            const failedOver = await this.tryFailover(promoted, "quota", failoverContext, continuedSessionID)
+            this.reportProviderFailure(activeModel, promoted.failure)
+            const failedOver = failoverOn
+              ? await this.tryFailover(promoted, "quota", failoverContext, continuedSessionID)
+              : undefined
             if (failedOver !== undefined) {
               result = failedOver
               break
@@ -606,7 +674,7 @@ export class AgentRunner {
             // Burst budget exhausted: the provider keeps throttling this model.
             // The ordered fallback ladder is the last resort before the typed
             // error surfaces; unclassified failures stay fail-closed.
-            if (err.failure?.class === "burst") {
+            if (err.failure?.class === "burst" && failoverOn) {
               const failedOver = await this.tryFailover(err, "burst", failoverContext, continuedSessionID)
               if (failedOver !== undefined) {
                 result = failedOver
@@ -627,19 +695,34 @@ export class AgentRunner {
         }
       }
       const agentResult = result!
+      // Pre-create quarantine routing is a failover too: surface the note on
+      // the result (unless a mid-flight failover already attached one) so the
+      // caller and the registry tell the same story as a session switch.
+      const finalResult: AgentResult =
+        routedFrom !== undefined && activeModel !== undefined && agentResult.failover === undefined
+          ? {
+              ...agentResult,
+              failover: {
+                from: routedFrom,
+                to: { ...activeModel },
+                class: "quota",
+                reason: (routedReason ?? "provider quarantined").slice(0, 300),
+              },
+            }
+          : agentResult
       this.registry.updateAgent(this.runID, record.id, {
         status: "succeeded",
-        effectiveAgent: agentResult.agent,
-        effectiveModel: agentResult.model,
-        tokens: agentResult.tokens,
-        data: agentResult.data,
+        effectiveAgent: finalResult.agent,
+        effectiveModel: finalResult.model,
+        tokens: finalResult.tokens,
+        data: finalResult.data,
         endedAt: Date.now(),
         // Keyed calls persist replay identity (and the text a future warm
         // rerun needs) so resumeFrom can skip this child next time.
-        ...(key && digest ? { key, promptDigest: digest, resultText: agentResult.text } : {}),
+        ...(key && digest ? { key, promptDigest: digest, resultText: finalResult.text } : {}),
       })
       this.maybeReport()
-      return agentResult
+      return finalResult
     } catch (err) {
       const aborted = err instanceof AgentCallError && err.kind === "abort"
       this.registry.updateAgent(this.runID, record.id, {
@@ -679,32 +762,15 @@ export class AgentRunner {
   ): Promise<AgentResult | undefined> {
     const continueFn = this.driver.continueAgent
     if (sessionID === undefined || continueFn === undefined || context.dead === undefined) return undefined
-    let pinPool: ReadonlyArray<PinPoolEntry> = []
-    if (this.pinPool) {
-      try {
-        pinPool = await this.pinPool(this.availableAgents ?? [])
-      } catch {
-        pinPool = [] // pin collection must never break a run
-      }
-    }
-    let disabledProviders: ReadonlySet<string> | undefined
-    if (this.disabledProviders) {
-      try {
-        disabledProviders = await this.disabledProviders()
-      } catch {
-        disabledProviders = undefined // fail open — mirrors spawn-path pin resolution
-      }
-    }
-    const candidates = resolveFallbacks({
-      dead: context.dead,
-      failureClass,
-      ...(context.callFallbacks !== undefined ? { callFallbacks: context.callFallbacks } : {}),
-      ...(this.modelFallbacks !== undefined ? { modelFallbacks: this.modelFallbacks } : {}),
-      pinPool,
-      ...(disabledProviders !== undefined ? { disabledProviders } : {}),
-      readOnly: isReadOnlyChild(this.permissions, context.requestedAgent),
-    })
-    if (candidates.length === 0) {
+    const candidates = await this.resolveLadder(context, failureClass)
+    // A quarantined candidate is skipped (a second provider may have been
+    // quarantined while this child ran): the ladder only routes to providers
+    // the breaker still considers healthy.
+    const eligible =
+      this.providerHealth !== undefined
+        ? candidates.filter((candidate) => !this.providerHealth!.isQuarantined(candidate.model.providerID))
+        : candidates
+    if (eligible.length === 0) {
       this.safeReport(
         `${context.phase} — ${context.label ?? context.recordID} provider ${failureClass} failure on ` +
           `${context.dead.providerID}/${context.dead.id}; no eligible failover candidate`,
@@ -716,10 +782,10 @@ export class AgentRunner {
     // Reason starts with the provider signal itself and is refreshed by each
     // failed candidate so the returned note describes the real last failure.
     let lastReason = err.failure?.reason ?? errorMessage(err)
-    for (let index = 0; index < candidates.length; index++) {
-      const candidate = candidates[index]!
+    for (let index = 0; index < eligible.length; index++) {
+      const candidate = eligible[index]!
       this.safeReport(
-        `${context.phase} — ${context.label ?? context.recordID} failover ${index + 1}/${candidates.length} (${failureClass}): ` +
+        `${context.phase} — ${context.label ?? context.recordID} failover ${index + 1}/${eligible.length} (${failureClass}): ` +
           `${from.providerID}/${from.id} → ${candidate.model.providerID}/${candidate.model.id} [${candidate.source}]`,
       )
       try {
@@ -747,6 +813,12 @@ export class AgentRunner {
         }
       } catch (retryErr) {
         if (retryErr instanceof AgentCallError && retryErr.kind === "abort") throw retryErr
+        // A candidate that ALSO died is a provider signal in its own right:
+        // report it so the breaker sees the second provider's health too.
+        this.reportProviderFailure(
+          candidate.model,
+          retryErr instanceof AgentCallError ? retryErr.failure : undefined,
+        )
         lastReason =
           retryErr instanceof AgentCallError && retryErr.failure !== undefined
             ? retryErr.failure.reason
@@ -758,6 +830,112 @@ export class AgentRunner {
       }
     }
     return undefined
+  }
+
+  /**
+   * Resolve the ordered ladder for a failover context: per-call opts.fallbacks
+   * > run-level fallback override (ask-mode resume) > plugin option
+   * modelFallbacks > agent-config pin pool > catalog inference for read-only
+   * children. Lazy pin-pool / disabled-provider reads degrade to "no rung"
+   * and never break a run.
+   */
+  private async resolveLadder(context: FailoverContext, failureClass: "quota" | "burst"): Promise<FallbackCandidate[]> {
+    if (context.dead === undefined) return []
+    let pinPool: ReadonlyArray<PinPoolEntry> = []
+    if (this.pinPool) {
+      try {
+        pinPool = await this.pinPool(this.availableAgents ?? [])
+      } catch {
+        pinPool = [] // pin collection must never break a run
+      }
+    }
+    let disabledProviders: ReadonlySet<string> | undefined
+    if (this.disabledProviders) {
+      try {
+        disabledProviders = await this.disabledProviders()
+      } catch {
+        disabledProviders = undefined // fail open — mirrors spawn-path pin resolution
+      }
+    }
+    const override = this.fallbackOverride?.()
+    return resolveFallbacks({
+      dead: context.dead,
+      failureClass,
+      ...(context.callFallbacks !== undefined ? { callFallbacks: context.callFallbacks } : {}),
+      ...(override !== undefined ? { runFallback: modelPinString(override) } : {}),
+      ...(this.modelFallbacks !== undefined ? { modelFallbacks: this.modelFallbacks } : {}),
+      pinPool,
+      ...(disabledProviders !== undefined ? { disabledProviders } : {}),
+      readOnly: isReadOnlyChild(this.permissions, context.requestedAgent),
+    })
+  }
+
+  /**
+   * Pre-create quarantine routing: the intended provider is quarantined, so no
+   * session may be created on it. Returns the first ladder candidate whose
+   * provider is NOT quarantined (the caller creates the session directly on
+   * it), or undefined when nothing eligible remains — fail closed.
+   */
+  private async routeAroundQuarantine(context: FailoverContext): Promise<FallbackCandidate | undefined> {
+    if (context.dead === undefined) return undefined
+    const candidates = await this.resolveLadder(context, "quota")
+    const candidate = candidates.find(
+      (entry) => this.providerHealth === undefined || !this.providerHealth.isQuarantined(entry.model.providerID),
+    )
+    if (candidate === undefined) {
+      this.safeReport(
+        `${context.phase} — ${context.label ?? context.recordID} provider ${context.dead.providerID} is quarantined; ` +
+          `no eligible failover candidate — failing the child`,
+      )
+      return undefined
+    }
+    this.safeReport(
+      `${context.phase} — ${context.label ?? context.recordID} provider ${context.dead.providerID} is quarantined; ` +
+        `creating the session on ${candidate.model.providerID}/${candidate.model.id} [${candidate.source}] instead`,
+    )
+    return candidate
+  }
+
+  /**
+   * Typed quarantine failure (no session was created): the provider is
+   * account-level dead and the ladder had nothing eligible. Carries the
+   * quota-shaped classification so callers and the registry see the same
+   * failure type as a live quota failure.
+   */
+  private quarantineFailure(dead: ModelRef): AgentCallError {
+    return new AgentCallError(
+      "outcome",
+      `provider ${dead.providerID} is quarantined after a quota failure and no eligible failover candidate remains — failing before session.create`,
+      undefined,
+      { class: "quota", reason: `provider ${dead.providerID} quarantined; no eligible failover candidate` },
+      undefined,
+    )
+  }
+
+  /**
+   * Report one classified child failure into the run-level breaker. The
+   * breaking model is the one that produced the failure (intended model, or a
+   * routed/replaced candidate). Never throws; unclassified failures are
+   * ignored.
+   */
+  private reportProviderFailure(model: ModelRef | undefined, failure: FailureClassification | undefined): void {
+    if (this.providerHealth === undefined || model === undefined || failure === undefined) return
+    if (failure.class === "quota") {
+      this.providerHealth.report({
+        runID: this.runID,
+        providerID: model.providerID,
+        class: "quota",
+        ...(failure.resetAt !== undefined ? { resetAt: failure.resetAt } : {}),
+        model: modelPinString(model),
+      })
+    } else if (failure.class === "burst") {
+      this.providerHealth.report({
+        runID: this.runID,
+        providerID: model.providerID,
+        class: "burst",
+        model: modelPinString(model),
+      })
+    }
   }
 
   private maybeReport(force = false): void {
