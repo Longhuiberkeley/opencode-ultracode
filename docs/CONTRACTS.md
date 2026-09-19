@@ -86,11 +86,13 @@ in your final report) is the single source of truth. Import shared types from `.
 - A also wires NO direct session calls inside setup (deadlock rule) — commands do session calls
   inside their executors (allowed).
 
-### Builder B — execution runtime (`src/supervisor.ts`, `src/worker-host.ts`, `src/worker-script.ts`, `src/primitives.ts`, `src/sessions.ts`, `src/serialize.ts`)
+### Builder B — execution runtime (`src/supervisor.ts`, `src/worker-host.ts`, `src/worker-script.ts`, `src/primitives.ts`, `src/sessions.ts`, `src/serialize.ts`, `src/failure-classify.ts`, `src/failover.ts`, `src/provider-slots.ts`)
 
 - `src/sessions.ts`: `createSessionDriver(ctxLike: SessionCtx, opts)`. `SessionCtx` is a narrow
   interface (see test/fakes.ts) mirroring the verified plugin session methods:
-  `create/get/prompt/wait/context/interrupt`. `runAgent({ prompt, agent, label, phase, schema, defaultAgent, availableAgents }, hooks: { onSessionID(sessionID), abort: AbortSignal })`:
+  `create/get/prompt/wait/context/interrupt` plus optional `switchModel` (feature-detected —
+  `typeof ctx.session.switchModel === "function"`; fork/compact are **not** on the plugin host,
+  so failover is always switchModel-in-place on the same sessionID). `runAgent({ prompt, agent, label, phase, schema, defaultAgent, availableAgents }, hooks: { onSessionID(sessionID), abort: AbortSignal })`:
   1. resolve agent: explicit `agent` (missing from available => throw with list) else `defaultAgent`
      (missing => throw with guidance) — callers pre-validated defaults;
   2. `session.create({ title: label || phase || "workflow agent", agent })` — register sessionID via
@@ -100,7 +102,9 @@ in your final report) is the single source of truth. Import shared types from `.
   4. `session.prompt` → `session.wait` (both race an `AbortSignal`-driven rejector; on abort call
      `session.interrupt({ sessionID, continue: false })` best-effort);
   5. `session.get` for `outcome` + tokens; `session.context` for the last assistant message:
-     text/model/agent/tokens; `outcome !== "succeeded"` => typed error carrying text if any;
+     text/model/agent/tokens; `outcome !== "succeeded"` => typed error carrying text if any
+     **and** a `failure` classification when the last assistant message exposed a provider
+     error (`burst` / `quota` / `other` — see `src/failure-classify.ts`);
   6. schema mode: tolerant JSON extraction (whole-trimmed response, else single fenced ```json
      block, else first `{...}`/`[...]` balanced scan; reject ambiguous multiples; NO eval);
      validate with a tiny validator (`src/serialize.ts` `validateJsonSchemaValue(schema, value): { ok, error }`
@@ -110,10 +114,18 @@ in your final report) is the single source of truth. Import shared types from `.
   7. return `AgentResult`.
 - `src/primitives.ts`: host-side bridge handlers. `AgentRunner` = wrapper around runAgent that
   enforces: registry bookkeeping (addAgent => pending; updateAgent running/succeeded/failed with
-  tokens/model), semaphore (`acquire(abort)` — queue FIFO, abort rejects queued), run-wide agent
-  counter (maxAgents => throw typed "agent cap reached"), phase label (ambient from last `phase()`
-  event + explicit opts.phase wins), progress reporting callback (throttled ~500ms:
+  tokens/model — **retries and failovers reuse the SAME registry row**, never a second row),
+  run-level semaphore (`acquire(abort)` — queue FIFO, abort rejects queued), then provider
+  slots when `providerConcurrency` caps the child's provider (`src/provider-slots.ts`: instance
+  FIFO + optional machine mkdir-claim dirs), run-wide agent counter (maxAgents => throw typed
+  "agent cap reached"), phase label (ambient from last `phase()` event + explicit opts.phase
+  wins), progress reporting callback (throttled ~500ms:
   `"phase X — running aN (M done, K failed) of cap"`).
+  Consults the supervisor-owned `ProviderHealth` breaker BEFORE `session.create`: a
+  quota-quarantined provider is never created on (the ladder runs first; no candidate => typed
+  fail); a burst-throttled provider serializes + staggers admission, never aborts.
+  Burst-class outcome failures continue the SAME session (jittered exponential backoff);
+  quota-class failures switchModel-in-place to the first eligible ladder candidate.
   Also `loadWorkflowForComposition(name)` handler: storage.loadWorkflow, depth cap 1 (a composed
   workflow may not compose another), returns `{ script, meta }` to the worker.
 - `src/worker-host.ts`: spawn `node:worker_threads` Worker from `src/worker-script.ts` **source**
@@ -137,10 +149,16 @@ in your final report) is the single source of truth. Import shared types from `.
   with warning). Unhandled rejection in worker => run fails with the error.
 - `src/supervisor.ts`: implement `Supervisor`. Owns: registry+storage+sessions driver injection,
   run state machine (`running -> stopping -> final`), abort controllers per run, child session set,
+  **one `ProviderBreaker` shared across every run it starts** (quota strike quarantines the
+  provider until the parsed reset; three burst strikes in 60 s throttle admission — serialize +
+  stagger, never abort), **instance-level provider slot map** (`Map<providerID, Semaphore>`) plus
+  machine slots from `src/provider-slots.ts` when `providerConcurrency` is set,
   settle-all-before-finalize (track every in-flight agent()/bridge call; on script return or throw:
   close admission, wait outstanding calls (grace 15s) interrupting children, then finalize),
   timeout watchdog, stop() (status stopping -> close gate -> interrupt children -> terminate worker
-  after grace -> finalize `stopped`), dispose() (stopAll). Envelope assembly: `serialize.ts`
+  after grace -> finalize `stopped`), pause() (also used by ask-mode quarantine: paused runs do
+  not burn the watchdog), resume(`{ model? }`) (optional pin becomes this run's fallback override),
+  dispose() (stopAll). Envelope assembly: `serialize.ts`
   `buildEnvelope(run, maxChars)`; if `JSON.stringify(result)` > maxChars => preview (first maxChars
   chars of pretty JSON) + `truncated: true` + persist full result artifact via storage; result must
   stay valid-JSON-envelope-shaped. Total tokens = sum of agent tokens.

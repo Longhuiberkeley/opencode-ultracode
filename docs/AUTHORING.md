@@ -7,6 +7,7 @@ the `Ultracode` skill; this document is the long form.
 - [The ultracode_run tool](#the-ultracode_run-tool)
 - [The script model](#the-script-model)
 - [Globals reference](#globals-reference)
+- [Provider rate limits and failover](#provider-rate-limits-and-failover)
 - [meta fields](#meta-fields)
 - [Structured output with opts.schema](#structured-output-with-optsschema)
 - [Patterns](#patterns)
@@ -252,6 +253,8 @@ agent(prompt: string, opts?: {
   phase?: string    // phase grouping; explicit beats the ambient phase() label
   schema?: Json     // JSON Schema -> reply parsed+validated into .data
   key?: string      // stable idempotency key -> warm-rerun replay (see below)
+  retry?: { attempts?: number; backoffMs?: number }  // same-session burst continues
+  fallbacks?: string[]  // per-call quota ladder (pin strings); beats modelFallbacks
 }): Promise<{
   text: string      // concatenated text parts of the final assistant message
   sessionID: string
@@ -260,6 +263,7 @@ agent(prompt: string, opts?: {
   tokens?: TokenUsage
   data?: Json       // present iff opts.schema was given and validation succeeded
   cachedFrom?: string  // source runID when this result was warm-replayed
+  failover?: { from: ModelRef; to: ModelRef; class: "quota"; reason: string }
 }>
 ```
 
@@ -270,18 +274,49 @@ Semantics and failure modes:
 
 - **Concurrency / queueing:** at most `concurrency` (default 8) child sessions run at once;
   further calls wait FIFO. Queued calls are rejected if the run stops while they wait.
+  Plugin option `providerConcurrency` additionally caps in-flight children per provider
+  (instance + machine slots) — see [Caps](#caps).
 - **Agent resolution:** explicit `opts.agent` missing from the server's agent list => the call
   fails with the available-agents list (the same list preflight shows for `meta.requires`).
   Omitted => plugin default; if that doesn't exist, fail-fast with guidance.
 - **Child failure:** if the child session's outcome is not `succeeded`, the call rejects with a
-  typed error carrying any partial text it produced.
+  typed error carrying any partial text it produced **and**, when the last assistant message
+  exposed a provider error, `failure: { class, message, status, resetAt?, reason }` (`class` is
+  `"burst"` | `"quota"` | `"other"`). Burst-class failures retry the same session; quota-class
+  failures fail over automatically unless `failover: "off"` — see
+  [Provider rate limits and failover](#provider-rate-limits-and-failover). Do not hand-roll
+  sleep-and-retry around these.
 - **Schema mode:** see [below](#structured-output-with-optsschema). Invalid output after one
   repair round rejects the call.
-- One `agent()` call = one run-record entry ("a1", "a2", ...) with its own tokens and
-  `effectiveModel` — visible in `/ultracode show`.
+- One `agent()` call = one run-record entry ("a1", "a2", ...) with its own tokens,
+  `spawnModel` (intended) and `effectiveModel` (what actually ran) — visible in `/ultracode show`.
+  Retries and failovers reuse that same row.
 
 Design guidance: prompts should state the role, the exact input, and the exact output contract;
 keep each under a few hundred words; put bulk data (JSON arrays) at the end after instructions.
+
+### Provider rate limits and failover
+
+Provider-shaped child failures are classified and handled by the runtime — scripts do not retry
+them, and they must not `sleep()` waiting for a plan-quota reset (run `timeoutMs` is 60 min;
+quota windows are hours).
+
+- **Burst** (per-minute / concurrent-session caps: `429`, "rate limit reached for requests", no
+  hours-away reset): the **same session** continues on the **same model** with jittered
+  exponential backoff (`opts.retry` / plugin `agentRetryAttempts` + `agentRetryBackoffMs`). A
+  failed session that already did work is never replaced by a fresh one.
+- **Quota** (plan "usage limit" / "quota" / "5 hour" / "1-week", or a parsed reset hours away):
+  same-model **and** same-provider retry is instant death. The child **fails over in place** via
+  `session.switchModel` on the SAME session (the plugin host does not expose fork or compact),
+  then is re-prompted with a continuation that says the previous turn may be empty. Automatic
+  unless plugin option `failover` is `"off"`. No eligible fallback → the call rejects with the
+  typed quota error.
+
+When the child finishes on a different model than it was spawned on, the result carries
+`failover: { from, to, class: "quota", reason }`. Typed errors (`AgentCallError`) carry
+`failure.class` so a catch can see *why* without parsing strings. `opts.fallbacks` is the
+per-call ladder (beats `modelFallbacks`); do not hard-code provider lists in saved workflows —
+the user's pins and the plugin option own routing.
 
 ### `parallel(thunks) -> Promise<Array<T | null>>`
 
@@ -343,7 +378,7 @@ Loads and runs a **saved** workflow inside the current run, resolves with its JS
 
 - **Depth 1 only**: a composed workflow's script may not call `workflow()` again (throws).
 - The composed workflow's agents run under the *same* run: same concurrency semaphore, same
-  `maxAgents` budget, same wall-clock timeout, same stop/abort semantics.
+  per-provider slots, same `maxAgents` budget, same wall-clock timeout, same stop/abort semantics.
 - Its `meta.requires` is NOT re-preflighted at compose time (the outer run is already live) —
   a missing agent surfaces as an agent-resolution error from its first `agent()` call.
 - Unknown name or unreadable files => the call rejects (inside the script, so catch it if
@@ -832,6 +867,7 @@ What the `ultracode_run` tool returns to the parent session (always valid JSON):
 | Cap | Default | Where configured |
 | --- | --- | --- |
 | Concurrent child sessions | 8 | plugin option `concurrency` |
+| Per-provider in-flight | unset | plugin option `providerConcurrency` (`providerID` → 1–16; instance + machine slots) |
 | Total `agent()` calls per run | 200 | plugin option `maxAgents` |
 | Run wall clock | 60 min | plugin option `timeoutMs` |
 | `sleep()` per call | 60 s | hard clamp |

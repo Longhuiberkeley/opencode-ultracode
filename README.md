@@ -257,7 +257,7 @@ back to defaults.
 | `agentScope` | string | `"host"` | `host` (default): every agent the location registry exposes, shipped primaries like `build` included. `configured`: only agents with a definition file in `<project>/.opencode/agents/` or `~/.config/opencode/agents/` — exactly the set `opencode2 subagent-config` manages, with `disabled: true` agents and agents pinned to providers in `disabled_providers` excluded. Shipped file-less agents are rejected with a clear error until you create their file (`subagent-config set build <model>`), and unpinned configured agents inherit the default agent's pin. |
 | `agentRetryAttempts` | number | `1` | Extra attempts for a child whose session fails at the provider level (outcome `failed`). Retries **continue the same session** on the same model — a failed session that already did work is never replaced by a fresh one — and quota-shaped failures (`usage limit`, `quota`, `5 hour`/`1-week`, or a parsed reset) are **never** retried: same-model and same-provider retries are guaranteed instant deaths. Failures without a burst/rate-limit classification get exactly **one** same-model probe; if that probe dies with no new work (0-token instant death) it is promoted to quota and the typed error surfaces for failover. Aborts and schema errors never retry. Per-call override: `agent(prompt, { retry: { attempts, backoffMs } })`. `0` disables. |
 | `agentRetryBackoffMs` | number | `5000` | Base of the jittered exponential retry backoff: attempt n waits `base × 2ⁿ` with ±50% jitter, capped at 30 s (0..120000 ms configured). A stopping run never waits out a backoff. |
-| `modelFallbacks` | object | `{}` | Quota failover ladder for provider rate limits: keys are `"provider/id"` pins (no variant), values are ordered `"provider/id#variant"` fallback lists. A quota-shaped failure (`usage limit`, `quota`, `5 hour`/`1-week`, or a parsed reset) never retries the same model or the same provider: the child continues in the **same session** via `session.switchModel` on the first eligible candidate and returns `failover: { from, to, class, reason }`. Ladder precedence: per-call `agent(prompt, { fallbacks: [...] })` > the ask-mode run override (`ultracode_control resume { model }`) > this map > your agent-config pins on other providers (disabled agents and `disabled_providers` skipped) > catalog inference for read-only children (run `noEditTools` or the `explore` agent). Edit-capable children may not fail over DOWN when catalog price tiers are known; without tier metadata only explicit/per-call and pin-pool candidates pass. No eligible candidate, or a driver without `switchModel`, fails the child with the typed quota error — a run never sleeps waiting for a quota reset. See [Provider failover](#provider-failover). |
+| `modelFallbacks` | object | `{}` | Quota failover ladder for provider rate limits: keys are `"provider/id"` pins (no variant), values are ordered `"provider/id#variant"` fallback lists. A quota-shaped failure (`usage limit`, `quota`, `5 hour`/`1-week`, or a parsed reset) never retries the same model or the same provider: the child continues in the **same session** via `session.switchModel` on the first eligible candidate and returns `failover: { from, to, class, reason }`. Ladder precedence: per-call `agent(prompt, { fallbacks: [...] })` > the ask-mode run override (`ultracode_control resume { model }`) > this map > your agent-config pins on other providers (disabled agents and `disabled_providers` skipped) > catalog inference for read-only children (run `noEditTools` or the `explore` agent). Edit-capable children may not fail over DOWN when catalog price tiers are known; without tier metadata only explicit/per-call and pin-pool candidates pass. No eligible candidate, or a driver without `switchModel`, fails the child with the typed quota error — a run never sleeps waiting for a quota reset. See [Provider rate limits and failover](#provider-rate-limits-and-failover). |
 | `failover` | string | `"auto"` | Provider-failover policy. `auto`: classify and fail over immediately. `ask`: same, but a provider quarantine (or burst-throttle engagement) pauses the affected run and emits ONE coalesced report naming the provider, reset time, affected children, proposed fallback and the exact resume invocation; the run resumes via `ultracode_control { action: "resume", model?, remember? }` (or `/ultracode resume [runID] [--model pin] [--remember]`). `off`: no failover at all — children fail with the typed provider error (retry policy is unaffected). |
 | `askTimeoutMs` | number | `0` | Ask-mode auto-proceed timeout: `0` waits indefinitely while the ask pause holds (paused runs do not burn `timeoutMs`); `> 0` resumes the run in auto-mode policy after that many ms, even without an answer (0–86 400 000 ms). |
 | `childStallMs` | number | `900000` | Child-liveness watchdog: a running child with no activity for this many ms gets its record marked with a stall cause and is interrupted, so frozen provider streams fail visibly instead of hanging until the run timeout. `0` disables. Paused runs suspend the scan. |
@@ -292,7 +292,7 @@ Panel settings (`h`/`l` to the settings pane, `+/-` to edit) persist a project-s
 }
 ```
 
-### Provider failover
+### Provider rate limits and failover
 
 Two provider failure shapes need different handling, and the plugin distinguishes them from the
 structured error the failed turn exposes (`finish: "error"` plus
@@ -355,6 +355,45 @@ Observability: the registry row keeps `spawnModel` (what the child was intended 
 `effectiveModel` (what actually ran), plus a `failover` note in the progress/status text; the
 `agent()` result carries `failover: { from, to, class: "quota", reason }`. Warm reruns never replay a
 keyed result that finished on a different model than its recorded spawn model.
+
+**Concurrency tiers.** The per-run `concurrency` semaphore still bounds one run. On top of it:
+
+- **Instance-level** provider slots: one FIFO semaphore per providerID, supervisor-owned and shared
+  across every run this OpenCode process starts.
+- **Machine-level** slots, only when `providerConcurrency` maps a providerID to a cap N (1–16): N
+  directories under `~/.local/share/opencode/ultracode/provider-slots/<providerID>/slot-<i>`, claimed
+  by atomic `mkdir` (EEXIST = taken), heartbeat-touched every 10 s while held, released by removing
+  the dir on settle. A slot whose mtime is older than 30 s is stale and reclaimable (crash-safe
+  under-admission). Node core has no `flock` — mkdir-claim + staleness is the portable design; a
+  live holder that pauses past 30 s without a heartbeat can theoretically be stolen, so the observed
+  failure mode is under-admission, not over-admission.
+
+Acquire order is run-concurrency then provider permit; abort releases nothing partially.
+Unconfigured providers are unchanged.
+
+**Worked example — coding-plan account.** A GLM / Z.AI coding-plan provider that 429s when more
+than a few children share the same account:
+
+```json
+{
+  "plugins": [
+    {
+      "package": "./plugins/ultracode",
+      "options": {
+        "concurrency": 8,
+        "providerConcurrency": { "zai-coding-plan": 3 },
+        "failover": "auto"
+      }
+    }
+  ]
+}
+```
+
+At most 3 in-flight children on `zai-coding-plan` (across every run this OpenCode process
+supervises, **and** across other processes on the same machine). Burst 429s retry the same session
+with jittered backoff; a 5-hour / 1-week quota strike quarantines that provider and fails remaining
+children over to the next ladder candidate on a **different** provider. Pair with `modelFallbacks`
+when you want a stable fallback list instead of pin-pool / catalog inference.
 
 ## Usage
 
@@ -444,12 +483,12 @@ global (registered from the always-mounted chip component).
 | `ultracode_status` tool | Read-only `{ runID? }` → `{ runID, status, agents: { done, total, failed }, startedAt, elapsedMs, checkpoints?: [{name, at}], resumedFrom?, children: [{ agentID, sessionID?, label?, phase?, status, cached?, waitingForPermission? }] }`; settled runs carry the result inline when it fits the cap, else `resultPreview` + `resultTruncated` + `resultChars` + `resultHint`. | — |
 | `ultracode_result` tool | `{ runID, offset?, maxLength? }` → one page of a settled run's FULL result: `{ source, totalChars, offset, chunk, complete, nextOffset }`. Chunks are substrings of the compact JSON — concatenate from offset 0 following `nextOffset`, then parse. | — |
 | `ultracode_catalog` tool | Read-only discovery, and the only fresh source of it: `{}` → agents, live caps, every saved workflow (`kind`, description, **params (names always; JSON types only when declared — explicit params, a // Tool input: header, or a saved run's real args; graph-derived params are names only)**, phases, requires, trust, last-run stats from this conversation), graph-template summaries and script-template summaries; `{ workflow }` → one workflow's full graph spec or script head; `{ template }` / `{ templates: true }` → complete graph specs to adapt; `{ scriptTemplate }` / `{ scriptTemplates: true }` → complete script bodies to adapt (`staged-delivery`, `verify-fix`). Executes nothing; bounded (40 workflows, sliced strings). | — |
-| `ultracode_control` tool | Orchestrator control of **owned** runs: `{ action: "stop" \| "pause" \| "resume", runID? }`. Implicit target only when exactly one active owned run. Stop is recorded as the run's stop reason (`/ultracode show` displays it). | same verbs via panel keys |
+| `ultracode_control` tool | Orchestrator control of **owned** runs: `{ action: "stop" \| "pause" \| "resume", runID?, model?, remember? }`. Implicit target only when exactly one active owned run. Stop is recorded as the run's stop reason (`/ultracode show` displays it). Ask-mode resume: `model` (`"provider/id#variant"`) is this run's fallback override; `remember: true` persists it into `modelFallbacks` (never agent pin files). | same verbs via panel keys |
 | `/ultracode result [runID]` | Print the **full** result of a run (artifact first, run-record fallback — serves truncated and background runs alike). | — |
 | `/ultracode graph <name\|runID>` | Render a graph workflow's DAG: execution waves, a node table (kind, agent, source ref, bounds), returns, and a mermaid flowchart. **Not trust-gated** — rendering is how you review a graph before approving it. Works for a saved `<name>.graph.json` workflow or any graph-authored run. | — |
 | `/ultracode stop [runID]` | Graceful stop: no new agent calls, children interrupted, worker terminated after a grace period. | `x` |
 | `/ultracode pause [runID]` | Close admission of new `agent()` calls; in-flight finish; watchdog suspended. | `p` (toggles pause) |
-| `/ultracode resume [runID]` | Reopen admission on a paused run. | `p` (toggles resume) |
+| `/ultracode resume [runID] [--model pin] [--remember]` | Reopen admission on a paused run. Ask mode: `--model provider/id#variant` answers the quarantine ask (run-level fallback override); `--remember` persists it into `modelFallbacks`. | `p` (toggles resume) |
 | `/ultracode rerun [runID] [argsJSON]` | Start a new run from a finished run's script (trust/digest checks if it was a named workflow; graph runs compare the **spec**, so a newer compiler is not mistaken for an edit). Add `--warm` to warm-start: keyed succeeded agents replay from the source run's cache instead of respawning (see [Warm reruns](#warm-reruns)). | — |
 | `/ultracode save <name>` | Save `.opencode/workflows/<name>.js` **or** `<name>.graph.json` as a named workflow (no prior run). An authored `<name>.json` manifest is preserved; a graph spec file is never rewritten. | — |
 | `/ultracode save <runID> <name>` | Save a run as a named workflow: a graph run saves its **spec** (`.graph.json` + manifest), a script run saves its script (`.js` + manifest). | `s` (name via `dialog.prompt`) |
@@ -517,7 +556,7 @@ disabled for finished runs.
 Launch long work normally — runs are background by default, so you can keep chatting. The orchestrator can use
 `ultracode_steer { runID, agentID?, text }` to pass an adjustment to a running child
 without killing the workflow or restarting finished children, and
-`ultracode_control { action, runID? }` to stop / pause / resume runs it owns. Steering
+`ultracode_control { action, runID?, model?, remember? }` to stop / pause / resume runs it owns. Steering
 acknowledges admission, not that the child has already applied the adjustment. Background
 completion appends a one-line settle notice to the parent session and wakes the parent
 agent (live-verified) — status, agents, result brief, and stop reason arrive in-conversation.
@@ -665,8 +704,8 @@ Workflows multiply tokens. Controls, in order of leverage:
    `<project>/.opencode/agents/<id>.md`, project wins). A typical shape: cheap agent for
    extraction/search fan-out (`explore`), strong agent for judgment/synthesis (`general` or
    your `reviewer`).
-   No model or provider id appears anywhere in this plugin; children run as **your** configured
-   agents **on your pinned models**: the plugin reads the same documented agent config the
+   Scripts never hard-code provider or model ids; children run as **your** configured
+   agents **on your pinned models** (quota failover may switch the same session to another of *your* pins — see [Provider rate limits and failover](#provider-rate-limits-and-failover)): the plugin reads the same documented agent config the
    client reads and applies the pin when creating each child session (OpenCode's server-side
    `session.create` does not apply global pins itself — live-verified). An agent without a pin of its own (e.g. shipped `build`) inherits the default agent's pin
    instead of the location default, so a workflow child can never drift onto a model you
@@ -776,6 +815,8 @@ list of available agents and guidance instead of spawning a broken run.
 | Child ran the "wrong" model (pin drift) | Children apply the agent pin from `~/.config/opencode/agents/<id>.md` / project `.opencode/agents/<id>.md` (project wins) at session create; re-pinning applies to the **next** spawned child. Unpinned agents use the location default — which on some installs is a free-tier model. Runs record `effectiveModel` per agent and the envelope lists distinct `models`; check `/ultracode show` to confirm. |
 | Result came back truncated | The script returned more than `maxResultChars`. The envelope carries a compact `preview`, `resultChars`, and usually a `resultArtifactKey`; page the full value with the `ultracode_result` tool (or print it with `/ultracode result <runID>`), raise the option, or return a summary instead of a dump. |
 | Run status `interrupted` after restart | Persisted `running`/`stopping` runs are marked `interrupted` on plugin load. There is no auto-replay; re-run the workflow. |
+| Child failed with `provider.rate-limit` / 429, or "usage limit" / "quota" | Burst-class 429s retry the **same session** with jittered backoff. Quota-class ("usage limit", "5 hour", "1-week") fails over in place to another provider unless `failover: "off"`. Check `/ultracode show` for `spawnModel` vs `effectiveModel`. |
+| Run paused with a provider-quarantine report | Ask mode (`failover: "ask"`). Resume with `ultracode_control { action: "resume", model?, remember? }` or `/ultracode resume [runID] [--model pin] [--remember]`. |
 | Nested `ultracode_run` tool call rejected | By design: sessions owned by a running workflow cannot start their own runs (no recursion). |
 | `/ultracode can …` (or other prose) is "Unknown argument" | `/ultracode` is management only. To author a workflow, send a normal message such as `please ultracode …` without the leading slash. |
 | `npm test` fails with "Cannot find module .../test" | Node 22.13 quirk with `--test <dir>`. Run `node --experimental-strip-types --test` (auto-discovery) or pass the test file(s) directly. |

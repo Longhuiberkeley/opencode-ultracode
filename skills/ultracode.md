@@ -142,7 +142,7 @@ prompts and args, then run it inline or save it. Injected globals, nothing else:
 
 | Global | Call | Semantics |
 | --- | --- | --- |
-| `agent` | `agent(prompt, opts?)` | Spawns one subagent and waits. Resolves `{ text, sessionID, agent, model, tokens, data?, cachedFrom? }`. `opts`: `agent` (agent id), `model` (EXPLICIT override in the pin-string shape — only when the user asked for a model; beats pins and the run-level model), `label`, `phase`, `schema`, `key`. With `opts.schema`, extracted JSON lands in `.data`, validated and repaired once. `opts.key` (stable id, e.g. `"lane:3"`) marks the call replayable: on a warm rerun (`resumeFrom`, or `/ultracode rerun <runID> --warm`) a succeeded call with the same key AND the same prompt+schema+agent+model digest returns from cache — no session, no cap hit. Key every deterministic call in a long run. |
+| `agent` | `agent(prompt, opts?)` | Spawns one subagent and waits. Resolves `{ text, sessionID, agent, model, tokens, data?, cachedFrom?, failover? }`. `opts`: `agent` (agent id), `model` (EXPLICIT override in the pin-string shape — only when the user asked for a model; beats pins and the run-level model), `label`, `phase`, `schema`, `key`. With `opts.schema`, extracted JSON lands in `.data`, validated and repaired once. `opts.key` (stable id, e.g. `"lane:3"`) marks the call replayable: on a warm rerun (`resumeFrom`, or `/ultracode rerun <runID> --warm`) a succeeded call with the same key AND the same prompt+schema+agent+model digest returns from cache — no session, no cap hit. Key every deterministic call in a long run. Plan-quota children fail over automatically (same session, different provider) unless the user set failover off; `.failover` is present when the child finished on a different model than it was spawned on. |
 | `parallel` | `parallel(thunks)` | Barrier over thunks. A thunk that throws resolves as `null`; siblings still run. |
 | `pipeline` | `pipeline(items, ...stages)` | Runs every item through the stages in order. A failing item becomes `null`; other items are unaffected. |
 | `phase` | `phase(name)` | Sets the ambient phase label for progress grouping. |
@@ -390,9 +390,9 @@ maxLength }`; chunks are substrings of the compact JSON, so concatenate from off
 
 - `ultracode_status { runID? }` — per-child detail (id, session, label, phase, status, tokens,
   tool calls, permission waits) and, once settled, the result itself or a bounded preview.
-- `ultracode_control { action: "stop" | "pause" | "resume", runID? }` — your own runs only. Stop
+- `ultracode_control { action: "stop" | "pause" | "resume", runID?, model?, remember? }` — your own runs only. Stop
   is graceful (no new agent calls, in-flight children interrupted) and is recorded as the run's
-  stop reason; pause closes admission of new `agent()` calls.
+  stop reason; pause closes admission of new `agent()` calls. Ask-mode resume: optional `model` (pin) is this run's fallback override; `remember: true` persists it for future runs.
 - `ultracode_steer { runID, agentID?, text }` — deliver a user adjustment to ONE running child
   without stopping the workflow. If several children are active, pick the relevant agentID from
   status; do not broadcast edits blindly. It does not restart completed children.
