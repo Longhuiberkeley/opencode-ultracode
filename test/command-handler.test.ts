@@ -12,6 +12,7 @@ import {
   NO_ACTIVE_RUN,
   PLUGIN_VERSION,
   SOURCE_STILL_ACTIVE,
+  executeSaveTool,
   feedToolEvent,
   formatGraphView,
   formatShowRun,
@@ -19,6 +20,7 @@ import {
   helpText,
   multipleActiveMessage,
   resolveRunStatus,
+  runSaveManifest,
   type CommandDeps,
   type CommandStorage,
   type CommandSupervisor,
@@ -38,7 +40,7 @@ import type {
   SavedWorkflow,
 } from "../src/types.ts"
 import { DEFAULT_OPTIONS } from "../src/types.ts"
-import { applyOverlay, overlayFromPanel, panelSettingsFrom, parseSettingsAckPayload } from "../src/settings.ts"
+import { applyOverlay, overlayFromPanel, panelSettingsFrom, parseSettingsAckPayload, type SettingsOverlay } from "../src/settings.ts"
 import { FakeRegistry } from "./fakes.ts"
 
 function digest(script: string): string {
@@ -62,6 +64,7 @@ class MemoryStorage implements CommandStorage {
   trust = new Map<string, string>()
   artifacts = new Map<string, Json>()
   throwsOnLoad = new Map<string, Error>()
+  throwsOnTrust = new Map<string, Error>()
 
   listWorkflows(): SavedWorkflow[] {
     return [...this.workflows.values()]
@@ -87,6 +90,7 @@ class MemoryStorage implements CommandStorage {
       phases?: string[]
       requires?: string[]
       savedFromRunID?: string
+      params?: Json
       source: "project" | "personal"
     },
   ): Promise<SavedWorkflow> {
@@ -97,6 +101,7 @@ class MemoryStorage implements CommandStorage {
         description: manifest.description,
         phases: manifest.phases,
         requires: manifest.requires,
+        ...(manifest.params !== undefined ? { params: manifest.params } : {}),
         hash: digest(script),
         source: manifest.source,
         savedAt: Date.now(),
@@ -118,6 +123,7 @@ class MemoryStorage implements CommandStorage {
         description: manifest.description,
         phases: manifest.phases ?? compiled.meta.phases,
         requires: manifest.requires ?? compiled.meta.requires,
+        ...(manifest.params !== undefined ? { params: manifest.params } : {}),
         hash: digest(compiled.script),
         source: manifest.source,
         savedAt: Date.now(),
@@ -131,12 +137,17 @@ class MemoryStorage implements CommandStorage {
     return saved
   }
   fileScripts = new Map<string, string>()
+  fileGraphs = new Map<string, Json>()
   async saveWorkflowFromFile(name: string): Promise<SavedWorkflow> {
     const script = this.fileScripts.get(name)
-    if (!script) throw new Error(`workflow "${name}" not found`)
-    return this.saveWorkflow(name, script, { name, source: "project" })
+    if (script !== undefined) return this.saveWorkflow(name, script, { name, source: "project" })
+    const spec = this.fileGraphs.get(name)
+    if (spec !== undefined) return this.saveGraphWorkflow(name, spec, { name, source: "project" })
+    throw new Error(`workflow "${name}" not found`)
   }
   async trustWorkflow(name: string): Promise<{ workflow: SavedWorkflow; digest: string } | undefined> {
+    const forced = this.throwsOnTrust.get(name)
+    if (forced) throw forced
     const w = this.workflows.get(name)
     if (!w) return undefined
     const d = digest(w.script)
@@ -690,6 +701,127 @@ test("set missing value emits usage; unknown keys still ack", async () => {
   assert.equal(parseSettingsAckPayload(texts[0]!)?.overlay.concurrency, DEFAULT_OPTIONS.concurrency)
 })
 
+test("set providerconcurrency persists the overlay and acks the EFFECTIVE per-provider caps", async () => {
+  const registry = new FakeRegistry()
+  // Plugin option carries anthropic=2; the overlay starts empty.
+  const base = { ...DEFAULT_OPTIONS, providerConcurrency: { anthropic: 2 } as Record<string, number> }
+  let holder = { ...base }
+  let storedOverlay: SettingsOverlay = {}
+  const persisted: SettingsOverlay[] = []
+  const texts: string[] = []
+  const deps: CommandDeps = {
+    registry,
+    supervisor: new MemorySupervisor(registry),
+    storage: new MemoryStorage(),
+    say: async (_sid, t) => {
+      texts.push(t)
+    },
+    projectRoot: "/project",
+    personalWorkflowDir: "/home/u/.config/opencode/workflows",
+    listAgents: async () => ({ ok: true, agents: [{ id: "general" }] }),
+    defaultAgent: "general",
+    nextRunSettings: () => panelSettingsFrom(holder),
+    nextRunOverlay: () => storedOverlay,
+    effectiveProviderConcurrency: () => ({ ...holder.providerConcurrency }),
+    persistAndRefreshSettings: async (next) => {
+      persisted.push(next)
+      // Same merge seam index.ts uses: a full overlay replaces the stored one.
+      storedOverlay = { ...storedOverlay, ...next }
+      holder = applyOverlay(base, storedOverlay)
+      return panelSettingsFrom(holder)
+    },
+  }
+
+  await handleUltracodeCommand({ sessionID: "ses_parent", prompt: { text: "set providerconcurrency openai=4" } }, deps)
+  assert.deepEqual(persisted[0]?.providerConcurrency, { openai: 4 })
+  let ack = parseSettingsAckPayload(texts[0]!)
+  assert.ok(ack)
+  // EFFECTIVE caps: plugin anthropic=2 merged with overlay openai=4.
+  assert.deepEqual(ack?.providerConcurrency, { anthropic: 2, openai: 4 })
+  assert.equal(ack?.overlay.concurrency, DEFAULT_OPTIONS.concurrency, "panel keys untouched")
+
+  // A second set on another provider keeps the first overlay entry.
+  texts.length = 0
+  await handleUltracodeCommand({ sessionID: "ses_parent", prompt: { text: "set providerconcurrency google=1" } }, deps)
+  assert.deepEqual(persisted[1]?.providerConcurrency, { openai: 4, google: 1 })
+  ack = parseSettingsAckPayload(texts[0]!)!
+  assert.deepEqual(ack.providerConcurrency, { anthropic: 2, openai: 4, google: 1 })
+
+  // `none` removes the overlay entry → that provider falls back to the plugin
+  // option (anthropic keeps its plugin cap 2; openai's overlay cap is gone).
+  texts.length = 0
+  await handleUltracodeCommand({ sessionID: "ses_parent", prompt: { text: "set providerconcurrency openai=none" } }, deps)
+  assert.deepEqual(persisted[2]?.providerConcurrency, { google: 1 })
+  ack = parseSettingsAckPayload(texts[0]!)!
+  assert.deepEqual(ack.providerConcurrency, { anthropic: 2, google: 1 }, "no openai cap remains")
+})
+
+test("set providerconcurrency invalid forms are ignored — nothing persists, current state acks", async () => {
+  const registry = new FakeRegistry()
+  const base = { ...DEFAULT_OPTIONS, providerConcurrency: { anthropic: 2 } as Record<string, number> }
+  let storedOverlay: SettingsOverlay = { providerConcurrency: { openai: 4 } }
+  let holder = applyOverlay(base, storedOverlay)
+  let persistCalls = 0
+  const texts: string[] = []
+  const deps: CommandDeps = {
+    registry,
+    supervisor: new MemorySupervisor(registry),
+    storage: new MemoryStorage(),
+    say: async (_sid, t) => {
+      texts.push(t)
+    },
+    projectRoot: "/project",
+    personalWorkflowDir: "/home/u/.config/opencode/workflows",
+    listAgents: async () => ({ ok: true, agents: [{ id: "general" }] }),
+    defaultAgent: "general",
+    nextRunSettings: () => panelSettingsFrom(holder),
+    nextRunOverlay: () => storedOverlay,
+    effectiveProviderConcurrency: () => ({ ...holder.providerConcurrency }),
+    persistAndRefreshSettings: async (next) => {
+      persistCalls += 1
+      storedOverlay = { ...storedOverlay, ...next }
+      holder = applyOverlay(base, storedOverlay)
+      return panelSettingsFrom(holder)
+    },
+  }
+  const bad = ["bad/key=2", "openai=0", "openai=17", "openai=two", "openai"]
+  for (const value of bad) {
+    texts.length = 0
+    await handleUltracodeCommand(
+      { sessionID: "ses_parent", prompt: { text: `set providerconcurrency ${value}` } },
+      deps,
+    )
+    const ack = parseSettingsAckPayload(texts[0]!)
+    assert.ok(ack, `value ${JSON.stringify(value)} must still ack`)
+    assert.deepEqual(ack?.providerConcurrency, { anthropic: 2, openai: 4 }, `value ${JSON.stringify(value)}`)
+  }
+  assert.equal(persistCalls, 0, "invalid values never persist")
+  // One-token form is a usage error, same as every other set key.
+  texts.length = 0
+  await handleUltracodeCommand({ sessionID: "ses_parent", prompt: { text: "set providerconcurrency" } }, deps)
+  assert.match(texts[0]!, /Usage: \/ultracode set <key> <value>/)
+})
+
+test("set providerconcurrency without the overlay seam reports settings unavailable", async () => {
+  const texts: string[] = []
+  const deps: CommandDeps = {
+    registry: new FakeRegistry(),
+    supervisor: new MemorySupervisor(new FakeRegistry()),
+    storage: new MemoryStorage(),
+    say: async (_sid, t) => {
+      texts.push(t)
+    },
+    projectRoot: "/project",
+    personalWorkflowDir: "/home/u/.config/opencode/workflows",
+    listAgents: async () => ({ ok: true, agents: [{ id: "general" }] }),
+    defaultAgent: "general",
+    nextRunSettings: () => panelSettingsFrom({ ...DEFAULT_OPTIONS }),
+    persistAndRefreshSettings: async (overlay) => panelSettingsFrom(applyOverlay(DEFAULT_OPTIONS, overlay)),
+  }
+  await handleUltracodeCommand({ sessionID: "ses_parent", prompt: { text: "set providerconcurrency openai=4" } }, deps)
+  assert.equal(texts[0], "error: settings unavailable")
+})
+
 test("/ultracode resume asks: --model applies the fallback override and --remember persists it", async () => {
   const registry = new FakeRegistry()
   seed(registry, baseRun({ id: "run_paused", status: "paused" }))
@@ -993,6 +1125,199 @@ test("rerun carries graphSpec forward, so re-saving the rerun stays a graph", as
   const saved = await invoke("save run_fake1 lane-review", { registry: reg })
   assert.equal(saved.storage.graphSaves.length, 1)
   assert.equal(saved.storage.workflows.get("lane-review")?.manifest.kind, "graph")
+})
+
+test("runSaveManifest records provenance and derives params from the run's real args", () => {
+  const run = baseRun({
+    id: "run_m",
+    status: "succeeded",
+    name: "source-name",
+    script: "return 1",
+    args: { topic: "x", limit: 3 },
+    meta: { phases: ["scan"], requires: ["explore"] },
+  })
+  const manifest = runSaveManifest(run, "saved-name")
+  assert.equal(manifest.name, "saved-name")
+  assert.equal(manifest.description, "saved from run run_m (source-name)")
+  assert.deepEqual(manifest.phases, ["scan"])
+  assert.deepEqual(manifest.requires, ["explore"])
+  assert.equal(manifest.savedFromRunID, "run_m")
+  assert.equal(manifest.source, "project")
+  assert.deepEqual(manifest.params, {
+    args: [
+      { name: "topic", type: "string" },
+      { name: "limit", type: "number" },
+    ],
+  })
+  // No meta name / args → bare description, no params noise.
+  const bare = runSaveManifest(baseRun({ id: "run_b", script: "return 1" }), "bare")
+  assert.equal(bare.description, "saved from run run_b")
+  assert.equal(bare.params, undefined)
+})
+
+// ---------------------------------------------------------------------------
+// Agent-callable ultracode_save — same save/trust paths as the TUI verbs
+// ---------------------------------------------------------------------------
+
+async function invokeSaveTool(
+  input: { name: string; runID?: string; trust?: boolean },
+  opts: { registry?: FakeRegistry; storage?: MemoryStorage; sessionID?: string } = {},
+): Promise<{ outcome: Awaited<ReturnType<typeof executeSaveTool>>; registry: FakeRegistry; storage: MemoryStorage }> {
+  const registry = opts.registry ?? new FakeRegistry()
+  const storage = opts.storage ?? new MemoryStorage()
+  const outcome = await executeSaveTool({ registry, storage }, opts.sessionID ?? "ses_parent", input)
+  return { outcome, registry, storage }
+}
+
+test("save tool: runID saves the run's artifact with provenance; trust stays untouched by default", async () => {
+  const registry = new FakeRegistry()
+  seed(registry, baseRun({ id: "run_js", status: "succeeded", script: "return 7", args: { topic: "x" } }))
+  const { outcome, storage } = await invokeSaveTool({ name: "plain-flow", runID: "run_js" }, { registry })
+  assert.equal(outcome.ok, true)
+  if (!outcome.ok) return
+  assert.deepEqual(Object.keys(outcome.result).sort(), ["message", "name", "origin", "trusted"])
+  assert.equal(outcome.result.name, "plain-flow")
+  assert.equal(outcome.result.origin, "run run_js")
+  assert.equal(outcome.result.trusted, false)
+  assert.match(outcome.result.message, /approval is user-only/)
+  assert.match(outcome.result.message, /\/ultracode trust plain-flow/)
+  const saved = storage.workflows.get("plain-flow")
+  assert.equal(saved?.script, "return 7")
+  assert.equal(saved?.manifest.savedFromRunID, "run_js")
+  assert.equal(storage.trust.size, 0, "saving alone must never record trust")
+})
+
+test("save tool: runID + trust records the digest-bound approval in the same call", async () => {
+  const registry = new FakeRegistry()
+  seed(registry, baseRun({ id: "run_js", status: "succeeded", script: "return 7" }))
+  const { outcome, storage } = await invokeSaveTool(
+    { name: "trust-me", runID: "run_js", trust: true },
+    { registry },
+  )
+  assert.equal(outcome.ok, true)
+  if (!outcome.ok) return
+  assert.equal(outcome.result.trusted, true)
+  assert.equal(outcome.result.origin, "run run_js")
+  assert.match(outcome.result.message, /sha256 [0-9a-f]{12}/)
+  assert.match(outcome.result.message, /explicitly approved/)
+  assert.match(outcome.result.message, /invalidates trust/)
+  assert.equal(storage.trust.get("trust-me"), digest("return 7"))
+  assert.equal(storage.workflowTrustState("trust-me"), "trusted")
+})
+
+test("save tool: a graph run saves the SPEC and the message points at /ultracode graph", async () => {
+  const registry = new FakeRegistry()
+  seed(
+    registry,
+    baseRun({
+      id: "run_g",
+      status: "succeeded",
+      name: "lane review",
+      script: compiledOf(GRAPH_FIXTURE),
+      graphSpec: jsonCopy(GRAPH_FIXTURE),
+      meta: { phases: ["scout", "review"], requires: ["explore"] },
+    }),
+  )
+  const { outcome, storage } = await invokeSaveTool({ name: "lane-review", runID: "run_g" }, { registry })
+  assert.equal(storage.graphSaves.length, 1, "the graph save path was used")
+  assert.deepEqual(storage.graphSaves[0]!.spec, jsonCopy(GRAPH_FIXTURE))
+  assert.equal(storage.workflows.get("lane-review")?.manifest.kind, "graph")
+  assert.equal(storage.workflows.get("lane-review")?.manifest.savedFromRunID, "run_g")
+  assert.equal(outcome.ok, true)
+  if (!outcome.ok) return
+  assert.equal(outcome.result.origin, "run run_g")
+  assert.match(outcome.result.message, /\/ultracode graph lane-review/)
+  assert.match(outcome.result.message, /\/ultracode trust lane-review/)
+})
+
+test("save tool: without runID saves the project artifact and can record trust in the same call", async () => {
+  const storage = new MemoryStorage()
+  storage.fileScripts.set("plan-flow", "return 7")
+  const plain = await invokeSaveTool({ name: "plan-flow" }, { storage })
+  assert.equal(plain.outcome.ok, true)
+  if (!plain.outcome.ok) return
+  assert.equal(plain.outcome.result.origin, ".opencode/workflows/plan-flow.js")
+  assert.equal(plain.outcome.result.trusted, false)
+  assert.equal(storage.trust.size, 0)
+
+  const trusted = await invokeSaveTool({ name: "plan-flow", trust: true }, { storage })
+  assert.equal(trusted.outcome.ok, true)
+  if (!trusted.outcome.ok) return
+  assert.equal(trusted.outcome.result.origin, ".opencode/workflows/plan-flow.js")
+  assert.equal(trusted.outcome.result.trusted, true)
+  assert.equal(storage.trust.get("plan-flow"), digest("return 7"))
+})
+
+test("save tool: a project graph artifact reports the graph file as origin", async () => {
+  const storage = new MemoryStorage()
+  storage.fileGraphs.set("lane-review", jsonCopy(GRAPH_FIXTURE))
+  const { outcome } = await invokeSaveTool({ name: "lane-review" }, { storage })
+  assert.equal(outcome.ok, true)
+  if (!outcome.ok) return
+  assert.equal(outcome.result.origin, ".opencode/workflows/lane-review.graph.json")
+  assert.equal(storage.workflows.get("lane-review")?.manifest.kind, "graph")
+  assert.match(outcome.result.message, /\/ultracode graph lane-review/)
+})
+
+test("save tool: produces the same run save as the TUI verb (shared path)", async () => {
+  const run = (): RunRecord => baseRun({ id: "run_src", status: "succeeded", script: "return 99", name: "from-run" })
+  const tuiRegistry = new FakeRegistry()
+  seed(tuiRegistry, run())
+  const tui = await invoke("save run_src from-run", { registry: tuiRegistry })
+  const toolRegistry = new FakeRegistry()
+  seed(toolRegistry, run())
+  const tool = await invokeSaveTool({ name: "from-run", runID: "run_src" }, { registry: toolRegistry })
+  const tuiSaved = tui.storage.workflows.get("from-run")?.manifest
+  const toolSaved = tool.storage.workflows.get("from-run")?.manifest
+  for (const key of ["name", "description", "phases", "requires", "savedFromRunID", "source", "params"] as const) {
+    assert.deepEqual(toolSaved?.[key], tuiSaved?.[key], `manifest.${key} must match the TUI save`)
+  }
+})
+
+test("save tool: invalid names are rejected before any write or trust", async () => {
+  const storage = new MemoryStorage()
+  storage.fileScripts.set("UPPER", "return 1")
+  const { outcome } = await invokeSaveTool({ name: "UPPER", trust: true }, { storage })
+  assert.equal(outcome.ok, false)
+  if (outcome.ok) return
+  assert.match(outcome.error, /lowercase alphanumerics/)
+  assert.equal(storage.workflows.size, 0)
+  assert.equal(storage.trust.size, 0)
+})
+
+test("save tool: unknown or foreign runID errors cleanly and records nothing", async () => {
+  const registry = new FakeRegistry()
+  seed(registry, baseRun({ id: "run_other", parentSessionID: "ses_other", script: "return 1" }))
+  const storage = new MemoryStorage()
+  for (const runID of ["run_missing", "run_other"]) {
+    const { outcome } = await invokeSaveTool({ name: "save-me", runID, trust: true }, { registry, storage })
+    assert.equal(outcome.ok, false)
+    if (outcome.ok) return
+    assert.match(outcome.error, /does not belong to this conversation/)
+  }
+  assert.equal(storage.workflows.size, 0)
+  assert.equal(storage.trust.size, 0)
+})
+
+test("save tool: trust is never recorded when the save itself failed", async () => {
+  const storage = new MemoryStorage()
+  const { outcome } = await invokeSaveTool({ name: "missing-flow", trust: true }, { storage })
+  assert.equal(outcome.ok, false)
+  if (outcome.ok) return
+  assert.match(outcome.error, /could not save workflow/)
+  assert.equal(storage.trust.size, 0)
+})
+
+test("save tool: a trust failure after a successful save reports cleanly", async () => {
+  const storage = new MemoryStorage()
+  storage.fileScripts.set("plan-flow", "return 7")
+  storage.throwsOnTrust.set("plan-flow", new Error("kv down"))
+  const { outcome } = await invokeSaveTool({ name: "plan-flow", trust: true }, { storage })
+  assert.equal(outcome.ok, false)
+  if (outcome.ok) return
+  assert.match(outcome.error, /could not record trust — kv down/)
+  assert.equal(storage.trust.size, 0)
+  assert.equal(storage.workflows.size, 1, "the save itself stays written")
 })
 
 test("dashboard tags saved graph workflows and surfaces an unloadable spec", async () => {

@@ -9,7 +9,7 @@ import type { GraphNode, GraphSpec } from "./graph.ts"
 import { MAX_CHECKPOINTS } from "./registry.ts"
 import { compactStringify, safeSlice } from "./serialize.ts"
 import { reduceToolEvent, toolCallsFor, type ToolEvent, type ToolEventState } from "./run-events.ts"
-import { GRAPH_ARTIFACT_SUFFIX, normalizePath, sha256 } from "./storage.ts"
+import { GRAPH_ARTIFACT_SUFFIX, WORKFLOW_NAME_RE, normalizePath, sha256 } from "./storage.ts"
 import { paramsFromArgs, paramsValue } from "./params.ts"
 import type {
   Json,
@@ -30,12 +30,14 @@ import type {
 } from "./types.ts"
 import { countAgents, DEFAULT_OPTIONS, isActiveRunStatus } from "./types.ts"
 import {
+  applySetProviderConcurrency,
   applySetValue,
   capturedFromRecord,
   formatSettingsAck,
   overlayFromPanel,
   parseSetArgs,
   type PanelSettings,
+  type SettingsOverlay,
 } from "./settings.ts"
 
 /**
@@ -94,7 +96,7 @@ export const NESTED_RUN_REFUSED =
   "cannot start a run from inside an active workflow session — use /ultracode from the parent"
 
 /** Plugin package version shown on the bare /ultracode dashboard. */
-export const PLUGIN_VERSION = "0.11.0"
+export const PLUGIN_VERSION = "0.13.0"
 /** Oldest OpenCode binary build the inspect TUI is gated on (A7 / D7). */
 export const MIN_SUPPORTED_BUILD = 19271
 
@@ -115,6 +117,7 @@ export function helpText(): string {
     "- `/ultracode untrust <name>` — revoke trust for a saved workflow",
     "- `/ultracode settings [runID]` — next-run defaults and a run's captured settings",
     "- `/ultracode set <key> <value>` — persist overlay (concurrency, maxAgents, timeoutMs, permissions); applies next run",
+    "- set providerconcurrency `<providerID>=<N>` — runtime per-provider in-flight cap, N 1..16, ANY provider (no plugin option needed); `<providerID>=none` removes the overlay entry so the provider falls back to the plugin option (or uncapped). Applies to runs started after the change; in-flight runs keep their frozen caps (while they still spawn children, their older cap is enforced)",
     "- `/ultracode doctor` — install/load diagnostics (marker, entries, rpc, live vs persisted runs, last KV error)",
     "- `/ultracode help` — this text",
     "",
@@ -167,7 +170,7 @@ export const TOOL_DESCRIPTION: string = [
   "Caps are project settings — ultracode_catalog reports the live concurrency, agent cap and timeout under `caps`. Defaults: 8 concurrent agents, 200 agent() calls per run, 60 minutes wall clock (scripts are hard-capped at 512 KB, results truncate after 64 KB). A run that legitimately needs longer than the configured timeout takes an optional timeoutMs in its input (10 s-24 h; that run only, recorded on the run).",
   "Default / background: runs are background by default — the tool returns immediately after admission with { runID, status: \"running\", hint } (inspect panel via ctrl+g, or /ultracode status / ultracode_status). A late tool result cannot be delivered after execute returns; instead a settle notice lands in the parent session on completion and wakes the calling agent.",
   "background: false (opt-in) blocks until every agent settles, then returns { runID, status, agents, tokens, result | preview }.",
-  "Orchestrator tools: ultracode_status { runID? } (per-child detail, elapsed, settled result — full when it fits), ultracode_result { runID, offset?, maxLength? } (full settled result, page-by-page), ultracode_control { action: stop|pause|resume, runID? } (owned runs only), ultracode_steer { runID, agentID?, text } (running child).",
+  "Orchestrator tools: ultracode_status { runID? } (per-child detail, elapsed, settled result — full when it fits), ultracode_result { runID, offset?, maxLength? } (full settled result, page-by-page), ultracode_control { action: stop|pause|resume, runID? } (owned runs only), ultracode_steer { runID, agentID?, text } (running child), ultracode_save { runID?, name, trust? } (save a run you own or a project file as a named workflow; trust:true records trust ONLY after the user explicitly approved that workflow in chat — never silently).",
   "Truncated results: when a result exceeds the size cap, envelopes and status carry a preview plus resultChars/total size. Fetch the full value with ultracode_result — each call returns a chunk of the COMPACT JSON serialization plus nextOffset; concatenate chunks from offset 0 following nextOffset, then parse.",
   "",
   "Full patterns + live catalogs load with the Ultracode skill (auto-attaches on the standalone keyword 'ultracode').",
@@ -864,6 +867,14 @@ export interface CommandDeps {
   nextRunSettings?: () => PanelSettings
   persistAndRefreshSettings?: (overlay: ReturnType<typeof overlayFromPanel>) => Promise<PanelSettings>
   /**
+   * The STORED overlay (panel keys + non-panel maps). Base for
+   * `set providerconcurrency` edits so plugin-option keys are never baked
+   * into the overlay. Required for that set key.
+   */
+  nextRunOverlay?: () => SettingsOverlay
+  /** Effective per-provider caps (plugin option merged with the overlay) — set providerconcurrency acks. */
+  effectiveProviderConcurrency?: () => Record<string, number>
+  /**
    * Ask-mode `/ultracode resume --remember`: persist the model→modelFallbacks
    * entry through the settings path (never agent pin files).
    */
@@ -1127,7 +1138,12 @@ export async function handleUltracodeCommand(invocation: CommandInvocation, deps
   await deps.say(sessionID, `Unknown /ultracode argument: ${JSON.stringify(sub)}\n\n${helpText()}`)
 }
 
-function settingsAckFor(deps: CommandDeps, rest: string, overlay: PanelSettings): string {
+function settingsAckFor(
+  deps: CommandDeps,
+  rest: string,
+  overlay: PanelSettings,
+  providerConcurrency?: Record<string, number>,
+): string {
   const explicit = firstToken(rest)
   let runID: string | undefined
   let effective: PanelSettings | undefined
@@ -1142,7 +1158,12 @@ function settingsAckFor(deps: CommandDeps, rest: string, overlay: PanelSettings)
       effective = capturedFromRecord(active[0])
     }
   }
-  return formatSettingsAck({ overlay, runID, effective })
+  return formatSettingsAck({
+    overlay,
+    runID,
+    effective,
+    ...(providerConcurrency !== undefined ? { providerConcurrency } : {}),
+  })
 }
 
 async function renderSettings(deps: CommandDeps, sessionID: string, rest: string): Promise<void> {
@@ -1160,6 +1181,10 @@ async function setSettings(deps: CommandDeps, sessionID: string, rest: string): 
     await deps.say(sessionID, "Usage: /ultracode set <key> <value>")
     return
   }
+  if (parsed.key === "providerconcurrency") {
+    await setProviderConcurrency(deps, sessionID, parsed.value)
+    return
+  }
   const current = deps.nextRunSettings?.()
   if (!current || !deps.persistAndRefreshSettings) {
     await deps.say(sessionID, "error: settings unavailable")
@@ -1172,6 +1197,34 @@ async function setSettings(deps: CommandDeps, sessionID: string, rest: string): 
     applied = await deps.persistAndRefreshSettings(overlayFromPanel(overlay))
   }
   await deps.say(sessionID, settingsAckFor(deps, "", applied))
+}
+
+/**
+ * `/ultracode set providerconcurrency <providerID>=<N|none>`: edit the STORED
+ * overlay's providerConcurrency map (set or remove one entry), persist it
+ * through the same settings path every other set key uses, and ack with the
+ * resulting EFFECTIVE per-provider caps (plugin option merged with the
+ * overlay). Invalid provider ids and out-of-range values are ignored (ack
+ * current state, nothing persisted) — the config never-throw rule.
+ */
+async function setProviderConcurrency(deps: CommandDeps, sessionID: string, raw: string): Promise<void> {
+  const stored = deps.nextRunOverlay?.()
+  if (stored === undefined || !deps.persistAndRefreshSettings || !deps.nextRunSettings) {
+    await deps.say(sessionID, "error: settings unavailable")
+    return
+  }
+  const next = applySetProviderConcurrency(stored, raw)
+  if (next === "ignored") {
+    await deps.say(
+      sessionID,
+      settingsAckFor(deps, "", deps.nextRunSettings(), deps.effectiveProviderConcurrency?.()),
+    )
+    return
+  }
+  // Persist exactly like the panel-key set path: the full overlay (panel keys
+  // + the edited providerConcurrency map) merges over the stored overlay.
+  const applied = await deps.persistAndRefreshSettings(next)
+  await deps.say(sessionID, settingsAckFor(deps, "", applied, deps.effectiveProviderConcurrency?.()))
 }
 
 async function renderDashboard(deps: CommandDeps, sessionID: string): Promise<void> {
@@ -1575,6 +1628,156 @@ async function rerunRun(deps: CommandDeps, sessionID: string, rest: string): Pro
     })
 }
 
+/**
+ * Manifest for saving a run's artifact under `name` — shared by
+ * `/ultracode save <runID> <name>` and the agent-callable `ultracode_save`
+ * tool so both record identical provenance.
+ */
+export function runSaveManifest(run: RunRecord, name: string): SaveWorkflowManifestInput {
+  const display = run.meta?.name ?? run.name
+  return {
+    name,
+    description: display && display !== name ? `saved from run ${run.id} (${display})` : `saved from run ${run.id}`,
+    phases: run.meta?.phases,
+    requires: run.meta?.requires,
+    savedFromRunID: run.id,
+    source: "project",
+    // The run's real args are the most accurate params evidence available;
+    // storage merges them over what the artifact itself declares.
+    params: paramsValue(paramsFromArgs(run.args)),
+  }
+}
+
+/**
+ * Save a run's artifact under `name` — the ONE save path shared by
+ * `/ultracode save <runID> <name>` and the agent-callable `ultracode_save`
+ * tool. A graph run saves its SPEC: writing `run.script` instead would launder
+ * generated plumbing into a hand-editable `.js` pair and lose validation,
+ * auto-keys and `/ultracode graph` rendering.
+ */
+export async function saveRunArtifact(
+  storage: Pick<CommandStorage, "saveWorkflow" | "saveGraphWorkflow">,
+  run: RunRecord,
+  name: string,
+): Promise<SavedWorkflow> {
+  const manifest = runSaveManifest(run, name)
+  return run.graphSpec !== undefined
+    ? storage.saveGraphWorkflow(name, run.graphSpec, manifest)
+    : storage.saveWorkflow(name, run.script, manifest)
+}
+
+/** Storage surface the agent-callable save tool needs (satisfied by StorageImpl). */
+export type SaveToolStorage = Pick<
+  CommandStorage,
+  "saveWorkflow" | "saveGraphWorkflow" | "saveWorkflowFromFile" | "trustWorkflow" | "workflowTrustState"
+>
+
+/** Compact JSON returned by `ultracode_save` on success. */
+export type SaveToolResult = {
+  name: string
+  /** Where the saved workflow came from: `run <runID>` or the project artifact file. */
+  origin: string
+  /** Trust state of the saved workflow's current version after this call. */
+  trusted: boolean
+  /** Outcome + next-step note for the calling agent to relay to the user. */
+  message: string
+}
+
+/**
+ * Host-free core of the agent-callable `ultracode_save` tool. With `runID` it
+ * runs the SAME path as `/ultracode save <runID> <name>` (ownership is checked
+ * first, before existence, so a foreign conversation's runID is never an
+ * existence oracle); without it, it loads the project artifact `<name>.js` /
+ * `<name>.graph.json` exactly like `/ultracode save <name>`. `trust: true`
+ * records the digest-bound approval AFTER a successful save, through the same
+ * `trustWorkflow` path as `/ultracode trust <name>`. Never throws: storage
+ * failures come back as `{ ok: false }` messages.
+ */
+export async function executeSaveTool(
+  deps: { registry: Pick<Registry, "get">; storage: SaveToolStorage },
+  sessionID: string,
+  input: { name: string; runID?: string; trust?: boolean },
+): Promise<{ ok: true; result: SaveToolResult } | { ok: false; error: string }> {
+  // Same name rule as the TUI (storage enforces it on its own API too) — fail
+  // before any write or trust reads.
+  if (!WORKFLOW_NAME_RE.test(input.name)) {
+    return {
+      ok: false,
+      error: `invalid workflow name ${JSON.stringify(input.name)} — lowercase alphanumerics, "-" or "_", max 64 chars`,
+    }
+  }
+  let fromRunID: string | undefined
+  let saved: SavedWorkflow
+  if (input.runID !== undefined) {
+    // Ownership before existence (matches ultracode_result).
+    const run = deps.registry.get(input.runID)
+    if (run?.parentSessionID !== sessionID) {
+      return { ok: false, error: "run does not belong to this conversation" }
+    }
+    fromRunID = run.id
+    try {
+      saved = await saveRunArtifact(deps.storage, run, input.name)
+    } catch (err) {
+      return { ok: false, error: `could not save workflow — ${describeError(err)}` }
+    }
+  } else {
+    try {
+      saved = await deps.storage.saveWorkflowFromFile(input.name)
+    } catch (err) {
+      return {
+        ok: false,
+        error:
+          `could not save workflow — ${describeError(err)}. ` +
+          `Author \`.opencode/workflows/${input.name}.js\` (or \`${input.name}${GRAPH_ARTIFACT_SUFFIX}\` for a graph) first, or pass runID for a run from this conversation.`,
+      }
+    }
+  }
+  const artifact = saved.manifest.kind === "graph" ? `${input.name}${GRAPH_ARTIFACT_SUFFIX}` : `${input.name}.js`
+  const origin = fromRunID !== undefined ? `run ${fromRunID}` : `.opencode/workflows/${artifact}`
+  if (input.trust === true) {
+    // Trust is recorded ONLY after a successful save: every failure above
+    // returns before this branch, so a bad runID or a missing project file can
+    // never mark a name trusted.
+    let trusted: Awaited<ReturnType<SaveToolStorage["trustWorkflow"]>>
+    try {
+      trusted = await deps.storage.trustWorkflow(input.name)
+    } catch (err) {
+      return { ok: false, error: `saved "${input.name}" but could not record trust — ${describeError(err)}` }
+    }
+    if (!trusted) {
+      return { ok: false, error: `workflow "${input.name}" not found on disk after save — nothing was trusted` }
+    }
+    return {
+      ok: true,
+      result: {
+        name: saved.manifest.name,
+        origin,
+        trusted: true,
+        message:
+          `Saved and trusted \`${input.name}\` (sha256 ${trusted.digest.slice(0, 12)}…) because the user explicitly approved saving and trusting it in chat — name the workflow in your reply so the approval is visible. ` +
+          "Editing the artifact later invalidates trust until the user re-approves.",
+      },
+    }
+  }
+  const review =
+    saved.manifest.kind === "graph"
+      ? `tell the user to review it with \`/ultracode graph ${input.name}\` then approve it with \`/ultracode trust ${input.name}\``
+      : `tell the user to approve it with \`/ultracode trust ${input.name}\``
+  const trusted = deps.storage.workflowTrustState(input.name) === "trusted"
+  return {
+    ok: true,
+    result: {
+      name: saved.manifest.name,
+      origin,
+      trusted,
+      message: trusted
+        ? `Saved \`${input.name}\` (${saved.manifest.source}, ${artifact}); the digest matches the approved version — already trusted.`
+        : `Saved \`${input.name}\` (${saved.manifest.source}, ${artifact}) but not trusted — approval is user-only: ${review}, ` +
+          "or call this tool again with trust: true after the user explicitly approves this workflow in chat.",
+    },
+  }
+}
+
 async function saveRun(deps: CommandDeps, sessionID: string, rest: string): Promise<void> {
   const saveMatch = /^(\S+)\s+(\S+)$/.exec(rest)
   if (saveMatch) {
@@ -1586,25 +1789,7 @@ async function saveRun(deps: CommandDeps, sessionID: string, rest: string): Prom
       return
     }
     try {
-      const display = run.meta?.name ?? run.name
-      const manifest: SaveWorkflowManifestInput = {
-        name,
-        description: display && display !== name ? `saved from run ${run.id} (${display})` : `saved from run ${run.id}`,
-        phases: run.meta?.phases,
-        requires: run.meta?.requires,
-        savedFromRunID: run.id,
-        source: "project",
-        // The run's real args are the most accurate params evidence available;
-        // storage merges them over what the artifact itself declares.
-        params: paramsValue(paramsFromArgs(run.args)),
-      }
-      // A graph run saves its SPEC. Saving run.script instead would launder
-      // generated plumbing into a hand-editable `.js` pair and lose validation,
-      // auto-keys and `/ultracode graph` rendering.
-      const saved =
-        run.graphSpec !== undefined
-          ? await deps.storage.saveGraphWorkflow(name, run.graphSpec, manifest)
-          : await deps.storage.saveWorkflow(name, run.script, manifest)
+      const saved = await saveRunArtifact(deps.storage, run, name)
       await saySavedWorkflow(deps, sessionID, saved.manifest.name, saved.manifest.source, saved.manifest.kind)
     } catch (err) {
       await deps.say(sessionID, `error: could not save workflow — ${describeError(err)}`)

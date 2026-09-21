@@ -118,14 +118,25 @@ interface SemaphoreWaiter {
   signal?: AbortSignal
 }
 
-/** Counting semaphore with a FIFO wait queue; queued waiters reject on abort. */
+/**
+ * Counting semaphore with a FIFO wait queue; queued waiters reject on abort.
+ * The limit is MUTABLE: `setLimit(n)` raises or lowers it later — a raise
+ * admits queued waiters FIFO from the new headroom; a lower bound applies to
+ * future admissions only (holders are never preempted, queued waiters are
+ * never rejected).
+ */
 export class Semaphore {
-  private readonly limit: number
+  private limitValue: number
   private active = 0
   private readonly queue: SemaphoreWaiter[] = []
 
   constructor(limit: number) {
-    this.limit = Math.max(1, Math.floor(limit))
+    this.limitValue = Math.max(1, Math.floor(limit))
+  }
+
+  /** Current admission limit (>= 1; adjustable via setLimit). */
+  get limit(): number {
+    return this.limitValue
   }
 
   get running(): number {
@@ -134,6 +145,28 @@ export class Semaphore {
 
   get queued(): number {
     return this.queue.length
+  }
+
+  /**
+   * Adjust the limit. Unchanged (after clamping to >= 1) is a no-op. When the
+   * limit GREW, the FIFO queue drains while headroom remains: each admitted
+   * waiter's abort listener is removed, `active` rises by one and the waiter
+   * resolves (new headroom — unlike release()'s slot transfer, which keeps
+   * active unchanged). A SHRINK only lowers the limit for FUTURE admissions:
+   * holders keep their permits and queued waiters stay queued.
+   */
+  setLimit(n: number): void {
+    const next = Math.max(1, Math.floor(n))
+    if (next === this.limitValue) return
+    const grew = next > this.limitValue
+    this.limitValue = next
+    if (!grew) return
+    while (this.active < this.limitValue && this.queue.length > 0) {
+      const waiter = this.queue.shift()!
+      if (waiter.signal) waiter.signal.removeEventListener("abort", waiter.onAbort)
+      this.active++ // admission from new headroom
+      waiter.resolve()
+    }
   }
 
   acquire(signal?: AbortSignal): Promise<void> {
@@ -152,7 +185,7 @@ export class Semaphore {
         reject(new AgentCallError("abort", "agent aborted: run stopping"))
         return
       }
-      if (this.active < this.limit) {
+      if (this.active < this.limitValue) {
         // Synchronous acquisition: no queue entry, so no abort listener to
         // register (the holder isn't auto-released on abort; a listener here
         // would leak — the queued path below owns listener cleanup).

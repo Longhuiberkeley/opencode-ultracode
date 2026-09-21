@@ -10,10 +10,12 @@ import { parseModelPin } from "./agent-pins.ts"
 
 /** Same charset as pin providerIDs; also rejects ".." / "/" so keys are slot-path-safe. */
 const PROVIDER_CONCURRENCY_KEY = /^[A-Za-z0-9._-]+$/
-const PROVIDER_CONCURRENCY_MIN = 1
-const PROVIDER_CONCURRENCY_MAX = 16
+/** Shared with the /ultracode set providerconcurrency overlay key (src/settings.ts). */
+export const PROVIDER_CONCURRENCY_MIN = 1
+export const PROVIDER_CONCURRENCY_MAX = 16
 
-function isProviderConcurrencyKey(id: string): boolean {
+/** Exported: the /ultracode set providerconcurrency parser validates ids with the SAME rule. */
+export function isProviderConcurrencyKey(id: string): boolean {
   if (id.includes("/") || id.includes("\\") || id.includes("\0") || id.includes("..")) return false
   return PROVIDER_CONCURRENCY_KEY.test(id)
 }

@@ -4,7 +4,13 @@
  */
 import type { PermissionMode, UltracodeOptions } from "./types.ts"
 import { CONCURRENCY_CAP, DEFAULT_OPTIONS, MAX_RUN_TIMEOUT_MS, MIN_RUN_TIMEOUT_MS, clampConcurrency } from "./types.ts"
-import { parseModelFallbacks } from "./config.ts"
+import {
+  PROVIDER_CONCURRENCY_MAX,
+  PROVIDER_CONCURRENCY_MIN,
+  isProviderConcurrencyKey,
+  parseModelFallbacks,
+  parseProviderConcurrency,
+} from "./config.ts"
 
 export type PanelSettings = {
   concurrency: number
@@ -25,6 +31,13 @@ export type SettingsOverlay = {
    * the stored map instead of replacing it.
    */
   modelFallbacks?: Record<string, string[]>
+  /**
+   * Runtime per-provider in-flight caps (`/ultracode set providerconcurrency
+   * <providerID>=<N>`). NOT a panel setting: same merge rule as
+   * modelFallbacks — the panel never edits it and `overlayFromPanel`
+   * deliberately omits it, so it survives panel saves.
+   */
+  providerConcurrency?: Record<string, number>
 }
 
 export type SettingsKey = keyof PanelSettings
@@ -47,6 +60,11 @@ export type SettingsAck = {
   overlay: PanelSettings
   runID?: string
   effective?: PanelSettings
+  /**
+   * Effective per-provider caps (plugin option merged with the overlay).
+   * Carried by `set providerconcurrency` acks; not a panel setting.
+   */
+  providerConcurrency?: Record<string, number>
 }
 
 export function panelSettingsFrom(options: Required<UltracodeOptions>): PanelSettings {
@@ -98,6 +116,12 @@ export function applyOverlay(
   // time `remember: true` writes a one-key overlay.
   if (overlay.modelFallbacks !== undefined) {
     next.modelFallbacks = { ...base.modelFallbacks, ...overlay.modelFallbacks }
+  }
+  // Same per-key merge for provider caps: overlay keys win, plugin keys the
+  // overlay does not mention keep their values (so removing an overlay key
+  // falls back to the plugin option).
+  if (overlay.providerConcurrency !== undefined) {
+    next.providerConcurrency = { ...base.providerConcurrency, ...overlay.providerConcurrency }
   }
   return next
 }
@@ -151,6 +175,10 @@ export function parseSettingsOverlay(raw: unknown): SettingsOverlay {
   if (modelFallbacks !== undefined && Object.keys(modelFallbacks).length > 0) {
     overlay.modelFallbacks = modelFallbacks
   }
+  const providerConcurrency = parseProviderConcurrency(record.providerConcurrency)
+  if (providerConcurrency !== undefined && Object.keys(providerConcurrency).length > 0) {
+    overlay.providerConcurrency = providerConcurrency
+  }
   return overlay
 }
 
@@ -194,6 +222,35 @@ export function applySetValue(current: PanelSettings, key: string, raw: string):
     return { ...current, permissions: raw as PermissionMode }
   }
   return "ignored"
+}
+
+/**
+ * Apply `/ultracode set providerconcurrency <providerID>=<N|none>`.
+ * `N` must be an integer 1..16 (the same bounds as the plugin option);
+ * `none` removes the overlay entry so the provider falls back to the plugin
+ * option (or to uncapped). The result REPLACES the overlay's map wholesale —
+ * it is seeded from the STORED overlay, never from the effective merge, so
+ * plugin-option keys are never baked into the overlay. Bad provider ids and
+ * bad values are ignored (config rule: never throw).
+ */
+export function applySetProviderConcurrency(
+  overlay: SettingsOverlay,
+  raw: string,
+): SettingsOverlay | "ignored" {
+  const m = /^([^=\s]+)=([^=\s]+)$/.exec(raw)
+  if (!m) return "ignored"
+  const provider = m[1]!
+  const value = m[2]!
+  if (!isProviderConcurrencyKey(provider)) return "ignored"
+  const caps: Record<string, number> = { ...(overlay.providerConcurrency ?? {}) }
+  if (value === "none") {
+    delete caps[provider]
+    return { ...overlay, providerConcurrency: caps }
+  }
+  const n = parseSetNumber(value)
+  if (n === undefined || n < PROVIDER_CONCURRENCY_MIN || n > PROVIDER_CONCURRENCY_MAX) return "ignored"
+  caps[provider] = n
+  return { ...overlay, providerConcurrency: caps }
 }
 
 export function stepPanelSetting(current: PanelSettings, key: SettingsKey, dir: 1 | -1): PanelSettings {
@@ -252,6 +309,9 @@ export function formatSettingsAck(payload: SettingsAck): string {
   const body: Record<string, unknown> = { overlay: payload.overlay }
   if (payload.runID) body.runID = payload.runID
   if (payload.effective) body.effective = payload.effective
+  // Effective per-provider caps (non-panel extra key; parseSettingsAckPayload
+  // round-trips it through the same fail-closed parser as the overlay).
+  if (payload.providerConcurrency !== undefined) body.providerConcurrency = payload.providerConcurrency
   return `${SETTINGS_ACK_PREFIX} ${JSON.stringify(body)}`
 }
 
@@ -269,6 +329,10 @@ export function parseSettingsAckPayload(text: string): SettingsAck | undefined {
     if (typeof rec.runID === "string") ack.runID = rec.runID
     const effective = parsePanelSettings(rec.effective)
     if (effective) ack.effective = effective
+    const providerConcurrency = parseProviderConcurrency(rec.providerConcurrency)
+    if (providerConcurrency !== undefined && Object.keys(providerConcurrency).length > 0) {
+      ack.providerConcurrency = providerConcurrency
+    }
     return ack
   } catch {
     return undefined

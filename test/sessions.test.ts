@@ -5,7 +5,7 @@
  */
 import test from "node:test"
 import assert from "node:assert/strict"
-import { createSessionDriver, buildChildTitle, parseChildTitle, describeSessionFailure, buildContinuationPrompt } from "../src/sessions.ts"
+import { createSessionDriver, buildChildTitle, parseChildTitle, describeSessionFailure, buildContinuationPrompt, SCHEMA_REPAIR_ROUNDS } from "../src/sessions.ts"
 import { AgentCallError, RunClosedError } from "../src/sessions.ts"
 import { FakeSessionCtx } from "./fakes.ts"
 import type { ScriptedReply } from "./fakes.ts"
@@ -332,18 +332,68 @@ test("runAgent: schema mode — fenced JSON accepted without repair", async () =
   assert.equal([...fake.sessions.values()][0].prompts, 1)
 })
 
-test("runAgent: schema mode — still invalid after repair => typed schema error", async () => {
+test("runAgent: schema mode — both repair rounds invalid => typed schema error naming the round count", async () => {
+  // The fake repeats its last queued reply once the queue is down to one, so
+  // every repair round fails with the same schema-invalid JSON.
   const { fake, driver } = makeDriver([{ text: "nope" }, { text: '{"wrong": 1}' }])
   await assert.rejects(
     driver.runAgent(input({ schema: SCHEMA }), ["general"], hooks()),
     (err: unknown) =>
       err instanceof AgentCallError &&
       err.kind === "schema" &&
-      /still invalid after repair/.test(err.message) &&
+      /structured output repair failed after 2 rounds/.test(err.message) &&
       /missing required property "answer"/.test(err.message),
   )
   const session = [...fake.sessions.values()][0]
-  assert.equal(session.prompts, 2) // exactly one repair round, no third prompt
+  // first prompt + the bounded repair rounds — never an unbounded loop.
+  assert.equal(session.prompts, 1 + SCHEMA_REPAIR_ROUNDS)
+})
+
+test("runAgent: schema mode — a second repair round can still rescue the call", async () => {
+  const { fake, driver } = makeDriver([
+    { text: "not json at all" },
+    { text: '{"wrong": 1}' },
+    { text: '{"answer": "42"}', model: { providerID: "p", id: "repair-2" } },
+  ])
+  const result = await driver.runAgent(input({ schema: SCHEMA }), ["general"], hooks())
+  assert.deepEqual(result.data, { answer: "42" }) // repaired: true — text/model come from the FINAL repaired reply.
+  assert.equal(result.text, '{"answer": "42"}')
+  assert.deepEqual(result.model, { providerID: "p", id: "repair-2" })
+  const session = [...fake.sessions.values()][0]
+  assert.equal(session.prompts, 3, "initial prompt + two repair rounds")
+  const repairMsgs = session.messages.filter((m) => m.type === "user").slice(1)
+  assert.equal(repairMsgs.length, 2)
+  // Round 1 keeps the established repair prompt; round 2 escalates.
+  assert.match(repairMsgs[0]!.text ?? "", /not a valid JSON value/)
+  assert.doesNotMatch(repairMsgs[0]!.text ?? "", /no trailing commas/)
+  // Each repair prompt carries the LATEST problem, not the first one.
+  assert.match(repairMsgs[1]!.text ?? "", /missing required property "answer"/)
+  assert.match(
+    repairMsgs[1]!.text ?? "",
+    /Start your reply with \{ or \[ and end with the matching closing bracket\. No prose, no markdown fences, no trailing commas, no comments\./,
+  )
+})
+
+test("runAgent: schema mode — scalar schema escalates with bare-value guidance, not brackets", async () => {
+  // A top-level scalar schema must NOT be pushed toward { / [ on the escalated
+  // round — a bare value ("42") is the valid shape and must rescue the call.
+  const { fake, driver } = makeDriver([
+    { text: "the answer is forty-two" },
+    { text: "still not a number" },
+    { text: "42" },
+  ])
+  const result = await driver.runAgent(
+    input({ prompt: "extract", schema: { type: "number" } }),
+    ["general"],
+    hooks(),
+  )
+  assert.deepEqual(result.data, 42)
+  const session = [...fake.sessions.values()][0]
+  assert.equal(session.prompts, 3, "initial prompt + two repair rounds")
+  const escalated = session.messages.filter((m) => m.type === "user")[2]
+  assert.ok(escalated)
+  assert.match(escalated.text ?? "", /bare JSON value only/)
+  assert.doesNotMatch(escalated.text ?? "", /Start your reply with \{ or \[/)
 })
 
 // ---------------------------------------------------------------------------

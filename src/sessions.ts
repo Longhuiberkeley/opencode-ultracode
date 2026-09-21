@@ -159,6 +159,15 @@ interface StructuredOutcome {
 // ---------------------------------------------------------------------------
 
 /**
+ * Repair rounds after the first invalid structured-output reply. Bounded so a
+ * lane that keeps emitting bad JSON costs at most this many extra prompts
+ * before the typed schema error fires (heavy-work lanes deserve more than one
+ * chance; the run must not pay for an unbounded loop). Round 1 keeps the
+ * established repair prompt; round 2 escalates the output-shape instruction.
+ */
+export const SCHEMA_REPAIR_ROUNDS = 2
+
+/**
  * Build the session driver. The returned driver ALWAYS supports
  * `continueAgent` (`Required<SessionDriver>`): the optional seam on
  * SessionDriver exists only so hand-built doubles can stay small.
@@ -272,9 +281,9 @@ export function createSessionDriver(sessions: SessionCtx, options: SessionDriver
       tokens: info.tokens ?? first.message?.tokens,
     }
 
-    // Schema mode: tolerant extraction + validate + ONE repair round.
+    // Schema mode: tolerant extraction + validate + BOUNDED repair rounds.
     // After a successful repair, .text/.model/.tokens describe the REPAIRED
-    // response (attempt 2), consistent with .data.
+    // response (the last attempt), consistent with .data.
     if (schema !== undefined) {
       const structured = await resolveStructured(sessions, sessionID, schema, first, signal)
       result.data = structured.data
@@ -356,10 +365,12 @@ export function createSessionDriver(sessions: SessionCtx, options: SessionDriver
   }
 
   /**
-   * Structured-output resolution: extract -> validate; on failure run exactly
-   * ONE repair round (second prompt carrying the validation error), then
-   * re-extract + re-validate or throw a typed schema error. On success via
-   * repair, the returned text/model/tokens describe the REPAIRED response.
+   * Structured-output resolution: extract -> validate; on failure run BOUNDED
+   * repair rounds (`SCHEMA_REPAIR_ROUNDS`): round 1 re-prompts with the
+   * validation problem, round 2 restates it and escalates the output-shape
+   * instruction. Rounds exhausted => typed schema error naming the count. On
+   * success via repair, the returned text/model/tokens describe the REPAIRED
+   * (final) response.
    */
   async function resolveStructured(
     sessions: SessionCtx,
@@ -378,39 +389,61 @@ export function createSessionDriver(sessions: SessionCtx, options: SessionDriver
       problem = extracted.error
     }
 
-    // ONE repair round: re-prompt with the validation error, then re-validate.
-    const repairPrompt =
-      "Your previous reply was not a valid JSON value matching the required schema.\n" +
-      `Problem: ${problem}\n` +
-      "Output only the corrected JSON value — no prose, no markdown fences."
-    await promptAndWait(sessions, sessionID, buildPromptText(repairPrompt, schema), signal)
-    const info = await sessions.get({ sessionID })
-    const reply = await readAssistantReply(sessions, sessionID, info.outcome)
-    if (info.outcome !== "succeeded") {
-      const detail = describeSessionFailure(info, reply.message)
-      throw new AgentCallError(
-        "outcome",
-        `agent session outcome "${info.outcome ?? "unknown"}" during schema repair${detail ? `: ${snippet(detail, snippetChars)}` : ""}` +
-          (reply.text ? `${detail ? " | " : ": "}${snippet(reply.text, snippetChars)}` : ""),
-        reply.text,
-        classifySessionFailure(info, reply.message, reply.text),
-      )
+    // BOUNDED repair rounds: each re-prompt carries the LATEST problem, so a
+    // lane that emits bad JSON after heavy work gets more than one chance to
+    // correct itself — but a persistently bad lane can never burn the run
+    // (the loop stops after SCHEMA_REPAIR_ROUNDS attempts). Round 2 escalates
+    // with an explicit output-shape instruction — bracket-delimited only for
+    // object/array schemas; scalar schemas are told to stay bare values.
+    let reply: AssistantReply = first
+    for (let round = 0; round < SCHEMA_REPAIR_ROUNDS; round++) {
+      const repairPrompt =
+        "Your previous reply was not a valid JSON value matching the required schema.\n" +
+        `Problem: ${problem}\n` +
+        "Output only the corrected JSON value — no prose, no markdown fences." +
+        (round > 0
+          ? isContainerSchema(schema)
+            ? "\nStart your reply with { or [ and end with the matching closing bracket. No prose, no markdown fences, no trailing commas, no comments."
+            : "\nOutput the bare JSON value only — a quoted string, a number, true/false, or null. No prose, no markdown fences."
+          : "")
+      await promptAndWait(sessions, sessionID, buildPromptText(repairPrompt, schema), signal)
+      const info = await sessions.get({ sessionID })
+      reply = await readAssistantReply(sessions, sessionID, info.outcome)
+      if (info.outcome !== "succeeded") {
+        const detail = describeSessionFailure(info, reply.message)
+        throw new AgentCallError(
+          "outcome",
+          `agent session outcome "${info.outcome ?? "unknown"}" during schema repair${detail ? `: ${snippet(detail, snippetChars)}` : ""}` +
+            (reply.text ? `${detail ? " | " : ": "}${snippet(reply.text, snippetChars)}` : ""),
+          reply.text,
+          classifySessionFailure(info, reply.message, reply.text),
+        )
+      }
+      const attempt = extractJson(reply.text)
+      if (attempt.ok) {
+        const check = validateJsonSchemaValue(schema, attempt.value)
+        if (check.ok) {
+          return {
+            data: attempt.value,
+            repaired: true,
+            text: reply.text,
+            model: reply.message?.model ?? null,
+            tokens: info.tokens ?? reply.message?.tokens,
+          }
+        }
+        problem = check.error
+      } else {
+        problem = attempt.error
+      }
     }
-    const second = extractJson(reply.text)
-    if (!second.ok) {
-      throw new AgentCallError("schema", `structured output repair failed: ${second.error}`, reply.text)
-    }
-    const secondCheck = validateJsonSchemaValue(schema, second.value)
-    if (!secondCheck.ok) {
-      throw new AgentCallError("schema", `structured output still invalid after repair: ${secondCheck.error}`, reply.text)
-    }
-    return {
-      data: second.value,
-      repaired: true,
-      text: reply.text,
-      model: reply.message?.model ?? null,
-      tokens: info.tokens ?? reply.message?.tokens,
-    }
+
+    // Rounds exhausted — typed schema error naming the count, carrying the
+    // LAST problem and the last reply text.
+    throw new AgentCallError(
+      "schema",
+      `structured output repair failed after ${SCHEMA_REPAIR_ROUNDS} rounds: ${problem}`,
+      reply.text,
+    )
   }
 
   return { runAgent, continueAgent }
@@ -419,6 +452,17 @@ export function createSessionDriver(sessions: SessionCtx, options: SessionDriver
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * True when the schema's top-level type is object or array — the escalated
+ * repair round's start-with-a-bracket instruction applies only to container
+ * shapes; scalar schemas (string/number/boolean) must stay bare JSON values.
+ */
+function isContainerSchema(schema: Json): boolean {
+  if (schema === null || typeof schema !== "object" || Array.isArray(schema)) return false
+  const t = (schema as { type?: unknown }).type
+  return t === "object" || t === "array"
+}
 
 /**
  * Best-effort failure detail for a non-succeeded outcome: the server-side

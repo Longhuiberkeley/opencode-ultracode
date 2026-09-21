@@ -11,6 +11,7 @@
 import { CONTROL_ACTIONS, type ControlAction } from "./control.ts"
 import { parseModelPin } from "./agent-pins.ts"
 import { SCRIPT_TEMPLATES } from "./script-templates.ts"
+import { WORKFLOW_NAME_RE } from "./storage.ts"
 import type {
   GraphRunInput,
   InlineRunInput,
@@ -751,4 +752,70 @@ export function validateCatalogToolInput(raw: unknown): CatalogToolInput | { ok:
   if (templates !== undefined) out.templates = templates
   if (scriptTemplates !== undefined) out.scriptTemplates = scriptTemplates
   return out
+}
+
+export type SaveToolInput = {
+  ok: true
+  /** Workflow name to save under (storage's name rule, enforced up front). */
+  name: string
+  /** Save this run (must belong to the calling conversation) instead of a project file. */
+  runID?: string
+  /**
+   * Record trust after saving. ONLY legal when the user explicitly approved
+   * THIS workflow in chat — the caller (agent) asserts that evidence; the
+   * boundary itself is documented in the tool description and skill.
+   */
+  trust?: boolean
+}
+
+/**
+ * Input for the `ultracode_save` tool: `{ runID?, name, trust? }`.
+ * `runID` saves a run's artifact (a graph run saves its spec); without it the
+ * project file `<name>.js` / `<name>.graph.json` is saved. `trust: true`
+ * additionally records trust for the saved workflow — reserved for explicit
+ * user approval relayed by the calling agent.
+ */
+export function validateSaveToolInput(raw: unknown): SaveToolInput | { ok: false; error: string } {
+  if (!isObj(raw)) return { ok: false, error: `input must be an object, got ${typeOf(raw)}` }
+  const extra = rejectExtras(raw, new Set(["name", "runID", "trust"]))
+  if (extra) return { ok: false, error: extra }
+  const name = raw["name"]
+  if (typeof name !== "string" || name.trim() === "") {
+    return {
+      ok: false,
+      error: `"name" must be a non-empty workflow name, got ${typeOf(name) === "string" ? "empty string" : typeOf(name)}`,
+    }
+  }
+  const trimmed = name.trim()
+  if (!WORKFLOW_NAME_RE.test(trimmed)) {
+    return {
+      ok: false,
+      error: `"name" must be lowercase alphanumerics, "-" or "_", max 64 chars (got ${JSON.stringify(trimmed)})`,
+    }
+  }
+  let runID: string | undefined
+  if (has(raw, "runID")) {
+    const value = raw["runID"]
+    if (typeof value !== "string" || value.trim() === "") {
+      return {
+        ok: false,
+        error: `"runID" must be a non-empty string, got ${typeOf(value) === "string" ? "empty string" : typeOf(value)}`,
+      }
+    }
+    runID = value
+  }
+  let trust: boolean | undefined
+  if (has(raw, "trust")) {
+    const value = raw["trust"]
+    if (typeof value !== "boolean") {
+      return { ok: false, error: `"trust" must be a boolean, got ${typeOf(value)}` }
+    }
+    trust = value
+  }
+  return {
+    ok: true,
+    name: trimmed,
+    ...(runID !== undefined ? { runID } : {}),
+    ...(trust !== undefined ? { trust } : {}),
+  }
 }

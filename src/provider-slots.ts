@@ -268,10 +268,12 @@ export class ProviderSlotPool {
 
 /**
  * Supervisor-owned limiter: one FIFO Semaphore per provider (shared across
- * every run this supervisor owns) plus the machine slot pool. First `cap`
- * observed for a provider wins as the semaphore limit (options are process-
- * level; in-flight runs keep their freezeEffective snapshot for whether to
- * acquire at all).
+ * every run this supervisor owns) plus the machine slot pool. The LATEST
+ * observed `cap` wins as the semaphore limit — limits move with configuration
+ * (`/ultracode set providerconcurrency` picked up by runs started after the
+ * change); a lowered cap applies to future admissions only and holders are
+ * never preempted. In-flight runs keep their freezeEffective snapshot for
+ * whether to acquire at all.
  */
 export class ProviderConcurrencyGate implements ProviderLimiter {
   private readonly semaphores = new Map<string, Semaphore>()
@@ -296,6 +298,11 @@ export class ProviderConcurrencyGate implements ProviderLimiter {
     if (sem === undefined) {
       sem = new Semaphore(n)
       this.semaphores.set(providerID, sem)
+    } else if (sem.limit !== n) {
+      // Latest observed cap wins: a run started after a config raise/shrink
+      // moves the shared limit. Growth drains the queue; shrink binds future
+      // admissions only.
+      sem.setLimit(n)
     }
     await sem.acquire(signal)
     let hold: ProviderSlotHold | undefined

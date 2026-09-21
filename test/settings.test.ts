@@ -8,12 +8,15 @@ import { loadOptions } from "../src/config.ts"
 import { readFileSync } from "node:fs"
 import {
   applyOverlay,
+  applySetProviderConcurrency,
   applySetValue,
   evaluateOwnedPermission,
+  formatSettingsAck,
   freezeEffective,
   isShellWriteCommand,
   overlayFromPanel,
   parseSetArgs,
+  parseSettingsAckPayload,
   parseSettingsOverlay,
   permissionHookDecision,
   permissionStallAction,
@@ -21,6 +24,7 @@ import {
   rememberModelFallback,
   stepPanelSetting,
   panelSettingsFrom,
+  type SettingsOverlay,
 } from "../src/settings.ts"
 import { FakeRegistry, FakeStorage } from "./fakes.ts"
 import { CONCURRENCY_CAP, DEFAULT_OPTIONS, clampConcurrency } from "../src/types.ts"
@@ -410,4 +414,104 @@ test("freezeEffective copies providerConcurrency so later mutation cannot leak",
   assert.deepEqual(snap.providerConcurrency, { anthropic: 2 })
   shared.openai = 1
   assert.deepEqual(snap.providerConcurrency, { anthropic: 2 })
+})
+
+// ---------------------------------------------------------------------------
+// Per-provider runtime caps (providerConcurrency in the KV overlay)
+// ---------------------------------------------------------------------------
+
+test("parseSettingsOverlay: providerConcurrency parses through the same fail-closed rule as the plugin option", () => {
+  const parsed = parseSettingsOverlay({
+    providerConcurrency: { openai: 4, "bad/key": 2, anthropic: 0, google: 17, "no..dot": 3 },
+  })
+  assert.deepEqual(parsed.providerConcurrency, { openai: 4 })
+  assert.equal(parseSettingsOverlay({ providerConcurrency: "nope" }).providerConcurrency, undefined)
+  assert.equal(parseSettingsOverlay({ providerConcurrency: {} }).providerConcurrency, undefined)
+  assert.equal(parseSettingsOverlay({ providerConcurrency: null }).providerConcurrency, undefined)
+})
+
+test("applyOverlay: providerConcurrency merges per key — overlay wins, unmentioned keys keep plugin values", () => {
+  const base = { ...DEFAULT_OPTIONS, providerConcurrency: { anthropic: 2, openai: 8 } }
+  const merged = applyOverlay(base, parseSettingsOverlay({ providerConcurrency: { openai: 3, google: 1 } }))
+  assert.deepEqual(merged.providerConcurrency, { anthropic: 2, openai: 3, google: 1 })
+  assert.deepEqual(base.providerConcurrency, { anthropic: 2, openai: 8 }, "plugin map is never mutated")
+})
+
+test("applyOverlay: removing an overlay key (map emptied) falls back to the plugin option per key", () => {
+  const base = { ...DEFAULT_OPTIONS, providerConcurrency: { anthropic: 2 } }
+  const overlay = applySetProviderConcurrency({ providerConcurrency: { anthropic: 3 } }, "anthropic=none")
+  assert.notEqual(overlay, "ignored")
+  if (overlay !== "ignored") {
+    assert.deepEqual(overlay.providerConcurrency, {})
+    const merged = applyOverlay(base, overlay)
+    assert.deepEqual(merged.providerConcurrency, { anthropic: 2 }, "plugin value returns")
+  }
+})
+
+test("applySetProviderConcurrency: set, remove, and invalid forms", () => {
+  const once = applySetProviderConcurrency({}, "openai=4")
+  assert.notEqual(once, "ignored")
+  if (once !== "ignored") assert.deepEqual(once.providerConcurrency, { openai: 4 })
+  const twice = applySetProviderConcurrency(once === "ignored" ? {} : once, "anthropic=1")
+  assert.notEqual(twice, "ignored")
+  if (twice !== "ignored") assert.deepEqual(twice.providerConcurrency, { openai: 4, anthropic: 1 })
+  const removed = applySetProviderConcurrency(twice === "ignored" ? {} : twice, "openai=none")
+  assert.notEqual(removed, "ignored")
+  if (removed !== "ignored") assert.deepEqual(removed.providerConcurrency, { anthropic: 1 })
+
+  // invalid provider ids (same charset rule as config.ts) and bad values are ignored
+  assert.equal(applySetProviderConcurrency({}, "bad/key=2"), "ignored")
+  assert.equal(applySetProviderConcurrency({}, "bad..key=2"), "ignored")
+  assert.equal(applySetProviderConcurrency({}, "openai=0"), "ignored")
+  assert.equal(applySetProviderConcurrency({}, "openai=17"), "ignored")
+  assert.equal(applySetProviderConcurrency({}, "openai=two"), "ignored")
+  assert.equal(applySetProviderConcurrency({}, "openai"), "ignored")
+  assert.equal(applySetProviderConcurrency({}, "=4"), "ignored")
+
+  // panel keys and other non-panel maps survive untouched
+  const withOthers: SettingsOverlay = { concurrency: 2, modelFallbacks: { "a/b": ["c/d"] } }
+  const edited = applySetProviderConcurrency(withOthers, "openai=4")
+  assert.notEqual(edited, "ignored")
+  if (edited !== "ignored") {
+    assert.equal(edited.concurrency, 2)
+    assert.deepEqual(edited.modelFallbacks, { "a/b": ["c/d"] })
+  }
+})
+
+test("overlayFromPanel keeps omitting providerConcurrency so panel saves cannot drop it", () => {
+  const panel = overlayFromPanel(stepPanelSetting(panelSettingsFrom(DEFAULT_OPTIONS), "concurrency", 1))
+  assert.equal("providerConcurrency" in panel, false)
+  assert.equal("modelFallbacks" in panel, false)
+  // The merge a panel save performs keeps the stored caps (modelFallbacks rule).
+  const stored: SettingsOverlay = { providerConcurrency: { openai: 2 } }
+  const merged: SettingsOverlay = { ...stored, ...panel }
+  assert.deepEqual(merged.providerConcurrency, { openai: 2 })
+})
+
+test("provider caps survive the KV overlay round-trip and reach the next run's options", () => {
+  const storage = new FakeStorage()
+  const overlay = applySetProviderConcurrency({ concurrency: 4 }, "openai=3")
+  assert.notEqual(overlay, "ignored")
+  if (overlay !== "ignored") {
+    storage.saveSettingsOverlay(overlay)
+    const reloaded = parseSettingsOverlay(storage.loadSettingsOverlay())
+    assert.deepEqual(reloaded.providerConcurrency, { openai: 3 })
+    const options = applyOverlay(loadOptions({ providerConcurrency: { anthropic: 2 } }).options, reloaded)
+    assert.deepEqual(options.providerConcurrency, { anthropic: 2, openai: 3 })
+    assert.deepEqual(freezeEffective(options).providerConcurrency, { anthropic: 2, openai: 3 })
+  }
+})
+
+test("settings ack round-trips effective provider caps without changing the panel contract", () => {
+  const ack = formatSettingsAck({
+    overlay: panelSettingsFrom(DEFAULT_OPTIONS),
+    providerConcurrency: { openai: 3 },
+  })
+  const parsed = parseSettingsAckPayload(ack)
+  assert.ok(parsed)
+  assert.equal(parsed?.overlay.concurrency, DEFAULT_OPTIONS.concurrency)
+  assert.deepEqual(parsed?.providerConcurrency, { openai: 3 })
+  // an ack without caps still parses, with the field absent
+  const plain = parseSettingsAckPayload(formatSettingsAck({ overlay: panelSettingsFrom(DEFAULT_OPTIONS) }))
+  assert.equal(plain?.providerConcurrency, undefined)
 })

@@ -228,7 +228,7 @@ test("staged-delivery: stage list and fix rounds are capped", async () => {
 
 test("staged-delivery: a schema-broken verifier degrades to a stage failure, not a run crash", async () => {
   const ctx = makeSupervisor()
-  // Queue empties after these: the repair round repeats the broken text, the
+  // Queue empties after these: the repair rounds repeat the broken text, the
   // schema error throws, and the template catches it -> "verifier unavailable".
   ctx.sessions
     .push(DONE_OK("a done"))

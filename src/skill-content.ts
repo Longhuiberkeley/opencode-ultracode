@@ -52,10 +52,13 @@ the live \`caps\`. Drill in with \`{ workflow: "name" }\` for one workflow's ful
 
 Two things it tells you that guessing cannot: what \`args\` a saved workflow actually takes, and
 whether the user has trusted it. Trust gates SAVED workflows only: running by name requires the user's
-one-time \`/ultracode trust <name>\` — relay that and wait. An inline \`{ script }\` you author now runs
-without saving or trusting (there is no digest check against saved files); save when you will rerun or
-share the orchestration. Never dodge an untrusted saved workflow by inlining its content — that bypasses
-the user's pending approval; ask them to trust it.
+one-time \`/ultracode trust <name>\` — relay that and wait, or record their EXPLICIT chat approval
+yourself with \`ultracode_save { name, trust: true }\` (never silently). An inline \`{ script }\` you author
+now runs without saving or trusting (there is no digest check against saved files). Save what is
+GENUINELY repeatable: after a run settles, judge whether the same shape will recur (not a one-off),
+ASK the user, and only then save — on explicit approval record trust too.
+Never dodge an untrusted saved workflow by inlining its content — that bypasses the user's pending
+approval; ask them to trust it.
 
 ## Decide: answer, delegate, or workflow
 
@@ -137,11 +140,13 @@ Author in Plan mode; run by name from Build mode. Do not call \`ultracode_run\` 
 1. Write ONE artifact into the project workflows directory: \`<name>.graph.json\` (a graph — pure
    JSON, no escaping hazards) or \`<name>.js\` (a script, async-function body, no module syntax).
    Name: lowercase alphanumerics, \`-\` or \`_\`, max 64 chars.
-2. \`/ultracode save <name>\` (one-token file save). After a run, \`/ultracode save <runID> <name>\`
-   still works — a graph run saves its spec, not the compiled script.
-3. Review a graph with \`/ultracode graph <name>\` (waves, node table, mermaid — works before
-   trust, which is the point), then \`/ultracode trust <name>\` (digest-bound; editing the artifact
-   invalidates trust until it is re-approved).
+2. \`ultracode_save { name }\` (one-token file save; \`/ultracode save <name>\` is the user's version).
+   After a run settles, \`ultracode_save { runID, name }\` saves that run — a graph run saves its spec, not the compiled script.
+3. Review a graph with \`/ultracode graph <name>\` (waves, node table, mermaid — works before trust,
+   which is the point). Trust is user-only: if the orchestration is GENUINELY repeatable (the same
+   shape will recur, not a one-off), ASK the user; only after the user explicitly approves in chat
+   call \`ultracode_save { name, trust: true }\` (\`{ runID, name, trust: true }\` for a settled run).
+   Editing the artifact later invalidates trust until the user re-approves.
 4. Build: \`ultracode_run\` with \`{ workflow: "name", args? }\`. Do not mix native subagent fan-out
    with a workflow in the same task.
 
@@ -155,7 +160,7 @@ prompts and args, then run it inline or save it. Injected globals, nothing else:
 
 | Global | Call | Semantics |
 | --- | --- | --- |
-| \`agent\` | \`agent(prompt, opts?)\` | Spawns one subagent and waits. Resolves \`{ text, sessionID, agent, model, tokens, data?, cachedFrom?, failover? }\`. \`opts\`: \`agent\` (agent id), \`model\` (EXPLICIT override in the pin-string shape — only when the user asked for a model; beats pins and the run-level model), \`label\`, \`phase\`, \`schema\`, \`key\`. With \`opts.schema\`, extracted JSON lands in \`.data\`, validated and repaired once. \`opts.key\` (stable id, e.g. \`"lane:3"\`) marks the call replayable: on a warm rerun (\`resumeFrom\`, or \`/ultracode rerun <runID> --warm\`) a succeeded call with the same key AND the same prompt+schema+agent+model digest returns from cache — no session, no cap hit. Key every deterministic call in a long run. Plan-quota children fail over automatically (same session, different provider) unless the user set failover off; \`.failover\` is present when the child finished on a different model than it was spawned on. |
+| \`agent\` | \`agent(prompt, opts?)\` | Spawns one subagent and waits. Resolves \`{ text, sessionID, agent, model, tokens, data?, cachedFrom?, failover? }\`. \`opts\`: \`agent\` (agent id), \`model\` (EXPLICIT override in the pin-string shape — only when the user asked for a model; beats pins and the run-level model), \`label\`, \`phase\`, \`schema\`, \`key\`. With \`opts.schema\`, extracted JSON lands in \`.data\`, validated and repaired through bounded retry (up to 2 correction prompts before the call fails). \`opts.key\` (stable id, e.g. \`"lane:3"\`) marks the call replayable: on a warm rerun (\`resumeFrom\`, or \`/ultracode rerun <runID> --warm\`) a succeeded call with the same key AND the same prompt+schema+agent+model digest returns from cache — no session, no cap hit. Key every deterministic call in a long run. Plan-quota children fail over automatically (same session, different provider) unless the user set failover off; \`.failover\` is present when the child finished on a different model than it was spawned on. |
 | \`parallel\` | \`parallel(thunks)\` | Barrier over thunks. A thunk that throws resolves as \`null\`; siblings still run. |
 | \`pipeline\` | \`pipeline(items, ...stages)\` | Runs every item through the stages in order. A failing item becomes \`null\`; other items are unaffected. |
 | \`phase\` | \`phase(name)\` | Sets the ambient phase label for progress grouping. |
@@ -357,8 +362,10 @@ return { research: research.stats, audit: audit.stats }
 
 Saved workflows (samples included) run only after the user approves them once via
 \`/ultracode trust <name>\`; editing the artifact later invalidates that approval. An unapproved
-call fails fast with that instruction — relay it to the user instead of retrying. Plan-authored
-files use the same gate after \`/ultracode save <name>\`.
+call fails fast with that instruction — relay it to the user instead of retrying; after the user
+explicitly approves in chat you may record it with \`ultracode_save { name, trust: true }\`, and only
+when the orchestration is GENUINELY repeatable. Plan-authored files use the same gate after
+\`ultracode_save { name }\`.
 
 ## Complete script example
 

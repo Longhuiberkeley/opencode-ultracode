@@ -195,9 +195,13 @@ OpenCode plan/build is a host agent mode. Handoff is file + trust + named run:
    standard shape, `<name>.graph.json` (pure JSON, no escaping hazards). Do not call `ultracode_run` inline.
 2. `/ultracode save <name>` (one-token; picks up either artifact, and preserves a hand-written
    `<name>.json` manifest's `description` / `phases` / `requires` / `params`). After a run,
-   `/ultracode save <runID> <name>` still works.
-3. Review a graph with `/ultracode graph <name>` (works before trust), then
-   `/ultracode trust <name>` (digest-bound; a changed script or spec is refused until re-trusted).
+   `/ultracode save <runID> <name>` still works. The agent-callable `ultracode_save { name }` /
+   `{ runID, name }` runs the same paths (returns `{ name, origin, trusted, message }`).
+3. Review a graph with `/ultracode graph <name>` (works before trust), then approve with
+   `/ultracode trust <name>` (digest-bound; a changed script or spec is refused until re-trusted) —
+   or, after the user explicitly approves in chat, the agent records the same approval in one call
+   with `ultracode_save { name, trust: true }`, and only when the orchestration is genuinely
+   repeatable. Editing the artifact later invalidates trust until re-approved.
 4. **Build:** `{ workflow: "name", args? }`. Do not mix native subagent fan-out with a workflow in the same task.
 
 The registered skill is `buildSkillContent` in `src/skill-content.ts`, not an on-disk markdown file.
@@ -286,8 +290,8 @@ Semantics and failure modes:
   failures fail over automatically unless `failover: "off"` — see
   [Provider rate limits and failover](#provider-rate-limits-and-failover). Do not hand-roll
   sleep-and-retry around these.
-- **Schema mode:** see [below](#structured-output-with-optsschema). Invalid output after one
-  repair round rejects the call.
+- **Schema mode:** see [below](#structured-output-with-optsschema). Invalid output after the
+  bounded repair rounds rejects the call.
 - One `agent()` call = one run-record entry ("a1", "a2", ...) with its own tokens,
   `spawnModel` (intended) and `effectiveModel` (what actually ran) — visible in `/ultracode show`.
   Retries and failovers reuse that same row.
@@ -454,8 +458,10 @@ Pass a JSON Schema in `opts.schema` and the runtime handles extraction + validat
    ever.
 3. The value is validated against a small but sufficient validator: `type`, `required`,
    `properties`, `items`, `enum`, `minimum`, `maximum` (`additionalProperties` is ignored).
-4. On invalid: **one repair round** — the child is re-prompted with the validation error and
-   asked for corrected JSON only. Still invalid => the `agent()` call rejects.
+4. On invalid: **bounded repair rounds** (up to 2: the second restates the problem and adds an
+   explicit output-shape instruction) — the child is re-prompted with the latest
+   validation error and asked for corrected JSON only. Still invalid after the last round =>
+   the `agent()` call rejects.
 
 Authoring tips:
 
@@ -879,7 +885,7 @@ What the `ultracode_run` tool returns to the parent session (always valid JSON):
 | Cap | Default | Where configured |
 | --- | --- | --- |
 | Concurrent child sessions | 8 | plugin option `concurrency` |
-| Per-provider in-flight | unset | plugin option `providerConcurrency` (`providerID` → 1–16; instance + machine slots) |
+| Per-provider in-flight | unset | plugin option `providerConcurrency` (`providerID` → 1–16; instance + machine slots), or the runtime overlay `/ultracode set providerconcurrency <providerID>=<N|none>` (per-key merge; the overlay wins, unmentioned providers keep plugin values) |
 | Total `agent()` calls per run | 200 | plugin option `maxAgents` |
 | Run wall clock | 60 min | plugin option `timeoutMs` |
 | `sleep()` per call | 60 s | hard clamp |

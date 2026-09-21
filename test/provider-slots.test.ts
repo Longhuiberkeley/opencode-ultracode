@@ -12,6 +12,7 @@ import {
   ProviderConcurrencyGate,
   ProviderSlotPool,
 } from "../src/provider-slots.ts"
+import { Semaphore } from "../src/primitives.ts"
 
 const tick = (ms = 15): Promise<void> => new Promise((r) => setTimeout(r, ms))
 
@@ -161,6 +162,89 @@ test("gate: cap 1 serializes two acquires; abort of waiter holds nothing extra",
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
+})
+
+test("gate: a later larger cap raises the live limit (latest cap wins)", async () => {
+  const dir = await tempSlotsDir()
+  try {
+    const pool = new ProviderSlotPool({ baseDir: dir, heartbeatMs: 0, rand: () => 0 })
+    const gate = new ProviderConcurrencyGate({ slotPool: pool })
+    const first = await gate.acquire("anthropic", 2)
+    const second = await gate.acquire("anthropic", 2)
+    assert.equal(gate.running("anthropic"), 2)
+    let thirdGot = false
+    const thirdP = gate.acquire("anthropic", 4).then((p) => {
+      thirdGot = true
+      return p
+    })
+    await tick()
+    assert.equal(thirdGot, true, "cap 4 admits a third child while two cap-2 permits are held")
+    const third = await thirdP
+    assert.equal(gate.running("anthropic"), 3)
+    await first.release()
+    await second.release()
+    await third.release()
+    assert.equal(gate.running("anthropic"), 0)
+    assert.deepEqual(await listSlots(dir, "anthropic"), [])
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("gate: a later smaller cap queues future admissions and never preempts holders", async () => {
+  const dir = await tempSlotsDir()
+  try {
+    const pool = new ProviderSlotPool({ baseDir: dir, heartbeatMs: 0, rand: () => 0 })
+    const gate = new ProviderConcurrencyGate({ slotPool: pool })
+    const held: Awaited<ReturnType<ProviderConcurrencyGate["acquire"]>>[] = []
+    for (let i = 0; i < 3; i++) held.push(await gate.acquire("openai", 4))
+    assert.equal(gate.running("openai"), 3)
+    let fourthGot = false
+    const fourthP = gate.acquire("openai", 2).then((p) => {
+      fourthGot = true
+      return p
+    })
+    await tick(30)
+    assert.equal(fourthGot, false, "cap 2 with 3 live holders must queue the fourth child")
+    assert.equal(gate.queued("openai"), 1)
+    assert.equal(gate.running("openai"), 3, "a shrink never preempts permit holders")
+    await held[0]!.release()
+    const fourth = await fourthP
+    assert.equal(fourthGot, true, "one release transfers the slot to the queued child")
+    assert.equal(gate.running("openai"), 3)
+    await held[1]!.release()
+    await held[2]!.release()
+    await fourth.release()
+    assert.equal(gate.running("openai"), 0)
+    assert.deepEqual(await listSlots(dir, "openai"), [])
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("gate: setLimit growth drains the FIFO queue in arrival order", async () => {
+  const sem = new Semaphore(1)
+  await sem.acquire()
+  const order: string[] = []
+  for (const id of ["a", "b", "c"]) {
+    void sem.acquire().then(() => {
+      order.push(id)
+    })
+  }
+  await tick()
+  assert.deepEqual(order, [])
+  sem.setLimit(3) // room for exactly two more
+  await tick()
+  assert.deepEqual(order, ["a", "b"], "new headroom resolves waiters FIFO")
+  assert.equal(sem.queued, 1)
+  assert.equal(sem.running, 3)
+  sem.setLimit(4)
+  await tick()
+  assert.deepEqual(order, ["a", "b", "c"])
+  assert.equal(sem.queued, 0)
+  assert.equal(sem.running, 4)
+  for (let i = 0; i < 4; i++) sem.release()
+  assert.equal(sem.running, 0)
 })
 
 test("machine slot: release after foreign re-claim does not delete the foreign dir", async () => {

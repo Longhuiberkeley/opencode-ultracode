@@ -22,6 +22,7 @@ import {
   TOOL_DESCRIPTION,
   buildResultChunk,
   enrichStatusPayload,
+  executeSaveTool,
   executeWorkflowLaunch,
   feedToolEvent,
   formatDoctorReport,
@@ -63,7 +64,15 @@ import { compileGraphSpec, validateGraphSpec } from "./graph.ts"
 import type { GraphSpec } from "./graph.ts"
 import { SCRIPT_TEMPLATES, scriptTemplate } from "./script-templates.ts"
 import { StorageImpl, normalizePath, readProjectWorkflowFile, resolveContainedPath, sha256 } from "./storage.ts"
-import { resolveBackground, validateCatalogToolInput, validateControlToolInput, validateResultToolInput, validateStatusToolInput, validateToolInput } from "./tool-input.ts"
+import {
+  resolveBackground,
+  validateCatalogToolInput,
+  validateControlToolInput,
+  validateResultToolInput,
+  validateSaveToolInput,
+  validateStatusToolInput,
+  validateToolInput,
+} from "./tool-input.ts"
 import type {
   FsLike,
   Json,
@@ -423,6 +432,28 @@ const CONTROL_TOOL_INPUT_SCHEMA: Record<string, unknown> = {
       type: "boolean",
       description:
         "Resume only, requires model: persist the model→modelFallbacks entry through the settings path (/ultracode set) so future runs use it. Never touches agent pin files.",
+    },
+  },
+}
+
+const SAVE_TOOL_INPUT_SCHEMA: Record<string, unknown> = {
+  type: "object",
+  additionalProperties: false,
+  required: ["name"],
+  properties: {
+    runID: {
+      type: "string",
+      description:
+        'Save THIS run\'s artifact under name (the run must belong to this conversation; a graph run saves its spec, not the compiled script). Omit to save the project file ".opencode/workflows/<name>.js" / "<name>.graph.json" instead.',
+    },
+    name: {
+      type: "string",
+      description: "Workflow name to save under: lowercase alphanumerics, - or _, max 64 chars.",
+    },
+    trust: {
+      type: "boolean",
+      description:
+        "Also record trust for the saved workflow's current version. ONLY pass true when the user EXPLICITLY approved this exact workflow in chat — otherwise leave it unset and relay /ultracode trust <name> to the user.",
     },
   },
 }
@@ -976,7 +1007,7 @@ export default Plugin.define({
                     // Model-facing reroute guard, appended ONLY at the tool
                     // boundary (humans see the bare storage message via /ultracode).
                     const trustHint = /is not trusted/.test(message)
-                      ? " Trust is user-only: relay the /ultracode trust command to the user and wait — do not silently reroute to an inline script."
+                      ? " Trust is user-only: relay the /ultracode trust command to the user and wait — or, after the user EXPLICITLY approves this workflow in chat, record it with ultracode_save { name, trust: true }. Never silently reroute to an inline script."
                       : ""
                     return { content: `error: ${message}${trustHint}` }
                   }
@@ -1200,6 +1231,31 @@ export default Plugin.define({
         } catch (err) {
           warn("failed to register the ultracode_result tool", err)
         }
+        try {
+          editor.add({
+            name: "save",
+            options: { namespace: "ultracode" },
+            description:
+              "Save an ultracode workflow under a name, and — only with explicit user approval — record trust. Input { runID?, name, trust? }: with runID saves that run's artifact (the run must belong to this conversation; a graph run saves its spec, not the compiled script); without runID saves the project file .opencode/workflows/<name>.js or <name>.graph.json. trust: true is ONLY for immediately after the user explicitly approved saving and trusting in chat; otherwise omit trust and tell the user to review with /ultracode graph then /ultracode trust. Returns compact JSON { name, origin, trusted, message }. Editing the artifact later invalidates trust until re-approved.",
+            input: SAVE_TOOL_INPUT_SCHEMA,
+            execute: async (rawInput: unknown, tool) => {
+              try {
+                const parsed = validateSaveToolInput(rawInput)
+                if (!parsed.ok) return { content: `error: ${parsed.error}` }
+                // Persisted-run warm-up + fresh workflow scan (same rationale as
+                // ultracode_catalog): saves must see current disk state.
+                await runsReconciled
+                await storage.refreshWorkflows()
+                const outcome = await executeSaveTool({ registry, storage }, tool.sessionID, parsed)
+                return { content: outcome.ok ? JSON.stringify(outcome.result) : `error: ${outcome.error}` }
+              } catch (err) {
+                return { content: `error: could not save workflow — ${describeError(err)}` }
+              }
+            },
+          })
+        } catch (err) {
+          warn("failed to register the ultracode_save tool", err)
+        }
         editor.add({
           name: "catalog",
           options: { namespace: "ultracode" },
@@ -1311,6 +1367,8 @@ export default Plugin.define({
           listAgents,
           defaultAgent: options.agent,
           nextRunSettings: () => panelSettingsFrom(options),
+          nextRunOverlay: () => overlay,
+          effectiveProviderConcurrency: () => ({ ...options.providerConcurrency }),
           persistAndRefreshSettings: async (nextOverlay) => {
             // Merge over the stored overlay: panel saves carry only the four
             // panel keys, so a remembered modelFallbacks map survives them.

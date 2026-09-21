@@ -96,6 +96,13 @@ test("helpText lists exactly the D2 verb set", () => {
   assert.equal(listed.length, D2_VERBS.length, "each D2 verb listed once")
 })
 
+test("helpText documents the set providerconcurrency key and its value forms", () => {
+  assert.match(helpText(), /providerconcurrency/)
+  assert.match(helpText(), /<providerID>=<N>/)
+  assert.match(helpText(), /<providerID>=none/)
+  assert.match(helpText(), /1\.\.16/)
+})
+
 test("palette command description lists D2 verbs including set and settings", () => {
   const src = readFileSync(new URL("../src/index.ts", import.meta.url), "utf8")
   assert.match(src, /D2_VERBS\.join/)
@@ -123,4 +130,29 @@ test("tool description names every primitive and stays within the line cap", () 
     ),
   )
   assert.match(TOOL_DESCRIPTION, /[Rr]oute by agent/)
+})
+
+test("index.ts registers the agent-callable save tool with a gated trust recording", () => {
+  const src = readFileSync(new URL("../src/index.ts", import.meta.url), "utf8")
+  // Namespaced registration with its own try/catch + warn (per-tool isolation).
+  assert.match(src, /name: "save",\s*\n\s*options: \{ namespace: "ultracode" \}/)
+  assert.match(src, /failed to register the ultracode_save tool/)
+  assert.match(src, /validateSaveToolInput/)
+  // The handler delegates to the host-free executor the command tests cover.
+  assert.match(src, /executeSaveTool\(\{ registry, storage \}, tool\.sessionID, parsed\)/)
+  // The description carries the exact user-approval-only sentence.
+  assert.ok(
+    src.includes(
+      "trust: true is ONLY for immediately after the user explicitly approved saving and trusting in chat; otherwise omit trust and tell the user to review with /ultracode graph then /ultracode trust",
+    ),
+    "the save tool description must gate trust on immediate explicit chat approval",
+  )
+})
+
+test("index.ts wires the provider-concurrency set seams through the settings path", () => {
+  const src = readFileSync(new URL("../src/index.ts", import.meta.url), "utf8")
+  assert.match(src, /nextRunOverlay: \(\) => overlay/)
+  assert.match(src, /effectiveProviderConcurrency: \(\) => \(\{ \.\.\.options\.providerConcurrency \}\)/)
+  // The overlay persist path stays the ONE KV seam every set key shares.
+  assert.match(src, /storage\.saveSettingsOverlay\(merged\)/)
 })

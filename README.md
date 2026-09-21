@@ -424,8 +424,11 @@ prompt (whitespace-delimited, optionally followed by a colon). Before/after:
 Ultracode is for **multi-agent orchestration with an isolated script and structural verify**.
 Native subagents (`general` / `explore` / Task) are for **one** focused child. Ultracode
 composes with those native OpenCode subagents: it spawns ordinary child sessions users already
-know; it does not replace or hide them. Plan mode: author `.opencode/workflows/<name>.js` +
-`/ultracode save <name>` + `/ultracode trust <name>`. Build mode: `{ workflow: name }` — or run
+know; it does not replace or hide them. Plan mode: author `.opencode/workflows/<name>.js` (or
+`<name>.graph.json`), save it with `ultracode_save { name }`, optionally review a graph with
+`/ultracode graph <name>`, and approve it with `/ultracode trust <name>` — after you explicitly
+approve in chat, the agent can record the same digest-bound trust in one call with
+`ultracode_save { name, trust: true }`. Build mode: `{ workflow: name }` — or run
 an authored file directly with `{ path: ".opencode/workflows/<name>.js", args }` (preferred over
 embedding any script longer than ~30 lines) and served templates with `{ template: "verify-fix", args }`.
 Do not mix native fan-out and a workflow in one task; children do not inherit parent skills — restate
@@ -496,6 +499,7 @@ global (registered from the always-mounted chip component).
 | `ultracode_result` tool | `{ runID, offset?, maxLength? }` → one page of a settled run's FULL result: `{ source, totalChars, offset, chunk, complete, nextOffset }`. Chunks are substrings of the compact JSON — concatenate from offset 0 following `nextOffset`, then parse. | — |
 | `ultracode_catalog` tool | Read-only discovery, and the only fresh source of it: `{}` → agents, live caps, every saved workflow (`kind`, description, **params (names always; JSON types only when declared — explicit params, a // Tool input: header, or a saved run's real args; graph-derived params are names only)**, phases, requires, trust, last-run stats from this conversation), graph-template summaries and script-template summaries; `{ workflow }` → one workflow's full graph spec or script head; `{ template }` / `{ templates: true }` → complete graph specs to adapt; `{ scriptTemplate }` / `{ scriptTemplates: true }` → complete script bodies to adapt (`staged-delivery`, `verify-fix`). Executes nothing; bounded (40 workflows, sliced strings). | — |
 | `ultracode_control` tool | Orchestrator control of **owned** runs: `{ action: "stop" \| "pause" \| "resume", runID?, model?, remember? }`. Implicit target only when exactly one active owned run. Stop is recorded as the run's stop reason (`/ultracode show` displays it). Ask-mode resume: `model` (`"provider/id#variant"`) is this run's fallback override; `remember: true` persists it into `modelFallbacks` (never agent pin files). | same verbs via panel keys |
+| `ultracode_save` tool | Agent-callable save: `{ runID?, name, trust? }` — with `runID` saves that run (must belong to the calling conversation; a graph run saves its spec), without it saves the project file `<name>.js` / `<name>.graph.json`. Returns compact JSON `{ name, origin, trusted, message }`. `trust: true` is legal ONLY immediately after the user explicitly approved saving and trusting that workflow in chat; otherwise omit it and point the user at `/ultracode graph <name>` then `/ultracode trust <name>`. Editing the artifact later invalidates trust until re-approved. | — |
 | `/ultracode result [runID]` | Print the **full** result of a run (artifact first, run-record fallback — serves truncated and background runs alike). | — |
 | `/ultracode graph <name\|runID>` | Render a graph workflow's DAG: execution waves, a node table (kind, agent, source ref, bounds), returns, and a mermaid flowchart. **Not trust-gated** — rendering is how you review a graph before approving it. Works for a saved `<name>.graph.json` workflow or any graph-authored run. | — |
 | `/ultracode stop [runID]` | Graceful stop: no new agent calls, children interrupted, worker terminated after a grace period. | `x` |
@@ -506,6 +510,7 @@ global (registered from the always-mounted chip component).
 | `/ultracode save <runID> <name>` | Save a run as a named workflow: a graph run saves its **spec** (`.graph.json` + manifest), a script run saves its script (`.js` + manifest). | `s` (name via `dialog.prompt`) |
 | `/ultracode settings [runID]` | Next-run overlay plus that run's captured snapshot. | settings pane (`h`/`l`); `r` refreshes an **active** run |
 | `/ultracode set <key> <value>` | Persist overlay (`concurrency`, `maxAgents`, `timeoutMs`, `permissions`); applies to the **next** run. | `+`/`-` in settings pane |
+| `/ultracode set providerconcurrency <providerID>=<N>` | Runtime per-provider in-flight cap (`N` 1–16, any provider — no plugin option needed), through the same KV overlay. `<providerID>=none` removes the overlay entry so the provider falls back to the plugin option (or uncapped). Applies to runs started after the change; in-flight runs keep their frozen caps, and while such a run is still spawning children its older cap is the one enforced. Not a panel setting. | — |
 | `/ultracode trust <name>` | One-time approval for a saved workflow (content digest). | — |
 | `/ultracode untrust <name>` | Revoke trust for a saved workflow. | — |
 | `/ultracode help` | Print this command list and the authoring hint. | — |

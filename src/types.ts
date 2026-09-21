@@ -1042,6 +1042,8 @@ export type SettingsOverlayLike = {
   permissions?: PermissionMode
   /** Remembered failover entries (see settings.SettingsOverlay; not a panel key). */
   modelFallbacks?: Record<string, string[]>
+  /** Runtime per-provider caps (see settings.SettingsOverlay; not a panel key). */
+  providerConcurrency?: Record<string, number>
 }
 
 // ---------------------------------------------------------------------------

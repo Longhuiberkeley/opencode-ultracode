@@ -109,8 +109,9 @@ in your final report) is the single source of truth. Import shared types from `.
      block, else first `{...}`/`[...]` balanced scan; reject ambiguous multiples; NO eval);
      validate with a tiny validator (`src/serialize.ts` `validateJsonSchemaValue(schema, value): { ok, error }`
      supporting type/required/properties/items/enum/minimum/maximum/additionalProperties-ignored);
-     on invalid => ONE repair round: `session.prompt` with the validation error asking to output
-     corrected JSON only, re-extract+validate; still invalid => throw typed error;
+     on invalid => up to SCHEMA_REPAIR_ROUNDS (=2, `src/sessions.ts`) repair rounds: `session.prompt` with the
+     latest validation error asking to output corrected JSON only (round 2 adds strict start-with-`{`/`[` guidance);
+     still invalid after the final round => throw typed error naming the round count;
   7. return `AgentResult`.
 - `src/primitives.ts`: host-side bridge handlers. `AgentRunner` = wrapper around runAgent that
   enforces: registry bookkeeping (addAgent => pending; updateAgent running/succeeded/failed with
@@ -209,7 +210,7 @@ in your final report) is the single source of truth. Import shared types from `.
     parallel/pipeline semantics, no-`export` validation, JSON-only return enforcement, console
     buffering, infinite loop + terminate (availability), nested workflow depth cap (mock bridge).
   - `sessions.test.ts`: runAgent happy path, missing agent fail-fast, outcome != succeeded error,
-    schema repair round, abort => interrupt called (FakeSessionCtx supports it).
+    schema repair rounds (bounded SCHEMA_REPAIR_ROUNDS: second-round rescue, exhaustion error), abort => interrupt called (FakeSessionCtx supports it).
   - `skill-content.test.ts`: content covers every primitive name; samples parse + mention only
     stock agents; manifests match sample scripts.
   Tests must pass with `npm test` (`node --experimental-strip-types --test test/`).

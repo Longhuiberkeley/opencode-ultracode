@@ -10,6 +10,7 @@ import {
   resolveBackground,
   validateCatalogToolInput,
   validateResultToolInput,
+  validateSaveToolInput,
   validateStatusToolInput,
   validateToolInput,
 } from "../src/tool-input.ts"
@@ -262,6 +263,44 @@ test("result tool input: runID required; offset/maxLength validated; extras reje
   const extra = validateResultToolInput({ runID: "r", nope: 1 })
   assert.equal(extra.ok, false)
   if (!extra.ok) assert.match(extra.error, /unexpected key "nope"/)
+})
+
+test("save tool input: name required; runID/trust optional; extras rejected", () => {
+  assert.deepEqual(validateSaveToolInput({ name: "deep-research" }), { ok: true, name: "deep-research" })
+  assert.deepEqual(validateSaveToolInput({ name: "my-flow", runID: "run_abc", trust: true }), {
+    ok: true,
+    name: "my-flow",
+    runID: "run_abc",
+    trust: true,
+  })
+  assert.deepEqual(validateSaveToolInput({ name: " x ", runID: "run_abc" }), {
+    ok: true,
+    name: "x",
+    runID: "run_abc",
+  })
+  const missing = validateSaveToolInput({})
+  assert.equal(missing.ok, false)
+  if (!missing.ok) assert.match(missing.error, /"name" must be a non-empty workflow name/)
+  const empty = validateSaveToolInput({ name: "" })
+  assert.equal(empty.ok, false)
+  if (!empty.ok) assert.match(empty.error, /empty string/)
+  for (const badName of ["My-Flow", "with space", "a/b", "x".repeat(65)]) {
+    const result = validateSaveToolInput({ name: badName })
+    assert.equal(result.ok, false, `name ${JSON.stringify(badName)} must be rejected`)
+    if (!result.ok) assert.match(result.error, /"name" must be lowercase alphanumerics/)
+  }
+  const badRun = validateSaveToolInput({ name: "x", runID: 5 })
+  assert.equal(badRun.ok, false)
+  if (!badRun.ok) assert.match(badRun.error, /"runID" must be a non-empty string/)
+  const badTrust = validateSaveToolInput({ name: "x", trust: "yes" })
+  assert.equal(badTrust.ok, false)
+  if (!badTrust.ok) assert.match(badTrust.error, /"trust" must be a boolean/)
+  const extra = validateSaveToolInput({ name: "x", nope: 1 })
+  assert.equal(extra.ok, false)
+  if (!extra.ok) assert.match(extra.error, /unexpected key "nope"/)
+  const nonObject = validateSaveToolInput("x")
+  assert.equal(nonObject.ok, false)
+  if (!nonObject.ok) assert.match(nonObject.error, /input must be an object/)
 })
 
 test("resumeFrom: valid run id accepted on both union branches; junk rejected", () => {

@@ -124,6 +124,29 @@ test("skill content teaches graph review, saving and the graph handoff", () => {
   assert.match(SKILL_CONTENT, /a graph run saves its spec, not the compiled script/, "no laundering")
 })
 
+test("skill content documents the agent-callable save tool and the gated trust recording", () => {
+  assert.ok(SKILL_CONTENT.includes("ultracode_save"), "the save tool must be named")
+  assert.match(SKILL_CONTENT, /ultracode_save \{ name, trust: true \}/, "the trust-recording call is shown verbatim")
+  assert.match(SKILL_CONTENT, /explicitly approves in chat/, "recording trust requires explicit user approval")
+  // The repeatable-first save flow: reason, ASK, then record on explicit approval.
+  assert.match(SKILL_CONTENT, /GENUINELY repeatable/, "genuine repeatability is the save trigger")
+  assert.match(SKILL_CONTENT, /ASK the user/, "the agent must ask before saving/trusting")
+  assert.match(
+    SKILL_CONTENT,
+    /Editing the artifact later invalidates trust until the user re-approves/,
+    "edits invalidate trust until re-approval",
+  )
+  // The user-only boundary itself stays intact.
+  assert.match(SKILL_CONTENT, /relay that and wait/)
+  assert.match(SKILL_CONTENT, /Never dodge an untrusted saved workflow by inlining its content/)
+})
+
+test("skill content documents bounded schema repair, not a single round", () => {
+  assert.match(SKILL_CONTENT, /validated and repaired through bounded retry/)
+  assert.match(SKILL_CONTENT, /up to 2 correction prompts/)
+  assert.doesNotMatch(SKILL_CONTENT, /repaired once/)
+})
+
 test("skill content teaches coexistence with domain skills", () => {
   assert.ok(SKILL_CONTENT.includes("execution mechanism"), "must position the skill as mechanism-only")
   assert.ok(SKILL_CONTENT.includes("ONE orchestration mechanism"), "must forbid double fan-out")
