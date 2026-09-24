@@ -17,6 +17,7 @@ import type { Json, SavedWorkflow, Storage } from "../src/types.ts"
 import type { AgentRunHooks, AgentRunInput, SessionDriver } from "../src/sessions.ts"
 import { AgentCallError, createSessionDriver } from "../src/sessions.ts"
 import { FakeRegistry, FakeSessionCtx, FakeStorage } from "./fakes.ts"
+import { ModelRouter, parseModelRouting } from "../src/model-routing.ts"
 import type { ContextMessage, SessionCtx } from "../src/types.ts"
 
 const tick = (ms = 5): Promise<void> => new Promise((r) => setTimeout(r, ms))
@@ -100,6 +101,60 @@ function makeRunner(overrides: Partial<AgentRunnerOptions> = {}) {
   })
   return { registry, run, reports, driver, calls, runner }
 }
+
+test("opt-in tier route wins over pin; explicit override wins over route", async () => {
+  const router = new ModelRouter(parseModelRouting({ timezone: "Asia/Hong_Kong", roles: { general: "strong" },
+    tiers: { strong: { plans: [[{ model: "xai/grok-4.7#high" }]], payg: [] } } }))
+  const { runner, calls } = makeRunner({ pinForAgent: async () => ({ providerID: "openai", id: "gpt-6-sol" }),
+    selectModel: (role, tier, excluded) => router.select({ role, ...(tier ? { tier } : {}), disabled: excluded }).then((choice) => choice.model) })
+  const first = runner.call("review", { tier: "strong" })
+  await tick()
+  assert.equal(calls[0]?.input.model?.providerID, "xai")
+  calls[0]!.resolve(okResult("ses_one"))
+  await first
+  const second = runner.call("explicit", { model: { providerID: "openai", id: "gpt-6-luna" } })
+  await tick()
+  assert.equal(calls[1]?.input.model?.id, "gpt-6-luna")
+  calls[1]!.resolve(okResult("ses_two"))
+  await second
+})
+
+test("an explicit tier hint on an empty tier names the empty tier", async () => {
+  const router = new ModelRouter(parseModelRouting({ timezone: "UTC", roles: {},
+    tiers: { frontier: { plans: [], payg: [] } } }))
+  const { runner } = makeRunner({
+    selectModel: (role, tier, excluded) => router.select({ role, ...(tier ? { tier } : {}), disabled: excluded }).then((choice) => choice.model) })
+  await assert.rejects(runner.call("general", { tier: "frontier" }), /routing tier frontier is empty — configure it or drop the tier hint/)
+})
+
+test("a role mapped to an empty tier that falls back to another empty tier spawns on the agent pin", async () => {
+  const router = new ModelRouter(parseModelRouting({ timezone: "UTC", roles: { reviewer: "frontier" },
+    tiers: { frontier: { plans: [], payg: [], fallback: "strong" }, strong: { plans: [], payg: [] } } }))
+  const { runner, calls, registry, run } = makeRunner({
+    pinForAgent: async () => ({ providerID: "anthropic", id: "claude-pin" }),
+    selectModel: (role, tier, excluded) => router.select({ role, ...(tier ? { tier } : {}), disabled: excluded }).then((choice) => choice.model) })
+  const pending = runner.call("review this", { agent: "reviewer" })
+  await tick()
+  assert.deepEqual(calls[0]!.input.model, { providerID: "anthropic", id: "claude-pin" }, "the empty chain degrades to the pin")
+  assert.equal(registry.getAgent(run.id, "a1")!.spawnModel?.source, "pin")
+  calls[0]!.resolve(okResult("ses_empty_pin"))
+  await pending
+  // The same empty chain reached by an EXPLICIT hint is a caller mistake, not a pin.
+  await assert.rejects(runner.call("general", { tier: "frontier" }),
+    /routing tier frontier is empty — configure it or drop the tier hint/)
+})
+
+test("a routed spawn records its model source as route", async () => {
+  const router = new ModelRouter(parseModelRouting({ timezone: "UTC", roles: { general: "strong" },
+    tiers: { strong: { plans: [[{ model: "xai/grok-4.7" }]], payg: [] } } }))
+  const { runner, calls, registry, run } = makeRunner({
+    selectModel: (role, tier, excluded) => router.select({ role, ...(tier ? { tier } : {}), disabled: excluded }).then((choice) => choice.model) })
+  const pending = runner.call("route me")
+  await tick()
+  assert.deepEqual(registry.getAgent(run.id, "a1")!.spawnModel, { providerID: "xai", id: "grok-4.7", source: "route" })
+  calls[0]!.resolve(okResult("ses_route"))
+  await pending
+})
 
 // ---------------------------------------------------------------------------
 // Semaphore
@@ -972,6 +1027,23 @@ test("agentCacheKey: per-call model changes the digest; absent model keeps legac
   assert.notEqual(variant, overridden, "variant participates in the digest")
 })
 
+test("agentCacheKey: tier hint changes the digest; model-only keys keep the legacy format", () => {
+  const base = agentCacheKey("prompt", {}, "general")
+  const hinted = agentCacheKey("prompt", { tier: "strong" }, "general")
+  assert.notEqual(hinted, base, "same key + different tier must never replay the other shelf's result")
+  assert.ok(hinted.includes("\u0000tier:strong"), "tier is a labeled trailing segment")
+  assert.equal(hinted, agentCacheKey("prompt", { tier: "strong" }, "general"), "deterministic")
+  const modelLegacy = `${"prompt"}\u0000${JSON.stringify(null)}\u0000${"general"}\u0000google/gemini-3.7-flash`
+  assert.equal(
+    agentCacheKey("prompt", { model: { providerID: "google", id: "gemini-3.7-flash" } }, "general"),
+    modelLegacy,
+    "the model segment keeps its historical unprefixed shape (stored digests survive)",
+  )
+  const both = agentCacheKey("prompt", { model: { providerID: "google", id: "gemini-3.7-flash" }, tier: "frontier" }, "general")
+  assert.notEqual(both, modelLegacy, "a tier hint must not replay a model-only result")
+  assert.ok(both.endsWith("\u0000tier:frontier"))
+})
+
 test("delayAbortable: abort during backoff rejects immediately", async () => {
   const c = new AbortController()
   const p = delayAbortable(10_000, c.signal)
@@ -1141,12 +1213,18 @@ test("AgentRunner failover: per-call fallbacks win and a dead fallback advances 
 })
 
 test("AgentRunner failover: pin pool picks a cross-provider pin and skips disabled providers", async () => {
+  // Pin-path child (agent pin, no explicit per-call model): the pin pool is
+  // the authorized implicit rung, with the child's OWN agent pin promoted
+  // first. Explicit-model children never reach this rung (see the literal
+  // contract tests in breaker.test.ts).
   const fake = fakeFailoverSession([quotaReply(), { text: "pinned recovery", model: { providerID: "google", id: "gemini-3.7-flash" } }])
   const seenAgentIDs: string[][] = []
   const { runner } = makeRunner({
     driver: createSessionDriver(fake),
     retryAttempts: 0,
     retryBackoffMs: 0,
+    pinForAgent: async (agentID) =>
+      agentID === "general" ? { providerID: "xai", id: "grok-4.6" } : undefined,
     pinPool: async (agentIDs) => {
       seenAgentIDs.push([...agentIDs])
       return [
@@ -1157,10 +1235,11 @@ test("AgentRunner failover: pin pool picks a cross-provider pin and skips disabl
     },
     disabledProviders: async () => new Set(["disabledprov"]),
   })
-  const res = await runner.call("go", { model: { providerID: "xai", id: "grok-4.6" }, agent: "general" })
+  const res = await runner.call("go", { agent: "general" })
   assert.equal(res.text, "pinned recovery")
   assert.deepEqual(seenAgentIDs, [["general", "explore"]])
   assert.equal(res.failover?.to.providerID, "google")
+  assert.equal(fake.createdModels[0] != null && fake.createdModels[0]!.providerID === "xai", true, "spawned on the agent pin")
 })
 
 test("AgentRunner failover: burst budget exhausted fails over on the same session", async () => {
@@ -1327,7 +1406,13 @@ test("AgentRunner breaker: a quarantined provider is never created on — the la
 })
 
 test("AgentRunner breaker: a quarantined provider with no eligible candidate fails typed BEFORE session.create", async () => {
-  const { registry, run, calls, runner } = makeRunner({ providerHealth: quarantinedXai() })
+  // Explicit model, no authorized substitute: the child waits out the window
+  // (bounded here by a tiny test budget), then fails typed — never substitutes.
+  const { registry, run, calls, runner } = makeRunner({
+    providerHealth: quarantinedXai(),
+    windowWaitSliceMs: 1,
+    maxWindowWaitMs: 4,
+  })
   await assert.rejects(
     runner.call("doomed", { model: { providerID: "xai", id: "grok-4.6" } }),
     (err: unknown) => {
@@ -1397,12 +1482,31 @@ test("AgentRunner breaker: admission is consulted once and classified failures a
     },
     report: (input) => reported.push({ providerID: input.providerID, class: input.class, runID: input.runID }),
   }
+  // Quota leg: the breaker quarantines exactly when the first quota report
+  // lands (mirrors ProviderBreaker), so the explicit child waits out a closed
+  // window and the typed error surfaces — no substitution, one report.
+  let quotaQuarantined = false
+  const flippingHealth: ProviderHealth = {
+    isQuarantined: () => quotaQuarantined,
+    quarantinedUntil: () => (quotaQuarantined ? Date.now() + 60_000 : undefined),
+    isThrottled: () => false,
+    admit: async () => {},
+    report: (input) => {
+      reported.push({ providerID: input.providerID, class: input.class, runID: input.runID })
+      if (input.class === "quota") quotaQuarantined = true
+    },
+  }
   // Quota: one report (quota), no ladder configured => typed error surfaces.
   const quotaFake = fakeFailoverSession([quotaReply()])
-  const quotaRun = makeRunner({ driver: createSessionDriver(quotaFake), providerHealth: health, retryAttempts: 0 })
+  const quotaRun = makeRunner({
+    driver: createSessionDriver(quotaFake),
+    providerHealth: flippingHealth,
+    retryAttempts: 0,
+    windowWaitSliceMs: 1,
+    maxWindowWaitMs: 4,
+  })
   await assert.rejects(quotaRun.runner.call("q", { model: { providerID: "xai", id: "grok-4.6" } }))
   assert.deepEqual(reported, [{ providerID: "xai", class: "quota", runID: quotaRun.run.id }])
-  assert.equal(admits, 1, "admission consults the breaker before create")
 
   // Burst: strikes are reported too (attempts 0 => the failure surfaces).
   const burstReply = {
@@ -1415,6 +1519,7 @@ test("AgentRunner breaker: admission is consulted once and classified failures a
   const burstRun = makeRunner({ driver: createSessionDriver(burstFake), providerHealth: health, retryAttempts: 0 })
   await assert.rejects(burstRun.runner.call("b", { model: { providerID: "xai", id: "grok-4.6" } }))
   assert.deepEqual(reported[1], { providerID: "xai", class: "burst", runID: burstRun.run.id })
+  assert.equal(admits, 1, "admission consults the breaker before create")
 
   // Unclassified failures contribute nothing.
   const otherFake = fakeFailoverSession([{ text: "", outcome: "failed", finish: "error" }])
@@ -1449,6 +1554,53 @@ test("AgentRunner breaker: quarantine routing refreshes dead so the next quota l
     ["anthropic/claude-x"],
     "B's provider is excluded; google/gemini-other must not be attempted",
   )
+})
+
+test("AgentRunner breaker: a routed child's per-call fallbacks still win", async () => {
+  const router = new ModelRouter(parseModelRouting({ timezone: "UTC", roles: { general: "strong" },
+    tiers: { strong: { plans: [[{ model: "xai/grok-4.6" }]], payg: [] } } }))
+  const { runner, calls } = makeRunner({
+    providerHealth: quarantinedXai(),
+    modelFallbacks: { "xai/grok-4.6": ["google/gemini-3.7-flash"] },
+    selectModel: (role, tier, excluded) => router.select({ role, ...(tier ? { tier } : {}), disabled: excluded }).then((choice) => choice.model),
+  })
+  const pending = runner.call("routed", { fallbacks: ["anthropic/claude-x"] })
+  await tick()
+  assert.deepEqual(calls[0]!.input.model, { providerID: "anthropic", id: "claude-x" }, "an explicit author rung beats the routing policy")
+  calls[0]!.resolve(okResult("ses_call_fb"))
+  await pending
+})
+
+test("AgentRunner breaker: a routed child honours the ask-mode resume override", async () => {
+  const router = new ModelRouter(parseModelRouting({ timezone: "UTC", roles: { general: "strong" },
+    tiers: { strong: { plans: [[{ model: "xai/grok-4.6" }]], payg: [] } } }))
+  const { runner, calls } = makeRunner({
+    providerHealth: quarantinedXai(),
+    modelFallbacks: { "xai/grok-4.6": ["google/gemini-3.7-flash"] },
+    fallbackOverride: () => ({ providerID: "openai", id: "gpt-6" }),
+    selectModel: (role, tier, excluded) => router.select({ role, ...(tier ? { tier } : {}), disabled: excluded }).then((choice) => choice.model),
+  })
+  const pending = runner.call("routed")
+  await tick()
+  assert.deepEqual(calls[0]!.input.model, { providerID: "openai", id: "gpt-6" }, "the user's resume answer is not discarded")
+  calls[0]!.resolve(okResult("ses_override_route"))
+  await pending
+})
+
+test("AgentRunner breaker: a routed child stays inside the routing policy for implicit rungs", async () => {
+  const router = new ModelRouter(parseModelRouting({ timezone: "UTC", roles: { general: "strong" },
+    tiers: { strong: { plans: [[{ model: "xai/grok-4.6" }], [{ model: "google/gemini-3.7-flash" }]], payg: [] } } }))
+  const { runner, calls } = makeRunner({
+    providerHealth: quarantinedXai(),
+    modelFallbacks: { "xai/grok-4.6": ["anthropic/claude-x"] },
+    pinPool: async () => [{ agentID: "general", pin: "anthropic/claude-x" }],
+    selectModel: (role, tier, excluded) => router.select({ role, ...(tier ? { tier } : {}), disabled: excluded }).then((choice) => choice.model),
+  })
+  const pending = runner.call("routed")
+  await tick()
+  assert.deepEqual(calls[0]!.input.model, { providerID: "google", id: "gemini-3.7-flash" }, "the router re-picks; implicit rungs do not leak")
+  calls[0]!.resolve(okResult("ses_policy"))
+  await pending
 })
 
 test("agent runner: abort during queued breaker admission records interrupted", async () => {

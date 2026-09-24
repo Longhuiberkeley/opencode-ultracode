@@ -5,7 +5,11 @@
  */
 import test from "node:test"
 import assert from "node:assert/strict"
+import { mkdtemp } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import path from "node:path"
 import { ProviderBreaker, SupervisorImpl, PROVIDER_BURST_STRIKE_LIMIT, PROVIDER_BURST_WINDOW_MS } from "../src/supervisor.ts"
+import { readQuarantineMarker, writeQuarantineMarker } from "../src/provider-quarantine.ts"
 import type { ParentContext, UltracodeOptions } from "../src/types.ts"
 import { DEFAULT_OPTIONS } from "../src/types.ts"
 import { ULTRACODE_RPC } from "../src/rpc-definition.ts"
@@ -17,7 +21,13 @@ const tick = (ms = 10): Promise<void> => new Promise((r) => setTimeout(r, ms))
 
 function makeSupervisor(
   optionsOverrides: Partial<UltracodeOptions> = {},
-  depsOverrides: { breakerStaggerMs?: number; now?: () => number } = {},
+  depsOverrides: {
+    breakerStaggerMs?: number
+    now?: () => number
+    breakerQuarantineTTLms?: number
+    windowWaitSliceMs?: number
+    maxWindowWaitMs?: number
+  } = {},
 ) {
   const registry = new FakeRegistry()
   const storage = new FakeStorage()
@@ -83,7 +93,7 @@ test("breaker: quota quarantines until the parsed reset, emits once, expires on 
   assert.equal(breaker.isQuarantined("xai"), true)
   assert.equal(breaker.quarantinedUntil("xai"), resetAt)
   assert.equal(events.length, 1, "one transition event")
-  assert.deepEqual(breaker.quarantines(), [{ providerID: "xai", resetAt, models: ["xai/grok-4.6"] }])
+  assert.deepEqual(breaker.quarantines(), [{ providerID: "xai", until: resetAt, resetAt, models: ["xai/grok-4.6"] }])
 
   // A second child dying on the same dead provider must not ask again.
   breaker.report({ runID: "run_a", providerID: "xai", class: "quota", model: "xai/grok-mini" })
@@ -99,12 +109,55 @@ test("breaker: quota quarantines until the parsed reset, emits once, expires on 
   assert.deepEqual(breaker.quarantines(), [])
 })
 
-test("breaker: unknown reset quarantines for the supervisor's lifetime", () => {
-  const breaker = new ProviderBreaker({ now: () => 1 })
+test("breaker: unknown reset quarantines for a bounded TTL, then self-heals (no restart needed)", () => {
+  let now = 1_000_000
+  const events: Array<{ kind: string; estimated?: boolean; until?: number }> = []
+  const breaker = new ProviderBreaker({ now: () => now, quarantineTTLms: 500, onEvent: (e) => events.push(e) })
   breaker.report({ runID: "run_a", providerID: "xai", class: "quota" })
   assert.equal(breaker.isQuarantined("xai"), true)
-  assert.equal(breaker.quarantinedUntil("xai"), Number.POSITIVE_INFINITY)
-  assert.deepEqual(breaker.quarantines(), [{ providerID: "xai", models: [] }])
+  // Bounded TTL — never Infinity (the old plugin-instance-lifetime quarantine
+  // kept rerouting children around a provider whose window had reset hours
+  // earlier, until a service restart).
+  assert.equal(breaker.quarantinedUntil("xai"), now + 500)
+  const [snap] = breaker.quarantines()
+  assert.equal(snap!.estimated, true, "the snapshot marks the TTL estimate")
+  assert.equal(snap!.resetAt, undefined, "resetAt stays reserved for provider-reported resets")
+  assert.equal(snap!.until, now + 500)
+  assert.equal(events[0]!.estimated, true)
+
+  // Before the TTL lapses the provider is still avoided.
+  now += 499
+  assert.equal(breaker.isQuarantined("xai"), true)
+
+  // After the TTL the quarantine prunes itself: the next child re-probes.
+  now += 2
+  assert.equal(breaker.isQuarantined("xai"), false, "TTL expiry presumes health")
+  assert.deepEqual(breaker.quarantines(), [])
+
+  // A re-probe that still fails quota starts a FRESH TTL quarantine.
+  breaker.report({ runID: "run_a", providerID: "xai", class: "quota" })
+  assert.equal(breaker.quarantinedUntil("xai"), now + 500)
+})
+
+test("breaker: a reported reset replaces a TTL estimate even when it is earlier", () => {
+  let now = 1_000_000
+  const breaker = new ProviderBreaker({ now: () => now, quarantineTTLms: 30 * 60_000 })
+  // Unknown reset first: a 30-min estimate.
+  breaker.report({ runID: "run_a", providerID: "xai", class: "quota" })
+  assert.equal(breaker.quarantinedUntil("xai"), now + 30 * 60_000)
+  // A sibling child then reports the provider's real reset five minutes out —
+  // the estimate must not outlive the actual window (a waiting explicit-model
+  // child would sleep past its provider's reopen).
+  breaker.report({ runID: "run_a", providerID: "xai", class: "quota", resetAt: now + 5 * 60_000 })
+  assert.equal(breaker.quarantinedUntil("xai"), now + 5 * 60_000)
+  assert.equal(breaker.quarantines()[0]!.estimated, undefined, "the real reset clears the estimate flag")
+  assert.equal(breaker.quarantines()[0]!.resetAt, now + 5 * 60_000)
+  now += 5 * 60_000 + 1
+  assert.equal(breaker.isQuarantined("xai"), false, "the reported reset lifts the quarantine on time")
+  // Between two reported resets the later one still wins (conservative).
+  breaker.report({ runID: "run_a", providerID: "xai", class: "quota", resetAt: now + 10 * 60_000 })
+  breaker.report({ runID: "run_a", providerID: "xai", class: "quota", resetAt: now + 2 * 60_000 })
+  assert.equal(breaker.quarantinedUntil("xai"), now + 10 * 60_000)
 })
 
 test("breaker: three burst strikes within 60s engage the throttle; a 60s quiet window lifts it", () => {
@@ -201,11 +254,19 @@ return { a: a.text, b: b.text, bFailover: b.failover ?? null };
   assert.equal(result.bFailover?.from?.providerID, "xai")
   assert.equal(result.bFailover?.to?.providerID, "google")
   assert.equal(result.bFailover?.class, "quota")
-  assert.deepEqual(ctx.supervisor.providerQuarantines(), [{ providerID: "xai", models: ["xai/grok-4.6"] }])
+  const snaps = ctx.supervisor.providerQuarantines()
+  assert.equal(snaps.length, 1)
+  assert.equal(snaps[0]!.providerID, "xai")
+  assert.equal(snaps[0]!.estimated, true, "no reset time in the failure — TTL estimate")
+  assert.equal(snaps[0]!.resetAt, undefined)
+  assert.ok(typeof snaps[0]!.until === "number")
+  assert.deepEqual(snaps[0]!.models, ["xai/grok-4.6"])
 })
 
 test("breaker: quarantine with no eligible candidate fails the child before session.create", async () => {
-  const ctx = makeSupervisor()
+  // Explicit model with NO authorized fallback: the child waits out the window
+  // (bounded here by a tiny test budget), then fails typed — never substitutes.
+  const ctx = makeSupervisor({}, { windowWaitSliceMs: 2, maxWindowWaitMs: 40, breakerQuarantineTTLms: 60_000 })
   // Quarantine xai first (same supervisor, shared breaker).
   ctx.sessions.push(QUOTA_REPLY)
   const first = await ctx.supervisor.start(
@@ -481,6 +542,119 @@ test("remember: a persisted fallback entry routes the NEXT run's quota failover 
 })
 
 // ---------------------------------------------------------------------------
+// Explicit-model literal contract (wait for the window, never substitute)
+// ---------------------------------------------------------------------------
+
+test("explicit model: quota mid-flight waits for the window, then continues the SAME session on the SAME model", async () => {
+  const ctx = makeSupervisor({}, { windowWaitSliceMs: 5, maxWindowWaitMs: 5_000, breakerQuarantineTTLms: 60 })
+  ctx.sessions.push(QUOTA_REPLY)
+  ctx.sessions.push(ok("DONE", "zai-coding-plan", "glm-5.3"))
+  const outcome = await ctx.supervisor.start(
+    { script: `const r = await agent("one", { model: "zai-coding-plan/glm-5.3", label: "literal" }); return r.text;` },
+    ctx.parent,
+  )
+  assert.equal(outcome.envelope.status, "succeeded", outcome.run.error ?? "")
+  assert.equal(outcome.envelope.result, "DONE")
+  // One session, created on the explicit model, continued in place.
+  assert.equal(ctx.sessions.sessions.size, 1)
+  assert.deepEqual(ctx.sessions.createdModels, [{ providerID: "zai-coding-plan", id: "glm-5.3" }])
+  assert.deepEqual(ctx.sessions.switches, [], "an explicit model is never switched")
+  const [session] = [...ctx.sessions.sessions.values()]
+  assert.equal(session!.prompts, 2, "original prompt + window-reopen continuation")
+  // The wait was reported (never a silent takeover).
+  assert.ok(ctx.reports.some((r) => r.includes("quota window closed — waiting")), `wait report missing: ${ctx.reports.join(" | ")}`)
+  const row = outcome.run.agents[0]!
+  assert.equal(row.status, "succeeded")
+  assert.equal(row.spawnModel?.providerID, "zai-coding-plan")
+  assert.equal(row.effectiveModel?.providerID, "zai-coding-plan")
+  assert.equal(row.effectiveModel?.id, "glm-5.3")
+})
+
+test("explicit model: pre-create quarantine waits, then creates on the explicit model; authorized fallbacks still win", async () => {
+  // Run 1: explicit model WITH a per-call fallback list (authorized): fails
+  // over to it immediately — no waiting — and quarantines zai (TTL 150ms).
+  const ctx = makeSupervisor({}, { windowWaitSliceMs: 5, maxWindowWaitMs: 2_000, breakerQuarantineTTLms: 150 })
+  ctx.sessions.push(QUOTA_REPLY)
+  ctx.sessions.push(ok("SAVED", "google", "gemini-3.7-flash"))
+  const first = await ctx.supervisor.start(
+    { script: `const r = await agent("one", { model: "zai-coding-plan/glm-5.3", fallbacks: ["google/gemini-3.7-flash"] }); return r.text;` },
+    ctx.parent,
+  )
+  assert.equal(first.envelope.status, "succeeded", first.run.error ?? "")
+  assert.equal(first.envelope.result, "SAVED")
+  assert.deepEqual(ctx.sessions.switches.map((s) => `${s.model.providerID}/${s.model.id}`), ["google/gemini-3.7-flash"])
+
+  // Run 2 (zai still quarantined): a literal child WAITS OUT the pre-create
+  // quarantine, then its session is created on exactly the explicit model.
+  // (Reset the reply queue first: the fake repeats the tail reply, which run
+  // 1's continuation consumed without shifting.)
+  ctx.sessions.replies.length = 0
+  ctx.sessions.push(ok("LITERAL", "zai-coding-plan", "glm-5.3"))
+  const second = await ctx.supervisor.start(
+    { script: `const r = await agent("two", { model: "zai-coding-plan/glm-5.3" }); return r.text;` },
+    ctx.parent,
+  )
+  assert.equal(second.envelope.status, "succeeded", second.run.error ?? "")
+  assert.equal(second.envelope.result, "LITERAL")
+  assert.equal(ctx.sessions.sessions.size, 2)
+  assert.deepEqual(ctx.sessions.createdModels[1], { providerID: "zai-coding-plan", id: "glm-5.3" })
+  assert.equal(ctx.sessions.switches.length, 1, "the literal child never switches")
+})
+
+test("explicit model: never substitutes through the pin pool — typed quota error when the window stays closed", async () => {
+  // The incident shape: pin pool offers general's luna#max; a literal child
+  // must NOT take it. Small wait budget => the typed error surfaces fast.
+  const registry = new FakeRegistry()
+  const storage = new FakeStorage()
+  const sessions = new FakeSessionCtx()
+  const supervisor = new SupervisorImpl({
+    registry,
+    storage,
+    sessions,
+    options: { ...DEFAULT_OPTIONS, timeoutMs: 5_000 },
+    settleGraceMs: 300,
+    stopKillGraceMs: 80,
+    pinPool: async () => [{ agentID: "general", pin: "openai/gpt-6-luna#max" }],
+    windowWaitSliceMs: 2,
+    maxWindowWaitMs: 40,
+    breakerQuarantineTTLms: 60_000,
+  })
+  sessions.push(QUOTA_REPLY)
+  const outcome = await supervisor.start(
+    { script: `await agent("literal", { model: "zai-coding-plan/glm-5.3" })\nreturn "unreachable"` },
+    { sessionID: "ses_parent", report: () => {} },
+  )
+  assert.equal(outcome.envelope.status, "failed")
+  assert.match(outcome.run.error ?? "", /Usage limit reached/)
+  assert.equal(sessions.sessions.size, 1, "no extra session")
+  assert.deepEqual(sessions.switches, [], "the luna pin was never taken")
+  assert.deepEqual(sessions.createdModels, [{ providerID: "zai-coding-plan", id: "glm-5.3" }])
+  const row = outcome.run.agents[0]!
+  assert.equal(row.status, "failed")
+  assert.equal(row.effectiveModel ?? row.spawnModel?.providerID, "zai-coding-plan")
+})
+
+test("auto mode: a provider quarantine is reported once per run without pausing", async () => {
+  const ctx = makeSupervisor({}, { windowWaitSliceMs: 2, maxWindowWaitMs: 40, breakerQuarantineTTLms: 60_000 })
+  ctx.sessions.push(QUOTA_REPLY)
+  ctx.sessions.push(QUOTA_REPLY)
+  const outcome = await ctx.supervisor.start(
+    { script: `try { await agent("a", { model: "zai/glm-5.3" }) } catch {}\ntry { await agent("b", { model: "zai/glm-5.3" }) } catch {}\nreturn "done"` },
+    ctx.parent,
+  )
+  assert.equal(outcome.envelope.status, "succeeded", outcome.run.error ?? "")
+  assert.equal(ctx.reports.some((r) => r.includes("provider ask —")), false, "auto never asks")
+  const quarantineReports = ctx.reports.filter((r) => r.includes("quarantined (quota"))
+  assert.equal(quarantineReports.length, 1, "ONE coalesced auto report per (run, provider)")
+  assert.match(quarantineReports[0]!, /zai/)
+  assert.match(quarantineReports[0]!, /1 child\(ren\) affected/)
+  // The per-child wait lines are separate and name the literal contract.
+  assert.ok(ctx.reports.some((r) => r.includes("quota window closed — waiting")))
+})
+
+
+
+// ---------------------------------------------------------------------------
 // RPC surface
 // ---------------------------------------------------------------------------
 
@@ -496,4 +670,47 @@ test("rpc definition: control method carries the ask-mode resume surface", () =>
     "remembered",
     "rememberError",
   ])
+})
+// ---------------------------------------------------------------------------
+// Machine-wide quarantine markers (cross-process knowledge sharing)
+// ---------------------------------------------------------------------------
+
+test("breaker: a quota quarantine publishes a machine marker a sibling process can read", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "uc-breaker-"))
+  const now = Date.now()
+  const writer = new ProviderBreaker({ now: () => now, machineQuarantineDir: dir })
+  writer.report({ runID: "run_1", providerID: "xai", class: "quota", model: "grok-4.7" })
+  await tick(30)
+  const marker = await readQuarantineMarker(dir, "xai", now)
+  assert.ok(marker !== undefined, "marker file published")
+  assert.ok(marker.until <= now + 30 * 60_000, "estimated quarantine bounded by TTL cap")
+
+  // A sibling breaker sharing the dir sees the quarantine after refresh —
+  // in-memory state empty, marker only.
+  const sibling = new ProviderBreaker({ now: () => now, machineQuarantineDir: dir, machineRefreshMs: 250 })
+  await sibling.refreshMachineQuarantine()
+  assert.equal(sibling.isQuarantined("xai"), true)
+  const snap = sibling.quarantines().find((q) => q.providerID === "xai")
+  assert.ok(snap !== undefined)
+  assert.equal(snap.estimated, true, "external marker reported as estimate")
+  assert.equal(sibling.isQuarantined("openai"), false)
+})
+
+test("breaker: machine markers are advice — expiry frees siblings, own state stays authoritative", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "uc-breaker-"))
+  const start = Date.now()
+  await writeQuarantineMarker({ dir, providerID: "xai", until: start + 10_000, estimated: false, now: start })
+  const breaker = new ProviderBreaker({ now: () => start, machineQuarantineDir: dir, machineRefreshMs: 250 })
+  await breaker.refreshMachineQuarantine()
+  assert.equal(breaker.isQuarantined("xai"), true)
+
+  // Later clock: the marker expired — the provider is probe-eligible again.
+  const later = new ProviderBreaker({ now: () => start + 11_000, machineQuarantineDir: dir, machineRefreshMs: 250 })
+  await later.refreshMachineQuarantine()
+  assert.equal(later.isQuarantined("xai"), false)
+
+  // Own in-memory quarantine is unaffected by marker absence/clearing.
+  const own = new ProviderBreaker({ now: () => start })
+  own.report({ runID: "run_1", providerID: "xai", class: "quota", resetAt: start + 60_000 })
+  assert.equal(own.isQuarantined("xai"), true)
 })

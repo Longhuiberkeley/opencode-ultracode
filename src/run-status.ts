@@ -24,19 +24,23 @@ export type AuthoritativeSnapshot = {
   runningCount?: number
   projectID?: string
   directory?: string
-  agentDetails?: Pick<
-    AgentRecord,
-    | "id"
-    | "sessionID"
-    | "status"
-    | "phase"
-    | "label"
-    | "requestedAgent"
-    | "effectiveAgent"
-    | "effectiveModel"
-    | "tokens"
-    | "toolCalls"
-  >[]
+  agentDetails?: Array<
+    Pick<
+      AgentRecord,
+      | "id"
+      | "sessionID"
+      | "status"
+      | "phase"
+      | "label"
+      | "requestedAgent"
+      | "effectiveAgent"
+      | "effectiveModel"
+      | "spawnModel"
+      | "tokens"
+      | "contextTokens"
+      | "toolCalls"
+    > & { stalledMs?: number }
+  >
   queuedCount?: number
 }
 
@@ -135,7 +139,7 @@ export function authoritativeFromRecord(
     // render agent/model/tokens/toolCalls instead of "-". Undefined-valued
     // keys drop at serialization, so unfinished children stay lean.
     agentDetails: record.agents.map(
-      ({ id, sessionID, status, phase, label, requestedAgent, effectiveAgent, effectiveModel, tokens, toolCalls }) => ({
+      ({ id, sessionID, status, phase, label, requestedAgent, effectiveAgent, effectiveModel, spawnModel, tokens, contextTokens, toolCalls }) => ({
         id,
         sessionID,
         status,
@@ -144,7 +148,9 @@ export function authoritativeFromRecord(
         requestedAgent,
         effectiveAgent,
         effectiveModel,
+        spawnModel,
         tokens,
+        contextTokens,
         toolCalls,
       }),
     ),
@@ -165,6 +171,22 @@ export function selectAuthoritative(
   return live ?? persisted
 }
 
+/**
+ * Stamp stalledMs onto RUNNING children with a known activity timestamp.
+ * Children without one keep it absent — "unknown" must never render as
+ * "stalled" (a legitimately silent long tool call is not a hang, and the
+ * childStallMs interrupt scanner owns the actual intervention).
+ */
+function stampStalled(snap: AuthoritativeSnapshot, activityFor: (sessionID: string) => number | undefined, now: number): void {
+  if (!snap.agentDetails) return
+  for (const agent of snap.agentDetails) {
+    if (agent.status !== "running" || !agent.sessionID) continue
+    const at = activityFor(agent.sessionID)
+    if (at === undefined) continue
+    agent.stalledMs = Math.max(0, now - at)
+  }
+}
+
 export function collectRunStatus(input: {
   runID?: string
   sessionID?: string
@@ -175,10 +197,20 @@ export function collectRunStatus(input: {
   persistedList: () => readonly RunRecord[]
   projectID?: string
   directory?: string
+  /**
+   * Last-observed activity per child session (epoch ms) — live supervisor
+   * knowledge. When present, RUNNING children gain stalledMs = now - activity
+   * so orchestrators/TUI can flag silent hangs. Fire-and-forget safe.
+   */
+  activityFor?: (sessionID: string) => number | undefined
 }): AuthoritativeSnapshot[] {
   const scope: SnapshotScope = { projectID: input.projectID, directory: input.directory }
-  const stamp = (record: RunRecord, source: AuthoritativeSource): AuthoritativeSnapshot =>
-    authoritativeFromRecord(record, source, scope)
+  const now = Date.now()
+  const stamp = (record: RunRecord, source: AuthoritativeSource): AuthoritativeSnapshot => {
+    const snap = authoritativeFromRecord(record, source, scope)
+    if (input.activityFor !== undefined) stampStalled(snap, input.activityFor, now)
+    return snap
+  }
   const matchesSession = (snap: AuthoritativeSnapshot): boolean => {
     if (!input.sessionID) return true
     return snap.parentSessionID === input.sessionID
@@ -188,7 +220,14 @@ export function collectRunStatus(input: {
     if (input.directory && snap.directory && snap.directory !== input.directory) return false
     return true
   }
-  const matches = (snap: AuthoritativeSnapshot): boolean => matchesSession(snap) && matchesLocation(snap)
+  // An EXPLICIT runID is a targeted lookup (a selected run in the TUI, a
+  // backfill for a run the session-scoped list could not cover — e.g. runs
+  // owned by a subagent session). Location still applies (cross-project
+  // probes stay empty); the session filter must not, or subagent-owned runs
+  // can never be resolved and their heuristic display (which can lie during
+  // same-session failover) would be unfalsifiable.
+  const matches = (snap: AuthoritativeSnapshot): boolean =>
+    input.runID !== undefined ? matchesLocation(snap) : matchesSession(snap) && matchesLocation(snap)
   const persistedGet = (id: string): RunRecord | undefined => input.persistedList().find((r) => r.id === id)
   if (input.runID) {
     const live = input.liveGet(input.runID)
@@ -350,8 +389,11 @@ function parseSnapshot(raw: unknown): AuthoritativeSnapshot | undefined {
         requestedAgent: optionalNonEmptyString(a.requestedAgent),
         effectiveAgent: optionalNonEmptyString(a.effectiveAgent),
         effectiveModel: parseModelRef(a.effectiveModel),
+        spawnModel: parseModelRef(a.spawnModel),
         tokens: parseTokenUsage(a.tokens),
+        contextTokens: optionalFiniteNumber(a.contextTokens),
         toolCalls: optionalFiniteNumber(a.toolCalls),
+        stalledMs: optionalFiniteNumber(a.stalledMs),
       }]
     })
   }

@@ -16,6 +16,7 @@ import {
   compileGraphSpec,
   graphNodeCount,
   graphNodeIds,
+  graphParamNames,
   graphToAscii,
   graphToMermaid,
   graphLevels,
@@ -316,6 +317,102 @@ test("graph: levels group independent nodes into parallel waves", () => {
   )
   const { script } = compileGraphSpec(spec)
   assert.match(script, /const \[r_a, r_b\] = await parallel\(\[/)
+})
+
+test("graph: tier templates — {{ref}} compiles through G_tier and schedules after its producer", () => {
+  const spec: GraphSpec = {
+    nodes: [
+      { id: "scout", kind: "agent", prompt: "scout", schema: { type: "object", required: ["tier"], properties: { tier: { type: "string" } } } },
+      { id: "work", kind: "agent", prompt: "work", tier: "{{scout.tier}}" },
+    ],
+  }
+  const check = validateGraphSpec(spec)
+  assert.equal(check.ok, true, JSON.stringify(check))
+  const { script } = compileGraphSpec(spec)
+  assert.match(script, /const G_tier = /)
+  assert.match(script, /tier: G_tier\(v_scout\?\.tier\)/)
+  // A templated tier is a data edge: work never runs beside (or before) scout.
+  assert.deepEqual(graphLevels(spec).map((l) => l.map((n) => n.id)), [["scout"], ["work"]])
+})
+
+test("graph: a tier-only args ref is discovered as a parameter", () => {
+  const names = graphParamNames({
+    nodes: [{ id: "work", kind: "agent", prompt: "do the work", tier: "{{args.policy}}" }],
+  })
+  assert.deepEqual(names, ["policy"])
+})
+
+test("graph: tier template rejects mixed text and unresolved refs", () => {
+  const mixed = validateGraphSpec({
+    nodes: [
+      { id: "scout", kind: "agent", prompt: "s" },
+      { id: "w", kind: "agent", prompt: "w", tier: "strong then {{scout.tier}}" },
+    ],
+  })
+  assert.equal(mixed.ok, false)
+  assert.ok(mixed.errors.some((e) => e.includes("exactly one {{ref}}")))
+  const forward = validateGraphSpec({
+    nodes: [
+      { id: "w", kind: "agent", prompt: "w", tier: "{{later.tier}}" },
+      { id: "later", kind: "agent", prompt: "l" },
+    ],
+  })
+  assert.equal(forward.ok, false)
+  assert.ok(forward.errors.some((e) => e.includes("tier {{later.tier}} does not resolve")))
+})
+
+test("graph: literal tiers compile untouched — no G_tier prelude, trust digests survive", () => {
+  const spec: GraphSpec = { nodes: [{ id: "a", kind: "agent", prompt: "a", tier: "strong" }] }
+  const { script } = compileGraphSpec(spec)
+  assert.match(script, /tier: "strong"/)
+  assert.doesNotMatch(script, /G_tier/)
+})
+
+test("graph e2e: a templated tier hands the producer's verdict to the child call", async () => {
+  const spec: GraphSpec = {
+    nodes: [
+      { id: "scout", kind: "agent", prompt: "scout", schema: { type: "object", required: ["tier"], properties: { tier: { type: "string" } } } },
+      { id: "work", kind: "agent", prompt: "work", tier: "{{scout.tier}}" },
+      { id: "bare", kind: "agent", prompt: "bare", tier: "{{scout.missing}}" },
+    ],
+  }
+  const compiled = compileGraphSpec(spec)
+  const handler: MockHandler = async (fn, callArgs) => {
+    void fn
+    const opts = (callArgs[1] ?? {}) as { key?: string }
+    if (opts.key === "scout") {
+      return { text: "scout", sessionID: "ses_scout", agent: "explore", data: { tier: "strong" } }
+    }
+    return { text: "done", sessionID: "ses_" + String(opts.key), agent: "general" } as unknown as Json
+  }
+  const result = await runInWorker(compiled.script, {}, handler)
+  assert.equal(result.ok, true, result.error ?? "run failed")
+  const optsOf = (key: string) =>
+    (result.calls.find((c) => c.fn === "agent" && ((c.args[1] ?? {}) as { key?: string }).key === key)?.args[1] ?? {}) as { tier?: string }
+  assert.equal(optsOf("work").tier, "strong")
+  assert.equal(optsOf("bare").tier, undefined, "absent evidence degrades to the role default, not a bogus tier")
+})
+
+test("graph e2e: a failed producer degrades its templated tier to the role default", async () => {
+  const spec: GraphSpec = {
+    nodes: [
+      { id: "scout", kind: "agent", prompt: "scout", schema: { type: "object", required: ["tier"], properties: { tier: { type: "string" } } } },
+      { id: "other", kind: "agent", prompt: "other" },
+      { id: "work", kind: "agent", prompt: "work", tier: "{{scout.tier}}" },
+    ],
+  }
+  const compiled = compileGraphSpec(spec)
+  const handler: MockHandler = async (fn, callArgs) => {
+    void fn
+    const opts = (callArgs[1] ?? {}) as { key?: string }
+    if (opts.key === "scout") throw new Error("scout died in its wave")
+    return { text: "done", sessionID: "ses_" + String(opts.key), agent: "general" } as unknown as Json
+  }
+  const result = await runInWorker(compiled.script, {}, handler)
+  assert.equal(result.ok, true, result.error ?? "run failed")
+  const work = result.calls.find((c) => c.fn === "agent" && ((c.args[1] ?? {}) as { key?: string }).key === "work")
+  assert.ok(work, "work spawned despite the failed producer")
+  assert.equal(((work.args[1] ?? {}) as { tier?: string }).tier, undefined, "a null producer degrades to the role default instead of crashing the wave")
 })
 
 // ---------------------------------------------------------------------------

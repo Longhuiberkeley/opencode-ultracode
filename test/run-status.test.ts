@@ -333,3 +333,62 @@ test("runStateTransition: agent finished, run completed, run failed", () => {
     { runID: "run_t", status: "failed", reason: "run-failed" },
   )
 })
+
+test("collectRunStatus: an EXPLICIT runID drops the session filter (subagent-owned runs resolve); the list keeps it", () => {
+  // Regression (2026-09-24): runs spawned by a subagent session never matched
+  // the panel session, so the TUI could not overlay authoritative state and
+  // rendered "✗ failed / finished" from heuristics while children worked.
+  const subagentRun = record({ id: "run_sub", parentSessionID: "ses_build_child" })
+  const targeted = collectRunStatus({
+    runID: "run_sub",
+    sessionID: "ses_panel_main",
+    liveGet: (id) => (id === "run_sub" ? subagentRun : undefined),
+    liveList: () => [subagentRun],
+    persistedList: () => [],
+  })
+  assert.equal(targeted.length, 1)
+  assert.equal(targeted[0]!.runID, "run_sub")
+
+  // The no-runID inventory still honors session scoping.
+  const listed = collectRunStatus({
+    sessionID: "ses_panel_main",
+    liveGet: () => undefined,
+    liveList: () => [subagentRun],
+    persistedList: () => [],
+  })
+  assert.equal(listed.length, 0)
+
+  // Location scoping applies to the targeted path too (cross-project stays empty).
+  const crossProject = collectRunStatus({
+    runID: "run_sub",
+    sessionID: "ses_panel_main",
+    directory: "/other/project",
+    liveGet: (id) =>
+      id === "run_sub" ? record({ id: "run_sub", parentSessionID: "ses_build_child", directory: "/this/project" }) : undefined,
+    liveList: () => [],
+    persistedList: () => [],
+  })
+  assert.equal(crossProject.length, 0)
+})
+
+test("collectRunStatus: activityFor stamps stalledMs on running children only", () => {
+  const now = Date.now()
+  const run = record({
+    agents: [
+      { id: "a1", status: "running", sessionID: "ses_1" },
+      { id: "a2", status: "running", sessionID: "ses_unknown" },
+      { id: "a3", status: "succeeded", sessionID: "ses_3" },
+    ],
+  })
+  const snaps = collectRunStatus({
+    runID: run.id,
+    liveGet: () => run,
+    liveList: () => [run],
+    persistedList: () => [],
+    activityFor: (sid) => (sid === "ses_1" ? now - 120_000 : undefined),
+  })
+  const details = snaps[0]!.agentDetails!
+  assert.equal(details[0]!.stalledMs, 120_000)
+  assert.equal(details[1]!.stalledMs, undefined)
+  assert.equal(details[2]!.stalledMs, undefined)
+})

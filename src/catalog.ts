@@ -66,6 +66,18 @@ export interface CatalogCaps {
   maxLoopDepth: number
   /** Hard per-loop iteration ceiling (200): the per-run maxLoopIterations input may tighten below any loop's budget, never raise it. */
   maxLoopIterations: number
+  /**
+   * Routing policy summary for authoring-time tier hints. Only NON-EMPTY tiers
+   * are listed as hintable (an explicit hint on an empty tier throws at spawn
+   * unless the tier carries a fallback); roles stay visible either way because
+   * a role mapped to an empty tier silently keeps the agent pin. Absent when
+   * no routing policy is configured — then tier hints are inert and authors
+   * should not emit them.
+   */
+  routing?: {
+    tiers: Array<{ name: string; models: number }>
+    roles: Record<string, string>
+  }
 }
 
 export interface CatalogInput {

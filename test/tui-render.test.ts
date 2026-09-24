@@ -181,6 +181,7 @@ test("phaseColumns + agentRows D11 parity (status dot replaces status cell)", ()
         label: "seeker",
         status: "running",
         tokens: TOKENS_42_6K,
+        contextTokens: 18_000,
         title: "[uc:run_abc123def456 a3 extract p:ses_parent] seeker",
         agent: "explore",
         model: { providerID: "openrouter", id: "kimi" },
@@ -222,6 +223,7 @@ test("phaseColumns + agentRows D11 parity (status dot replaces status cell)", ()
     phase: "extract",
     status: "running",
     tokens: TOKENS_42_6K,
+    contextTokens: 18_000,
     sessionID: "ses_1",
     effectiveAgent: "explore",
     effectiveModel: { providerID: "openrouter", id: "kimi" },
@@ -259,8 +261,8 @@ test("phaseColumns + agentRows D11 parity (status dot replaces status cell)", ()
   assert.deepEqual(agentRows(run, "extract"), [expectedFull])
   assert.deepEqual(agentRows(run, "missing"), [])
 
-  // Explicit golden strings — populated agent/model/tokens/tools (sparse "-" must not pass).
-  assert.deepEqual(expectedFull, ["●", "a3 seeker", "extract", "explore", "openrouter/kimi", "42.6k", "4"])
+  // Explicit golden strings — populated agent/model/ctx/tools (sparse "-" must not pass).
+  assert.deepEqual(expectedFull, ["●", "a3 seeker", "extract", "explore", "openrouter/kimi", "18k", "4"])
   assert.deepEqual(expectedSparse, ["○", "a1", "verify", "general", "anthropic/sonnet", "-", "1"])
   assert.deepEqual(expectedFailed, ["✗", "a2 judge", "verify", "general", "anthropic/sonnet", "-", "2"])
 })
@@ -401,6 +403,7 @@ test("twoColumn: phases left, D11 right, pagination ↓, header", () => {
         label: "seeker",
         status: "running",
         tokens: TOKENS_42_6K,
+        contextTokens: 18_000,
         title: "[uc:run_abc123def456789 a3 extract p:ses_parent] seeker",
         agent: "explore",
         model: { providerID: "openrouter", id: "kimi" },
@@ -437,7 +440,7 @@ test("twoColumn: phases left, D11 right, pagination ↓, header", () => {
   assert.deepEqual(page0.header, ["run_abc123def456 · 1/3 agents · 1.5s"])
   assert.deepEqual(page0.left, ["Phases", "> 1 extract 0/1", "  2 verify 1/2"])
   assert.equal(page0.right[0]![0], "extract · 1 agents")
-  assert.deepEqual(page0.right[1], ["●", "a3 seeker", "extract", "explore", "openrouter/kimi", "42.6k", "4"])
+  assert.deepEqual(page0.right[1], ["●", "a3 seeker", "extract", "explore", "openrouter/kimi", "18k", "4"])
   assert.equal(page0.page, "1–1 of 1")
   assert.deepEqual(page0.footer, [])
 
@@ -1339,6 +1342,42 @@ test("sessionToStatus: idle with no execution is pending; terminal executions an
   assert.equal(
     sessionToStatus({ id: "a", title: "[uc:run_x a1] x", outcome: "succeeded", hostStatus: "idle" }),
     "succeeded",
+  )
+})
+
+test("sessionToStatus: a FRESH execution-started outranks a sticky failed outcome (failover resume); stale does not", () => {
+  const now = Date.now()
+  // Failover carve-out: the supervisor's same-session continue resumed this
+  // child after a provider failure — a fresh started observation must show
+  // running, not the stale terminal signal.
+  assert.equal(
+    sessionToStatus(
+      { id: "a", title: "[uc:run_x a1] x", outcome: "failed", lastExecution: "started", lastExecutionAt: now - 1_000 },
+      now,
+    ),
+    "running",
+  )
+  assert.equal(
+    sessionToStatus(
+      { id: "a", title: "[uc:run_x a1] x", lastExecution: "started", lastExecutionAt: now - 30_000 },
+      now,
+    ),
+    "running",
+  )
+  // Bounded freshness: a started observation older than 15 min no longer
+  // overrides the terminal signal (a missed finishing event must not pin a
+  // child as running forever — genuinely silent children surface via stalledMs).
+  assert.equal(
+    sessionToStatus(
+      { id: "a", title: "[uc:run_x a1] x", outcome: "failed", lastExecution: "started", lastExecutionAt: now - 16 * 60_000 },
+      now,
+    ),
+    "failed",
+  )
+  // No timestamp on the observation (legacy map shape): terminal precedence.
+  assert.equal(
+    sessionToStatus({ id: "a", title: "[uc:run_x a1] x", outcome: "failed", lastExecution: "started" }, now),
+    "failed",
   )
 })
 

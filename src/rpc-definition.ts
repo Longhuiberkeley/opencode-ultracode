@@ -106,6 +106,17 @@ export const ULTRACODE_RPC = {
                           variant: { type: "string" as const },
                         },
                       },
+                      // Intended spawn model (provenance when a failover
+                      // changed what actually ran).
+                      spawnModel: {
+                        type: "object" as const,
+                        required: ["providerID", "id"],
+                        properties: {
+                          providerID: { type: "string" as const },
+                          id: { type: "string" as const },
+                          variant: { type: "string" as const },
+                        },
+                      },
                       tokens: {
                         type: "object" as const,
                         required: ["input", "output"],

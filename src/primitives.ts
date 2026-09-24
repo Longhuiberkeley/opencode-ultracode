@@ -21,7 +21,7 @@ import type {
   Storage,
   WorkflowMeta,
 } from "./types.ts"
-import { clampConcurrency } from "./types.ts"
+import { clampConcurrency, requestContext } from "./types.ts"
 import type { SessionDriver } from "./sessions.ts"
 import { AgentCallError, buildContinuationPrompt } from "./sessions.ts"
 import type { ProviderLimiter, ProviderPermit } from "./provider-slots.ts"
@@ -49,16 +49,25 @@ export interface WarmCacheEntry {
 /**
  * Warm-cache identity: prompt + schema + resolved agent (+ the effective
  * explicit model override — per-call, or the run-level model folded in by the
- * runner). Everything that changes what the child would produce must change
- * the digest. The model segment is appended ONLY when set so digests of
- * pre-override runs stay valid across the upgrade (warm replays keep
- * working); an overridden call with the same key never replays a result
- * produced on a different model. Config pins are excluded by design.
+ * runner — and the routing tier hint). Everything that changes what the child
+ * would produce must change the digest. The model and tier segments are
+ * appended ONLY when set so digests of pre-override runs stay valid across the
+ * upgrade (warm replays keep working); an overridden or tier-hinted call with
+ * the same key never replays a result produced on a different model or shelf.
+ * Config pins are excluded by design.
  */
 export function agentCacheKey(prompt: string, opts: AgentOpts, defaultAgent: string): string {
   const base = `${prompt}\u0000${JSON.stringify(opts.schema ?? null)}\u0000${opts.agent ?? defaultAgent}`
-  if (opts.model === undefined) return base
-  return `${base}\u0000${opts.model.providerID}/${opts.model.id}${opts.model.variant ? `#${opts.model.variant}` : ""}`
+  // The model segment keeps its historical unprefixed shape so stored digests
+  // of model-overridden calls still match; the tier segment (always prefixed,
+  // never model-pin-shaped) only ever ADDS a miss, never a false hit.
+  if (opts.model === undefined && opts.tier === undefined) return base
+  let key = base
+  if (opts.model !== undefined) {
+    key += `\u0000${opts.model.providerID}/${opts.model.id}${opts.model.variant ? `#${opts.model.variant}` : ""}`
+  }
+  if (opts.tier !== undefined) key += `\u0000tier:${opts.tier}`
+  return key
 }
 
 /** Digest used for keyed replay matching (sha256 hex). */
@@ -99,6 +108,11 @@ export function buildWarmCache(source: RunRecord | undefined): Map<string, WarmC
         ...(a.effectiveAgent !== undefined ? { agent: a.effectiveAgent } : {}),
         ...(a.effectiveModel !== undefined ? { model: a.effectiveModel } : {}),
         ...(a.tokens !== undefined ? { tokens: a.tokens } : {}),
+        // Reconstruct requestTokens from the persisted scalar so a replayed
+        // row keeps its last-request context: requestContext() sums
+        // input+cache.read+cache.write, so carrying the scalar as cache.read
+        // round-trips exactly.
+        ...(a.contextTokens !== undefined ? { requestTokens: { input: 0, output: 0, reasoning: 0, cache: { read: a.contextTokens, write: 0 } } } : {}),
         ...(a.data !== undefined ? { data: a.data } : {}),
         cachedFrom: source.id,
       },
@@ -301,6 +315,16 @@ export interface AgentRunnerOptions {
   /** Clock injection for throttle tests. */
   now?: () => number
   /**
+   * Abort-responsiveness slice for explicit-model window waits (default
+   * WINDOW_WAIT_SLICE_MS). Test injection only — not a budget.
+   */
+  windowWaitSliceMs?: number
+  /**
+   * Total per-call wait budget for an explicit-model child whose provider
+   * quota window is closed (default MAX_EXPLICIT_WINDOW_WAIT_MS).
+   */
+  maxWindowWaitMs?: number
+  /**
    * Instance+machine provider concurrency limiter (supervisor-owned, shared
    * across its runs). Acquired AFTER the run semaphore and AFTER model
    * resolution, released on settle. Absent => no provider slots.
@@ -311,6 +335,8 @@ export interface AgentRunnerOptions {
    * missing from the map is unconfigured — no instance permit, no slot dir.
    */
   providerConcurrency?: Readonly<Record<string, number>>
+  /** Opt-in Ultracode-only selector; undefined preserves agent pins. */
+  selectModel?: (role: string, tier?: string, excluded?: ReadonlySet<string>) => Promise<ModelRef | undefined>
 }
 
 /** Inputs shared by the runner's failover attempts (built once per agent call). */
@@ -328,6 +354,20 @@ interface FailoverContext {
   recordID: string
   /** Per-call opts.fallbacks (top ladder rung). */
   callFallbacks: ReadonlyArray<string> | undefined
+  /** Routed children may only fail over through the same eligibility policy. */
+  routedTier?: string
+  /**
+   * Where the spawn model came from. "call"/"run" are EXPLICIT choices: the
+   * child never silently substitutes (quota waits for the provider window,
+   * and the ladder is restricted to explicitly authorized substitutes).
+   */
+  modelSource: "call" | "run" | "pin" | "route" | undefined
+}
+
+/** Lazily-initialized per-call wait budget for explicit-model window waits. */
+interface WindowBudget {
+  /** Absolute deadline (epoch ms); assigned on first wait. */
+  deadline: number | undefined
 }
 
 /** Mutable provider-permit box so mid-flight failover can swap without nesting. */
@@ -356,6 +396,21 @@ export const RETRY_BACKOFF_BASE_MS = 2_000
  * not recover. Attempts, not wait length, are the retry bound.
  */
 export const RETRY_BACKOFF_CAP_MS = 30_000
+
+/**
+ * Sleep slice for explicit-model window waits. NOT a budget — only the
+ * abort/stop responsiveness quantum (a stopping run interrupts the wait at
+ * the next slice) and the status cadence if a report line is ever added.
+ */
+export const WINDOW_WAIT_SLICE_MS = 60_000
+/**
+ * Total per-call budget an explicit-model child may spend waiting for its
+ * provider's quota window before the typed quota error surfaces. Sized to
+ * survive a 5-hour plan window; in practice the run's own timeoutMs and
+ * stop/abort bound it sooner. Deliberately NOT a substitution trigger: when
+ * this budget lapses the child fails loudly on the model it was told to use.
+ */
+export const MAX_EXPLICIT_WINDOW_WAIT_MS = 6 * 60 * 60_000
 
 /**
  * Jittered exponential backoff for a same-session continue: base * 2^attempt
@@ -436,8 +491,13 @@ export class AgentRunner {
   private readonly retryAttempts: number
   private readonly retryBackoffMs: number
   private readonly now: () => number
+  private readonly windowWaitSliceMs: number
+  private readonly maxWindowWaitMs: number
+  /** Providers this runner already reported a window wait for (one report each). */
+  private readonly windowWaitNotified = new Set<string>()
   private readonly providerLimiter: ProviderLimiter | undefined
   private readonly providerConcurrency: Readonly<Record<string, number>> | undefined
+  private readonly selectModel: AgentRunnerOptions["selectModel"]
   private started = 0
   private lastReportAt = 0
 
@@ -464,11 +524,14 @@ export class AgentRunner {
     this.warmCache = options.warmCache
     this.retryAttempts = clampRetryAttempts(options.retryAttempts, 0)
     this.retryBackoffMs = clampRetryBackoffMs(options.retryBackoffMs, RETRY_BACKOFF_BASE_MS)
+    this.windowWaitSliceMs = Math.max(1, Math.floor(options.windowWaitSliceMs ?? WINDOW_WAIT_SLICE_MS))
+    this.maxWindowWaitMs = Math.max(this.windowWaitSliceMs, Math.floor(options.maxWindowWaitMs ?? MAX_EXPLICIT_WINDOW_WAIT_MS))
     this.digestFn =
       options.digest ?? ((prompt, opts) => agentCacheDigest(prompt, opts, this.defaultAgent))
     this.now = options.now ?? Date.now
     this.providerLimiter = options.providerLimiter
     this.providerConcurrency = options.providerConcurrency
+    this.selectModel = options.selectModel
   }
 
   get agentsStarted(): number {
@@ -551,14 +614,21 @@ export class AgentRunner {
       // caller asked for THIS model), and carry their source so drift reports
       // can tell an intentional override from a config pin.
       let model: { providerID: string; id: string; variant?: string } | undefined
-      let modelSource: "call" | "run" | "pin" | undefined
+      let modelSource: "call" | "run" | "pin" | "route" | undefined
       if (opts.model !== undefined) {
         model = opts.model
         modelSource = "call"
       } else if (this.runModel !== undefined) {
         model = this.runModel
         modelSource = "run"
-      } else if (this.pinForAgent) {
+      } else if (this.selectModel) {
+        model = await this.selectModel(requestedAgent, opts.tier)
+        if (model !== undefined) modelSource = "route"
+        // An explicit tier that yields no model is an empty tier (unknown tiers and
+        // all-gated tiers throw inside the router), so name it for the caller.
+        else if (opts.tier !== undefined) throw new Error(`routing tier ${opts.tier} is empty — configure it or drop the tier hint`)
+      }
+      if (model === undefined && opts.model === undefined && this.runModel === undefined && this.pinForAgent) {
         try {
           model = await this.pinForAgent(requestedAgent)
           if (model === undefined && requestedAgent !== this.defaultAgent) {
@@ -598,6 +668,8 @@ export class AgentRunner {
       let result: AgentResult | undefined
       let continuedSessionID: string | undefined
       let continuationPrompt: string | undefined
+      // Lazily-initialized per-call budget for explicit-model window waits.
+      const windowBudget: WindowBudget = { deadline: undefined }
       // Failover inputs shared by every branch. Without a resolved spawn model
       // the policy cannot prove a candidate differs from the dead one, so the
       // ladder refuses to route (fail closed).
@@ -610,14 +682,20 @@ export class AgentRunner {
         label: opts.label,
         recordID: record.id,
         callFallbacks: opts.fallbacks,
+        ...(modelSource === "route" && this.selectModel ? { routedTier: opts.tier ?? "" } : {}),
+        modelSource,
       }
       // Breaker admission, BEFORE any session exists. A quota-quarantined
       // provider is never created on again: the child routes around it through
       // the SAME ladder (the candidate rides session.create — one row, zero
       // sessions on the dead provider) or fails with the typed quarantine error
-      // when nothing eligible remains. A burst-throttled provider serializes
-      // admission (stagger) instead of aborting the run. `failover: "off"`
-      // skips all breaker routing: children behave exactly as before.
+      // when nothing eligible remains. EXPLICIT-model children are the
+      // exception: an explicit `model` is a literal contract, so instead of
+      // routing around a closed window they WAIT for it (bounded by
+      // maxWindowWaitMs), then run on exactly the requested model. A
+      // burst-throttled provider serializes admission (stagger) instead of
+      // aborting the run. `failover: "off"` skips all breaker routing and all
+      // waiting: children behave exactly as before.
       const failoverOn = this.failoverMode !== "off"
       const health = this.providerHealth
       const abortSignal = this.signal ?? NEVER_ABORTED.signal
@@ -631,17 +709,23 @@ export class AgentRunner {
         if (health.isQuarantined(model.providerID)) {
           // Re-checked AFTER the admit wait: a quarantine may have landed while
           // this child queued behind the burst gate.
-          const candidate = await this.routeAroundQuarantine(failoverContext)
-          if (candidate === undefined) throw this.quarantineFailure(model)
-          activeModel = candidate.model
-          // The model actually used is B, not the original A: ladder keys,
-          // dead-provider exclusion, and failover.from must follow B.
-          failoverContext.dead = { ...candidate.model }
-          routedFrom = model
-          routedReason =
-            `provider ${model.providerID} is quarantined after a quota failure — routed to ` +
-            `${candidate.model.providerID}/${candidate.model.id} before any session was created`
-          await health.admit(activeModel.providerID, abortSignal)
+          if (this.explicitLiteral(failoverContext)) {
+            if (!(await this.waitOutQuarantine(model, failoverContext, windowBudget))) {
+              throw this.quarantineFailure(model)
+            }
+          } else {
+            const candidate = await this.routeAroundQuarantine(failoverContext)
+            if (candidate === undefined) throw this.quarantineFailure(model)
+            activeModel = candidate.model
+            // The model actually used is B, not the original A: ladder keys,
+            // dead-provider exclusion, and failover.from must follow B.
+            failoverContext.dead = { ...candidate.model }
+            routedFrom = model
+            routedReason =
+              `provider ${model.providerID} is quarantined after a quota failure — routed to ` +
+              `${candidate.model.providerID}/${candidate.model.id} before any session was created`
+          }
+          await health.admit(activeModel?.providerID ?? model.providerID, abortSignal)
         }
       }
       // Provider concurrency: AFTER the run semaphore (already held) and AFTER
@@ -652,39 +736,44 @@ export class AgentRunner {
       // semaphore and the machine slot dir.
       providerHold.providerID = activeModel?.providerID
       providerHold.permit = await this.acquireConfiguredPermit(providerHold.providerID, abortSignal)
+      // Attempt-0 spawn as a closure: the explicit-model window recovery below
+      // re-runs it when a quota failure raced session creation (no session to
+      // continue yet). Reads `activeModel` at call time.
+      const spawnAttempt = (): Promise<AgentResult> =>
+        this.driver.runAgent(
+          {
+            prompt,
+            agent: opts.agent,
+            ...(activeModel !== undefined ? { model: activeModel } : {}),
+            label: opts.label,
+            phase: titlePhase,
+            schema: opts.schema,
+            defaultAgent: this.defaultAgent,
+            runID: this.runID,
+            ord: record.id,
+          },
+          this.availableAgents,
+          {
+            signal: this.signal ?? NEVER_ABORTED.signal,
+            onSessionID: (sessionID) => {
+              continuedSessionID = sessionID
+              this.registry.updateAgent(this.runID, record.id, {
+                status: "running",
+                sessionID,
+                startedAt: Date.now(),
+              })
+              try {
+                this.registry.bindAgentSession(this.runID, record.id, sessionID)
+              } catch {
+                // provenance must not break the call
+              }
+            },
+          },
+        )
       for (let attempt = 0; ; attempt++) {
         try {
           if (attempt === 0) {
-            result = await this.driver.runAgent(
-              {
-                prompt,
-                agent: opts.agent,
-                ...(activeModel !== undefined ? { model: activeModel } : {}),
-                label: opts.label,
-                phase: titlePhase,
-                schema: opts.schema,
-                defaultAgent: this.defaultAgent,
-                runID: this.runID,
-                ord: record.id,
-              },
-              this.availableAgents,
-              {
-                signal: this.signal ?? NEVER_ABORTED.signal,
-                onSessionID: (sessionID) => {
-                  continuedSessionID = sessionID
-                  this.registry.updateAgent(this.runID, record.id, {
-                    status: "running",
-                    sessionID,
-                    startedAt: Date.now(),
-                  })
-                  try {
-                    this.registry.bindAgentSession(this.runID, record.id, sessionID)
-                  } catch {
-                    // provenance must not break the call
-                  }
-                },
-              },
-            )
+            result = await spawnAttempt()
           } else {
             result = await continueFn!.call(
               this.driver,
@@ -708,8 +797,36 @@ export class AgentRunner {
           // mode pauses the run, so the branch below already sees the pause.
           this.reportProviderFailure(activeModel, err.failure)
           // Quota-shaped: account-level and hours long — no same-model and no
-          // same-provider retry, ever. Fail over on the SAME session instead.
+          // same-provider retry, ever. Fail over on the SAME session instead —
+          // EXCEPT explicit-model children, whose contract is literal: they
+          // wait for the provider window and continue on the SAME model.
           if (err.failure?.class === "quota") {
+            if (failoverOn && this.explicitLiteral(failoverContext)) {
+              const recovered = await this.explicitQuotaRecovery(err, failoverContext, windowBudget, () =>
+                continuedSessionID !== undefined && continueFn !== undefined
+                  ? continueFn.call(
+                      this.driver,
+                      {
+                        sessionID: continuedSessionID,
+                        // No model on the continuation: the session already
+                        // runs the explicit model, and omitting it keeps an
+                        // ask-mode resume override from rewriting it.
+                        continuationPrompt: buildContinuationPrompt(prompt, windowWaitReason(err)),
+                        ...(opts.schema !== undefined ? { schema: opts.schema } : {}),
+                      },
+                      { signal: this.signal ?? NEVER_ABORTED.signal },
+                    )
+                  : spawnAttempt(),
+              )
+              if (recovered.kind === "result") {
+                result = recovered.result
+                break
+              }
+              if (recovered.kind === "exhausted") throw err
+              // "authorized": an ask-mode resume override appeared mid-wait —
+              // fall through to the ladder, which is restricted to explicitly
+              // authorized substitutes for explicit-model children.
+            }
             const failedOver = failoverOn
               ? await this.tryFailover(err, "quota", failoverContext, continuedSessionID, providerHold)
               : undefined
@@ -724,6 +841,26 @@ export class AgentRunner {
           if (attempt > 0 && err.noProgress === true) {
             const promoted = promoteQuotaFailure(err)
             this.reportProviderFailure(activeModel, promoted.failure)
+            if (failoverOn && this.explicitLiteral(failoverContext)) {
+              const recovered = await this.explicitQuotaRecovery(promoted, failoverContext, windowBudget, () =>
+                continuedSessionID !== undefined && continueFn !== undefined
+                  ? continueFn.call(
+                      this.driver,
+                      {
+                        sessionID: continuedSessionID,
+                        continuationPrompt: buildContinuationPrompt(prompt, windowWaitReason(promoted)),
+                        ...(opts.schema !== undefined ? { schema: opts.schema } : {}),
+                      },
+                      { signal: this.signal ?? NEVER_ABORTED.signal },
+                    )
+                  : spawnAttempt(),
+              )
+              if (recovered.kind === "result") {
+                result = recovered.result
+                break
+              }
+              if (recovered.kind === "exhausted") throw promoted
+            }
             const failedOver = failoverOn
               ? await this.tryFailover(promoted, "quota", failoverContext, continuedSessionID, providerHold)
               : undefined
@@ -782,6 +919,7 @@ export class AgentRunner {
         effectiveAgent: finalResult.agent,
         effectiveModel: finalResult.model,
         tokens: finalResult.tokens,
+        ...(requestContext(finalResult.requestTokens) !== undefined ? { contextTokens: requestContext(finalResult.requestTokens) } : {}),
         data: finalResult.data,
         endedAt: Date.now(),
         // Keyed calls persist replay identity (and the text a future warm
@@ -908,6 +1046,108 @@ export class AgentRunner {
     return undefined
   }
 
+  /**
+   * True when this child carries an EXPLICIT model choice (per-call `model`
+   * or run-level `model`) that has NO authorized substitute: no per-call
+   * `fallbacks`, no ask-mode resume override, and no user-configured
+   * `modelFallbacks` entry for the dead model. Such a child never silently
+   * substitutes — a closed quota window is waited out, not routed around.
+   */
+  private explicitLiteral(context: FailoverContext): boolean {
+    if (context.modelSource !== "call" && context.modelSource !== "run") return false
+    if (context.callFallbacks !== undefined) return false
+    if (this.fallbackOverride?.() !== undefined) return false
+    if (context.dead !== undefined && this.modelFallbacks !== undefined) {
+      const configured = this.modelFallbacks[`${context.dead.providerID}/${context.dead.id}`]
+      if (configured !== undefined && configured.length > 0) return false
+    }
+    return true
+  }
+
+  /**
+   * Explicit-model window wait: sleep (abort-aware) until the provider's
+   * quarantine lifts — the provider-reported reset when the failure named
+   * one, else the breaker's bounded TTL re-probe deadline — or the per-call
+   * wait budget is spent. ONE status report per provider per runner, so a
+   * day that would previously reroute silently now says what it is doing.
+   * Returns false when the budget ran out (the caller fails the child with
+   * the typed quota error — never a substitution). An abort propagates.
+   */
+  private async waitOutQuarantine(model: ModelRef, context: FailoverContext, budget: WindowBudget): Promise<boolean> {
+    const health = this.providerHealth
+    if (health === undefined) return false
+    let reported = this.windowWaitNotified.has(model.providerID)
+    while (health.isQuarantined(model.providerID)) {
+      if (!reported) {
+        reported = true
+        this.windowWaitNotified.add(model.providerID)
+        const until = health.quarantinedUntil(model.providerID)
+        this.safeReport(
+          `${context.phase} — ${context.label ?? context.recordID} explicit model ${modelPinString(model)}: ` +
+            `provider ${model.providerID} quota window closed — waiting${until !== undefined ? ` until ~${new Date(until).toLocaleTimeString()}` : ""} (no substitution)`,
+        )
+      }
+      budget.deadline ??= this.now() + this.maxWindowWaitMs
+      const now = this.now()
+      if (now >= budget.deadline) {
+        this.safeReport(
+          `${context.phase} — ${context.label ?? context.recordID} explicit model ${modelPinString(model)}: ` +
+            `provider ${model.providerID} window did not reopen within the wait budget — failing the child`,
+        )
+        return false
+      }
+      const until = health.quarantinedUntil(model.providerID) ?? now
+      const slice = Math.min(
+        this.windowWaitSliceMs,
+        Math.max(1, budget.deadline - now),
+        Math.max(1, until - now),
+      )
+      await delayAbortable(slice, this.signal ?? NEVER_ABORTED.signal)
+    }
+    if (this.windowWaitNotified.has(model.providerID)) this.windowWaitNotified.delete(model.providerID)
+    return true
+  }
+
+  /**
+   * Explicit-model quota recovery: wait out the provider window, then retry —
+   * continuing the SAME session when one exists, re-running the spawn when the
+   * quota failure raced session creation. A retry that dies quota-shaped (or
+   * as a 0-token no-progress promotion) re-quarantines the provider and the
+   * loop waits again, all bounded by the per-call budget. Returns:
+   *  - "result"    — the child finished on the explicit model;
+   *  - "authorized" — an authorized substitute appeared mid-wait (ask-mode
+   *    resume override): the caller falls through to the normal ladder, which
+   *    is restricted to explicitly authorized substitutes for such children;
+   *  - "exhausted" — the budget lapsed (or the model is unknown): the caller
+   *    rethrows the typed quota error. Fail closed, never substitute.
+   */
+  private async explicitQuotaRecovery(
+    err: AgentCallError,
+    context: FailoverContext,
+    budget: WindowBudget,
+    retry: () => Promise<AgentResult>,
+  ): Promise<{ kind: "result"; result: AgentResult } | { kind: "authorized" } | { kind: "exhausted" }> {
+    if (context.dead === undefined) return { kind: "exhausted" }
+    for (;;) {
+      if (!this.explicitLiteral(context)) return { kind: "authorized" }
+      if (!(await this.waitOutQuarantine(context.dead, context, budget))) return { kind: "exhausted" }
+      try {
+        return { kind: "result", result: await retry() }
+      } catch (retryErr) {
+        if (retryErr instanceof AgentCallError && retryErr.kind === "abort") throw retryErr
+        if (!(retryErr instanceof AgentCallError) || retryErr.kind !== "outcome") throw retryErr
+        const failure =
+          retryErr.failure?.class === "quota"
+            ? retryErr.failure
+            : retryErr.noProgress === true
+              ? promoteQuotaFailure(retryErr).failure
+              : undefined
+        if (failure === undefined) throw retryErr
+        this.reportProviderFailure(context.dead, failure)
+      }
+    }
+  }
+
   /** Configured providerConcurrency cap for a provider, or undefined if unconfigured. */
   private permitCap(providerID: string | undefined): number | undefined {
     if (providerID === undefined) return undefined
@@ -951,17 +1191,31 @@ export class AgentRunner {
    * > run-level fallback override (ask-mode resume) > plugin option
    * modelFallbacks > agent-config pin pool > catalog inference for read-only
    * children. Lazy pin-pool / disabled-provider reads degrade to "no rung"
-   * and never break a run.
+   * and never break a run. A routed child normally asks the router for the
+   * policy's next candidate instead, but an explicit per-call `fallbacks` list
+   * or a run-level override still uses the normal ladder.
+   *
+   * EXPLICIT-model children (per-call or run-level `model`) are restricted to
+   * the EXPLICITLY authorized rungs — their fallbacks, the resume override,
+   * the user's modelFallbacks map. The pin pool and catalog inference are
+   * implicit rungs: "use exactly this model" must never quietly become
+   * another agent's pin (observed live: every explicit glm-5.3 child silently
+   * rerouted onto the default agent's max-effort pin for a whole day).
    */
   private async resolveLadder(context: FailoverContext, failureClass: "quota" | "burst"): Promise<FallbackCandidate[]> {
     if (context.dead === undefined) return []
-    let pinPool: ReadonlyArray<PinPoolEntry> = []
-    if (this.pinPool) {
+    const override = this.fallbackOverride?.()
+    // A routed child normally stays inside the routing policy: it cannot escape
+    // onto an implicit rung (pin pool / modelFallbacks / catalog inference) that
+    // the policy gated out. Explicit author and user choices still win, though:
+    // a per-call `{ fallbacks }` or an ask-mode resume override drops through to
+    // the normal ladder instead of being discarded.
+    if (context.routedTier !== undefined && this.selectModel &&
+      context.callFallbacks === undefined && override === undefined) {
       try {
-        pinPool = await this.pinPool(this.availableAgents ?? [])
-      } catch {
-        pinPool = [] // pin collection must never break a run
-      }
+        const next = await this.selectModel(context.requestedAgent, context.routedTier || undefined, new Set([context.dead.providerID]))
+        return next ? [{ model: next, source: "option" }] : []
+      } catch { return [] }
     }
     let disabledProviders: ReadonlySet<string> | undefined
     if (this.disabledProviders) {
@@ -971,7 +1225,26 @@ export class AgentRunner {
         disabledProviders = undefined // fail open — mirrors spawn-path pin resolution
       }
     }
-    const override = this.fallbackOverride?.()
+    // Explicit contract: authorized rungs only — never pins, never inference.
+    if (context.modelSource === "call" || context.modelSource === "run") {
+      return resolveFallbacks({
+        dead: context.dead,
+        failureClass,
+        ...(context.callFallbacks !== undefined ? { callFallbacks: context.callFallbacks } : {}),
+        ...(override !== undefined ? { runFallback: modelPinString(override) } : {}),
+        ...(this.modelFallbacks !== undefined ? { modelFallbacks: this.modelFallbacks } : {}),
+        ...(disabledProviders !== undefined ? { disabledProviders } : {}),
+        readOnly: false,
+      })
+    }
+    let pinPool: ReadonlyArray<PinPoolEntry> = []
+    if (this.pinPool) {
+      try {
+        pinPool = await this.pinPool(this.availableAgents ?? [])
+      } catch {
+        pinPool = [] // pin collection must never break a run
+      }
+    }
     return resolveFallbacks({
       dead: context.dead,
       failureClass,
@@ -979,6 +1252,7 @@ export class AgentRunner {
       ...(override !== undefined ? { runFallback: modelPinString(override) } : {}),
       ...(this.modelFallbacks !== undefined ? { modelFallbacks: this.modelFallbacks } : {}),
       pinPool,
+      preferAgent: context.requestedAgent,
       ...(disabledProviders !== undefined ? { disabledProviders } : {}),
       readOnly: isReadOnlyChild(this.permissions, context.requestedAgent),
     })
@@ -1169,6 +1443,16 @@ function continuationReason(err: AgentCallError): string {
   if (err.failure?.class === "burst") return "transient provider rate limit (burst) — retrying on the same model"
   if (err.failure?.class === "other") return "provider-side failure — retrying on the same model"
   return "provider failure — same-model probe"
+}
+
+/**
+ * Continuation reason for the explicit-model window wait: the provider's
+ * quota window closed and has now reopened; the child continues on the SAME
+ * model (an explicit model is a literal contract, never substituted).
+ */
+function windowWaitReason(err: AgentCallError): string {
+  const reset = err.failure?.resetAt
+  return `provider quota window was closed${reset !== undefined ? ` (reset ${new Date(reset).toISOString()})` : ""} — window has reopened, continuing on the same model`
 }
 
 /**

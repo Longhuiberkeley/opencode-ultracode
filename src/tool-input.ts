@@ -560,12 +560,23 @@ export function validateToolInput(raw: unknown): ToolInputResult {
 /** Input for the read-only `ultracode_status` tool. */
 export function validateStatusToolInput(
   raw: unknown,
-): { ok: true; runID?: string } | { ok: false; error: string } {
+): { ok: true; runID?: string; waitMs?: number } | { ok: false; error: string } {
   if (raw === undefined || raw === null) return { ok: true }
   if (!isObj(raw)) return { ok: false, error: `input must be an object, got ${typeOf(raw)}` }
-  const extra = rejectExtras(raw, new Set(["runID"]))
+  const extra = rejectExtras(raw, new Set(["runID", "waitMs"]))
   if (extra) return { ok: false, error: extra }
-  if (!has(raw, "runID")) return { ok: true }
+  let waitMs: number | undefined
+  if (has(raw, "waitMs")) {
+    const rawWait = raw["waitMs"]
+    if (typeof rawWait !== "number" || !Number.isFinite(rawWait) || rawWait < 1_000 || rawWait > 60_000) {
+      return {
+        ok: false,
+        error: `"waitMs" must be a number between 1000 and 60000 (ms), got ${typeof rawWait === "number" ? String(rawWait) : typeOf(rawWait)}`,
+      }
+    }
+    waitMs = Math.floor(rawWait)
+  }
+  if (!has(raw, "runID")) return { ok: true, ...(waitMs !== undefined ? { waitMs } : {}) }
   const runID = raw["runID"]
   if (typeof runID !== "string" || runID.trim() === "") {
     return {
@@ -573,7 +584,7 @@ export function validateStatusToolInput(
       error: `"runID" must be a non-empty string, got ${typeOf(runID) === "string" ? "empty string" : typeOf(runID)}`,
     }
   }
-  return { ok: true, runID }
+  return { ok: true, runID, ...(waitMs !== undefined ? { waitMs } : {}) }
 }
 
 /**

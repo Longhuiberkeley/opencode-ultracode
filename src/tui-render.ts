@@ -88,6 +88,8 @@ export type SessionView = {
   hostStatus?: "idle" | "running"
   /** Last `session.execution.*` event for this id (TUI-owned). */
   lastExecution?: "started" | "succeeded" | "failed" | "interrupted"
+  /** Epoch ms when the lastExecution observation arrived (TUI-owned). */
+  lastExecutionAt?: number
 }
 
 export type RunAgentView = {
@@ -100,6 +102,16 @@ export type RunAgentView = {
   title: string
   agent?: string
   model?: { providerID: string; id: string }
+  /** Intended spawn model (provenance when a failover changed what ran). */
+  spawnModel?: { providerID: string; id: string }
+  /**
+   * Current request context of the child's last COMPLETED model request
+   * (input + cache read + write) — the statusline-style metric. Absent while
+   * the first request is still in flight.
+   */
+  contextTokens?: number
+  /** Milliseconds since last observed activity (running children, live runs). */
+  stalledMs?: number
   toolCalls?: number
 }
 
@@ -163,8 +175,25 @@ export function outcomeToStatus(outcome: string | undefined): AgentStatus {
  * orphan — it is never counted as running and is not final, so a transient
  * child cannot flash ✗ and cannot settle a run on its own. Crashes after
  * activity surface through the terminal execution events above.
+ *
+ * Failover carve-out: a FRESH execution-started observation outranks a
+ * terminal outcome/execution. The supervisor's same-session continue (quota
+ * failover, burst retry) resumes the SAME session after a failed turn; the
+ * session-level failure signal stays sticky while the child is demonstrably
+ * executing again (observed 2026-09-24: children showed ✗ failed for 10+
+ * productive minutes). Freshness is bounded (15 min) so a missed finishing
+ * event cannot pin a child as running forever — beyond that, the terminal
+ * signal wins and the stalledMs field flags genuinely silent children.
  */
 export function sessionToStatus(session: SessionView, nowTs?: number): AgentStatus {
+  if (
+    session.lastExecution === "started" &&
+    session.lastExecutionAt !== undefined &&
+    nowTs !== undefined &&
+    nowTs - session.lastExecutionAt <= 15 * 60_000
+  ) {
+    return "running"
+  }
   if (session.outcome !== undefined && session.outcome !== "") {
     return outcomeToStatus(session.outcome)
   }
@@ -479,7 +508,10 @@ function snapshotAgents(snap: AuthoritativeSnapshot, cached: readonly RunAgentVi
       title: a.label ?? a.id,
       agent: a.effectiveAgent ?? a.requestedAgent ?? prev?.agent,
       model: a.effectiveModel ?? prev?.model,
+      spawnModel: a.spawnModel ?? prev?.spawnModel,
       tokens: a.tokens ?? prev?.tokens,
+      contextTokens: a.contextTokens ?? prev?.contextTokens,
+      stalledMs: a.stalledMs,
       toolCalls: a.toolCalls ?? prev?.toolCalls,
     }
   })
@@ -592,10 +624,12 @@ function toAgentRecord(a: RunAgentView): AgentRecord {
     phase: a.phase,
     status: a.status,
     tokens: a.tokens,
+    contextTokens: a.contextTokens,
     sessionID: a.sessionID,
     effectiveAgent: a.agent,
     requestedAgent: a.agent,
     effectiveModel: a.model,
+    spawnModel: a.spawnModel,
     toolCalls: a.toolCalls,
   }
 }
@@ -1277,13 +1311,29 @@ export function cycleInspectPane(pane: InspectPane | undefined, dir: number): In
 export function agentDetailLines(agent: RunAgentView): string[] {
   const rec = toAgentRecord(agent)
   const title = rec.label ? `${rec.id} ${rec.label}` : rec.id
-  const model = rec.effectiveModel ? `${rec.effectiveModel.providerID}/${rec.effectiveModel.id}` : "-"
+  // A failed child that never ran still shows the model it targeted.
+  const shown = rec.effectiveModel ?? rec.spawnModel
+  const model = shown != null ? `${shown.providerID}/${shown.id}` : "-"
+  const drifted =
+    rec.effectiveModel != null &&
+    rec.spawnModel != null &&
+    (rec.spawnModel.providerID !== rec.effectiveModel.providerID || rec.spawnModel.id !== rec.effectiveModel.id)
   return [
     title,
-    `status  ${STATUS_DOT[agent.status]} ${agent.status}`,
+    `status  ${STATUS_DOT[agent.status]} ${agent.status}${agent.stalledMs !== undefined && agent.stalledMs > 600_000 ? ` (stalled ${compactElapsed(agent.stalledMs)})` : ""}`,
     `agent   ${rec.effectiveAgent || rec.requestedAgent || "-"}`,
     `model   ${model}`,
-    `tokens  ${compactTokens(agent.tokens)}`,
+    // Intended vs actual model (tier-aware failover / quarantine routing).
+    // Absent when nothing drifted — an explicit-model child that waited for
+    // its provider window keeps one model throughout.
+    ...(drifted ? [`spawn   ${rec.spawnModel!.providerID}/${rec.spawnModel!.id}`] : []),
+    // The statusline-standard metric: input + cache of the child's LAST
+    // COMPLETED request — the same quantity childLimits caps. Absent while
+    // the first request is in flight.
+    `context ${agent.contextTokens !== undefined && Number.isFinite(agent.contextTokens) ? compactCount(agent.contextTokens) : "-"} (last request)`,
+    // Cumulative across the child's model turns (each turn re-sends the
+    // conversation) — NOT a single request's context size.
+    `tokens  ${compactTokens(agent.tokens)}${agent.tokens ? " (spent, sum of turns)" : ""}`,
     `session ${agent.sessionID}`,
     `tools   ${agent.toolCalls === undefined ? "-" : String(agent.toolCalls)}`,
   ]
@@ -1297,7 +1347,7 @@ export function phaseDetailLines(run: RunView, phaseId: string): string[] {
     phaseId,
     ...(agg ? [`status  ${statusDot(agg)} ${agg}`] : []),
     `agents  ${done}/${agents.length}`,
-    `tokens  ${phaseTokenSum(agents)}`,
+    `tokens  ${phaseTokenSum(agents)} (spent, sum of turns)`,
   ]
   // Child rows make a phase row reachable/informative on its own (the tree is
   // the only other place its agents appear).

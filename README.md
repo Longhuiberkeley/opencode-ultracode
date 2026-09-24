@@ -198,6 +198,12 @@ export { default } from "./src/index.ts"
 export { default } from "./src/tui.tsx"
 ```
 
+For deliberate research, see [Research methodology](docs/RESEARCH.md): reason across plausible
+formulations before selecting a baseline, retain informative negatives, and distinguish evidence
+from priority. `kaggle-ml` supports `metricDirection: "min" | "max"` and stops on substantive
+stagnation rather than growing bookkeeping alone. UltraCode runs independently of SpecFlow;
+project research stages are domain context, not runtime requirements.
+
 Optionally list it in `.opencode/opencode.json` (relative path from that file):
 
 ```json
@@ -244,6 +250,12 @@ Recommended `.gitignore` entries for projects using the plugin:
 All optional; defaults shown. Unknown keys are ignored (with a warning in logs), bad values fall
 back to defaults.
 
+For the opt-in role/tier routing policy and model-specific child input limits, see
+[Model routing](docs/MODEL-ROUTING.md). `opencode2 ultracode-config` provides an
+interactive editor plus scriptable `list`, `explain`, `limits`, `tier`, `role`,
+and `provider` commands (install its shim dispatch with `bash scripts/install-config-cli.sh`
+after a global plugin install). It does not change ordinary `subagent-config` pins.
+
 | Option | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `agent` | string | `"general"` | Default agent id for `agent()` calls that omit `opts.agent`. Validated at run start — fail fast if missing. |
@@ -258,7 +270,7 @@ back to defaults.
 | `agentRetryAttempts` | number | `1` | Extra attempts for a child whose session fails at the provider level (outcome `failed`). Retries **continue the same session** on the same model — a failed session that already did work is never replaced by a fresh one — and quota-shaped failures (`usage limit`, `quota`, `5 hour`/`1-week`, or a parsed reset) are **never** retried: same-model and same-provider retries are guaranteed instant deaths. Failures without a burst/rate-limit classification get exactly **one** same-model probe; if that probe dies with no new work (0-token instant death) it is promoted to quota and the typed error surfaces for failover. Aborts and schema errors never retry. Per-call override: `agent(prompt, { retry: { attempts, backoffMs } })`. `0` disables. |
 | `agentRetryBackoffMs` | number | `5000` | Base of the jittered exponential retry backoff: attempt n waits `base × 2ⁿ` with ±50% jitter, capped at 30 s (0..120000 ms configured). A stopping run never waits out a backoff. |
 | `modelFallbacks` | object | `{}` | Quota failover ladder for provider rate limits: keys are `"provider/id"` pins (no variant), values are ordered `"provider/id#variant"` fallback lists. A quota-shaped failure (`usage limit`, `quota`, `5 hour`/`1-week`, or a parsed reset) never retries the same model or the same provider: the child continues in the **same session** via `session.switchModel` on the first eligible candidate and returns `failover: { from, to, class, reason }`. Ladder precedence: per-call `agent(prompt, { fallbacks: [...] })` > the ask-mode run override (`ultracode_control resume { model }`) > this map > your agent-config pins on other providers (disabled agents and `disabled_providers` skipped). Catalog inference for read-only children and the tier-gate price proxy are inactive until host catalog metadata is wired; today pin-pool/explicit candidates are the user's own choices. No eligible candidate, or a driver without `switchModel`, fails the child with the typed quota error — a run never sleeps waiting for a quota reset. See [Provider rate limits and failover](#provider-rate-limits-and-failover). |
-| `failover` | string | `"auto"` | Provider-failover policy. `auto`: classify and fail over immediately. `ask`: same, but a QUOTA quarantine that would fail over pending/at-risk children pauses the affected run and emits ONE coalesced report naming the provider, reset time, affected children, proposed fallback and the exact resume invocation; burst throttle never pauses (admission-only). The run resumes via `ultracode_control { action: "resume", model?, remember? }` (or `/ultracode resume [runID] [--model pin] [--remember]`). `off`: no failover at all — children fail with the typed provider error (retry policy is unaffected). |
+| `failover` | string | `"auto"` | Provider-failover policy. `auto`: classify and fail over immediately — explicit-model children WAIT for the provider window instead of substituting, and each provider quarantine produces ONE coalesced report per run. `ask`: same, but a QUOTA quarantine that would fail over pending/at-risk children pauses the affected run and emits ONE coalesced report naming the provider, reset time, affected children, proposed fallback and the exact resume invocation; burst throttle never pauses (admission-only). The run resumes via `ultracode_control { action: "resume", model?, remember? }` (or `/ultracode resume [runID] [--model pin] [--remember]`). `off`: no failover and no window waiting at all — children fail with the typed provider error (retry policy is unaffected). |
 | `askTimeoutMs` | number | `0` | Ask-mode auto-proceed timeout: `0` waits indefinitely while the ask pause holds (paused runs do not burn `timeoutMs`); `> 0` resumes the run in auto-mode policy after that many ms, even without an answer (0–86 400 000 ms). |
 | `childStallMs` | number | `900000` | Child-liveness watchdog: a running child with no activity for this many ms gets its record marked with a stall cause and is interrupted, so frozen provider streams fail visibly instead of hanging until the run timeout. `0` disables. Paused runs suspend the scan. |
 | `maxLoopDepth` | number | `2` | Hard cap on `loop()` nesting inside one run (engine-owned preflight in the worker; deeper nesting fails before iteration 1). Budgets are shared across nested loops, so this bounds structural blowup only. A per-run `maxLoopDepth` run input (1–16, same bounds) can raise or lower it for one run without touching config. |
@@ -269,7 +281,7 @@ Panel settings (`h`/`l` to the settings pane, `+/-` to edit) persist a project-s
 
 **Per-run loop-cap overrides:** the same forms also accept `maxLoopDepth` (integer 1–16, same bounds as the plugin option — the global default and the range remain the runaway guard) and `maxLoopIterations` (integer 1–200, **tighten-only**: each `loop()`'s effective bound becomes `min(budget.iterations, input)`, so a caller can cap a long-running template at N passes without editing it but can never raise an authored budget). `maxLoopDepth` exists for designs that legitimately nest deeper — `loop({unit})` composition shares ONE depth stack, so a trusted workflow containing loops called per-iteration needs depth 3+. The iteration ceiling applies per loop (not a run-wide total — the shared agent ledger and wall clock bound totals) and also binds loops inside composed units; a loop that stops at the ceiling reports `budget: { requested, effective }` in its summary. Both are recorded on the run (`maxLoopDepthOverride` / `maxLoopIterationsOverride` + `effective`), echoed in the admission ack and `ultracode_status`, reproduced by `/ultracode rerun`, and the worker's preflight error points an author at the per-run `maxLoopDepth` input. `ultracode_catalog` shows both caps under `caps`.
 
-**Explicit model overrides:** when the main agent is *told* which model to use ("use gemini 3.7 flash as the general subagent"), it can pass that through instead of the config pins. Precedence: per-call `agent(prompt, { model })` > run-input `model` (every `ultracode_run` form accepts `"provider/id#variant"`) > your agent-config pins > server default; graph nodes accept a `model` field the same way. Guardrails: `disabled: true` agents stay unusable, and a model on a provider you took offline (`disabled_providers`) is rejected with a clear error unless the same run input passes `allowDisabledProviders: true` (run-wide). Overrides are recorded with their source (`call` / `run` / `pin`) on each agent row, a run-level override is echoed by `ultracode_status` and reproduced by `/ultracode rerun`, and saved workflows list the model ids they name (`models` in `ultracode_catalog`) so trust review sees the routing before approval — that list is a static hint (string-literal model overrides in scripts and graph node fields), not an inventory: run-input overrides and dynamic routing are not listed. Keyed warm-replay digests include the effective model override (per-call or run-level), so an override never replays a result produced on a different model; config pins are excluded by design.
+**Explicit model overrides:** when the main agent is *told* which model to use ("use gemini 3.7 flash as the general subagent"), it can pass that through instead of the config pins. Precedence: per-call `agent(prompt, { model })` > run-input `model` (every `ultracode_run` form accepts `"provider/id#variant"`) > your agent-config pins > server default; graph nodes accept a `model` (or routing-policy `tier`) field the same way. Guardrails: `disabled: true` agents stay unusable, and a model on a provider you took offline (`disabled_providers`) is rejected with a clear error unless the same run input passes `allowDisabledProviders: true` (run-wide). Overrides are recorded with their source (`call` / `run` / `pin` / `route` — the last meaning "chosen by the routing policy") on each agent row, a run-level override is echoed by `ultracode_status` and reproduced by `/ultracode rerun`, and saved workflows list the model ids they name (`models` in `ultracode_catalog`) so trust review sees the routing before approval — that list is a static hint (string-literal model overrides in scripts and graph node fields), not an inventory: run-input overrides and dynamic routing are not listed. Keyed warm-replay digests include the effective model override (per-call or run-level) and any `tier` hint, so an override or hint never replays a result produced on a different model or shelf; config pins are excluded by design.
 
 **Loop mode (`loop()` + `queue()`):** script-mode iteration with engine-owned disciplines — stop conditions (iterations, wall clock, token budget, absolute deadline), per-iteration agent budgets with a reservation for the verdict/skeptic calls, automatic per-iteration checkpoints and auto-keys (`<key>:i<n>:a<m>`, so an interrupted loop warm-reruns and pays only the unfinished tail), stall detection, bounded history, and an evidence-shaped verdict contract: a `done` claim must survive one independent skeptic re-derivation before the loop may stop (`skeptic: false` opts out), and refuted terminations continue the loop. `queue(items)` is a pure serializable worklist (content-hash ids, `deps` gating, statuses that round-trip through `items()`) for kanban- and worklist-shaped runs. Served recipes: `kanban` (ticket queue; plan → implement → review per ticket, review findings become follow-ups) and `kaggle-ml` (reflect → propose per-component variations → select ≤3 full configs, never a cross product → run → judge metrics from verbatim evidence → keep the best). Nesting is capped by `maxLoopDepth` (default 2; a per-run `maxLoopDepth` input of 1–16 unlocks legitimate deeper designs, e.g. a `unit` whose workflow itself contains loops) with a shared budget ledger; `unit: { name, args }` runs a trusted saved workflow per iteration, preflighted before iteration 1. A per-run `maxLoopIterations` input (1–200, tighten-only) caps each loop's iterations below its authored budget — engine ceilings on top of the authored `budget` fields (iterations clamp 1–200, `agentsPerIteration` 1–64), stall detection (`stallK`, default 3), the shared `maxAgents` ledger and the run wall clock bound the rest. Leftover work follows a result-shape convention: the loop templates return `remaining` (unprocessed tickets) — pass it as the next run's `tickets`/`open` args to continue in the same conversation; cross-conversation campaign memory is deliberately not built yet (see `docs/DESIGN-NOTES/reduce.md` for the triggers that would justify it).
 
@@ -315,7 +327,10 @@ The ladder is configurable and has no hardcoded model lists: per-call
 (`ultracode_control resume { model }`) > the `modelFallbacks` option > the pins
 from your agent config on other providers (disabled agents and `disabled_providers` are skipped) >
 catalog inference for read-only children (run mode `noEditTools`, or the `explore` agent) over
-enabled, tool-capable models whose context window fits the session. **Today the catalog
+enabled, tool-capable models whose context window fits the session. A child that was routed by a
+model-routing tier normally re-asks the router for the policy's next candidate instead of the
+implicit rungs, but an explicit per-call `fallbacks` list or an ask-mode resume override still
+wins. **Today the catalog
 rung and the tier-gate price proxy are inactive:** the plugin host's model catalog is
 not wired into `resolveLadder`, so the effective ladder is per-call > run override >
 `modelFallbacks` > pin pool. Failover-down for edit-capable children is therefore
@@ -333,8 +348,10 @@ breaker today: they never fail over, and they also bypass provider admission
 **Run-level breaker (quota quarantine + burst throttle).** The supervisor owns one breaker shared by
 every run it starts, so a single quota strike protects the whole campaign:
 
-- QUOTA quarantines the provider until the parsed reset (or for the plugin instance when the message
-  names no reset). Later children resolving to that provider **never call `session.create` on it**:
+- QUOTA quarantines the provider until the parsed reset; when the message names no reset, for a
+  **bounded TTL (30 min)** — never the plugin instance's lifetime. A provider whose window silently
+  reset therefore self-heals without a service restart (a re-probe that still fails re-quarantines
+  for another TTL). Later children resolving to that provider **never call `session.create` on it**:
   the failover ladder runs BEFORE the session exists and the first eligible candidate is created
   directly (the row keeps the intended `spawnModel` and records the actual `effectiveModel`). With no
   eligible candidate the child fails typed before any session is created.
@@ -342,6 +359,33 @@ every run it starts, so a single quota strike protects the whole campaign:
   serialized and staggered (200 ms) until a 60 s quiet window. The run is never aborted.
 - `failover: "off"` opts out of all of it: children fail with the typed provider error exactly like
   before the failover feature (retry policy still applies).
+
+**Explicit models are a literal contract.** A per-call `agent(prompt, { model })` or run-level `model`
+means *use exactly this model*. When its provider's quota window closes:
+
+- the child **waits for the window** (abort-aware; the provider-reported reset, else the breaker's
+  TTL re-probe deadline) and then continues the **same session on the same model** — up to a total
+  per-call wait budget (6 h default; in practice the run's `timeoutMs` and stop bound it sooner);
+- it is **never substituted implicitly** — not by the agent pin pool, not by catalog inference. The
+  only authorized substitutes are the ones someone chose on purpose: a per-call `fallbacks` list,
+  an ask-mode resume override, or a `modelFallbacks` entry for that dead model;
+- when the budget lapses with the window still closed, the child fails with the typed quota error
+  (loud, never a silent reroute);
+- every wait reports once per provider (`<phase> — <label> explicit model …: provider … quota window
+  closed — waiting until ~HH:MM (no substitution)`), and in `auto` mode each provider quarantine
+  additionally produces ONE coalesced report per run naming the reset/re-probe time and the affected
+  children — a day-long takeover can no longer hide from the parent session.
+
+Waiting children hold their run-semaphore slot (and, mid-flight, their provider permit) — a fully
+saturated run of waiters pauses until the window reopens, which is the intended "stop and wait"
+semantics. Stop/abort interrupts a wait immediately; `failover: "off"` disables waiting too.
+
+**Non-explicit children fail over shelf-first.** A tier-routed child re-asks the router for the
+policy's next eligible candidate (same gates and weights). A pin-path child (no routing mapping)
+walks the pin pool with its **own agent's pin first** — a `reviewer` child lands on the reviewer pin,
+never silently on `general`'s. Explicit rungs (per-call `fallbacks`, resume override,
+`modelFallbacks`) still take precedence over the pool.
+
 
 **Ask mode (`failover: "ask"`).** When a provider is QUOTA-quarantined and the
 affected run has pending/at-risk children that would actually fail over, the run is
@@ -702,7 +746,8 @@ Long runs die — timeouts, restarts, stops. Two primitives make that cheap inst
   (`checkpoints`); newest 50 kept. Gates between phases stay one cheap reviewer child — never a
   gate fan-out (the wall clock is the binding constraint).
 - **Keyed replay** (`opts.key` on `agent()` + `resumeFrom` tool input / `/ultracode rerun --warm`):
-  keyed successes persist a digest (prompt + schema + resolved agent) and their final text. A warm
+  keyed successes persist a digest (prompt + schema + resolved agent + effective model override and
+  tier hint, when set) and their final text. A warm
   rerun returns matching key+digest results from cache — no session, no concurrency slot, no
   `maxAgents` consumption; the replay is recorded as `cached: true`, the envelope carries
   `resumedFrom`, and replays contribute zero tokens to the new run. Pending-write semantics: a

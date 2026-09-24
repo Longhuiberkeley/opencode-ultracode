@@ -7,6 +7,8 @@
 import type { AgentScope, FailoverMode, PermissionMode, UltracodeOptions } from "./types.ts"
 import { DEFAULT_OPTIONS, MAX_LOOP_DEPTH, MAX_RUN_TIMEOUT_MS, MIN_LOOP_DEPTH, MIN_RUN_TIMEOUT_MS } from "./types.ts"
 import { parseModelPin } from "./agent-pins.ts"
+import { parseModelRouting } from "./model-routing.ts"
+import { parseChildLimits } from "./child-context.ts"
 
 /** Same charset as pin providerIDs; also rejects ".." / "/" so keys are slot-path-safe. */
 const PROVIDER_CONCURRENCY_KEY = /^[A-Za-z0-9._-]+$/
@@ -179,7 +181,7 @@ export function loadOptions(raw: unknown): LoadedOptions {
   const warnings: string[] = []
   // Fresh map (never the shared DEFAULT_OPTIONS reference): callers may mutate
   // the returned options, and a shared nested object would leak across loads.
-  const options: Required<UltracodeOptions> = { ...DEFAULT_OPTIONS, modelFallbacks: {}, providerConcurrency: {} }
+  const options: Required<UltracodeOptions> = { ...DEFAULT_OPTIONS, modelFallbacks: {}, providerConcurrency: {}, childLimits: {}, quotaSources: {} }
 
   if (raw === null || raw === undefined) return { options, warnings }
   if (typeof raw !== "object" || Array.isArray(raw)) {
@@ -231,6 +233,32 @@ export function loadOptions(raw: unknown): LoadedOptions {
 
   const providerConcurrency = parseProviderConcurrency(record["providerConcurrency"], warnings)
   if (providerConcurrency !== undefined) options.providerConcurrency = providerConcurrency
+
+  if (record["routing"] !== undefined && record["routing"] !== null) {
+    try { options.routing = parseModelRouting(record["routing"]) }
+    catch (error) { warnings.push(`option "routing": ${error instanceof Error ? error.message : String(error)} — routing disabled`) }
+  }
+  if (record["quotaCommand"] !== undefined && record["quotaCommand"] !== null) {
+    const command = record["quotaCommand"]
+    if (Array.isArray(command) && command.length && command.every((arg) => typeof arg === "string" && arg.length)) options.quotaCommand = [...command]
+    else warnings.push('option "quotaCommand" must be a non-empty array of command/argument strings — quota feed disabled')
+  }
+  if (record["quotaSources"] !== undefined) {
+    const sources = record["quotaSources"]
+    if (!sources || typeof sources !== "object" || Array.isArray(sources)) warnings.push('option "quotaSources" must map capacity pool ids to source definitions')
+    else for (const [id, raw] of Object.entries(sources)) {
+      const source = raw as Record<string, unknown> | null
+      if (!id || !source || typeof source !== "object" || Array.isArray(source) ||
+        !["capacity-v1", "check-rate"].includes(String(source.format)) || !Array.isArray(source.command) || !source.command.length ||
+        !source.command.every((arg) => typeof arg === "string" && arg.length)) {
+        warnings.push(`option "quotaSources.${id}" must have format capacity-v1 | check-rate and a nonempty command array`)
+      } else options.quotaSources[id] = { format: source.format as "capacity-v1" | "check-rate", command: [...source.command as string[]] }
+    }
+  }
+  if (record["childLimits"] !== undefined) {
+    try { options.childLimits = parseChildLimits(record["childLimits"]) }
+    catch (error) { warnings.push(`option "childLimits": ${error instanceof Error ? error.message : String(error)} — limits disabled`) }
+  }
 
   const failover = record["failover"]
   if (failover !== undefined) {

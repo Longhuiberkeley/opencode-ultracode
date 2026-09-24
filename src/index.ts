@@ -31,9 +31,13 @@ import {
   matchesUltracodeKeyword,
   prepareRunLaunch,
   resolveRunStatus,
+  STATUS_RETRY_AFTER_MS,
   type StatusChildView,
 } from "./command.ts"
 import { loadOptions } from "./config.ts"
+import { capacityFeed } from "./quota-command.ts"
+import { defaultProviderQuarantineDir } from "./provider-quarantine.ts"
+import { estimateRequestInput } from "./child-context.ts"
 import { CATALOG_RUN_LIMIT, CATALOG_RUN_SCAN, buildCatalog } from "./catalog.ts"
 import { applyResumeRemember, controlRun, controlToolContent } from "./control.ts"
 import {
@@ -346,6 +350,14 @@ const WORKFLOW_TOOL_INPUT_SCHEMA: Record<string, unknown> = {
   ],
 }
 
+/**
+ * Server-side pacing state for ultracode_status: last payload per
+ * (sessionID, runID) while RUNNING. Identical re-polls inside
+ * STATUS_RETRY_AFTER_MS get the cached payload flagged throttled — a model
+ * that ignores the payload's own hint still cannot busy-poll the host.
+ */
+const statusPollCache = new Map<string, { at: number; payload: Record<string, unknown> }>()
+
 const STATUS_TOOL_INPUT_SCHEMA: Record<string, unknown> = {
   type: "object",
   additionalProperties: false,
@@ -353,6 +365,13 @@ const STATUS_TOOL_INPUT_SCHEMA: Record<string, unknown> = {
     runID: {
       type: "string",
       description: "Run id to inspect. Omit to use the single active run; none or many active runs is an error listing ids.",
+    },
+    waitMs: {
+      type: "number",
+      minimum: 1000,
+      maximum: 60000,
+      description:
+        "Block up to this long (ms) waiting for the run to settle instead of polling — returns the settled payload when it finishes inside the window, else the fresh running payload. Prefer this over repeated calls; a settle notice is also delivered to the session on completion either way.",
     },
   },
 }
@@ -804,6 +823,30 @@ export default Plugin.define({
         storage,
         sessions,
         options,
+        quota: capacityFeed(options),
+        machineQuarantineDir: defaultProviderQuarantineDir(),
+        availableModels: (() => {
+          // The live catalog is large (thousands of entries, megabytes) and every
+          // routed child asks for it; cache it for a minute like the capacity feed
+          // so a many-child run fetches it once. A failed fetch is never cached —
+          // the next child retries.
+          let expires = 0
+          let pending: Promise<ReadonlySet<string> | undefined> | undefined
+          const load = async (): Promise<ReadonlySet<string> | undefined> => {
+            const modelDomain = (ctx as unknown as { model?: { list: () => Promise<Array<{ providerID: string; id: string; enabled?: boolean }>> } }).model
+            if (!modelDomain) return undefined
+            const rawModels = await modelDomain.list()
+            if (!Array.isArray(rawModels)) return undefined
+            return new Set(rawModels.filter((model) => model.enabled !== false).map((model) => `${model.providerID}/${model.id}`))
+          }
+          return async (): Promise<ReadonlySet<string> | undefined> => {
+            if (!pending || Date.now() >= expires) {
+              expires = Date.now() + 60_000
+              pending = load().catch((error: unknown) => { pending = undefined; expires = 0; throw error })
+            }
+            return pending
+          }
+        })(),
         loadWorkflowFresh: (name: string) => storage.loadWorkflowFresh(name),
         // Agent model pins: server-side session.create does not apply global
         // agent pins (live-verified 2026-09-09 — children fell back to the
@@ -1152,7 +1195,7 @@ export default Plugin.define({
             name: "status",
             options: { namespace: "ultracode" },
             description:
-              "Read-only status of an ultracode run owned by this conversation. Input { runID? } (omit → single active owned run). Returns { runID, status, agents: { done, total, failed }, startedAt, elapsedMs, children: [{ agentID, sessionID?, label?, phase?, status, tokens?: { input, output, reasoning }, toolCalls?, waitingForPermission? }] } and, once settled, the full result inline when it fits the size cap, else resultPreview + resultTruncated + resultChars (fetch the rest with ultracode_result). Per-child tokens expose which lane blew its budget.",
+              "Read-only status of an ultracode run owned by this conversation. Input { runID?, waitMs? } (omit runID → single active owned run). Returns { runID, status, agents: { done, total, failed }, startedAt, elapsedMs, children: [{ agentID, sessionID?, label?, phase?, status, contextTokens? (input+cache of the child's LAST completed request — the statusline-style current context), tokens? (cumulative), toolCalls?, stalledMs?, waitingForPermission? }] } and, once settled, the full result inline when it fits the size cap, else resultPreview + resultTruncated + resultChars (fetch the rest with ultracode_result). While RUNNING the payload carries retryAfterMs + hint: do NOT busy-poll — a settle notice wakes this session on completion; pass waitMs to block, or wait ≥ retryAfterMs between checks. Re-polls faster than retryAfterMs are throttled (throttled: true).",
             input: STATUS_TOOL_INPUT_SCHEMA,
             execute: async (rawInput: unknown, tool) => {
               try {
@@ -1166,16 +1209,59 @@ export default Plugin.define({
                 }
                 const resolved = resolveRunStatus(registry, parsed.runID ?? "", active)
                 if (!resolved.ok) return { content: `error: ${resolved.error}` }
-                const record = registry.get(resolved.payload.runID)
-                const payload = enrichStatusPayload(resolved.payload, record, Date.now(), options.maxResultChars)
-                const children = await Promise.all(
-                  (payload.children as Array<StatusChildView & { sessionID?: string }>).map(async (c) =>
-                    c.status === "running" && c.sessionID
-                      ? { ...c, waitingForPermission: await pendingPermissions(c.sessionID) }
-                      : c,
-                  ),
-                )
-                return { content: JSON.stringify({ ...payload, children }) }
+                const runID = resolved.payload.runID
+                const buildPayload = async (): Promise<Record<string, unknown>> => {
+                  // Re-resolve so a waitMs that outlived settlement reports
+                  // the final status/result, not the pre-wait snapshot.
+                  const fresh = resolveRunStatus(registry, runID, active)
+                  const payload = enrichStatusPayload(
+                    fresh.ok ? fresh.payload : resolved.payload,
+                    registry.get(runID),
+                    Date.now(),
+                    options.maxResultChars,
+                    (sid) => supervisor?.childActivity(sid),
+                  )
+                  const children = await Promise.all(
+                    (payload.children as Array<StatusChildView & { sessionID?: string }>).map(async (c) =>
+                      c.status === "running" && c.sessionID
+                        ? { ...c, waitingForPermission: await pendingPermissions(c.sessionID) }
+                        : c,
+                    ),
+                  )
+                  return { ...payload, children } as Record<string, unknown>
+                }
+                // Bounded blocking wait (anti busy-poll): sleep in 2 s slices,
+                // re-checking settlement, then answer once with the fresh state.
+                if (parsed.waitMs !== undefined) {
+                  const deadline = Date.now() + parsed.waitMs
+                  while (Date.now() < deadline) {
+                    const record = registry.get(runID)
+                    if (record === undefined || !isActiveRunStatus(record.status)) break
+                    await new Promise((r) => setTimeout(r, Math.min(2_000, Math.max(1, deadline - Date.now()))))
+                  }
+                  return { content: JSON.stringify(await buildPayload()) }
+                }
+                // Server-side pacing: identical RUNNING polls closer together
+                // than retryAfterMs return the cached payload, flagged — a
+                // model that ignores the hint still cannot hammer the host.
+                const key = `${tool.sessionID}|${runID}`
+                const record = registry.get(runID)
+                if (record !== undefined && isActiveRunStatus(record.status)) {
+                  const prev = statusPollCache.get(key)
+                  const now = Date.now()
+                  if (prev !== undefined && now - prev.at < STATUS_RETRY_AFTER_MS) {
+                    return { content: JSON.stringify({ ...prev.payload, throttled: true, waitedMs: now - prev.at }) }
+                  }
+                  const payload = await buildPayload()
+                  statusPollCache.set(key, { at: Date.now(), payload })
+                  if (statusPollCache.size > 256) {
+                    const oldest = [...statusPollCache.entries()].sort((a, b) => a[1].at - b[1].at)[0]
+                    if (oldest !== undefined) statusPollCache.delete(oldest[0])
+                  }
+                  return { content: JSON.stringify(payload) }
+                }
+                statusPollCache.delete(key)
+                return { content: JSON.stringify(await buildPayload()) }
               } catch (err) {
                 return { content: `error: ${describeError(err)}` }
               }
@@ -1295,6 +1381,22 @@ export default Plugin.define({
                   // input may tighten below (never raise).
                   maxLoopDepth: options.maxLoopDepth,
                   maxLoopIterations: MAX_LOOP_ITERATIONS,
+                  // Routing summary for authoring-time tier hints: only
+                  // non-empty tiers are hintable (an explicit hint on an empty
+                  // tier without a fallback throws at spawn).
+                  ...(options.routing
+                    ? {
+                        routing: {
+                          tiers: Object.entries(options.routing.tiers)
+                            .filter(([, tier]) => tier.plans.length > 0 || tier.payg.length > 0)
+                            .map(([name, tier]) => ({
+                              name,
+                              models: tier.plans.flat().length + tier.payg.flat().length,
+                            })),
+                          roles: { ...options.routing.roles },
+                        },
+                      }
+                    : {}),
                 },
                 ...(parsed.templates !== undefined ? { templates: parsed.templates } : {}),
                 ...(parsed.template !== undefined ? { template: parsed.template } : {}),
@@ -1514,6 +1616,7 @@ export default Plugin.define({
                 persistedList: () => storage.loadRuns(),
                 projectID,
                 directory: ctx.location.directory,
+                activityFor: (sid) => supervisor?.childActivity(sid),
               }),
             }
           },
@@ -1537,6 +1640,27 @@ export default Plugin.define({
     } catch (err) {
       warn("rpc register failed — TUI uses session heuristics", err)
     }
+
+    // ---- optional child-only active-input guard (ordinary sessions untouched) ----
+    try {
+      const reg = await ctx.session.hook("context", (event) => {
+        if (!registry.isOwnedActive(event.sessionID)) return
+        const limit = supervisor?.contextLimitFor?.(event.sessionID, event.model)
+        if (!limit) return
+        const estimate = estimateRequestInput(event.system, event.messages, event.tools)
+        if (estimate >= limit.hardInput) {
+          // Message contract, not a class: the worker bridge serializes errors to
+          // e.message, so the stable greppable prefix is the typing.
+          throw new Error(`ultracode context hard limit: estimated active input ${estimate} >= hardInput ${limit.hardInput} for ${event.model.providerID}/${event.model.id} (session ${event.sessionID}); assignment incomplete — schedule a continuation child from the last handoff`)
+        }
+        if (estimate >= limit.targetInput) {
+          for (const tool of Object.keys(event.tools)) delete event.tools[tool]
+          event.system.push({ type: "text", text:
+            "Ultracode working-context target reached; tools are disabled for this step. Compare the original task's requested scope with the evidence you have already gathered. If that evidence is sufficient to fully answer the task, return the final deliverable now. Otherwise begin your reply with a single line `HANDOFF:` and follow it with: the original task and its acceptance criteria; completed findings with evidence references; gaps and uncertainties; exact next actions for a continuation session. Do not claim completion if required work remains." })
+        }
+      })
+      registrations.push(reg as unknown as RegistrationLike)
+    } catch (err) { warn("child context guard unavailable", err) }
 
     // ---- prompt hook: attach the authoring skill on a standalone "ultracode" keyword ----
     try {

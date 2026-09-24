@@ -49,6 +49,8 @@ export type AgentScope = "host" | "configured"
  *   exactly the pre-failover behavior. Retry policy is unaffected.
  */
 export type FailoverMode = "auto" | "ask" | "off"
+import type { ModelRouting } from "./model-routing.ts"
+import type { ChildContextLimit } from "./child-context.ts"
 
 export interface UltracodeOptions {
   /** Default agent id for spawned agent() calls. Validated at run start (fail fast). Default "general". */
@@ -133,6 +135,14 @@ export interface UltracodeOptions {
    * are unchanged. Default {} (no provider slots).
    */
   providerConcurrency?: Record<string, number>
+  /** Optional Ultracode-only role x tier policy. No effect on ordinary OpenCode agents. */
+  routing?: ModelRouting | null
+  /** Opt-in machine-local JSON quota command, e.g. ["opencode2", "check-rate", "--json"]. */
+  quotaCommand?: string[] | null
+  /** Optional named, provider-agnostic capacity checkers. Legacy quotaCommand still works. */
+  quotaSources?: Record<string, { command: string[]; format: "capacity-v1" | "check-rate" }>
+  /** Only models named here receive the approximate active-input guard. */
+  childLimits?: Record<string, ChildContextLimit>
 }
 
 export const DEFAULT_OPTIONS: Required<UltracodeOptions> = {
@@ -152,6 +162,10 @@ export const DEFAULT_OPTIONS: Required<UltracodeOptions> = {
   failover: "auto",
   askTimeoutMs: 0,
   providerConcurrency: {},
+  routing: null,
+  quotaCommand: null,
+  quotaSources: {},
+  childLimits: {},
 }
 
 /** Local admission clamp (this repo default). Not a host API. */
@@ -212,12 +226,12 @@ export type CapturedSettings = {
 export type ModelRef = { providerID: string; id: string; variant?: string }
 
 /** Where a spawned child's intended model came from — precedence provenance. */
-export type ModelSpawnSource = "call" | "run" | "pin"
+export type ModelSpawnSource = "call" | "run" | "route" | "pin"
 
 /**
  * Intended spawn model on an agent record. `source` distinguishes an
- * INTENTIONAL override ("call"/"run") from a config pin or server default, so
- * drift reports can tell them apart.
+ * INTENTIONAL override ("call"/"run"), a routing-policy decision ("route"),
+ * and a config pin or server default, so drift reports can tell them apart.
  */
 export type SpawnModel = ModelRef & { source?: ModelSpawnSource }
 
@@ -437,6 +451,14 @@ export interface AgentRecord {
   status: AgentStatus
   error?: string
   tokens?: TokenUsage
+  /**
+   * Input + cache read + cache write of the child's LAST COMPLETED model
+   * request — the statusline-style "current request context", the same
+   * quantity the childLimits guard estimates before a call. Absent while a
+   * request is in flight (no completed turn yet) and for warm replays whose
+   * source record predates this field. NOT cumulative spend (that is `tokens`).
+   */
+  contextTokens?: number
   startedAt?: number
   endedAt?: number
   /** Parsed structured output when opts.schema was provided. */
@@ -548,6 +570,18 @@ export function addTokens(into: TokenUsage, add?: Partial<TokenUsage> | null): T
   return into
 }
 
+/**
+ * The statusline-style "current request context" of one model request: what
+ * the provider actually re-received (input + cache read + cache write).
+ * This is the number the childLimits guard estimates BEFORE a call; here it
+ * is the measured value of a completed request.
+ */
+export function requestContext(tokens?: Partial<TokenUsage> | null): number | undefined {
+  if (!tokens) return undefined
+  const context = (tokens.input ?? 0) + (tokens.cache?.read ?? 0) + (tokens.cache?.write ?? 0)
+  return context > 0 ? context : undefined
+}
+
 // ---------------------------------------------------------------------------
 // Result envelope returned by the workflow tool
 // ---------------------------------------------------------------------------
@@ -585,6 +619,8 @@ export interface RunEnvelope {
 export interface AgentOpts {
   /** Agent id. Default: plugin options.agent. Missing agent => fail fast with available list. */
   agent?: string
+  /** Opt-in tier within the Ultracode routing policy; absent uses routing.roles[agent]. */
+  tier?: string
   /**
    * Explicit per-call model override ("provider/id#variant" resolved by the
    * host): beats the run-level override and agent-config pins for THIS child.
@@ -630,6 +666,13 @@ export interface AgentResult {
   agent?: string
   model?: { providerID: string; id: string } | null
   tokens?: TokenUsage
+  /**
+   * Usage of the LAST model request only (message-level tokens: its input +
+   * cache.read + cache.write is the statusline-style "current request
+   * context"). Distinct from `tokens`, which is session-cumulative. Absent
+   * when the host exposes no message-level usage.
+   */
+  requestTokens?: TokenUsage
   /** Parsed structured output (present when opts.schema was given and validation succeeded). */
   data?: Json
   /** Present when this result was replayed from a prior run's warm cache. */
@@ -1084,8 +1127,12 @@ export type ProviderFailureClass = "quota" | "burst"
  */
 export interface ProviderQuarantineSnapshot {
   providerID: string
-  /** Parsed reset time (epoch ms) when the failure exposed one; undefined = run-lifetime. */
+  /** Quarantine expiry (epoch ms). Finite: TTL-based when the reset was unknown. */
+  until: number
+  /** Provider-REPORTED reset time; present only when the failure named one. */
   resetAt?: number
+  /** True when `until` is a bounded re-probe estimate, not a provider reset. */
+  estimated?: true
   /** "provider/id" keys whose failures triggered the quarantine (bounded, deduped). */
   models: string[]
 }
@@ -1094,10 +1141,10 @@ export interface ProviderQuarantineSnapshot {
  * Run-level provider breaker seam (implemented by src/supervisor.ts, consumed
  * by src/primitives.ts AgentRunner). ONE instance belongs to a supervisor and
  * is shared across its runs: a quota strike quarantines the provider (until
- * the parsed reset, else for the supervisor's lifetime) so later children
- * resolving to it never create a session; three burst strikes within 60 s
- * throttle admission (serialize + stagger) until a 60 s quiet window — never
- * an abort. The runner reports every classified child failure here and
+ * the parsed reset, else for a bounded TTL with a re-probe after it) so later
+ * children resolving to it never create a session; three burst strikes within
+ * 60 s throttle admission (serialize + stagger) until a 60 s quiet window —
+ * never an abort. The runner reports every classified child failure here and
  * consults it before `session.create`.
  */
 export interface ProviderHealth {
@@ -1126,6 +1173,8 @@ export interface ProviderHealth {
 }
 
 export interface Supervisor {
+  /** Child-only context guard. Undefined for ordinary sessions. */
+  contextLimitFor?(sessionID: string, model: ModelRef): ChildContextLimit | undefined
   /**
    * Execute a resolved run. Resolves only after all children are settled
    * (success, failure, stop, or timeout) — never while agents are live.
@@ -1159,6 +1208,11 @@ export interface Supervisor {
    * record marked with a stall error — runs fail visibly, no zombie rows.
    */
   noteChildActivity(sessionID: string): void
+  /**
+   * Last-observed activity for a live child (epoch ms), for status surfaces
+   * (stalledMs). Undefined when unknown — never rendered as stalled.
+   */
+  childActivity(sessionID: string): number | undefined
   activeRuns(): RunRecord[]
   /** Plugin unload: stop everything, kill workers, reject pending bridge calls. */
   dispose(): Promise<void>

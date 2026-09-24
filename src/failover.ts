@@ -97,6 +97,13 @@ export interface ResolveFallbacksInput {
   modelFallbacks?: Readonly<Record<string, ReadonlyArray<string>>>
   /** Agent-config pins across the run's agent ids (agent-pins.collectAgentPins). */
   pinPool?: ReadonlyArray<PinPoolEntry>
+  /**
+   * The dead child's requested agent id. Inside the pin rung, that agent's OWN
+   * pin is tried before any other agent's pin: a `reviewer` child must fail
+   * over onto the reviewer pin (its own shelf choice), not silently inherit
+   * `general`'s pin because it happens to be listed first. Stable otherwise.
+   */
+  preferAgent?: string
   /** Provider ids the user took offline — never a candidate. */
   disabledProviders?: ReadonlySet<string>
   /** True for read-only children (isReadOnlyChild): unlocks inference + down-tier. */
@@ -177,8 +184,14 @@ export function resolveFallbacks(input: ResolveFallbacksInput): FallbackCandidat
     if (model !== undefined) push(model, "option", { pin })
   }
   // 3. The user's agent-config pins on OTHER agents/providers. Disabled agents
-  //    never reach the pool (collectAgentPins skips them).
-  for (const entry of input.pinPool ?? []) {
+  //    never reach the pool (collectAgentPins skips them). The dead child's
+  //    requested agent is promoted first (preferAgent): a reviewer child keeps
+  //    its own shelf rather than inheriting the default agent's pin.
+  const pool = [...(input.pinPool ?? [])]
+  if (input.preferAgent !== undefined && pool.length > 1) {
+    pool.sort((a, b) => (a.agentID === input.preferAgent ? -1 : 0) - (b.agentID === input.preferAgent ? -1 : 0))
+  }
+  for (const entry of pool) {
     const model = parsePin(entry.pin)
     if (model !== undefined) push(model, "pin", { agentID: entry.agentID, pin: entry.pin })
   }

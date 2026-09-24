@@ -52,6 +52,8 @@ export type GraphNode = {
    * Beats pins and the run-level override; disabled_providers still block.
    */
   model?: string
+  /** Ultracode-only routing tier: a literal name or one whole-string `{{ref}}` (e.g. `"{{plan.tier}}"`); ignored when an explicit model is supplied. */
+  tier?: string
   /** agent/fanout/merge: prompt template. {{item}}/{{index}} valid in fanout+merge. */
   prompt?: string
   /** agent/fanout/merge: JSON Schema for structured output. */
@@ -113,11 +115,11 @@ export const DEFAULT_MERGE_BATCH = 8
 const ID_RE = /^[a-zA-Z_$][a-zA-Z0-9_$]{0,63}$/
 const RESERVED_IDS = new Set(["args", "item", "index"])
 const ALLOWED_NODE_KEYS: Record<GraphNodeKind, ReadonlySet<string>> = {
-  agent: new Set(["id", "kind", "agent", "model", "prompt", "schema", "label"]),
-  fanout: new Set(["id", "kind", "agent", "model", "prompt", "schema", "label", "max", "over"]),
+  agent: new Set(["id", "kind", "agent", "model", "tier", "prompt", "schema", "label"]),
+  fanout: new Set(["id", "kind", "agent", "model", "tier", "prompt", "schema", "label", "max", "over"]),
   partition: new Set(["id", "kind", "from", "budgetTokens", "tokensPerLine"]),
-  merge: new Set(["id", "kind", "agent", "model", "prompt", "schema", "from", "batches"]),
-  gate: new Set(["id", "kind", "agent", "model", "prompt", "schema", "from", "onFail"]),
+  merge: new Set(["id", "kind", "agent", "model", "tier", "prompt", "schema", "from", "batches"]),
+  gate: new Set(["id", "kind", "agent", "model", "tier", "prompt", "schema", "from", "onFail"]),
   checkpoint: new Set(["id", "kind", "from", "value"]),
   workflow: new Set(["id", "kind", "name", "argsFrom"]),
 }
@@ -224,17 +226,58 @@ function nodeDeps(node: GraphNode): string[] {
 /** Template vars that are loop/context bindings, not node references. */
 const TEMPLATE_NON_NODES: ReadonlySet<string> = new Set(["args", "item", "index", "items"])
 
-/** Node ids a prompt template interpolates (`{{report}}`, `{{verify.verdicts}}`). */
+/**
+ * Node ids a prompt OR tier template interpolates (`{{report}}`,
+ * `{{verify.verdicts}}`). A `tier: "{{scout.tier}}"` reads that node's value
+ * exactly like a prompt interpolation does, so wave scheduling must see it too.
+ */
 function nodeTemplateDeps(node: GraphNode): string[] {
-  if (typeof node.prompt !== "string") return []
   const heads: string[] = []
-  TEMPLATE_VAR_RE.lastIndex = 0
-  let m: RegExpExecArray | null
-  while ((m = TEMPLATE_VAR_RE.exec(node.prompt)) !== null) {
-    const head = m[1]!.split(".").map((s) => s.trim()).filter(Boolean)[0]
-    if (head !== undefined && !TEMPLATE_NON_NODES.has(head)) heads.push(head)
+  const scan = (text: string | undefined): void => {
+    if (typeof text !== "string") return
+    TEMPLATE_VAR_RE.lastIndex = 0
+    let m: RegExpExecArray | null
+    while ((m = TEMPLATE_VAR_RE.exec(text)) !== null) {
+      const head = m[1]!.split(".").map((s) => s.trim()).filter(Boolean)[0]
+      if (head !== undefined && !TEMPLATE_NON_NODES.has(head)) heads.push(head)
+    }
   }
+  scan(node.prompt)
+  scan(node.tier)
   return heads
+}
+
+/** A tier is a literal name or exactly one whole-string `{{ref}}` (evidence-based routing). */
+const TIER_REF_RE = /^\{\{\s*([^{}]+?)\s*\}\}$/
+
+/**
+ * The compiled `tier:` option part. Literals compile as before (byte-identical
+ * output, so saved-workflow trust digests are unchanged); a single `{{ref}}`
+ * compiles to the RAW value (not G_str-stringified) normalized by G_tier, so
+ * absent or non-string evidence degrades to `undefined` = the role default
+ * instead of poisoning the call with `"undefined"`.
+ */
+function tierOptionPart(
+  node: GraphNode,
+  defined: ReadonlySet<string>,
+  context: VarContext,
+): string | undefined {
+  if (node.tier === undefined) return undefined
+  if (!node.tier.includes("{{")) return `tier: ${jsonLiteral(node.tier)}`
+  const match = TIER_REF_RE.exec(node.tier)
+  const expr = match ? resolveVarPath(match[1]!, defined, context) : undefined
+  // Unresolvable here means compileGraphSpec ran without validateGraphSpec;
+  // fail loud rather than emit a literal the router would reject as unknown.
+  if (expr === undefined) {
+    throw new Error(
+      `graph compiler invariant: node "${node.id}" tier template does not resolve — run validateGraphSpec first`,
+    )
+  }
+  // Optional-chained access: a producer that failed in its wave is null, and a
+  // null dereference here would crash the run before the child could spawn.
+  // Absent evidence must degrade to the role default, so every property hop
+  // is guarded (the expr is built only from validated ID_RE segments + dots).
+  return `tier: G_tier(${expr.replace(/\./g, "?.")})`
 }
 
 /**
@@ -333,6 +376,22 @@ export function validateGraphSpec(spec: unknown): GraphCheck {
         errors.push(
           `${where} (${id}): model must be a "provider/id" or "provider/id#variant" string, got ${JSON.stringify(model)}`,
         )
+      }
+      if (n["tier"] !== undefined && (typeof n["tier"] !== "string" || !(n["tier"] as string).trim())) {
+        errors.push(`${where} (${id}): tier must be a non-empty string`)
+      }
+      // A templated tier must be exactly one whole-string ref that resolves
+      // against nodes defined earlier (same forward-only rule as prompts).
+      if (typeof n["tier"] === "string" && n["tier"].includes("{{")) {
+        const context: VarContext = kind === "fanout" || kind === "merge" ? "item" : "node"
+        const match = TIER_REF_RE.exec(n["tier"])
+        if (match === null) {
+          errors.push(`${where} (${id}): tier must be a literal tier name or exactly one {{ref}}`)
+        } else if (resolveVarPath(match[1]!, defined, context) === undefined) {
+          errors.push(
+            `${where} (${id}): tier {{${match[1]}}} does not resolve (defined so far: args${[...defined].map((d) => ", " + d).join("")})`,
+          )
+        }
       }
     }
 
@@ -455,6 +514,8 @@ function singleCallExpr(node: GraphNode, defined: ReadonlySet<string>): string {
   const parts: string[] = []
   if (node.agent !== undefined) parts.push(`agent: ${jsonLiteral(node.agent)}`)
   if (node.model !== undefined) parts.push(`model: ${jsonLiteral(node.model)}`)
+  const tier = tierOptionPart(node, defined, "node")
+  if (tier !== undefined) parts.push(tier)
   parts.push(`phase: ${jsonLiteral(node.id)}`)
   parts.push(`label: ${jsonLiteral(node.label ?? node.id)}`)
   parts.push(`key: ${jsonLiteral(node.id)}`)
@@ -472,6 +533,8 @@ function parallelCallExpr(node: GraphNode, defined: ReadonlySet<string>, refExpr
     const parts: string[] = []
     if (node.agent !== undefined) parts.push(`agent: ${jsonLiteral(node.agent)}`)
     if (node.model !== undefined) parts.push(`model: ${jsonLiteral(node.model)}`)
+    const tier = tierOptionPart(node, defined, "item")
+    if (tier !== undefined) parts.push(tier)
     parts.push(`phase: ${jsonLiteral(node.id)}`)
     const base = node.label ?? node.id
     parts.push(`label: ${jsonLiteral(base + ":")} + index`)
@@ -506,7 +569,12 @@ export function compileGraphSpec(spec: GraphSpec): CompiledGraph {
   lines.push(`const G_str = (x) => JSON.stringify(x === undefined ? null : x)`)
   lines.push(`const G_list = (x) => Array.isArray(x) ? x : (x === null || x === undefined ? [] : [x])`)
   lines.push(`const G_batch_map = (x, n) => { const src = G_list(x); const out = []; for (let i = 0; i < src.length; i += Math.max(1, n)) out.push(src.slice(i, i + Math.max(1, n))); return out }`)
-
+  // Evidence-based tier helper — emitted ONLY when some node templates its
+  // tier, so compiled scripts (the trust-digest basis) stay byte-identical
+  // for every graph that does not use the feature.
+  if (spec.nodes.some((n) => typeof n.tier === "string" && n.tier.includes("{{"))) {
+    lines.push(`const G_tier = (x) => (typeof x === "string" && x.trim() ? x : undefined)`)
+  }
   const phases: string[] = []
   const requires = new Set<string>()
 
@@ -792,10 +860,13 @@ export function graphParamNames(spec: unknown): string[] {
       if (raw === null || typeof raw !== "object" || Array.isArray(raw)) continue
       const n = raw as Record<string, unknown>
       for (const key of ["from", "over", "value", "argsFrom"]) addRef(n[key])
-      if (typeof n["prompt"] === "string") {
+      // A tier template reads args exactly like a prompt template — a tier-only
+      // args ref is still a parameter the caller must supply.
+      for (const field of ["prompt", "tier"]) {
+        if (typeof n[field] !== "string") continue
         TEMPLATE_VAR_RE.lastIndex = 0
         let m: RegExpExecArray | null
-        while ((m = TEMPLATE_VAR_RE.exec(n["prompt"])) !== null) addPath(m[1]!)
+        while ((m = TEMPLATE_VAR_RE.exec(n[field] as string)) !== null) addPath(m[1]!)
       }
     }
   }

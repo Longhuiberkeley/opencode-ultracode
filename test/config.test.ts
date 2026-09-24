@@ -42,6 +42,10 @@ test("loadOptions: empty object gives all defaults", () => {
     failover: "auto",
     askTimeoutMs: 0,
     providerConcurrency: {},
+    routing: null,
+    quotaCommand: null,
+    quotaSources: {},
+    childLimits: {},
   })
   assert.deepEqual(warnings, [])
 })
@@ -64,6 +68,10 @@ test("loadOptions: fully valid options round-trip", () => {
     failover: "ask",
     askTimeoutMs: 900_000,
     providerConcurrency: { anthropic: 2, openai: 1 },
+    routing: null,
+    quotaCommand: null,
+    quotaSources: {},
+    childLimits: {},
   }
   const { options, warnings } = loadOptions(raw)
   assert.deepEqual(options, raw)

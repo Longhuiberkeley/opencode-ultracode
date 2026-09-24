@@ -48,6 +48,9 @@ import type { WarmCacheEntry, WorkflowLoader } from "./primitives.ts"
 import { isReadOnlyChild, resolveFallbacks } from "./failover.ts"
 import type { PinPoolEntry } from "./failover.ts"
 import { defaultProviderSlotsDir, ProviderConcurrencyGate, ProviderSlotPool } from "./provider-slots.ts"
+import { defaultProviderQuarantineDir, readAllQuarantineMarkers, writeQuarantineMarker } from "./provider-quarantine.ts"
+import { ModelRouter, type RouteObservation } from "./model-routing.ts"
+import { childLimitFor } from "./child-context.ts"
 import { validateScriptSource } from "./worker-script.ts"
 import { spawnWorker } from "./worker-host.ts"
 import type { WorkerHandle, WorkerResult } from "./worker-host.ts"
@@ -66,6 +69,15 @@ export const PROVIDER_BURST_STRIKE_LIMIT = 3
 export const PROVIDER_THROTTLE_STAGGER_MS = 200
 /** Bounded per-provider memory of the model keys that triggered a quarantine. */
 export const PROVIDER_QUARANTINE_MODELS_CAP = 4
+/**
+ * Quarantine TTL when a quota failure names no reset time. The old behavior
+ * (Infinity, i.e. quarantined for the plugin instance's lifetime) meant one
+ * unlabeled quota error avoided the provider until a service restart — observed
+ * live: a coding-plan window reset hours later while every child kept routing
+ * around the provider. A bounded TTL trades one wasted request per re-probe for
+ * automatic recovery; a still-dead provider re-quarantines for another TTL.
+ */
+export const PROVIDER_QUARANTINE_UNKNOWN_TTL_MS = 30 * 60_000
 
 /**
  * What the breaker reports when a provider crosses into quarantine (quota) or
@@ -80,6 +92,10 @@ export interface ProviderBreakerEvent {
   kind: ProviderFailureClass
   /** Parsed reset time when the classification exposed one. */
   resetAt?: number
+  /** True when the quarantine is a TTL re-probe estimate, not a parsed reset. */
+  estimated?: boolean
+  /** Quarantine expiry (epoch ms; TTL-based when `estimated`). */
+  until?: number
   /** "provider/id" of the failing model (ask-report key resolution). */
   model?: string
   /** Strikes inside the window at engagement time (burst events). */
@@ -87,8 +103,10 @@ export interface ProviderBreakerEvent {
 }
 
 interface ProviderHealthState {
-  /** Epoch ms; Infinity = quarantined for this supervisor's lifetime. */
+  /** Epoch ms; undefined = not quarantined. Always finite (TTL when unknown). */
   quarantinedUntil: number | undefined
+  /** True while the quarantine end is a TTL re-probe estimate, not a provider reset. */
+  quarantineEstimated: boolean
   /** Model keys whose failures triggered the current quarantine (bounded). */
   quarantineModels: string[]
   /** Burst strike timestamps (pruned to PROVIDER_BURST_WINDOW_MS). */
@@ -101,11 +119,20 @@ interface ProviderHealthState {
  * Supervisor-owned provider breaker (the run-level breaker of the failover
  * policy). ONE instance per supervisor, shared across every run it owns.
  *
- * WHY supervisor-scoped and in-memory: quota is account-level and hours long,
- * so a single strike must stop EVERY subsequent child of EVERY run this
- * instance supervises from creating a session on that provider. Persisting the
- * state would resurrect hours-old strikes after an unrelated plan reset, so
- * the knowledge is deliberately process-local — a restart re-observes.
+ * WHY supervisor-scoped: quota is account-level and hours long, so a single
+ * strike must stop EVERY subsequent child of EVERY run this instance
+ * supervises from creating a session on that provider.
+ *
+ * Machine-wide markers (2026-09-25 revision): the knowledge USED to be
+ * deliberately process-local — a restart re-observes, and naive persistence
+ * would resurrect hours-old strikes after an unrelated plan reset. But quota
+ * is ACCOUNT-level while users run SEVERAL opencode processes in parallel
+ * (one per project lane), and on 2026-09-24 four boots each independently
+ * re-discovered the same dead xai provider, each burning children on it. The
+ * revision keeps every original guarantee: markers are TTL-bounded (≤30 min
+ * when estimated), atomic, merged with later-deadline-wins, and ADVICE ONLY —
+ * the in-memory state stays authoritative for this process; a marker can add
+ * a quarantine but never resurrect one beyond its own expiry.
  *
  * Two signals:
  * - QUOTA (classified account/plan quota): quarantine the provider until the
@@ -122,7 +149,19 @@ export class ProviderBreaker implements ProviderHealth {
   private readonly gates = new Map<string, Semaphore>()
   private readonly now: () => number
   private readonly staggerMs: number
+  private readonly quarantineTTLms: number
   private readonly onEvent: ((event: ProviderBreakerEvent) => void) | undefined
+  /**
+   * Machine-wide quarantine markers (sibling opencode processes' knowledge),
+   * merged into the in-memory state on a lazy async cadence. The in-memory
+   * breaker stays authoritative for its own process; markers only ADD
+   * quarantines, each bounded by its own TTL (see provider-quarantine.ts).
+   */
+  private readonly machineDir: string | undefined
+  private readonly external = new Map<string, { until: number }>()
+  private machineRefreshAt = 0
+  private machineRefreshInflight: Promise<void> | undefined
+  private machineTimer: ReturnType<typeof setInterval> | undefined
 
   constructor(
     options: {
@@ -130,12 +169,67 @@ export class ProviderBreaker implements ProviderHealth {
       now?: () => number
       /** Override the 200 ms stagger (tests). */
       staggerMs?: number
+      /** Override the unknown-reset quarantine TTL (tests). */
+      quarantineTTLms?: number
       onEvent?: (event: ProviderBreakerEvent) => void
+      /** Shared marker dir (default ~/.local/share/opencode/ultracode/provider-quarantine). */
+      machineQuarantineDir?: string
+      /** Machine marker refresh cadence (tests); default 5 s. */
+      machineRefreshMs?: number
     } = {},
   ) {
     this.now = options.now ?? Date.now
     this.staggerMs = Math.max(0, Math.floor(options.staggerMs ?? PROVIDER_THROTTLE_STAGGER_MS))
+    this.quarantineTTLms = Math.max(1, Math.floor(options.quarantineTTLms ?? PROVIDER_QUARANTINE_UNKNOWN_TTL_MS))
     this.onEvent = options.onEvent
+    this.machineDir = options.machineQuarantineDir
+    if (this.machineDir !== undefined) {
+      this.machineRefreshMs = Math.max(250, Math.floor(options.machineRefreshMs ?? 5_000))
+    }
+  }
+
+  private machineRefreshMs: number = 5_000
+
+  /** Lazy background merge of sibling-process markers (unref'd; test-injectable cadence). */
+  startMachineQuarantineRefresh(): void {
+    if (this.machineDir === undefined || this.machineTimer !== undefined) return
+    this.machineTimer = setInterval(() => void this.refreshMachineQuarantine(), this.machineRefreshMs)
+    if (typeof (this.machineTimer as { unref?: () => void }).unref === "function") {
+      ;(this.machineTimer as { unref: () => void }).unref()
+    }
+    void this.refreshMachineQuarantine()
+  }
+
+  /**
+   * Await a fresh-enough machine marker view (cached for one cadence). Called
+   * from async admission points (router select) — the sync isQuarantined gate
+   * only sees markers a prior refresh already merged.
+   */
+  async refreshMachineQuarantine(): Promise<void> {
+    if (this.machineDir === undefined) return
+    const now = this.now()
+    if (this.machineRefreshInflight !== undefined) return this.machineRefreshInflight
+    if (now - this.machineRefreshAt < this.machineRefreshMs) return
+    this.machineRefreshAt = now
+    const dir = this.machineDir
+    this.machineRefreshInflight = (async () => {
+      try {
+        const markers = await readAllQuarantineMarkers(dir!, now)
+        this.external.clear()
+        for (const [providerID, marker] of markers) this.external.set(providerID, { until: marker.until })
+      } catch {
+        // markers are advice; never a dependency
+      } finally {
+        this.machineRefreshInflight = undefined
+      }
+    })()
+    return this.machineRefreshInflight
+  }
+
+  /** Publish this process's quarantine to the machine dir (fire-and-forget). */
+  private publishMachineQuarantine(providerID: string, until: number, estimated: boolean): void {
+    if (this.machineDir === undefined) return
+    void writeQuarantineMarker({ dir: this.machineDir, providerID, until, estimated, now: this.now() })
   }
 
   isQuarantined(providerID: string): boolean {
@@ -143,11 +237,22 @@ export class ProviderBreaker implements ProviderHealth {
   }
 
   quarantinedUntil(providerID: string): number | undefined {
+    const own = this.ownQuarantinedUntil(providerID)
+    const marker = this.external.get(providerID)
+    const externalUntil = marker !== undefined && marker.until > this.now() ? marker.until : undefined
+    if (own === undefined) return externalUntil
+    if (externalUntil === undefined) return own
+    return Math.max(own, externalUntil)
+  }
+
+  private ownQuarantinedUntil(providerID: string): number | undefined {
     const state = this.states.get(providerID)
     if (state?.quarantinedUntil === undefined) return undefined
     if (state.quarantinedUntil <= this.now()) {
-      // The parsed reset passed: the provider is presumed healthy again.
+      // The parsed reset passed (or the unknown-reset TTL lapsed): the
+      // provider is presumed healthy again and the next child re-probes it.
       state.quarantinedUntil = undefined
+      state.quarantineEstimated = false
       state.quarantineModels = []
       return undefined
     }
@@ -187,23 +292,38 @@ export class ProviderBreaker implements ProviderHealth {
     const state = this.stateFor(providerID)
     if (input.class === "quota") {
       if (state.quarantinedUntil !== undefined && state.quarantinedUntil > now) {
-        // Already quarantined: keep (or extend to) the later known reset and
-        // remember the model. No event — ask mode must report once, not per
-        // child that dies on the same dead provider.
-        if (input.resetAt !== undefined && input.resetAt > state.quarantinedUntil) {
-          state.quarantinedUntil = input.resetAt
+        // Already quarantined: remember the model. No event — ask mode must
+        // report once, not per child that dies on the same dead provider.
+        // A provider-REPORTED reset always beats a TTL estimate (an estimate
+        // can be later than the real window reopen — a waiting explicit-model
+        // child would then sleep past its provider's window). Between two
+        // reported resets the later one wins (the conservative read).
+        if (input.resetAt !== undefined) {
+          if (state.quarantineEstimated || input.resetAt > state.quarantinedUntil) {
+            state.quarantinedUntil = input.resetAt
+            state.quarantineEstimated = false
+            this.publishMachineQuarantine(providerID, state.quarantinedUntil, false)
+          }
         }
         this.rememberModel(state, input.model)
         return
       }
-      state.quarantinedUntil = input.resetAt !== undefined ? input.resetAt : Number.POSITIVE_INFINITY
+      // Unknown reset: quarantine for the bounded TTL (a re-probe deadline),
+      // never Infinity — a provider whose window silently reset must recover
+      // without a service restart. A re-probe that still fails re-quarantines.
+      const estimated = input.resetAt === undefined
+      state.quarantinedUntil = input.resetAt !== undefined ? input.resetAt : now + this.quarantineTTLms
+      state.quarantineEstimated = estimated
       state.quarantineModels = []
       this.rememberModel(state, input.model)
+      this.publishMachineQuarantine(providerID, state.quarantinedUntil, estimated)
       this.emit({
         runID: input.runID,
         providerID,
         kind: "quota",
         ...(input.resetAt !== undefined ? { resetAt: input.resetAt } : {}),
+        ...(estimated ? { estimated: true } : {}),
+        ...(state.quarantinedUntil !== undefined ? { until: state.quarantinedUntil } : {}),
         ...(input.model !== undefined ? { model: input.model } : {}),
       })
       return
@@ -227,15 +347,28 @@ export class ProviderBreaker implements ProviderHealth {
   /** Snapshot for orchestrator surfaces (read-only; prunes expired quarantines). */
   quarantines(): ProviderQuarantineSnapshot[] {
     const out: ProviderQuarantineSnapshot[] = []
+    const seen = new Set<string>()
     for (const providerID of [...this.states.keys()]) {
       const until = this.quarantinedUntil(providerID)
       if (until === undefined) continue
+      seen.add(providerID)
       const state = this.states.get(providerID)!
       out.push({
         providerID,
-        ...(Number.isFinite(until) ? { resetAt: until } : {}),
+        // Always finite now (TTL when the failure named no reset). `resetAt`
+        // stays reserved for a provider-REPORTED reset so consumers can tell
+        // "window reopens at" from "we re-probe at".
+        until,
+        ...(state.quarantineEstimated ? { estimated: true as const } : { resetAt: until }),
         models: [...state.quarantineModels],
       })
+    }
+    // Machine markers with no in-memory state (a sibling process learned it):
+    // reported as estimates — this process has no classified failure of its own.
+    for (const [providerID, marker] of this.external) {
+      if (seen.has(providerID)) continue
+      if (marker.until <= this.now()) continue
+      out.push({ providerID, until: marker.until, estimated: true, models: [] })
     }
     return out
   }
@@ -251,7 +384,7 @@ export class ProviderBreaker implements ProviderHealth {
   private stateFor(providerID: string): ProviderHealthState {
     let state = this.states.get(providerID)
     if (state === undefined) {
-      state = { quarantinedUntil: undefined, quarantineModels: [], burstStrikes: [], lastAdmissionAt: 0 }
+      state = { quarantinedUntil: undefined, quarantineEstimated: false, quarantineModels: [], burstStrikes: [], lastAdmissionAt: 0 }
       this.states.set(providerID, state)
     }
     return state
@@ -320,10 +453,23 @@ export interface SupervisorDeps {
    * failover; absent => no exclusions. Index wiring; optional for tests.
    */
   disabledProviders?: () => Promise<ReadonlySet<string>>
+  /** Optional account-level quota feed; undefined is unknown, never unlimited. */
+  quota?: (id: string) => Promise<RouteObservation | undefined>
+  /** Live enabled model IDs at this project location (provider/model). */
+  availableModels?: () => Promise<ReadonlySet<string> | undefined>
   /** Clock injection for breaker tests (default Date.now). */
   now?: () => number
   /** Throttle stagger override for breaker tests (default 200 ms). */
   breakerStaggerMs?: number
+  /** Unknown-reset quarantine TTL override for breaker tests (default 30 min). */
+  breakerQuarantineTTLms?: number
+  /**
+   * Explicit-model window-wait knobs for tests (defaults
+   * WINDOW_WAIT_SLICE_MS / MAX_EXPLICIT_WINDOW_WAIT_MS). Small values let
+   * integration tests exercise budget exhaustion without real sleeping.
+   */
+  windowWaitSliceMs?: number
+  maxWindowWaitMs?: number
   /**
    * Override the machine-level provider-slot base dir (tests inject a temp
    * dir). Production uses ~/.local/share/opencode/ultracode/provider-slots.
@@ -331,6 +477,15 @@ export interface SupervisorDeps {
   providerSlotsDir?: string
   /** Heartbeat interval override for slot tests (default 10 s; 0 disables). */
   providerSlotHeartbeatMs?: number
+  /**
+   * Machine-wide quarantine marker dir (tests inject a tmp dir). Default:
+   * ~/.local/share/opencode/ultracode/provider-quarantine — sibling processes
+   * publish quota quarantines there so parallel boots stop re-discovering a
+   * dead provider. Empty string disables.
+   */
+  machineQuarantineDir?: string
+  /** Machine marker refresh cadence override for tests (default 5 s). */
+  machineQuarantineRefreshMs?: number
 }
 
 interface PauseWaiter {
@@ -383,6 +538,8 @@ interface RunState {
   askTimer: ReturnType<typeof setTimeout> | undefined
   /** Ask reports already emitted for this run (provider+kind coalescing keys). */
   askNotified: Set<string>
+  /** Auto-mode quarantine reports already emitted (provider+kind coalescing). */
+  autoNotified: Set<string>
   /** Escape hatch: explicit overrides may target disabled providers. */
   allowDisabledProviders: boolean
   /** Per-run tighten-only loop iteration ceiling (run input `maxLoopIterations`). */
@@ -432,6 +589,9 @@ export class SupervisorImpl implements Supervisor {
   private readonly isProviderDisabled: ((providerID: string) => Promise<boolean>) | undefined
   private readonly pinPool: ((agentIDs: readonly string[]) => Promise<ReadonlyArray<PinPoolEntry>>) | undefined
   private readonly disabledProviders: (() => Promise<ReadonlySet<string>>) | undefined
+  /** Explicit-model window-wait test overrides; undefined = code defaults. */
+  private readonly windowWaitSliceMs: number | undefined
+  private readonly maxWindowWaitMs: number | undefined
   private readonly settleGraceMs: number
   private readonly stopKillMs: number
   private readonly driver: Required<SessionDriver>
@@ -444,8 +604,18 @@ export class SupervisorImpl implements Supervisor {
    * enforces that); abort rejects queued waits.
    */
   private readonly providerLimiter: ProviderConcurrencyGate
+  private readonly quota: SupervisorDeps["quota"]
+  private readonly availableModels: SupervisorDeps["availableModels"]
+  private router: ModelRouter | undefined
   private readonly runs = new Map<string, RunState>()
   private disposed = false
+
+  /** Frozen per-run guard, scoped to a child actually owned by this supervisor. */
+  contextLimitFor(sessionID: string, model: { providerID: string; id: string; variant?: string }) {
+    const owner = this.registry.agentForSession(sessionID)
+    const state = owner ? this.runs.get(owner.runID) : undefined
+    return state && !state.closed ? childLimitFor(model, state.effective.childLimits) : undefined
+  }
 
   constructor(deps: SupervisorDeps) {
     this.registry = deps.registry
@@ -455,7 +625,12 @@ export class SupervisorImpl implements Supervisor {
     this.pinForAgent = deps.pinForAgent
     this.isProviderDisabled = deps.isProviderDisabled
     this.pinPool = deps.pinPool
+    this.quota = deps.quota
+    this.availableModels = deps.availableModels
+    this.router = deps.options.routing ? new ModelRouter(deps.options.routing) : undefined
     this.disabledProviders = deps.disabledProviders
+    this.windowWaitSliceMs = deps.windowWaitSliceMs
+    this.maxWindowWaitMs = deps.maxWindowWaitMs
     this.settleGraceMs = deps.settleGraceMs ?? SETTLE_GRACE_MS
     this.stopKillMs = deps.stopKillGraceMs ?? STOP_KILL_GRACE_MS
     // Driver construction performs no session calls — safe outside executors.
@@ -469,8 +644,11 @@ export class SupervisorImpl implements Supervisor {
     this.providerHealth = new ProviderBreaker({
       ...(deps.now ? { now: deps.now } : {}),
       ...(deps.breakerStaggerMs !== undefined ? { staggerMs: deps.breakerStaggerMs } : {}),
+      ...(deps.breakerQuarantineTTLms !== undefined ? { quarantineTTLms: deps.breakerQuarantineTTLms } : {}),
+      ...(deps.machineQuarantineDir !== undefined ? { machineQuarantineDir: deps.machineQuarantineDir } : {}),
       onEvent: (event) => this.handleProviderEvent(event),
     })
+    this.providerHealth.startMachineQuarantineRefresh()
     this.providerLimiter = new ProviderConcurrencyGate({
       slotPool: new ProviderSlotPool({
         baseDir: deps.providerSlotsDir ?? defaultProviderSlotsDir(),
@@ -549,6 +727,7 @@ export class SupervisorImpl implements Supervisor {
   }
 
   updateDefaults(next: Required<UltracodeOptions>): void {
+    if (next.routing !== this.options.routing) this.router = next.routing ? new ModelRouter(next.routing) : undefined
     this.options = { ...next }
   }
 
@@ -609,6 +788,9 @@ export class SupervisorImpl implements Supervisor {
 
       // 3.-4. AgentRunner over a driver wrapper that tracks child sessions,
       // registry ownership (ambient phase tracked via state) and late children.
+      const routerForRun = state.effective.routing
+        ? (state.effective.routing === this.options.routing ? this.router : undefined) ?? new ModelRouter(state.effective.routing)
+        : undefined
       const runner = new AgentRunner({
         driver: {
           runAgent: async (agentInput, availableAgents, hooks) => {
@@ -701,6 +883,8 @@ export class SupervisorImpl implements Supervisor {
         permissions: state.effective.permissions,
         failover: state.effective.failover,
         providerHealth: this.providerHealth,
+        ...(this.windowWaitSliceMs !== undefined ? { windowWaitSliceMs: this.windowWaitSliceMs } : {}),
+        ...(this.maxWindowWaitMs !== undefined ? { maxWindowWaitMs: this.maxWindowWaitMs } : {}),
         fallbackOverride: () => state.fallbackOverride,
         ...(this.pinPool ? { pinPool: this.pinPool } : {}),
         ...(this.disabledProviders ? { disabledProviders: this.disabledProviders } : {}),
@@ -712,6 +896,38 @@ export class SupervisorImpl implements Supervisor {
         ...(warmCache ? { warmCache } : {}),
         providerLimiter: this.providerLimiter,
         providerConcurrency: state.effective.providerConcurrency,
+        ...(routerForRun ? {
+          selectModel: async (role: string, tier?: string, excluded?: ReadonlySet<string>) => {
+            const disabled = new Set(excluded)
+            if (this.disabledProviders) {
+              try { for (const id of await this.disabledProviders()) disabled.add(id) } catch { /* existing disabled-provider behavior */ }
+            }
+            // Machine-wide + in-process quarantine knowledge: the router must
+            // not spawn onto a provider a sibling opencode process already
+            // classified as quota-dead (distinct skip reason for diagnostics).
+            await this.providerHealth.refreshMachineQuarantine()
+            const quarantined = new Set(this.providerHealth.quarantines().map((q) => q.providerID))
+            // Skip the (large, uncached) live-catalog fetch when no tier resolves:
+            // select() returns the no-model decision before reading it, so the
+            // fetch would be wasted for unmapped children.
+            const resolved = tier ?? state.effective.routing?.roles[role]
+            const available = resolved ? await this.availableModels?.() : undefined
+            try {
+              const decision = await routerForRun.select({ role, ...(tier ? { tier } : {}), disabled,
+                ...(quarantined.size > 0 ? { quarantined } : {}),
+                ...(available ? { available } : {}), ...(this.quota ? { quota: this.quota } : {}) })
+              this.safeParentReport(state, `routing ${role}${tier ? `/${tier}` : ""}: ${decision.reason}` +
+                (decision.skipped.length ? `; skipped ${decision.skipped.join("; ").slice(0, 500)}` : ""))
+              return decision.model
+            } catch (error) {
+              // A routing failure that kills a child must still be visible in the
+              // run log; rethrow so the caller sees the typed reason.
+              this.safeParentReport(state,
+                `routing ${role}${tier ? `/${tier}` : ""} FAILED: ${error instanceof Error ? error.message : String(error)}`.slice(0, 600))
+              throw error
+            }
+          },
+        } : {}),
       })
 
       // 5. Spawn the worker with bridge dispatch.
@@ -933,6 +1149,7 @@ export class SupervisorImpl implements Supervisor {
       fallbackOverride: undefined,
       askTimer: undefined,
       askNotified: new Set<string>(),
+      autoNotified: new Set<string>(),
       allowDisabledProviders: input.allowDisabledProviders === true,
       runLoopIterations: input.maxLoopIterations,
     }
@@ -990,6 +1207,10 @@ export class SupervisorImpl implements Supervisor {
       : {}
     const opts: AgentOpts = {}
     if (typeof o.agent === "string") opts.agent = o.agent
+    if (o.tier !== undefined) {
+      if (typeof o.tier !== "string" || !o.tier.trim()) throw new Error("agent(prompt, opts) — opts.tier must be a non-empty string")
+      opts.tier = o.tier.trim()
+    }
     if (typeof o.label === "string") opts.label = o.label
     if (typeof o.phase === "string") opts.phase = o.phase
     if (o.schema !== undefined) opts.schema = o.schema
@@ -1193,6 +1414,19 @@ export class SupervisorImpl implements Supervisor {
     }
   }
 
+  /**
+   * Last-observed activity for a live child (epoch ms), for status surfaces:
+   * the stalledMs shown to orchestrators/TUI is now - childActivity(sessionID).
+   * Undefined when unknown (no events observed — never reported as stalled).
+   */
+  childActivity(sessionID: string): number | undefined {
+    for (const state of this.runs.values()) {
+      const at = state.childLastActivity.get(sessionID)
+      if (at !== undefined) return at
+    }
+    return undefined
+  }
+
   /** Arm the per-run stall scanner; no-op when childStallMs is 0/disabled. */
   private armStallScanner(state: RunState): void {
     this.clearStallScanner(state)
@@ -1251,32 +1485,53 @@ export class SupervisorImpl implements Supervisor {
   // -------------------------------------------------------------------------
 
   /**
-   * Breaker event hook. Ask mode only: when a provider is QUOTA-quarantined
-   * and an active run has pending/at-risk children that would actually fail
-   * over, pause that run through the existing pause machinery (watchdog
-   * suspended — paused runs do not burn timeoutMs) and emit ONE coalesced
-   * report per (run, provider, kind): provider, class, reset time, affected
-   * child count, proposed fallback and the exact resume invocation. Burst
-   * throttle never pauses — it throttles admission only; burst children same-
-   * model-retry with backoff and make progress under auto policy. Children
-   * already inside a failover park in the driver's pause gate until the run is
-   * resumed, so the ask really does gate the failover. "off"/"auto" modes
-   * never take this path.
+   * Breaker event hook. Ask mode: when a provider is QUOTA-quarantined and an
+   * active run has pending/at-risk children that would actually fail over,
+   * pause that run through the existing pause machinery (watchdog suspended —
+   * paused runs do not burn timeoutMs) and emit ONE coalesced report per
+   * (run, provider, kind): provider, class, reset time, affected child count,
+   * proposed fallback and the exact resume invocation. Burst throttle never
+   * pauses — it throttles admission only; burst children same-model-retry with
+   * backoff and make progress under auto policy. Children already inside a
+   * failover park in the driver's pause gate until the run is resumed, so the
+   * ask really does gate the failover.
+   *
+   * Auto mode: no pause, but never silent either — ONE report per (run,
+   * provider, kind) names the quarantine, the reset/re-probe time and the
+   * affected children, so a day-long reroute onto a fallback pin is visible in
+   * the parent session instead of discovered from run records later. (Runs
+   * started AFTER the quarantine transition additionally report from the
+   * runner's wait/route-around paths.)
    */
   private handleProviderEvent(event: ProviderBreakerEvent): void {
     if (event.kind !== "quota") return // burst throttle admits; it does not pause
     for (const state of [...this.runs.values()]) {
-      if (state.effective.failover !== "ask") continue
       const key = `${event.kind}:${event.providerID}`
-      if (state.askNotified.has(key)) continue
       const affected = this.affectedChildCount(state, event.providerID)
-      if (affected === 0) continue // no child of this run would fail over: nothing to ask
-      if (!state.paused) {
-        if (!this.pause(state.runID)) continue // already stopping/final: cannot hold the run
+      if (state.effective.failover === "ask") {
+        if (state.askNotified.has(key)) continue
+        if (affected === 0) continue // no child of this run would fail over: nothing to ask
+        if (!state.paused) {
+          if (!this.pause(state.runID)) continue // already stopping/final: cannot hold the run
+        }
+        state.askNotified.add(key)
+        this.emitAskReport(state, event, affected)
+        this.armAskTimeout(state)
+        continue
       }
-      state.askNotified.add(key)
-      this.emitAskReport(state, event, affected)
-      this.armAskTimeout(state)
+      if (state.effective.failover === "auto" && !state.autoNotified.has(key) && affected > 0) {
+        state.autoNotified.add(key)
+        const when = event.estimated
+          ? `reset time unknown — re-probe after ${formatClock(event.until)}`
+          : event.resetAt !== undefined
+            ? `resets ${formatClock(event.resetAt)}`
+            : "reset time unknown"
+        this.safeParentReport(
+          state,
+          `provider ${event.providerID} quarantined (quota; ${when}): ${affected} child(ren) affected — ` +
+            `explicit-model children wait for the provider window, routed children fail over per policy`,
+        )
+      }
     }
   }
 
@@ -1330,9 +1585,11 @@ export class SupervisorImpl implements Supervisor {
       const when =
         event.kind === "burst"
           ? `${event.strikes ?? PROVIDER_BURST_STRIKE_LIMIT} burst strikes within ${Math.round(PROVIDER_BURST_WINDOW_MS / 1000)}s`
-          : event.resetAt !== undefined
-            ? `reset at ${new Date(event.resetAt).toISOString()}`
-            : "reset time unknown — quarantined for this plugin instance"
+          : event.estimated
+            ? `reset time unknown — quarantined for a bounded re-probe (expires ${event.until !== undefined ? new Date(event.until).toISOString() : "TTL"})`
+            : event.resetAt !== undefined
+              ? `reset at ${new Date(event.resetAt).toISOString()}`
+              : "reset time unknown"
       const modelBit = proposed !== undefined ? `, "model": "${modelPinString(proposed)}"` : ""
       const timeoutBit =
         state.effective.askTimeoutMs > 0
@@ -1374,6 +1631,8 @@ export class SupervisorImpl implements Supervisor {
       ...(override !== undefined ? { runFallback: modelPinString(override) } : {}),
       modelFallbacks: state.effective.modelFallbacks,
       pinPool,
+      // The at-risk child's own agent pin precedes other agents' pins.
+      preferAgent: this.affectedRequestedAgent(state, dead),
       ...(disabledProviders !== undefined ? { disabledProviders } : {}),
       readOnly: isReadOnlyChild(state.effective.permissions, this.affectedRequestedAgent(state, dead)),
     })
@@ -1531,4 +1790,9 @@ export class SupervisorImpl implements Supervisor {
 /** Convenience factory matching the Supervisor interface. */
 export function createSupervisor(deps: SupervisorDeps): Supervisor {
   return new SupervisorImpl(deps)
+}
+
+/** Local-clock time string for quarantine reports ("14:30:05"). */
+function formatClock(ms: number | undefined): string {
+  return ms !== undefined ? new Date(ms).toLocaleTimeString() : "unknown"
 }

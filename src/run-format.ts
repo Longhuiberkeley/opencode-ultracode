@@ -1,7 +1,11 @@
 /**
  * Shared run-inspect cell values (plugin-free, no markdown). Surfaces render.
  *
- * Agent row order (D11): status, ord+label, phase, agent, model, tokens, tools.
+ * Agent row order (D11): status, ord+label, phase, agent, model, ctx, tools.
+ * `ctx` is the statusline-style CURRENT REQUEST CONTEXT (input + cache read +
+ * write of the child's last completed request) — the same quantity the
+ * childLimits guard caps, so the table and the cap finally speak one metric.
+ * Cumulative per-child spend stays visible in detail panes / settle notices.
  */
 import type { AgentRecord, RunRecord, TokenUsage } from "./types.ts"
 import { countAgents } from "./types.ts"
@@ -39,10 +43,22 @@ export function agentCells(a: AgentRecord): string[] {
   const ordLabel = a.label ? `${a.id} ${a.label}` : a.id
   const phase = a.phase ?? "-"
   const agent = a.effectiveAgent || a.requestedAgent || "-"
-  const model = a.effectiveModel ? `${a.effectiveModel.providerID}/${a.effectiveModel.id}` : "-"
-  const tokens = compactTokens(a.tokens)
+  // A failed child that never ran still shows the model it targeted; when
+  // something else actually ran (tier-aware failover / quarantine routing),
+  // the intended spawn is named too. An explicit-model child that waited for
+  // its window never drifts, so this stays quiet for it.
+  const shown = a.effectiveModel ?? a.spawnModel
+  let model = shown != null ? `${shown.providerID}/${shown.id}` : "-"
+  if (
+    a.effectiveModel != null &&
+    a.spawnModel != null &&
+    (a.spawnModel.providerID !== a.effectiveModel.providerID || a.spawnModel.id !== a.effectiveModel.id)
+  ) {
+    model += ` (spawn: ${a.spawnModel.providerID}/${a.spawnModel.id})`
+  }
+  const ctx = a.contextTokens !== undefined && Number.isFinite(a.contextTokens) ? compactCount(a.contextTokens) : "-"
   const tools = a.toolCalls === undefined ? "-" : String(a.toolCalls)
-  return [a.status, ordLabel, phase, agent, model, tokens, tools]
+  return [a.status, ordLabel, phase, agent, model, ctx, tools]
 }
 
 /**

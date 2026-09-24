@@ -1380,6 +1380,32 @@ test("enrichStatusPayload: running run carries identity, elapsed, children detai
   assert.equal("resultPreview" in out, false)
 })
 
+test("enrichStatusPayload: RUNNING payloads carry poll pacing; settled ones do not", () => {
+  const running = baseRun({ agents: [{ id: "a1", status: "running", sessionID: "ses_1" }] })
+  const paced = enrichStatusPayload(payloadOf(running), running, 3_000)
+  assert.equal(paced.retryAfterMs, 15_000)
+  assert.match(paced.hint ?? "", /do NOT busy-poll/)
+  const settled = baseRun({ status: "succeeded", agents: [{ id: "a1", status: "succeeded" }] })
+  const calm = enrichStatusPayload(payloadOf(settled), settled, 3_000)
+  assert.equal("retryAfterMs" in calm, false)
+  assert.equal("hint" in calm, false)
+})
+
+test("enrichStatusPayload: children carry last-request context and stalledMs from activity", () => {
+  const run = baseRun({
+    agents: [
+      { id: "a1", status: "succeeded", sessionID: "ses_a1", contextTokens: 178_000 },
+      { id: "a2", status: "running", sessionID: "ses_a2" },
+    ],
+  })
+  const out = enrichStatusPayload(payloadOf(run), run, 10_000, 65_536, (sid) =>
+    sid === "ses_a2" ? 4_000 : undefined)
+  assert.equal(out.children[0]!.contextTokens, 178_000)
+  assert.equal(out.children[0]!.stalledMs, undefined)
+  assert.equal(out.children[1]!.stalledMs, 6_000)
+  assert.equal(out.children[1]!.contextTokens, undefined)
+})
+
 test("enrichStatusPayload: an explicit per-run timeout override is surfaced, absent otherwise", () => {
   const withOverride = baseRun({ timeoutOverrideMs: 7_200_000 })
   assert.equal(enrichStatusPayload(payloadOf(withOverride), withOverride, 3_000).timeoutOverrideMs, 7_200_000)

@@ -98,6 +98,10 @@ export function freezeEffective(options: Required<UltracodeOptions>): Required<U
     // Copy the map so a later mutation of the shared options cannot change
     // what an in-flight run's provider-slot acquires.
     providerConcurrency: { ...options.providerConcurrency },
+    routing: options.routing,
+    quotaCommand: options.quotaCommand ? [...options.quotaCommand] : null,
+    quotaSources: structuredClone(options.quotaSources),
+    childLimits: { ...options.childLimits },
   })
 }
 

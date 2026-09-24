@@ -69,6 +69,15 @@ test("skill content teaches routing + preflight + structure knobs", () => {
   assert.ok(SKILL_CONTENT.includes("opts.schema"), "must explain opts.schema structured output")
 })
 
+test("skill content teaches difficulty-based tier routing", () => {
+  assert.ok(SKILL_CONTENT.includes("opts.tier"), "must explain the opts.tier routing hint")
+  assert.match(SKILL_CONTENT, /Difficulty → `opts\.tier`/, "hard rule 4 leads with the tier hint")
+  assert.match(SKILL_CONTENT, /tier: "\{\{plan\.tier\}\}"/, "the graph evidence pattern is shown")
+  assert.match(SKILL_CONTENT, /\{ tier: plan\.data\.tier \}/, "the script evidence pattern is shown")
+  assert.match(SKILL_CONTENT, /prompt\+schema\+agent\+model\+tier digest/, "the warm-replay digest names tier")
+  assert.match(SKILL_CONTENT, /hintable tiers/, "caps discovery names the tier list")
+})
+
 test("skill content contains no provider or model ids", () => {
   // Dot-relative paths (.opencode/workflows/…) are config paths, not pins.
   const stripped = SKILL_CONTENT.replace(/\S*opencode\S*/g, " ")

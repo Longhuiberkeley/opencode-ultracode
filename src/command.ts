@@ -96,7 +96,7 @@ export const NESTED_RUN_REFUSED =
   "cannot start a run from inside an active workflow session — use /ultracode from the parent"
 
 /** Plugin package version shown on the bare /ultracode dashboard. */
-export const PLUGIN_VERSION = "0.13.0"
+export const PLUGIN_VERSION = "0.15.0"
 /** Oldest OpenCode binary build the inspect TUI is gated on (A7 / D7). */
 export const MIN_SUPPORTED_BUILD = 19271
 
@@ -211,6 +211,17 @@ function firstToken(rest: string): string {
 export const BACKGROUND_RUN_HINT =
   "A settle notice lands in the parent session when the run finishes and wakes the calling agent (status, agents, result brief, stop reason). The tool result itself cannot arrive after execute returns; poll /ultracode status [runID] / ultracode_status or the panel (ctrl+g) for detail."
 
+/**
+ * Pacing guidance for RUNNING status payloads: models that take "poll
+ * ultracode_status" literally have busy-polled every ~3.5 s for minutes
+ * (observed 2026-09-24). Every running payload carries this + retryAfterMs;
+ * rapid identical re-polls are additionally throttled server-side.
+ */
+export const STATUS_RUNNING_HINT =
+  "run still active — do NOT busy-poll: a settle notice will be delivered to this session when it finishes. Wait for it (work on something else or return), or re-check no sooner than retryAfterMs (ultracode_status accepts an optional bounded waitMs to block instead of polling)."
+/** Minimum spacing the status tool enforces between identical running polls. */
+export const STATUS_RETRY_AFTER_MS = 15_000
+
 export type RunStatusPayload = {
   runID: string
   status: RunStatus
@@ -302,8 +313,16 @@ export type StatusChildView = {
   phase?: string
   /** Child token usage (input/output/reasoning), when known — the per-lane budget feedback loop. */
   tokens?: { input: number; output: number; reasoning: number }
+  /**
+   * Input + cache read + write of the child's LAST COMPLETED model request —
+   * the statusline-style current request context (same quantity the
+   * childLimits guard caps). Absent while the first request is in flight.
+   */
+  contextTokens?: number
   /** Unique tool calls this child made, when known. */
   toolCalls?: number
+  /** Milliseconds since the last observed child activity (running children only). */
+  stalledMs?: number
   /** True when this child was replayed from a prior run's warm cache. */
   cached?: boolean
 }
@@ -318,6 +337,7 @@ export function enrichStatusPayload(
   run: RunRecord | undefined,
   now: number = Date.now(),
   maxResultChars: number = DEFAULT_OPTIONS.maxResultChars,
+  activityFor: (sessionID: string) => number | undefined = () => undefined,
 ): RunStatusPayload & {
   name?: string
   workflowName?: string
@@ -346,6 +366,10 @@ export function enrichStatusPayload(
   /** Recovery pointer when resultTruncated is true. */
   resultHint?: string
   error?: string
+  /** Poll pacing floor, present while the run is active. */
+  retryAfterMs?: number
+  /** Poll guidance, present while the run is active. */
+  hint?: string
 } {
   if (!run) return { ...payload, elapsedMs: 0, children: [] }
   const out: Record<string, unknown> = { ...payload }
@@ -361,6 +385,12 @@ export function enrichStatusPayload(
     out["modelOverride"] = `${run.modelOverride.providerID}/${run.modelOverride.id}${run.modelOverride.variant ? `#${run.modelOverride.variant}` : ""}`
   }
   out["elapsedMs"] = Math.max(0, (run.endedAt ?? now) - run.startedAt)
+  // Poll guard rail: every RUNNING payload names its own re-check floor and
+  // points at the settle notice — a model must never invent its own cadence.
+  if (isActiveRunStatus(run.status)) {
+    out["retryAfterMs"] = STATUS_RETRY_AFTER_MS
+    out["hint"] = STATUS_RUNNING_HINT
+  }
   const children: StatusChildView[] = run.agents.slice(0, STATUS_CHILDREN_LIMIT).map((a) => {
     const child: StatusChildView = { agentID: a.id, status: a.status }
     if (a.sessionID) child.sessionID = a.sessionID
@@ -369,8 +399,13 @@ export function enrichStatusPayload(
     if (a.tokens) {
       child.tokens = { input: a.tokens.input, output: a.tokens.output, reasoning: a.tokens.reasoning }
     }
+    if (typeof a.contextTokens === "number" && Number.isFinite(a.contextTokens)) child.contextTokens = a.contextTokens
     if (typeof a.toolCalls === "number") child.toolCalls = a.toolCalls
     if (a.cached) child.cached = true
+    if (a.status === "running" && a.sessionID) {
+      const at = activityFor(a.sessionID)
+      if (at !== undefined) child.stalledMs = Math.max(0, now - at)
+    }
     return child
   })
   out["children"] = children
@@ -539,7 +574,7 @@ export function buildResultChunk(
 // Show renderer (D11 cells + show-only sessionID)
 // ---------------------------------------------------------------------------
 
-const AGENT_TABLE_HEADERS = ["status", "id / label", "phase", "agent", "model", "tokens", "tools", "session"]
+const AGENT_TABLE_HEADERS = ["status", "id / label", "phase", "agent", "model", "ctx", "tools", "session"]
 
 export function formatShowRun(run: RunRecord, extra?: { pending?: readonly string[] }): string {
   const lines: string[] = []

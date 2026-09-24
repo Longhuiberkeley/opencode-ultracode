@@ -256,7 +256,7 @@ function hostStatusOf(data: DataApi | undefined, id: string): SessionView["hostS
 function asSessionView(
   value: unknown,
   details?: RowDetails,
-  extras?: { hostStatus?: SessionView["hostStatus"]; lastExecution?: SessionView["lastExecution"] },
+  extras?: { hostStatus?: SessionView["hostStatus"]; lastExecution?: SessionView["lastExecution"]; lastExecutionAt?: number },
 ): SessionView | undefined {
   if (!value || typeof value !== "object") return undefined
   const rec = value as Record<string, unknown>
@@ -274,13 +274,14 @@ function asSessionView(
     locationDirectory: locationDirectoryOf(rec.location),
     hostStatus: extras?.hostStatus,
     lastExecution: extras?.lastExecution,
+    lastExecutionAt: extras?.lastExecutionAt,
   }
 }
 
 function listSessions(
   data: DataApi | undefined,
   details: Map<string, RowDetails>,
-  executionBySession: Map<string, NonNullable<SessionView["lastExecution"]>>,
+  executionBySession: Map<string, { kind: NonNullable<SessionView["lastExecution"]>; at: number }>,
 ): SessionView[] {
   try {
     const raw = data?.session?.list?.()
@@ -289,10 +290,12 @@ function listSessions(
     for (const item of raw) {
       const rec = item && typeof item === "object" ? (item as { id?: string }) : undefined
       const extra = rec?.id ? details.get(rec.id) : undefined
+      const execution = rec?.id ? executionBySession.get(rec.id) : undefined
       const view = asSessionView(item, extra, rec?.id
         ? {
             hostStatus: hostStatusOf(data, rec.id),
-            lastExecution: executionBySession.get(rec.id),
+            lastExecution: execution?.kind,
+            lastExecutionAt: execution?.at,
           }
         : undefined)
       if (view) out.push(view)
@@ -386,7 +389,7 @@ export default Plugin.define({
         fired: {},
         prev: new Map(),
       }
-      const executionBySession = new Map<string, NonNullable<SessionView["lastExecution"]>>()
+      const executionBySession = new Map<string, { kind: NonNullable<SessionView["lastExecution"]>; at: number }>()
       const detailCache = new Map<string, RowDetails>()
       const detailInflight = new Map<string, Promise<void>>()
       const selMap: Record<string, InspectSelection> = {}
@@ -505,8 +508,12 @@ export default Plugin.define({
           )
           const parsed = parseRunStatusResponse(raw)
           if (!parsed || gen !== authGen || parent !== currentParentID()) return
-          if (runID) extraSnaps = parsed
-          else liveSnaps = parsed
+          if (runID) {
+            // MERGE per run (a backfill batch fetches several): other runs'
+            // targeted snapshots survive, same-run results are replaced.
+            const others = extraSnaps.filter((s) => s.runID !== runID)
+            extraSnaps = [...others, ...parsed]
+          } else liveSnaps = parsed
           bump()
         } catch {
           // silent: keep session heuristics
@@ -537,10 +544,52 @@ export default Plugin.define({
       const scopedAuth = (sessions: SessionView[], nowTs: number) => {
         const known = new Set(groupRuns(sessions, nowTs).map((r) => r.runID))
         const scope = chipScopeFromContext(context)
+        void backfillMissing(known)
         return {
           live: filterSnapshotsForChip(liveSnaps, scope, known),
           persisted: filterSnapshotsForChip(extraSnaps, scope, known),
         }
+      }
+
+      /**
+       * Subagent-owned runs (parent = a build/plan child session) never appear
+       * in the session-scoped list RPC, so their tree rows render from session
+       * heuristics — which lie during same-session failover (observed
+       * 2026-09-24: "✗ failed / finished" while children worked). Fetch each
+       * heuristic-known run the snapshots do not cover, targeted (the
+       * explicit-runID RPC path is location-scoped only) and budgeted (3
+       * attempts per run, then one retry per minute). extraSnaps MERGES per
+       * run so several backfills coexist.
+       */
+      const backfillAttempts = new Map<string, { tries: number; lastAt: number }>()
+      let backfillInflight = false
+      const backfillMissing = (known: ReadonlySet<string>): void => {
+        if (disposed || backfillInflight) return
+        const have = new Set([...liveSnaps, ...extraSnaps].map((s) => s.runID))
+        const now = Date.now()
+        const missing = [...known].filter((runID) => !have.has(runID))
+        const batch = missing
+          .map((runID) => {
+            const state = backfillAttempts.get(runID) ?? { tries: 0, lastAt: 0 }
+            return { runID, state }
+          })
+          .filter(({ state }) => state.tries < 3 || now - state.lastAt > 60_000)
+          .slice(0, 3)
+        if (batch.length === 0) return
+        backfillInflight = true
+        void (async () => {
+          try {
+            for (const { runID, state } of batch) {
+              if (disposed) return
+              state.tries += 1
+              state.lastAt = now
+              backfillAttempts.set(runID, state)
+              await refreshAuth(runID)
+            }
+          } finally {
+            backfillInflight = false
+          }
+        })()
       }
 
       const blockedFromStore = (runs: readonly RunView[]): PendingPermissionView[] => {
@@ -852,7 +901,7 @@ export default Plugin.define({
         }
         const sessionID = eventSessionID(ev)
         const kind = executionKind(eventType(ev))
-        if (sessionID && kind) executionBySession.set(sessionID, kind)
+        if (sessionID && kind) executionBySession.set(sessionID, { kind, at: Date.now() })
         if (sessionID && eventType(ev) === "session.deleted") executionBySession.delete(sessionID)
         if (sessionID) {
           const decision = cacheDecision(detailCache.get(sessionID), { type: eventType(ev) ?? "session.created", sessionID })

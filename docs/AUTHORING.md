@@ -107,6 +107,14 @@ for warm reruns:
   reviewer with the `{pass, action, issues}` verdict schema; auto-checkpoints and aborts on fail —
   `onFail: "continue"` to tolerate), `checkpoint` (persist a ref), `workflow` (compose a saved
   workflow, `argsFrom` ref).
+- **Model + tier overrides:** `agent`, `fanout`, `merge` and `gate` nodes accept `agent`, `model`
+  and `tier` fields. `tier` selects a routing-policy tier for that node's child (needs plugin
+  `routing`; see `docs/MODEL-ROUTING.md`). The value is a literal tier name or exactly one
+  whole-string template ref — `tier: "{{plan.tier}}"` — resolved against a node defined earlier,
+  which makes it a data edge for wave scheduling just like a prompt interpolation; absent or
+  non-string evidence degrades to the agent's role default. A hint naming an undefined tier fails
+  (`unknown routing tier X`), and a hint naming an empty tier fails by design — configure the tier
+  or drop the field.
 - **Refs:** `"$scout.items"`, `"$args.angles"`, `"$lanes.length"` — a node's *primary value* is
   its `.data` when a schema was given, else its `.text`; fanout/merge primaries are arrays / joined
   text. Refs must flow forward (spec order is the topological order); back-references are
@@ -259,6 +267,7 @@ agent(prompt: string, opts?: {
   key?: string      // stable idempotency key -> warm-rerun replay (see below)
   retry?: { attempts?: number; backoffMs?: number }  // same-session burst continues
   fallbacks?: string[]  // per-call quota ladder (pin strings); beats modelFallbacks
+  tier?: string     // routing-policy tier for this child; needs plugin options.routing (docs/MODEL-ROUTING.md)
 }): Promise<{
   text: string      // concatenated text parts of the final assistant message
   sessionID: string

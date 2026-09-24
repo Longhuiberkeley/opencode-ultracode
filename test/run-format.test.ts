@@ -29,6 +29,7 @@ test("agentCells golden rows", () => {
     effectiveModel: { providerID: "openrouter", id: "kimi" },
     status: "running",
     tokens: TOKENS_42_6K,
+    contextTokens: 18_000,
     toolCalls: 4,
   }
   assert.deepEqual(agentCells(full), [
@@ -37,7 +38,7 @@ test("agentCells golden rows", () => {
     "extract",
     "explore",
     "openrouter/kimi",
-    "42.6k",
+    "18k",
     "4",
   ])
 
@@ -59,6 +60,47 @@ test("agentCells golden rows", () => {
     toolCalls: 0,
   }
   assert.deepEqual(agentCells(failed), ["failed", "a2 judge", "verify", "general", "-", "-", "0"])
+
+  // Provenance: a failed child that never ran shows the model it targeted;
+  // a drifted child names the spawn model; a literal child stays quiet.
+  const targeted: AgentRecord = {
+    id: "a4",
+    label: "literal",
+    phase: "implement",
+    requestedAgent: "general",
+    effectiveModel: null,
+    spawnModel: { providerID: "zai-coding-plan", id: "glm-5.3" },
+    status: "failed",
+  }
+  assert.deepEqual(agentCells(targeted), [
+    "failed",
+    "a4 literal",
+    "implement",
+    "general",
+    "zai-coding-plan/glm-5.3",
+    "-",
+    "-",
+  ])
+
+  const drifted: AgentRecord = {
+    id: "a5",
+    label: "routed",
+    phase: "verify",
+    requestedAgent: "reviewer",
+    effectiveModel: { providerID: "openai", id: "gpt-6-sol" },
+    spawnModel: { providerID: "xai", id: "grok-4.7" },
+    status: "succeeded",
+  }
+  assert.deepEqual(agentCells(drifted)[4], "openai/gpt-6-sol (spawn: xai/grok-4.7)")
+
+  const literal: AgentRecord = {
+    id: "a6",
+    requestedAgent: "general",
+    effectiveModel: { providerID: "zai-coding-plan", id: "glm-5.3" },
+    spawnModel: { providerID: "zai-coding-plan", id: "glm-5.3" },
+    status: "succeeded",
+  }
+  assert.deepEqual(agentCells(literal)[4], "zai-coding-plan/glm-5.3")
 })
 
 test("runHeaderCells golden rows", () => {

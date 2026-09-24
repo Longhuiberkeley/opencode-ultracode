@@ -33,8 +33,9 @@ export interface ScriptTemplate {
   script: string
 }
 
-/** Hard cap on a served body — the catalog returns these whole. */
-export const MAX_SCRIPT_TEMPLATE_CHARS = 12_000
+/** Hard cap on a served body — includes the research evidence/memory contract.
+ * All four current bodies together remain below the 64 KB result envelope. */
+export const MAX_SCRIPT_TEMPLATE_CHARS = 20_000
 
 const STAGED_DELIVERY = `// staged-delivery — sequential write stages, each gated by an independent
 // verifier with bounded fix rounds. One write agent at a time; a stage that
@@ -298,8 +299,8 @@ return {
 
 const KAGGLE_ML = `// kaggle-ml — refinement loop for ML/quant work: reflect, propose per-component
 // variations, SELECT <=3 full configs (never the cross product), run each in its
-// own artifacts dir, judge metrics from evidence, keep the best. Not grid search.
-// Tool input: { args: { goal: "best CV score", components: ["data", "features", "model"], metric: "cv", target: 0.9, evalCommand: "python eval.py", dataRoot: "/data", judge: "general", deadline: "2026-09-18T08:00:00", maxIterations: 8, agentsPerIteration: 12 } }
+// own artifacts dir, judge metrics from evidence, retain scores and learnings.
+// Tool input: { args: { goal: "best CV score", components: ["data", "features", "model"], metric: "cv", metricDirection: "max", target: 0.9, evalCommand: "python eval.py", dataRoot: "/data", judge: "general", deadline: "2026-09-18T08:00:00", maxIterations: 8, agentsPerIteration: 12 } }
 if (!args || typeof args.goal !== "string" || args.goal.trim() === "") {
   throw new Error("kaggle-ml: args.goal is required (what to optimize)")
 }
@@ -309,8 +310,14 @@ if (!Array.isArray(args.components) || args.components.length === 0) {
 const goal = args.goal.trim()
 const components = args.components.slice(0, 5).map(String)
 const metric = typeof args.metric === "string" && args.metric.trim() ? args.metric.trim() : "score"
+if (args.metricDirection !== undefined && args.metricDirection !== "min" && args.metricDirection !== "max") {
+  throw new Error("kaggle-ml: args.metricDirection must be min or max")
+}
+const minimize = args.metricDirection === "min"
+const better = function (a, b) { return minimize ? a < b : a > b }
 const target = Number(args.target)
-const hasTarget = Number.isFinite(target)
+const hasTarget = args.target !== null && args.target !== undefined && args.target !== "" && Number.isFinite(target)
+const targetText = hasTarget ? " (target " + (minimize ? "<= " : ">= ") + target + ")" : ""
 const evalCommand = typeof args.evalCommand === "string" && args.evalCommand.trim() ? args.evalCommand.trim() : ""
 const dataRoot = typeof args.dataRoot === "string" && args.dataRoot.trim() ? args.dataRoot.trim() : ""
 const judge = typeof args.judge === "string" && args.judge.trim() ? args.judge.trim() : "general"
@@ -323,36 +330,69 @@ const agentsPerIteration = Math.max(
   Math.min(Number.isFinite(Number(args.agentsPerIteration)) ? Math.floor(Number(args.agentsPerIteration)) : 12, 20)
 )
 
-const MPLAN = { type: "object", required: ["strategy", "components"], properties: { strategy: { type: "string" }, components: { type: "array", items: { type: "object", required: ["id", "focus"], properties: { id: { type: "string" }, focus: { type: "string" }, status: { type: "string", enum: ["active", "dropped", "new"] } } } } } }
+const MPLAN = { type: "object", required: ["strategy", "components", "formulations", "selectionReason", "baseline", "evaluation"], properties: { strategy: { type: "string" }, formulations: { type: "array", minItems: 1, maxItems: 5, items: { type: "string" } }, selectionReason: { type: "string" }, baseline: { type: "string" }, evaluation: { type: "string" }, components: { type: "array", items: { type: "object", required: ["id", "focus"], properties: { id: { type: "string" }, focus: { type: "string" }, status: { type: "string", enum: ["active", "dropped", "new"] } } } } } }
 const MIDEA = { type: "object", required: ["variations"], properties: { variations: { type: "array", items: { type: "object", required: ["idea", "rationale"], properties: { idea: { type: "string" }, rationale: { type: "string" } } } } } }
 const MSELECT = { type: "object", required: ["configs"], properties: { configs: { type: "array", items: { type: "object", required: ["id", "chosen", "why"], properties: { id: { type: "string" }, chosen: { type: "array", items: { type: "object", required: ["componentId", "variationId"], properties: { componentId: { type: "string" }, variationId: { type: "string" } } } }, why: { type: "string" } } } } } }
-const MBUILD = { type: "object", required: ["candidateId", "metrics", "evidence"], properties: { candidateId: { type: "string" }, metrics: { type: "object" }, evidence: { type: "object", required: ["command", "outputQuote"], properties: { command: { type: "string" }, exitCode: { type: "number" }, outputQuote: { type: "string" } } }, artifactsRef: { type: "string" } } }
-const MVERDICT = { type: "object", required: ["status", "metrics", "evidence"], properties: { status: { type: "string", enum: ["improve", "done", "blocked"] }, metrics: { type: "object" }, candidateId: { type: "string" }, evidence: { type: "object", required: ["command", "outputQuote"], properties: { command: { type: "string" }, exitCode: { type: "number" }, outputQuote: { type: "string" } } } } }
+const MEVIDENCE = { type: "object", required: ["command", "exitCode", "outputQuote"], properties: { command: { type: "string" }, exitCode: { type: "number" }, outputQuote: { type: "string" } } }
+const MBUILD = { type: "object", required: ["candidateId", "metrics", "evidence"], properties: { candidateId: { type: "string" }, metrics: { type: "object" }, evidence: MEVIDENCE, artifactsRef: { type: "string" } } }
+const MVERDICT = { type: "object", required: ["status", "candidateId", "metrics", "evidence"], properties: { status: { type: "string", enum: ["improve", "done", "blocked"] }, metrics: { type: "object" }, candidateId: { type: "string" }, learning: { type: "object", required: ["question", "finding", "nextDecision", "evidenceRef"], properties: { question: { type: "string" }, finding: { type: "string" }, nextDecision: { type: "string" }, evidenceRef: { type: "string" } } }, evidence: MEVIDENCE } }
+
+// Substantive progress is separate from growing bookkeeping state. Only the
+// independent judge can establish a score or an evidence-linked learning.
+let verifiedBest = null
+let stalled = 0
+const knowledge = []
+const seenLearning = {}
+const seenEvidence = {}
+const acceptVerdict = function (v) {
+  const verdict = v.verdict
+  if (!verdict || !verdict.evidence || verdict.evidence.exitCode !== 0 || !verdict.evidence.command.trim() || !verdict.evidence.outputQuote.trim()) return false
+  const candidate = ((v.result && v.result.candidates) || []).find(function (c) { return c.id === verdict.candidateId })
+  if (!candidate) return false
+  let progress = false
+  const value = verdict.metrics && verdict.metrics[metric]
+  if (typeof value === "number" && Number.isFinite(value) && (!verifiedBest || better(value, verifiedBest.metrics[metric]))) {
+    verifiedBest = Object.assign({}, candidate, { metrics: verdict.metrics, evidence: verdict.evidence })
+    progress = true
+  }
+  const learned = verdict.learning
+  if (learned && [learned.question, learned.finding, learned.nextDecision, learned.evidenceRef].every(function (x) { return typeof x === "string" && x.trim() })) {
+    const signature = [learned.question, learned.finding, learned.nextDecision].join("|").toLowerCase().trim()
+    if (learned.evidenceRef === candidate.artifactsRef && !seenLearning[signature] && !seenEvidence[learned.evidenceRef]) {
+      seenLearning[signature] = true
+      seenEvidence[learned.evidenceRef] = true
+      knowledge.push(learned)
+      progress = true
+    }
+  }
+  return progress
+}
 
 const summary = await loop({
   key: "kaggle-ml",
   goal: goal,
-  state: { plan: null, trials: [], best: null, rounds: [] },
+  state: { plan: null, trials: [], recent: [], best: null, rounds: [] },
   budget: {
     iterations: maxIterations,
     agentsPerIteration: agentsPerIteration,
     ...(typeof args.deadline === "string" && args.deadline ? { deadline: args.deadline } : {}),
   },
   stop: { predicate: function (v) {
-    if (!hasTarget || !v.verdict || !v.verdict.metrics) return false
-    const got = Number(v.verdict.metrics[metric])
-    return Number.isFinite(got) && got >= target ? "target" : false
+    stalled = acceptVerdict(v) ? 0 : stalled + 1
+    // A stall ends this runtime episode; it does not falsify the research idea.
+    return stalled >= 3 ? "stall" : false
   }, stallK: 3 },
   verdict: {
     agent: judge,
     schema: MVERDICT,
     prompt: function (c) {
       return "Judge ML round " + c.i + " for: " + goal +
-        ".\\nMetric: " + metric + (hasTarget ? " (target >= " + target + ")" : "") +
+        ".\\nMetric: " + metric + targetText + "; " + (minimize ? "minimize" : "maximize") +
         ".\\nRound result: " + JSON.stringify(c.result) +
         ".\\nBest metrics: " + JSON.stringify(c.state.best && c.state.best.metrics ? c.state.best.metrics : null) +
-        ".\\nRE-DERIVE the best candidate's metric: run the evaluation, quote the command and the number. status=done ONLY if your own re-derivation meets the target." +
-        ".\\nSet candidateId to the id of the round candidate you re-derived (see round result); metrics = YOUR numbers."
+        ".\\nRE-DERIVE a round candidate's metric: run the evaluation and report evidence {command, exitCode, outputQuote}. status=done ONLY if your own successful re-derivation meets the target." +
+        ".\\nSet candidateId to the exact round candidate id; metrics = YOUR numbers. If no candidate can be evaluated, use candidateId='', metrics={}, evidence with a nonzero exitCode and the actual limitation. No target means status=improve, unless blocked." +
+        ".\\nOptionally record learning {question, finding, nextDecision, evidenceRef}: inspect the candidate artifact, cite its artifactsRef exactly, and state the scoped new evidence and how it changes the next decision. A poor score alone is not a falsification. Repetition, new wording, or a new file path is not new knowledge."
     },
   },
 }, async function (ctx) {
@@ -372,27 +412,35 @@ const summary = await loop({
       }
     }
   }
-  const recent = trials.slice(-5).map(function (t) {
-    return { config: t.config, metric: t.metrics ? t.metrics[metric] : null, source: t.metricsSource || "runner", note: t.note }
-  })
+  const recent = (state.recent || []).slice(-6)
   const plan = (await agent(
-    "Improve: " + goal + ".\\nMetric: " + metric + (hasTarget ? " (target >= " + target + ")" : "") +
-    ".\\nKnown best: " + JSON.stringify(state.best && state.best.metrics ? state.best.metrics : null) +
+    "Improve: " + goal + ".\\nMetric: " + metric + targetText + "; " + (minimize ? "minimize" : "maximize") +
+    ".\\nRead-only planning: inspect prerequisites as needed, then return the formulation and evaluation plan. Candidate implementation and runs belong to the later execution phase." +
+    ".\\nInitial component suggestions (revisable): " + JSON.stringify(components) +
+    ".\\nIndependently verified best: " + JSON.stringify(verifiedBest) +
     ".\\nRecent trials: " + JSON.stringify(recent) +
+    ".\\nRecent runtime outcomes (including errors and refutations): " + JSON.stringify(ctx.history.slice(-3)) +
     ".\\nCurrent plan: " + JSON.stringify(state.plan) +
-    ".\\nRevise it from the evidence. Respond JSON: strategy, components [{id, focus, status}].",
+    ".\\nVerified learnings: " + JSON.stringify(knowledge.slice(-12)) +
+    ".\\nBefore proposing experiments, reason across the plausible formulations of this mission: component-based, joint or end-to-end when relevant. State assumptions, tradeoffs, a credible baseline and how evaluation can distinguish the alternatives. Breadth is proportional to uncertainty, not a fixed quota. A decomposition is a hypothesis, not an imposed architecture; a joint formulation may be one component. Reuse this reasoning until evidence warrants revision." +
+    ".\\nChoose the highest-value next investigation. Prioritize focus; activate only components needed for it, including coupled changes for one coherent hypothesis. Dropped means deprioritized, not falsified; budgets and weak results do not kill a whole approach. Respond JSON: strategy, formulations, selectionReason, baseline, evaluation, components [{id, focus, status}].",
     { schema: MPLAN, key: "kaggle-ml:i" + ctx.i + ":reflect", label: "reflect", phase: "kaggle-ml" }
   )).data || { strategy: "", components: components.map(function (id) { return { id: id, focus: "", status: "active" } }) }
 
-  const active = (plan.components || []).filter(function (c) { return c.status !== "dropped" }).slice(0, 4)
+  const active = (plan.components || []).filter(function (c) { return c.status !== "dropped" }).slice(0, Math.min(4, ctx.budgetLeft.agentsPerIteration - 3))
+  const candidateLimit = Math.min(3, ctx.budgetLeft.agentsPerIteration - 2 - active.length)
+  const incumbent = verifiedBest || state.best
   const variations = {}
   for (let vi = 0; vi < active.length; vi++) {
     const comp = active[vi]
     try {
       const idea = (await agent(
         "Propose 2-3 concrete variations for the '" + comp.id + "' component.\\nGoal: " + goal +
+        ".\\nRead-only ideation; return proposals for the later execution phase." +
         ".\\nComponent focus: " + String(comp.focus || "") +
+        ".\\nChosen formulation and evaluation: " + JSON.stringify(plan) +
         ".\\nHistory (do not repeat failures; exploit what helped): " + JSON.stringify(recent) +
+        ".\\nVerified learnings: " + JSON.stringify(knowledge.slice(-12)) +
         ".\\nRespond JSON: variations [{idea, rationale}].",
         { schema: MIDEA, key: "kaggle-ml:i" + ctx.i + ":var:" + String(comp.id).slice(0, 20), label: "variations:" + comp.id, phase: "kaggle-ml" }
       )).data
@@ -403,19 +451,20 @@ const summary = await loop({
   }
 
   const select = (await agent(
-    "Select AT MOST 3 full configs to run this round.\\nGoal: " + goal +
+    "Select AT MOST " + candidateLimit + " full configs to run this round.\\nGoal: " + goal +
+    ".\\nRead-only selection; return configurations without implementing them." +
     ".\\nPlan: " + JSON.stringify(plan) +
     ".\\nVariations per component: " + JSON.stringify(variations) +
-    ".\\nIncumbent best config: " + JSON.stringify(state.best ? state.best.config : null) +
-    ".\\nRules: NEVER enumerate combinations (no grid search). Carry the incumbent forward as one config, changing at most one component. " +
-    "Respond JSON: configs [{id, chosen: [{componentId, variationId}], why}] (<=3).",
+    ".\\nIncumbent best config: " + JSON.stringify(incumbent ? incumbent.config : null) +
+    ".\\nRules: NEVER enumerate the cross product. Establish the named baseline first. Each candidate tests one coherent hypothesis; coupled changes are allowed when the hypothesis requires them. Preserve the incumbent as a comparator with its artifact reference: " + JSON.stringify(incumbent && incumbent.artifactsRef) + ". " +
+    "Respond JSON: configs [{id, chosen: [{componentId, variationId}], why}].",
     { schema: MSELECT, key: "kaggle-ml:i" + ctx.i + ":select", label: "select", phase: "kaggle-ml" }
   )).data || { configs: [] }
   // Dedupe by chosen-variation signature.
   const seenSig = {}
   const configs = []
   const rawConfigs = Array.isArray(select.configs) ? select.configs : []
-  for (let sci = 0; sci < rawConfigs.length && configs.length < 3; sci++) {
+  for (let sci = 0; sci < rawConfigs.length && configs.length < candidateLimit; sci++) {
     const cfg = rawConfigs[sci]
     const sig = JSON.stringify((Array.isArray(cfg.chosen) ? cfg.chosen : []).map(function (c) { return String(c && c.componentId) + "=" + String(c && c.variationId) }).sort())
     if (seenSig[sig]) continue
@@ -434,9 +483,10 @@ const summary = await loop({
     return cleaned || fallback
   }
   const nextTrials = trials.slice()
+  const rejected = []
   for (let ci = 0; ci < configs.length; ci++) {
     const cfg = configs[ci]
-    const cfgId = sanitizeId(cfg.id, "c" + ctx.i + "-" + (ci + 1))
+    const cfgId = (ctx.i ? "r" + ctx.i + "-" : "") + sanitizeId(cfg.id, "c" + (ci + 1)) + "-" + ci
     const dir = baseDir + "/cand-" + cfgId
     // Resolve selector ids to actual ideas (the runner must know WHAT to build).
     const resolved = []
@@ -446,44 +496,68 @@ const summary = await loop({
       const pool = variations[String(pick.componentId)] || []
       let match = null
       for (let pi = 0; pi < pool.length; pi++) if (pool[pi].id === pick.variationId) match = pool[pi]
-      resolved.push({ componentId: String(pick.componentId), variationId: String(pick.variationId), idea: match ? match.idea : "(no matching proposal)" })
+      if (!match) {
+        rejected.push({ config: cfg, note: "unresolvable selection", reason: "unknown variation: " + pick.variationId })
+        break
+      }
+      resolved.push({ componentId: String(pick.componentId), variationId: String(pick.variationId), idea: match.idea })
     }
+    if (resolved.length !== chosen.length) continue
     const build = (await agent(
       "Run this ML configuration.\\nGoal: " + goal +
       ".\\nConfig: " + JSON.stringify(cfg) +
+      ".\\nBaseline, formulation, and evaluation contract: " + JSON.stringify(plan) +
+      ".\\nIncumbent comparator: " + JSON.stringify(incumbent) +
       ".\\nResolved variations (what each chosen component must implement): " + JSON.stringify(resolved) +
       ".\\nWork ONLY inside (create it): " + dir +
       (dataRoot ? ". Read data read-only from: " + dataRoot : "") +
-      (evalCommand ? ".\\nThen run exactly: " + evalCommand : ".\\nUse your own evaluation and cite the exact command you ran") +
+      (evalCommand ? ".\\nThen run exactly: " + evalCommand : ".\\nUse the plan's baseline evaluation, preserving data split, population, metric and budget across candidates; cite the exact command") +
+      ".\\nProbe data/measurement feasibility before expensive work. Preserve diagnostics including null or adverse results in the artifact. Failed measurement is inconclusive, not evidence against the whole formulation." +
       ".\\nRespond JSON: candidateId (exactly " + JSON.stringify(cfgId) + "), metrics (numbers keyed by name, include '" + metric + "'), evidence {command, exitCode, outputQuote (the line with the metric)}, artifactsRef.",
       { schema: MBUILD, key: "kaggle-ml:i" + ctx.i + ":run:" + cfgId, label: "run:" + cfgId, phase: "kaggle-ml" }
     )).data
     if (build) {
-      nextTrials.push({ round: ctx.i, config: cfg, metrics: build.metrics || {}, evidence: build.evidence || null, artifactsRef: build.artifactsRef || dir, note: build.candidateId || cfgId, metricsSource: "runner" })
+      nextTrials.push({ round: ctx.i, config: cfg, resolved: resolved, metrics: build.metrics || {}, evidence: build.evidence || null, artifactsRef: build.artifactsRef || dir, note: cfgId, metricsSource: "runner" })
     }
   }
 
-  const scored = nextTrials.filter(function (t) { return t.metrics && Number.isFinite(Number(t.metrics[metric])) })
-  scored.sort(function (a, b) { return Number(b.metrics[metric]) - Number(a.metrics[metric]) })
+  const scored = nextTrials.filter(function (t) { return t.evidence && t.evidence.exitCode === 0 && t.metrics && typeof t.metrics[metric] === "number" && Number.isFinite(t.metrics[metric]) })
+  scored.sort(function (a, b) { return minimize ? a.metrics[metric] - b.metrics[metric] : b.metrics[metric] - a.metrics[metric] })
   const kept = scored.length > 0 ? scored.slice(0, 5) : nextTrials.slice(-5)
   const best = scored.length > 0 ? scored[0] : state.best
   const rounds = (state.rounds || []).concat([{ r: ctx.i, configs: configs.length, best: best && best.metrics ? best.metrics[metric] : null }])
   return {
-    state: { plan: plan, variations: variations, trials: kept, best: best, rounds: rounds },
+    state: { plan: plan, variations: variations, trials: kept, recent: recent.concat(nextTrials.slice(trials.length), rejected).slice(-6), best: best, rounds: rounds },
     result: {
       configs: configs.length,
-      candidates: nextTrials.slice(trials.length).map(function (t) { return { id: t.note, metric: t.metrics ? t.metrics[metric] : null } }),
+      rejected: rejected,
+      candidates: nextTrials.slice(trials.length).map(function (t) { return { id: t.note, config: t.config, resolved: t.resolved, metric: t.metrics ? t.metrics[metric] : null, artifactsRef: t.artifactsRef, evidence: t.evidence } }),
       best: best && best.metrics ? best.metrics[metric] : null,
     },
   }
 })
 
+// Terminating verdicts bypass the stop predicate; fold the final verified result
+// too. A refuted termination is null and cannot promote a candidate here.
+acceptVerdict({ verdict: summary.lastVerdict, result: summary.lastResult })
+const finalVerdict = summary.lastVerdict
+const finalScore = finalVerdict && finalVerdict.metrics && finalVerdict.metrics[metric]
+const targetVerified = hasTarget && typeof finalScore === "number" && Number.isFinite(finalScore) &&
+  (minimize ? finalScore <= target : finalScore >= target) &&
+  finalVerdict.evidence && finalVerdict.evidence.exitCode === 0 && finalVerdict.evidence.command.trim() && finalVerdict.evidence.outputQuote.trim() &&
+  ((summary.lastResult && summary.lastResult.candidates) || []).some(function (c) { return c.id === finalVerdict.candidateId })
+const invalidTarget = summary.stopReason === "target" && !targetVerified
 return {
-  stopReason: summary.stopReason,
+  stopReason: invalidTarget ? "blocked" : summary.stopReason,
+  ...(invalidTarget ? { terminationIssue: "Judge termination did not establish the configured target on a round candidate" } : {}),
   iterations: summary.iterations,
   metric: metric,
-  best: summary.state && summary.state.best ? summary.state.best.metrics : null,
-  bestConfig: summary.state && summary.state.best ? summary.state.best.config : null,
+  best: verifiedBest ? verifiedBest.metrics : null,
+  bestConfig: verifiedBest ? verifiedBest.config : null,
+  bestResolved: verifiedBest ? verifiedBest.resolved : null,
+  bestArtifact: verifiedBest ? verifiedBest.artifactsRef : null,
+  recent: (summary.state && summary.state.recent) || [],
+  knowledge: knowledge.slice(-12),
   rounds: (summary.state && summary.state.rounds) || [],
   lastVerdict: summary.lastVerdict,
   spent: summary.spent,
@@ -514,8 +588,8 @@ export const SCRIPT_TEMPLATES: readonly ScriptTemplate[] = [
   {
     name: "kaggle-ml",
     description:
-      "Refinement loop for ML/quant work (loop() + verdict/skeptic): reflect on the plan, propose per-component variations, select ≤3 full configurations (never a cross product), run each in its own artifacts dir, judge metrics from verbatim evidence, keep the best. Stops on the target metric, deadline, or budgets. ~6 child calls per round.",
-    args: ["goal", "components", "metric", "target", "evalCommand", "dataRoot", "judge", "deadline", "maxIterations", "agentsPerIteration"],
+      "Research refinement with provisional formulations, a baseline evaluation, focused variations and ≤3 coherent configurations. Retains recent negatives and evidence-linked learnings separately from top scores; independent verdict/skeptic checks. Stops on target, substantive stall, deadline or budget. No SpecFlow dependency.",
+    args: ["goal", "components", "metric", "metricDirection", "target", "evalCommand", "dataRoot", "judge", "deadline", "maxIterations", "agentsPerIteration"],
     script: KAGGLE_ML,
   },
 ]

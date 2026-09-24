@@ -204,6 +204,30 @@ test("catalog: caps are echoed so the model can budget the run it is about to au
   })
 })
 
+test("catalog: caps carry the routing summary — hintable (non-empty) tiers and roles", () => {
+  const out = buildCatalog({
+    caps: {
+      concurrency: 8,
+      maxAgents: 200,
+      timeoutMs: 3_600_000,
+      maxLoopDepth: 2,
+      maxLoopIterations: 200,
+      routing: {
+        tiers: [
+          { name: "standard", models: 4 },
+          { name: "strong", models: 3 },
+        ],
+        roles: { general: "standard", reviewer: "strong" },
+      },
+    },
+  }) as Record<string, Json>
+  const caps = out["caps"] as Record<string, Json>
+  assert.deepEqual(caps["routing"], {
+    tiers: [{ name: "standard", models: 4 }, { name: "strong", models: 3 }],
+    roles: { general: "standard", reviewer: "strong" },
+  })
+})
+
 // ---------------------------------------------------------------------------
 // Detail view
 // ---------------------------------------------------------------------------

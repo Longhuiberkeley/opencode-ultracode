@@ -72,7 +72,7 @@ IS a dependency: the scheduler orders it, so a reader never runs beside its prod
 
 | Kind | What it does | Key fields |
 | --- | --- | --- |
-| `agent` | one child | `prompt`, `agent?`, `schema?`, `label?` |
+| `agent` | one child | `prompt`, `agent?`, `tier?`, `schema?`, `label?` |
 | `fanout` | one child per item of `over` | `over`, `prompt` with `{{item}}`, `max` (always set it) |
 | `partition` | split an inventory into token-budgeted lanes, no agent | `from`, `budgetTokens`, `tokensPerLine` |
 | `merge` | batched merge children over `from`, joined text | `from`, `prompt`, `batches` |
@@ -81,13 +81,11 @@ IS a dependency: the scheduler orders it, so a reader never runs beside its prod
 | `workflow` | compose a saved workflow, depth 1 | `name`, `argsFrom?` |
 
 What the compiler does for you: null-checking and a total-failure abort per fanout or merge,
-batching, lane partitioning with coverage by construction, `phase` and `label` bookkeeping,
-independent nodes grouped into `parallel()` waves, and an auto `key` on every call (`scout`,
-`review:3`, `report:b1`) so a warm rerun replays finished children instead of paying twice.
+batching, lane partitioning with coverage by construction, `phase`/`label` bookkeeping, independent
+nodes grouped into `parallel()` waves, and an auto `key` on every call (`scout`, `review:3`, `report:b1`) so a warm rerun replays finished children instead of paying twice.
 
 Start from a template (`ultracode_catalog { template: "partitioned-review" }`) and edit prompts,
-caps and schemas — that is cheaper and safer than inventing structure. Templates ship for
-partitioned review, research with independent verification, and draft fact-checking.
+caps and schemas — cheaper than inventing structure; ships for review, research, fact-checking.
 
 ## Complete graph example (runs as-is)
 
@@ -147,7 +145,7 @@ prompts and args, then run it inline or save it. Injected globals, nothing else:
 
 | Global | Call | Semantics |
 | --- | --- | --- |
-| `agent` | `agent(prompt, opts?)` | Spawns one subagent and waits. Resolves `{ text, sessionID, agent, model, tokens, data?, cachedFrom?, failover? }`. `opts`: `agent` (agent id), `model` (EXPLICIT override in the pin-string shape — only when the user asked for a model; beats pins and the run-level model), `label`, `phase`, `schema`, `key`. With `opts.schema`, extracted JSON lands in `.data`, validated and repaired through bounded retry (up to 2 correction prompts before the call fails). `opts.key` (stable id, e.g. `"lane:3"`) marks the call replayable: on a warm rerun (`resumeFrom`, or `/ultracode rerun <runID> --warm`) a succeeded call with the same key AND the same prompt+schema+agent+model digest returns from cache — no session, no cap hit. Key every deterministic call in a long run. Plan-quota children fail over automatically (same session, different provider) unless the user set failover off; `.failover` is present when the child finished on a different model than it was spawned on. |
+| `agent` | `agent(prompt, opts?)` | Spawns one subagent and waits. Resolves `{ text, sessionID, agent, model, tokens, data?, cachedFrom?, failover? }`. `opts`: `agent` (agent id), `model` (EXPLICIT override in the pin-string shape — only when the user asked for a model; beats pins and the run-level model), `tier` (routing hint, rule 4), `label`, `phase`, `schema`, `key`. With `opts.schema`, extracted JSON lands in `.data`, validated and repaired through bounded retry (up to 2 correction prompts before the call fails). `opts.key` (stable id, e.g. `"lane:3"`) marks the call replayable: on a warm rerun (`resumeFrom`, or `/ultracode rerun <runID> --warm`) a succeeded call with the same key AND the same prompt+schema+agent+model+tier digest returns from cache — no session, no cap hit. Key every deterministic call in a long run. Plan-quota children fail over automatically (same session, different provider) unless the user set failover off; `.failover` is present when the child finished on a different model than it was spawned on. |
 | `parallel` | `parallel(thunks)` | Barrier over thunks. A thunk that throws resolves as `null`; siblings still run. |
 | `pipeline` | `pipeline(items, ...stages)` | Runs every item through the stages in order. A failing item becomes `null`; other items are unaffected. |
 | `phase` | `phase(name)` | Sets the ambient phase label for progress grouping. |
@@ -162,7 +160,8 @@ prompts and args, then run it inline or save it. Injected globals, nothing else:
 | `meta` | `meta` | Your tool-input metadata: name, description, phases, requires. |
 
 Caps are project settings, not constants: `ultracode_catalog` reports the live concurrency, agent
-cap and timeout under `caps` (defaults: 8 concurrent agents, 200 agent calls per run, 60 minutes
+cap, timeout and — when routing is configured — the hintable tiers under `caps` (defaults: 8
+concurrent agents, 200 agent calls per run, 60 minutes
 wall clock; separately, scripts are hard-capped at 512 KB and results truncate after 64 KB by
 default). Budget the wall clock before anything else — waves × dependent stages × ~5-10 min per child
 must fit; prefer wide-not-deep. When a run legitimately needs longer, pass `timeoutMs` in the run
@@ -173,6 +172,8 @@ effective = min(loop budget, input); cap a template, never raise a budget).
 
 ## Loop mode (engine-owned iteration)
 
+`loop()` is a runtime loop; research loops and cycles describe domain methodology. Before a baseline,
+reason across plausible formulations; decomposition is revisable; each `agent()` is a fresh session.
 Hand-rolled `while` loops re-derive budget math, stall detection, verdict validation and resume
 keys every time — `loop(spec, iterate)` makes the engine own them:
 
@@ -217,6 +218,7 @@ const summary = await loop({
   `onIterationError: retry | record | abort`.
 - Served loop templates: `kanban` (ticket worklist) and `kaggle-ml` (metric-targeted refinement).
   Inspect with `ultracode_catalog { scriptTemplate: "kanban" }`.
+- Generic stall detection compares whole state; counters can mask a stall. `kaggle-ml` uses a substantive-progress predicate (verified scores or new evidence-linked learnings) and `metricDirection: "min" | "max"`.
 - Leftover work is a result shape, not a mechanism: loop templates return `remaining` — continue
   it in a follow-up run in the SAME conversation by passing it as the next run's `tickets`/`open`
   args. Cross-conversation campaign memory is deliberately unbuilt (docs/DESIGN-NOTES/reduce.md).
@@ -231,9 +233,14 @@ const summary = await loop({
 3. **Return small JSON.** A few keys: a report string, counts, verdicts. Bigger values come back
    as a truncated preview — recover the full value with `ultracode_result` (offset paging), never
    by guessing past the cut.
-4. **Route by agent, not by model — `opts.model` is the exception.** The user's pins decide each
-   agent's model; use `opts.model` (or run input `model`) ONLY when the user asked for one — an
-   override beats pins, but a provider the user disabled stays locked unless the run unlocks it.
+4. **Difficulty → `opts.tier`; model names → `opts.model`.** When catalog caps list routing tiers,
+   hint each step's shelf: mechanical extraction `lite` if listed; routine work no hint (role
+   default); judgment, review, merge `strong`; final calls and architecture `frontier` (rare; unsure
+   → lower shelf). Prefer evidence over vibes: give scout, plan and plan-review schemas a `tier` enum of
+   the listed tiers and interpolate it in later steps — graph `tier: "{{plan.tier}}"`, script
+   `{ tier: plan.data.tier }`. Before evidence exists your read is the prior; the user's difficulty
+   instructions always win. `opts.model` (or run input `model`) ONLY when the user asked for a
+   model — beats pins and tiers; a provider the user disabled stays locked.
 5. **Prompts are the entire world.** A child agent sees ONLY its prompt string, zero conversation
    context. Make every prompt self-contained: paths, pasted snippets, criteria, output format.
 6. **Serialize write agents.** A clean context is NOT filesystem isolation: two write agents
@@ -266,7 +273,7 @@ A 300k-token child is a lane that was too wide, not a model problem. Budget **in
 is the only unit comparable across the user's model rotation.
 
 1. **Scout before you fan out** — one cheap `explore` child returns an inventory (paths + line
-   counts). The orchestration, not the children, partitions it into lanes. A `partition` node
+   counts, plus a `tier` verdict — rule 4). The orchestration, not the children, partitions it into lanes. A `partition` node
    does this at ~35000 estimated tokens per lane (≈3-4k lines at ~10 tokens per line).
 2. **Arithmetic coverage assertion** — every inventoried file lands in ≥1 lane. Coverage comes
    from the map, not from each child reading everything.
@@ -349,10 +356,9 @@ return { research: research.stats, audit: audit.stats }
 
 Saved workflows (samples included) run only after the user approves them once via
 `/ultracode trust <name>`; editing the artifact later invalidates that approval. An unapproved
-call fails fast with that instruction — relay it to the user instead of retrying; after the user
-explicitly approves in chat you may record it with `ultracode_save { name, trust: true }`, and only
-when the orchestration is GENUINELY repeatable. Plan-authored files use the same gate after
-`ultracode_save { name }`.
+call fails fast with that instruction — relay it instead of retrying; after the user explicitly
+approves in chat you may record it with `ultracode_save { name, trust: true }`, but only when the
+orchestration is GENUINELY repeatable. Plan-authored files use the same gate after `ultracode_save { name }`.
 
 ## Complete script example
 
@@ -389,11 +395,10 @@ return { brief: report.text, verified: kept.length, examined: claims.length }
 ## Running, steering and stopping a run
 
 Runs are background by default so the user can keep chatting. When the run settles, a one-line
-notice lands in the parent session and wakes the calling agent (status, agents, result brief,
-stop reason). If the result exceeds the size cap, the notice and `ultracode_status` carry a
-preview and the total size — fetch the full value with `ultracode_result { runID, offset,
-maxLength }`; chunks are substrings of the compact JSON, so concatenate from offset 0 following
-`nextOffset`, then parse once.
+notice lands in the parent session and wakes the calling agent (status, agents, result brief, stop
+reason). If the result exceeds the size cap, the notice and `ultracode_status` carry a preview and
+the total size — fetch the full value with `ultracode_result { runID, offset, maxLength }`; chunks
+are substrings of the compact JSON — concatenate from offset 0 following `nextOffset`, then parse.
 
 - `ultracode_status { runID? }` — per-child detail (id, session, label, phase, status, tokens,
   tool calls, permission waits) and, once settled, the result itself or a bounded preview.
@@ -412,8 +417,7 @@ Never paste a workflow script into a generic JS or execute sandbox — `agent`, 
 inside `ultracode_run`; anywhere else they are undefined.
 
 This skill auto-attaches when `ultracode` appears as a standalone keyword anywhere in the prompt
-(`ultracode: audit the auth module`, `please ultracode this`). Paths like `opencode-ultracode` do
-not match; plain "use a workflow" does not auto-attach — the host may still select this skill.
+(`ultracode: audit the auth module`, `please ultracode this`); paths like `opencode-ultracode` do not match, and plain "use a workflow" does not auto-attach — the host may still select this skill.
 
 ## Coexistence with other skills
 

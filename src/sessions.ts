@@ -152,6 +152,8 @@ interface StructuredOutcome {
   text?: string
   model?: AgentResult["model"]
   tokens?: TokenUsage
+  /** Message-level usage of the repair turn's request, when available. */
+  requestTokens?: TokenUsage
 }
 
 // ---------------------------------------------------------------------------
@@ -279,6 +281,9 @@ export function createSessionDriver(sessions: SessionCtx, options: SessionDriver
       agent: first.message?.agent,
       model: first.message?.model ?? null,
       tokens: info.tokens ?? first.message?.tokens,
+      // Message-level usage = THIS request's context (statusline-style
+      // current-request metric), distinct from session-cumulative `tokens`.
+      requestTokens: first.message?.tokens,
     }
 
     // Schema mode: tolerant extraction + validate + BOUNDED repair rounds.
@@ -291,6 +296,7 @@ export function createSessionDriver(sessions: SessionCtx, options: SessionDriver
         result.text = structured.text ?? first.text
         result.model = structured.model ?? null
         result.tokens = structured.tokens
+        result.requestTokens = structured.requestTokens
       }
     }
     return result
@@ -429,6 +435,7 @@ export function createSessionDriver(sessions: SessionCtx, options: SessionDriver
             text: reply.text,
             model: reply.message?.model ?? null,
             tokens: info.tokens ?? reply.message?.tokens,
+            requestTokens: reply.message?.tokens,
           }
         }
         problem = check.error

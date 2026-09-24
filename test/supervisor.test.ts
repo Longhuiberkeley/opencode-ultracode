@@ -8,6 +8,7 @@ import { mkdtemp, readdir, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { SupervisorImpl } from "../src/supervisor.ts"
+import { parseModelRouting } from "../src/model-routing.ts"
 import { RegistryImpl } from "../src/registry.ts"
 import type { Json, ParentContext, RunRecord, SessionCtx, UltracodeOptions } from "../src/types.ts"
 import { DEFAULT_OPTIONS } from "../src/types.ts"
@@ -273,6 +274,22 @@ test("supervisor: per-call opts.fallbacks are admitted and win; invalid pins fai
   assert.equal(outcome.envelope.status, "failed")
   assert.match(outcome.envelope.error ?? "", /opts\.fallbacks/)
   assert.equal(bad.sessions.sessions.size, 0, "admission rejects the call before any session is created")
+})
+
+test("supervisor: a routing failure still reports its reason into the run log", async () => {
+  const routing = parseModelRouting({
+    timezone: "UTC",
+    roles: { general: "a" },
+    allowUnknownQuota: false,
+    tiers: { a: { plans: [[{ model: "p/x", reservePercent: 50 }]], payg: [] } },
+  })
+  const ctx = makeSupervisor({ routing })
+  const outcome = await ctx.supervisor.start({ script: `await agent("q"); return 1;` }, ctx.parent)
+  assert.equal(outcome.envelope.status, "failed")
+  assert.ok(
+    ctx.reports.some((r) => r.includes("routing general FAILED: no eligible a model")),
+    `expected a failed-routing report, got: ${ctx.reports.join(" / ")}`,
+  )
 })
 
 test("supervisor: invalid script rejected before any run is created", async () => {

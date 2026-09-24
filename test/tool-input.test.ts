@@ -226,6 +226,13 @@ test("status tool input: omitted, runID, extras, wrong types", () => {
   assert.deepEqual(validateStatusToolInput(null), { ok: true })
   assert.deepEqual(validateStatusToolInput({}), { ok: true })
   assert.deepEqual(validateStatusToolInput({ runID: "run_abc" }), { ok: true, runID: "run_abc" })
+  assert.deepEqual(validateStatusToolInput({ runID: "run_abc", waitMs: 15_000 }), { ok: true, runID: "run_abc", waitMs: 15_000 })
+  assert.deepEqual(validateStatusToolInput({ waitMs: 5_000 }), { ok: true, waitMs: 5_000 })
+  for (const bad of [500, 60_001, Number.NaN, "1000", null]) {
+    const res = validateStatusToolInput({ waitMs: bad })
+    assert.equal(res.ok, false, `waitMs ${String(bad)} should be rejected`)
+    if (!res.ok) assert.match(res.error, /"waitMs" must be a number between 1000 and 60000/)
+  }
   const extra = validateStatusToolInput({ runID: "run_abc", extra: 1 })
   assert.equal(extra.ok, false)
   if (!extra.ok) assert.match(extra.error, /unexpected key "extra"/)

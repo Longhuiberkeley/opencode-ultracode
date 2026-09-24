@@ -90,6 +90,7 @@ test("script templates: fail fast on missing or degenerate args, spawning nothin
     ["kanban", { tickets: [] }, /args\.tickets must be a non-empty array/],
     ["kaggle-ml", undefined, /args\.goal is required/],
     ["kaggle-ml", { goal: "x" }, /args\.components must be a non-empty array/],
+    ["kaggle-ml", { goal: "x", components: ["model"], metricDirection: "lower_is_better" }, /args\.metricDirection must be min or max/],
   ]
   for (const [name, args, pattern] of cases) {
     const ctx = makeSupervisor()
@@ -429,15 +430,22 @@ test("kanban: a failed review spawns a follow-up ticket that gets processed", as
   assert.equal(result.reviewPassed, 1, "only the follow-up passed review")
 })
 
+const mlFormulation = {
+  formulations: ["component baseline", "joint end-to-end model"],
+  selectionReason: "Start with the cheaper baseline; compare the joint approach if interactions limit it",
+  baseline: "fixed split baseline",
+  evaluation: "python eval.py on the same held-out population",
+}
+
 test("kaggle-ml: one round meeting the target stops with target after skeptic verification", async () => {
   const ctx = makeSupervisor()
   ctx.sessions
-    .push({ text: JSON.stringify({ strategy: "stack", components: [{ id: "data", focus: "clean", status: "active" }, { id: "model", focus: "gbdt", status: "active" }] }), agent: "general" })
+    .push({ text: JSON.stringify({ ...mlFormulation, strategy: "stack", components: [{ id: "data", focus: "clean", status: "active" }, { id: "model", focus: "gbdt", status: "active" }] }), agent: "general" })
     .push({ text: JSON.stringify({ variations: [{ idea: "winsorize", rationale: "outliers", expectedDelta: 0.01 }] }), agent: "general" })
     .push({ text: JSON.stringify({ variations: [{ idea: "hist-gbdt", rationale: "tabular", expectedDelta: 0.02 }] }), agent: "general" })
-    .push({ text: JSON.stringify({ configs: [{ id: "c1", chosen: [{ componentId: "data", variationId: "winsorize" }, { componentId: "model", variationId: "hist-gbdt" }], why: "one change from incumbent" }] }), agent: "general" })
-    .push({ text: JSON.stringify({ candidateId: "c1", metrics: { cv: 0.95 }, evidence: { command: "python eval.py", exitCode: 0, outputQuote: "cv=0.95" }, artifactsRef: "cand-c1" }), agent: "general" })
-    .push({ text: JSON.stringify({ status: "done", metrics: { cv: 0.95 }, insight: { componentDelta: [], nextHints: [] }, evidence: { command: "python eval.py", exitCode: 0, outputQuote: "cv=0.95" } }), agent: "general" })
+    .push({ text: JSON.stringify({ configs: [{ id: "c1", chosen: [{ componentId: "data", variationId: "data-v1" }, { componentId: "model", variationId: "model-v1" }], why: "one coherent coupled hypothesis" }] }), agent: "general" })
+    .push({ text: JSON.stringify({ candidateId: "c1-0", metrics: { cv: 0.95 }, evidence: { command: "python eval.py", exitCode: 0, outputQuote: "cv=0.95" }, artifactsRef: "cand-c1" }), agent: "general" })
+    .push({ text: JSON.stringify({ status: "done", candidateId: "c1-0", metrics: { cv: 0.95 }, evidence: { command: "python eval.py", exitCode: 0, outputQuote: "cv=0.95" } }), agent: "general" })
     .push({ text: JSON.stringify({ verified: true, reason: "re-ran eval.py: cv=0.95" }), agent: "general" })
   const outcome = await ctx.supervisor.start(
     {
@@ -447,17 +455,19 @@ test("kaggle-ml: one round meeting the target stops with target after skeptic ve
     ctx.parent,
   )
   assert.equal(outcome.envelope.status, "succeeded", outcome.envelope.error ?? "run failed")
-  const result = outcome.envelope.result as { stopReason: string; iterations: number; best: { cv: number } | null }
+  const result = outcome.envelope.result as { stopReason: string; iterations: number; best: { cv: number } | null; bestArtifact: string; bestResolved: Array<{ idea: string }> }
   assert.equal(result.stopReason, "target")
   assert.equal(result.iterations, 1)
   assert.equal(result.best?.cv, 0.95)
+  assert.equal(result.bestArtifact, "cand-c1")
+  assert.deepEqual(result.bestResolved.map((v) => v.idea), ["winsorize", "hist-gbdt"], "best configuration remains interpretable beyond ephemeral proposal IDs")
   const keys = outcome.run.agents.map((a) => a.key)
   assert.deepEqual(keys, [
     "kaggle-ml:i0:reflect",
     "kaggle-ml:i0:var:data",
     "kaggle-ml:i0:var:model",
     "kaggle-ml:i0:select",
-    "kaggle-ml:i0:run:c1",
+    "kaggle-ml:i0:run:c1-0",
     "kaggle-ml:i0:verdict",
     "kaggle-ml:i0:skeptic",
   ])
@@ -501,10 +511,10 @@ test("kanban: explicit deps gate readiness across tickets", async () => {
 
 test("kaggle-ml: a round with zero selected configs still judges and continues", async () => {
   const ctx = makeSupervisor()
-  const reflect = { text: JSON.stringify({ strategy: "explore", components: [{ id: "data", focus: "clean", status: "active" }, { id: "model", focus: "gbdt", status: "active" }] }), agent: "general" }
+  const reflect = { text: JSON.stringify({ ...mlFormulation, strategy: "explore", components: [{ id: "data", focus: "clean", status: "active" }, { id: "model", focus: "gbdt", status: "active" }] }), agent: "general" }
   const ideas = { text: JSON.stringify({ variations: [{ idea: "x", rationale: "y", expectedDelta: 0.01 }] }), agent: "general" }
   const empty = { text: JSON.stringify({ configs: [] }), agent: "general" }
-  const judge = { text: JSON.stringify({ status: "improve", metrics: { cv: 0.8 }, insight: { componentDelta: [], nextHints: ["try more"] }, evidence: { command: "python eval.py", exitCode: 0, outputQuote: "cv=0.8" } }), agent: "general" }
+  const judge = { text: JSON.stringify({ status: "improve", candidateId: "", metrics: {}, evidence: { command: "", exitCode: -1, outputQuote: "No selected candidates" } }), agent: "general" }
   for (let round = 0; round < 2; round++) {
     ctx.sessions.push(reflect).push(ideas).push(ideas).push(empty).push(judge)
   }
@@ -527,7 +537,7 @@ test("kaggle-ml: a storage without runDirFor fails structurally before any runne
   const ctx = makeSupervisor()
   ;(ctx.storage as unknown as { runDirFor?: undefined }).runDirFor = undefined
   ctx.sessions
-    .push({ text: JSON.stringify({ strategy: "s", components: [{ id: "data", focus: "f", status: "active" }, { id: "model", focus: "f", status: "active" }] }), agent: "general" })
+    .push({ text: JSON.stringify({ ...mlFormulation, strategy: "s", components: [{ id: "data", focus: "f", status: "active" }, { id: "model", focus: "f", status: "active" }] }), agent: "general" })
     .push({ text: JSON.stringify({ variations: [{ idea: "x", rationale: "y" }] }), agent: "general" })
     .push({ text: JSON.stringify({ variations: [{ idea: "x", rationale: "y" }] }), agent: "general" })
     .push({ text: JSON.stringify({ configs: [{ id: "c1", chosen: [{ componentId: "data", variationId: "data-v1" }, { componentId: "model", variationId: "model-v1" }], why: "w" }] }), agent: "general" })
@@ -545,4 +555,131 @@ test("kaggle-ml: a storage without runDirFor fails structurally before any runne
     0,
     "structural failure happens before any runner spawns",
   )
+})
+
+function pushResearchRound(ctx: ReturnType<typeof makeSupervisor>, round: number, score: number, options: {
+  learning?: { question: string; finding: string; nextDecision: string; evidenceRef: string }
+  exitCode?: number
+} = {}) {
+  const id = (round ? `r${round}-` : "") + "c-0"
+  const evidence = { command: "python eval.py", exitCode: options.exitCode ?? 0, outputQuote: `score=${score}` }
+  const reply = (data: unknown) => ({ text: JSON.stringify(data), agent: "general" })
+  ctx.sessions
+    .push(reply({ ...mlFormulation, strategy: "investigate joint formulation", components: [{ id: "joint", focus: "test interactions", status: "active" }] }))
+    .push(reply({ variations: [{ idea: `joint variant ${round}`, rationale: "one coherent hypothesis" }] }))
+    .push(reply({ configs: [{ id: "c", chosen: [{ componentId: "joint", variationId: "joint-v1" }], why: "compare against baseline" }] }))
+    .push(reply({ candidateId: id, metrics: { score }, evidence, artifactsRef: `artifact-${round}` }))
+    .push(reply({ status: "improve", candidateId: id, metrics: { score }, evidence, ...(options.learning ? { learning: options.learning } : {}) }))
+}
+
+test("kaggle-ml: bookkeeping growth and worse scores do not mask a substantive stall", async () => {
+  const ctx = makeSupervisor()
+  for (let i = 0; i < 4; i++) pushResearchRound(ctx, i, 1 - i * 0.1)
+  const outcome = await ctx.supervisor.start({ script: scriptTemplate("kaggle-ml")!.script,
+    args: { goal: "improve", components: ["features", "model"], maxIterations: 8 } as never }, ctx.parent)
+  assert.equal(outcome.envelope.status, "succeeded", outcome.envelope.error ?? "run failed")
+  const result = outcome.envelope.result as { stopReason: string; iterations: number; best: { score: number }; recent: Array<{ resolved: Array<{ idea: string }> }> }
+  assert.equal(result.stopReason, "stall")
+  assert.equal(result.iterations, 4)
+  assert.equal(result.best.score, 1)
+  assert.equal(result.recent.at(-1)?.resolved[0]?.idea, "joint variant 3", "negative result survives separately from the winner")
+})
+
+test("kaggle-ml: evidence-linked negative learning permits focus; repetition does not", async () => {
+  const ctx = makeSupervisor()
+  pushResearchRound(ctx, 0, 1)
+  for (let i = 1; i < 5; i++) pushResearchRound(ctx, i, 0.5, { learning: {
+    question: "Can this instrument distinguish size effects?", finding: "Fill path ignores size", nextDecision: "Deprioritize sizing; repair the instrument", evidenceRef: `artifact-${i}`,
+  } })
+  const outcome = await ctx.supervisor.start({ script: scriptTemplate("kaggle-ml")!.script,
+    args: { goal: "improve", components: ["sizing"], maxIterations: 8 } as never }, ctx.parent)
+  assert.equal(outcome.envelope.status, "succeeded", outcome.envelope.error ?? "run failed")
+  const result = outcome.envelope.result as { stopReason: string; iterations: number; knowledge: unknown[] }
+  assert.equal(result.stopReason, "stall")
+  assert.equal(result.iterations, 5, "first useful negative earns continuation, repeated claim at new paths does not")
+  assert.equal(result.knowledge.length, 1)
+})
+
+test("kaggle-ml: invalid measurement cannot promote a score or learning", async () => {
+  const ctx = makeSupervisor()
+  for (let i = 0; i < 3; i++) pushResearchRound(ctx, i, 10 + i, { exitCode: 1, learning: {
+    question: `q${i}`, finding: `f${i}`, nextDecision: `d${i}`, evidenceRef: `artifact-${i}`,
+  } })
+  const outcome = await ctx.supervisor.start({ script: scriptTemplate("kaggle-ml")!.script,
+    args: { goal: "improve", components: ["data"], maxIterations: 8 } as never }, ctx.parent)
+  assert.equal(outcome.envelope.status, "succeeded", outcome.envelope.error ?? "run failed")
+  const result = outcome.envelope.result as { stopReason: string; best: unknown; knowledge: unknown[] }
+  assert.equal(result.stopReason, "stall")
+  assert.equal(result.best, null)
+  assert.deepEqual(result.knowledge, [])
+})
+
+test("kaggle-ml: minimization retains the lower independently verified score", async () => {
+  const ctx = makeSupervisor()
+  pushResearchRound(ctx, 0, 0.4)
+  pushResearchRound(ctx, 1, 0.2)
+  const outcome = await ctx.supervisor.start({ script: scriptTemplate("kaggle-ml")!.script,
+    args: { goal: "reduce loss", components: ["model"], metricDirection: "min", maxIterations: 2 } as never }, ctx.parent)
+  assert.equal(outcome.envelope.status, "succeeded", outcome.envelope.error ?? "run failed")
+  const result = outcome.envelope.result as { best: { score: number }; bestConfig: { id: string } }
+  assert.equal(result.best.score, 0.2)
+})
+
+for (const missing of ["candidateId", "exitCode"] as const) {
+  test(`kaggle-ml: missing judge ${missing} is schema-repaired instead of a false stall`, async () => {
+    const ctx = makeSupervisor()
+    pushResearchRound(ctx, 0, 0.8)
+    const valid = ctx.sessions.replies.pop()!
+    const data = JSON.parse(valid.text!)
+    if (missing === "exitCode") delete data.evidence.exitCode
+    else delete data.candidateId
+    ctx.sessions.push({ text: JSON.stringify(data), agent: "general" }).push(valid)
+    const outcome = await ctx.supervisor.start({ script: scriptTemplate("kaggle-ml")!.script,
+      args: { goal: "improve", components: ["joint"], maxIterations: 1 } as never }, ctx.parent)
+    assert.equal(outcome.envelope.status, "succeeded", outcome.envelope.error ?? "run failed")
+    assert.equal((outcome.envelope.result as { best: { score: number } }).best.score, 0.8)
+    assert.ok([...ctx.sessions.sessions.values()].some((s) => s.prompts === 2), "judge received a repair prompt")
+  })
+}
+
+test("kaggle-ml: an invalid selection preserves the other candidate and its evidence", async () => {
+  const ctx = makeSupervisor()
+  pushResearchRound(ctx, 0, 0.8)
+  const selection = JSON.parse(ctx.sessions.replies[2]!.text!)
+  selection.configs.push({ id: "bad", chosen: [{ componentId: "joint", variationId: "missing" }], why: "bad reference" })
+  ctx.sessions.replies[2]!.text = JSON.stringify(selection)
+  const outcome = await ctx.supervisor.start({ script: scriptTemplate("kaggle-ml")!.script,
+    args: { goal: "improve", components: ["joint"], maxIterations: 1 } as never }, ctx.parent)
+  assert.equal(outcome.envelope.status, "succeeded", outcome.envelope.error ?? "run failed")
+  const result = outcome.envelope.result as { iterations: number; best: { score: number }; recent: Array<{ reason?: string }> }
+  assert.equal(result.iterations, 1)
+  assert.equal(result.best.score, 0.8)
+  assert.ok(result.recent.some((r) => r.reason?.includes("unknown variation")))
+  assert.equal(outcome.run.agents.filter((a) => a.label?.startsWith("run:")).length, 1)
+})
+
+test("kaggle-ml: minimum iteration budget still completes an investigation", async () => {
+  const ctx = makeSupervisor()
+  pushResearchRound(ctx, 0, 0.8)
+  const outcome = await ctx.supervisor.start({ script: scriptTemplate("kaggle-ml")!.script,
+    args: { goal: "improve", components: ["joint"], maxIterations: 1, agentsPerIteration: 6 } as never }, ctx.parent)
+  assert.equal(outcome.envelope.status, "succeeded", outcome.envelope.error ?? "run failed")
+  assert.equal((outcome.envelope.result as { best: { score: number } }).best.score, 0.8)
+  assert.equal(outcome.envelope.agents.total, 5)
+})
+
+test("kaggle-ml: agreement of judge and skeptic cannot override the numerical target", async () => {
+  const ctx = makeSupervisor()
+  pushResearchRound(ctx, 0, 0.8)
+  const judge = JSON.parse(ctx.sessions.replies.at(-1)!.text!)
+  judge.status = "done"
+  ctx.sessions.replies.at(-1)!.text = JSON.stringify(judge)
+  ctx.sessions.push({ text: JSON.stringify({ verified: true }), agent: "general" })
+  const outcome = await ctx.supervisor.start({ script: scriptTemplate("kaggle-ml")!.script,
+    args: { goal: "improve", components: ["joint"], target: 0.9, maxIterations: 1 } as never }, ctx.parent)
+  assert.equal(outcome.envelope.status, "succeeded", outcome.envelope.error ?? "run failed")
+  const result = outcome.envelope.result as { stopReason: string; terminationIssue: string; best: { score: number } }
+  assert.equal(result.stopReason, "blocked")
+  assert.match(result.terminationIssue, /did not establish/)
+  assert.equal(result.best.score, 0.8)
 })

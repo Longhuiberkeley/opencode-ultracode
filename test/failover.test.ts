@@ -249,3 +249,45 @@ test("isReadOnlyChild: noEditTools mode or the explore agent", () => {
   assert.equal(isReadOnlyChild("autoEditsWorkflow", "build"), false)
   assert.equal(isReadOnlyChild(undefined, "general"), false)
 })
+
+test("resolveFallbacks: preferAgent promotes the child's own agent pin to the front of the pin rung", () => {
+  // The incident shape: a reviewer child dying on an explicit glm pin must
+  // fail over onto the REVIEWER pin (its own shelf), not silently inherit
+  // general's pin because it is listed first.
+  const pinPool: PinPoolEntry[] = [
+    { agentID: "data-processor", pin: "xiaomi/mimo-v2.6-flash" },
+    { agentID: "general", pin: "openai/gpt-6-luna#max" },
+    { agentID: "reviewer", pin: "openai/gpt-6-sol#high" },
+    { agentID: "sanity", pin: "xiaomi/mimo-v2.6-pro" },
+  ]
+  const dead = { providerID: "zai-coding-plan", id: "glm-5.3" }
+  const promoted = resolveFallbacks({ dead, failureClass: "quota", pinPool, preferAgent: "reviewer", readOnly: false })
+  assert.deepEqual(models(promoted), [
+    "openai/gpt-6-sol#high", // reviewer's OWN pin first
+    "xiaomi/mimo-v2.6-flash",
+    "openai/gpt-6-luna#max",
+    "xiaomi/mimo-v2.6-pro",
+  ])
+  assert.equal(promoted[0]!.agentID, "reviewer")
+  assert.equal(promoted[0]!.pin, "openai/gpt-6-sol#high")
+
+  // Without preferAgent the configured order is preserved (stable).
+  const plain = resolveFallbacks({ dead, failureClass: "quota", pinPool, readOnly: false })
+  assert.deepEqual(models(plain), [
+    "xiaomi/mimo-v2.6-flash",
+    "openai/gpt-6-luna#max",
+    "openai/gpt-6-sol#high",
+    "xiaomi/mimo-v2.6-pro",
+  ])
+
+  // Explicit rungs stay ABOVE the pin rung regardless of preferAgent.
+  const withRungs = resolveFallbacks({
+    dead,
+    failureClass: "quota",
+    callFallbacks: ["openai/gpt-6#high"],
+    pinPool,
+    preferAgent: "reviewer",
+    readOnly: false,
+  })
+  assert.deepEqual(models(withRungs).slice(0, 2), ["openai/gpt-6#high", "openai/gpt-6-sol#high"])
+})
