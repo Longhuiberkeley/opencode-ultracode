@@ -75,6 +75,35 @@ const RUN_ID_RE = /^[\w][\w.-]{0,127}$/
 const MANIFEST_VERSION = 1
 /** Safety cap for KV scan cursor loops. */
 const MAX_SCAN_PAGES = 1000
+/** Refresh-if-stale TTL for the panel/command run inventory (KV scan pacing). */
+export const RUNS_SCAN_TTL_MS = 4_000
+
+/** The slice of the storage surface refreshRunsIfStale needs. */
+export interface RunsCacheSource {
+  /** Async KV warm-up: re-scan the runs prefix and refresh the cache. */
+  loadRunsAsync?(): Promise<ReadonlyArray<RunRecord>>
+  /** Epoch ms of the last runs KV scan; 0 when never scanned. */
+  lastScanAt?(): number
+}
+
+/**
+ * Refresh the persisted runs cache when its last KV scan is older than `ttlMs`
+ * (default RUNS_SCAN_TTL_MS). A process that does not OWN a run only ever sees
+ * it through this cache, so a once-at-startup load leaves remote runs frozen at
+ * their admission-time snapshot. Returns true when a scan ran; sources without
+ * an async scan (test doubles, older hosts) are a no-op.
+ */
+export async function refreshRunsIfStale(
+  source: RunsCacheSource,
+  ttlMs: number = RUNS_SCAN_TTL_MS,
+  now: number = Date.now(),
+): Promise<boolean> {
+  if (typeof source.loadRunsAsync !== "function") return false
+  const last = typeof source.lastScanAt === "function" ? source.lastScanAt() : 0
+  if (last !== 0 && now - last < ttlMs) return false
+  await source.loadRunsAsync()
+  return true
+}
 
 /** Normalize a path with FakeFs.normalize semantics (".." pops, "." dropped). */
 export function normalizePath(path: string): string {
@@ -265,6 +294,8 @@ export class StorageImpl implements Storage {
   private readonly settingsKey: string
   private settingsCache: SettingsOverlayLike | undefined
   private runsCache: RunRecord[] = []
+  /** Epoch ms of the last runs KV scan (0 before the first). */
+  private lastScanAtMs = 0
   private persistFailures = 0
   private scanFailures = 0
   private lastPersistError: string | undefined
@@ -331,15 +362,29 @@ export class StorageImpl implements Storage {
     }
   }
 
+  /** Epoch ms of the last KV scan for run snapshots (0 before the first). */
+  lastScanAt(): number {
+    return this.lastScanAtMs
+  }
+
   /** Scan the KV (following `next` cursors) and refresh the run cache. */
   async loadRunsAsync(): Promise<RunRecord[]> {
     const entries = await this.scanAll(this.runsPrefix + "/")
+    this.lastScanAtMs = Date.now()
     const byID = new Map<string, RunRecord>()
     // Newest persisted state wins; seed with anything already cached (fresh saves).
     for (const record of this.runsCache) byID.set(record.id, record)
     for (const entry of entries) {
       const record = parseRunRecord(entry.value)
-      if (record) byID.set(record.id, record)
+      if (!record) continue
+      const cached = byID.get(record.id)
+      // Newest-write wins (owner.updatedAt, else startedAt) so a re-scan can
+      // neither clobber a fresher local save nor resurrect a terminal status
+      // from a stale read. An exact tie keeps the CACHED record — the scanned
+      // KV entry replaces only when strictly newer, so a same-millisecond
+      // stale running snapshot can never overwrite a locally known terminal
+      // state.
+      if (cached === undefined || runFreshness(record) > runFreshness(cached)) byID.set(record.id, record)
     }
     this.runsCache = [...byID.values()].sort((a, b) => a.startedAt - b.startedAt)
     return [...this.runsCache]
@@ -1000,6 +1045,15 @@ function parseRunRecord(value: unknown): RunRecord | undefined {
     ...(v as unknown as RunRecord),
     agents: Array.isArray(v["agents"]) ? (v["agents"] as RunRecord["agents"]) : [],
   }
+}
+
+/**
+ * Newest-write stamp for the runs-cache merge: the owning process stamps
+ * `owner.updatedAt` on every persist; owner-less legacy records fall back to
+ * their start time.
+ */
+function runFreshness(record: RunRecord): number {
+  return record.owner?.updatedAt ?? record.startedAt
 }
 
 function throwMismatch(name: string, manifestName: string): never {

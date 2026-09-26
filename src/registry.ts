@@ -23,6 +23,13 @@ export interface RegistryInit {
   now?: () => number
   /** Runtime identity stamped on persisted records and registered until dispose. */
   bootID?: string
+  /**
+   * Machine-wide liveness probe for remote owner boots (owner-liveness
+   * markers). Absent ⇒ legacy semantics: any different-boot owner counts as
+   * dead at reconcile ("flip on restart"). Present ⇒ a boot with a live
+   * marker keeps its runs running in this registry's view.
+   */
+  ownerAlive?: (bootID: string) => boolean
 }
 
 const FINAL_STATUSES: ReadonlySet<string> = new Set(["succeeded", "failed", "stopped", "interrupted"])
@@ -58,6 +65,13 @@ export class RegistryImpl implements Registry {
   private readonly throttleMs: number
   private readonly now: () => number
   private readonly bootID?: string
+  /**
+   * Machine-wide liveness probe for REMOTE owner boots (owner-liveness
+   * markers). Absent ⇒ legacy semantics: any different-boot owner counts as
+   * dead ("flip on restart"). Present (production wiring) ⇒ a boot with a
+   * live marker owns its runs and they are adopted, not flipped.
+   */
+  private readonly ownerAlive?: (bootID: string) => boolean
 
   constructor(init: RegistryInit) {
     this.persist = init.persist
@@ -65,6 +79,7 @@ export class RegistryImpl implements Registry {
     this.throttleMs = init.throttleMs ?? 1000
     this.now = init.now ?? Date.now
     this.bootID = init.bootID
+    this.ownerAlive = init.ownerAlive
     if (this.bootID) runtimeOwners.set(this.bootID, this)
   }
 
@@ -103,6 +118,7 @@ export class RegistryImpl implements Registry {
       agents: [],
     }
     this.runs.set(id, record)
+    this.createdRuns.add(id)
     // First snapshot is durable immediately (crash visibility for /ultracode).
     this.persistNow(id)
     return record
@@ -122,6 +138,20 @@ export class RegistryImpl implements Registry {
     return [...this.runs.values()]
       .filter((r) => isActiveRunStatus(r.status))
       .sort((a, b) => b.startedAt - a.startedAt)
+  }
+
+  /** Durable runID provenance — runs CREATED by this registry instance (or shared from a same-process owner registry). Distinct from presence: reconcile seeds adopted/legacy records into `runs` without marking them here. */
+  private createdRuns = new Set<string>()
+
+  /**
+   * True when THIS process created the run — durable provenance, kept after
+   * completion. Distinct from get()/listRecent(): a run ADOPTED at reconcile
+   * from a live remote owner is readable here but never owned, so callers
+   * deciding "is this mine to speak for" (remote runState push, live-vs-
+   * persisted freshness) must use this, not a get() presence check.
+   */
+  ownsRun(runID: string): boolean {
+    return this.createdRuns.has(runID)
   }
 
   setStatus(runID: string, status: RunStatus, extra?: { error?: string; stopReason?: string }): boolean {
@@ -251,11 +281,25 @@ export class RegistryImpl implements Registry {
   // ------------------------------------------------------------------
 
   /**
-   * Seed the registry from persisted records. Owner-less records (legacy) still
-   * flip `running|stopping|paused` → `interrupted` with stopReason
-   * "server restart". Records with a proven live owner in this process share
-   * that owner's record, so completion remains visible across location loads.
-   * Returns the number of flipped runs.
+   * A record owned by another process is treated as orphaned only once its
+   * owner heartbeat is this stale. Generous on purpose: a single long child
+   * can legitimately go many minutes between persists, and flipping a live
+   * remote run is worse than adopting a dead one for a while (the TUI's
+   * `stale` badge already flags old heartbeats in the meantime).
+   */
+  private static readonly ORPHAN_HEARTBEAT_MS = 30 * 60_000
+
+  /**
+   * Seed the registry from persisted records. Owner-less records (legacy) and
+   * records whose owner is provably gone flip `running|stopping|paused` →
+   * `interrupted` with stopReason "server restart". Records with a proven live
+   * owner in this process share that owner's record, so completion remains
+   * visible across location loads. A record carrying a REMOTE owner (different
+   * bootID) with a fresh heartbeat is flipped only when the owner-liveness
+   * probe is absent or says the boot is dead — flipping a live remote run
+   * would write a terminal "interrupted" record back to the KV and shadow the
+   * owner's subsequent updates in every panel. Returns the number of flipped
+   * runs.
    */
   reconcileOrphans(): number {
     if (!this.loader) return 0
@@ -275,14 +319,30 @@ export class RegistryImpl implements Registry {
       if (liveRecord) {
         // Share the actual record, not a clone that will never receive completion.
         this.runs.set(raw.id, liveRecord)
+        // Same-process provenance: the owning registry speaks for this run
+        // (its persist callback emits the runState push), so this mirror must
+        // not double-emit through the remote-refresh path either.
+        this.createdRuns.add(raw.id)
         continue
       }
       const record: RunRecord = {
         ...raw,
         agents: Array.isArray(raw.agents) ? raw.agents.map((a) => ({ ...a })) : [],
       }
+      // Owner evidence, strongest first: (1) an owner heartbeat stale beyond
+      // ORPHAN_HEARTBEAT_MS says the owner is gone no matter what; (2) with a
+      // liveness probe (production wiring — machine-wide owner-liveness
+      // markers), a REMOTE boot with a live marker is another process still
+      // running: adopt, don't flip; (3) without a probe (legacy/unit), or
+      // with a dead/missing marker, a different-boot owner counts as dead —
+      // the historical "flip on restart" crash-recovery semantics.
+      const heartbeat = raw.owner?.updatedAt
+      const remoteBootAlive =
+        this.ownerAlive !== undefined && typeof raw.owner?.bootID === "string" && this.ownerAlive(raw.owner.bootID)
+      const ownerGone =
+        heartbeat === undefined || now - heartbeat > RegistryImpl.ORPHAN_HEARTBEAT_MS || !remoteBootAlive
       let wasActive = false
-      if (isActiveRunStatus(record.status)) {
+      if (ownerGone && isActiveRunStatus(record.status)) {
         record.status = "interrupted"
         record.stopReason = "server restart"
         if (record.endedAt === undefined) record.endedAt = now

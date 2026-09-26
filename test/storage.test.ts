@@ -11,11 +11,13 @@ import { createHash } from "node:crypto"
 import { readFileSync } from "node:fs"
 import {
   GRAPH_ARTIFACT_SUFFIX,
+  RUNS_SCAN_TTL_MS,
   StorageImpl,
   WORKFLOW_NAME_RE,
   buildGraphBody,
   normalizePath,
   readProjectWorkflowFile,
+  refreshRunsIfStale,
   resolveContainedPath,
 } from "../src/storage.ts"
 import { compileGraphSpec } from "../src/graph.ts"
@@ -179,6 +181,84 @@ test("loadRunsAsync follows KV scan next-cursors until exhausted", async () => {
   const runs = await storage.loadRunsAsync()
   assert.deepEqual(runs.map((r) => r.id), ["run_a", "run_b", "run_c"])
   assert.ok(kv.lastAfter !== undefined, "cursor was actually followed")
+})
+
+test("loadRunsAsync merge: the newer remote owner stamp replaces the cached local record", async () => {
+  const { storage, kv } = makeStorage()
+  storage.saveRun(makeRun({ id: "run_remote", status: "running", owner: { bootID: "local", updatedAt: 10 } }))
+  await kv.set(
+    RUNS_KEY("run_remote"),
+    makeRun({ id: "run_remote", status: "succeeded", endedAt: 20, owner: { bootID: "remote", updatedAt: 20 } }) as unknown as Json,
+  )
+  const runs = await storage.loadRunsAsync()
+  assert.equal(runs.find((r) => r.id === "run_remote")?.status, "succeeded")
+})
+
+test("loadRunsAsync merge: an exact freshness tie keeps the cached record", async () => {
+  const { storage, kv } = makeStorage()
+  storage.saveRun(makeRun({ id: "run_tie", status: "running", owner: { bootID: "local", updatedAt: 30 } }))
+  await kv.set(
+    RUNS_KEY("run_tie"),
+    makeRun({ id: "run_tie", status: "paused", owner: { bootID: "remote", updatedAt: 30 } }) as unknown as Json,
+  )
+  // The scanned KV entry replaces only when STRICTLY newer — a same-millisecond
+  // snapshot can never overwrite locally known state (a stale running read
+  // must not resurrect what a fresher local write settled).
+  const runs = await storage.loadRunsAsync()
+  assert.equal(runs.find((r) => r.id === "run_tie")?.status, "running")
+})
+
+test("loadRunsAsync merge: a fresher local save beats a stale remote read", async () => {
+  const { storage, kv } = makeStorage()
+  storage.saveRun(makeRun({ id: "run_local", status: "succeeded", endedAt: 900, owner: { bootID: "local", updatedAt: 50 } }))
+  await kv.set(
+    RUNS_KEY("run_local"),
+    makeRun({ id: "run_local", status: "running", owner: { bootID: "remote", updatedAt: 40 } }) as unknown as Json,
+  )
+  const runs = await storage.loadRunsAsync()
+  assert.equal(runs.find((r) => r.id === "run_local")?.status, "succeeded")
+})
+
+test("loadRunsAsync merge: a stale remote read cannot resurrect a terminal status", async () => {
+  const { storage, kv } = makeStorage()
+  storage.saveRun(makeRun({ id: "run_done", status: "failed", endedAt: 800, owner: { bootID: "local", updatedAt: 60 } }))
+  await kv.set(
+    RUNS_KEY("run_done"),
+    makeRun({ id: "run_done", status: "running", owner: { bootID: "remote", updatedAt: 55 } }) as unknown as Json,
+  )
+  const first = await storage.loadRunsAsync()
+  assert.equal(first.find((r) => r.id === "run_done")?.status, "failed")
+  // Re-scanning the same stale entry must not flip it back either.
+  const second = await storage.loadRunsAsync()
+  assert.equal(second.find((r) => r.id === "run_done")?.status, "failed")
+})
+
+test("refreshRunsIfStale: scans when never scanned or past the TTL, no-op without an async scanner", async () => {
+  let scans = 0
+  let last = 0
+  const source = {
+    async loadRunsAsync(): Promise<RunRecord[]> {
+      scans++
+      last = 2_000
+      return []
+    },
+    lastScanAt: () => last,
+  }
+  assert.equal(await refreshRunsIfStale(source), true) // never scanned (0) → scan
+  assert.equal(scans, 1)
+  assert.equal(await refreshRunsIfStale(source, RUNS_SCAN_TTL_MS, last + 10), false) // inside the TTL
+  assert.equal(scans, 1)
+  assert.equal(await refreshRunsIfStale(source, RUNS_SCAN_TTL_MS, last + RUNS_SCAN_TTL_MS), true) // TTL boundary
+  assert.equal(scans, 2)
+  assert.equal(await refreshRunsIfStale({}), false) // test doubles without the hook are inert
+})
+
+test("loadRunsAsync stamps lastScanAt for the refresh-if-stale gate", async () => {
+  const { storage } = makeStorage()
+  assert.equal(storage.lastScanAt(), 0)
+  const before = Date.now()
+  await storage.loadRunsAsync()
+  assert.ok(storage.lastScanAt() >= before, "scan timestamp is set on load")
 })
 
 test("saveRun never throws when the KV backend fails", () => {

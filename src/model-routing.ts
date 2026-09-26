@@ -38,8 +38,18 @@ export interface ModelRouting {
   tiers: Record<string, RouteTier>
   /** Provider -> quota feed id. An absent feed never pretends to have headroom. */
   quotaIDs?: Record<string, string>
-  /** When quota is unknown, skip candidates with a reserve unless explicitly allowed. */
+  /**
+   * When quota is unknown, skip candidates with a reserve unless explicitly allowed.
+   * With an explicit false, EVERY plans candidate is skipped on an unknown feed.
+   */
   allowUnknownQuota?: boolean
+  /**
+   * Master switch (default true when omitted). false disables tier auto-selection:
+   * every child keeps its agent pin while roles and tiers stay configured for a
+   * later re-enable. Explicit per-call/run model overrides still win because they
+   * resolve above the router.
+   */
+  enabled?: boolean
 }
 
 export interface RouteObservation {
@@ -214,13 +224,20 @@ export function parseModelRouting(value: unknown): ModelRouting {
   // plans out whenever the feed command was missing — concentrating load on
   // unreserved plans that then died on the very quota the feed would have
   // shown. An explicit false keeps the fail-closed behavior for users who
-  // want a missing feed to never spend a paid plan.
+  // want a missing feed to never spend a paid plan: EVERY plans candidate is
+  // skipped on an unknown feed, reserved or not.
   if (r.allowUnknownQuota !== undefined && typeof r.allowUnknownQuota !== "boolean") {
     throw new Error("routing.allowUnknownQuota must be a boolean when present")
   }
+  // Master switch. Omitted enabled means true (current behavior); an explicit
+  // false keeps every child on its agent pin without touching roles or tiers.
+  if (r.enabled !== undefined && typeof r.enabled !== "boolean") {
+    throw new Error("routing.enabled must be a boolean when present")
+  }
   return { timezone, roles: roles as Record<string, string>, tiers,
     ...(quotaIDs ? { quotaIDs: quotaIDs as Record<string, string> } : {}),
-    allowUnknownQuota: r.allowUnknownQuota === undefined ? true : r.allowUnknownQuota === true }
+    allowUnknownQuota: r.allowUnknownQuota === undefined ? true : r.allowUnknownQuota === true,
+    enabled: r.enabled === undefined ? true : r.enabled === true }
 }
 
 /** Counter shared by a supervisor, so parallel children do not all pick the first plan. */
@@ -243,6 +260,10 @@ export class ModelRouter {
     available?: ReadonlySet<string>
     quota?: (id: string) => Promise<RouteObservation | undefined>
   }): Promise<RouteDecision> {
+    // Master switch FIRST: a disabled policy never resolves a tier, never reads
+    // a role, and never runs the empty-tier logic. Returning the same no-model
+    // decision as an unmapped agent lets every child keep its agent pin.
+    if (this.config.enabled === false) return { reason: "routing disabled; use agent pin", skipped: [] }
     const tier = input.tier ?? this.config.roles[input.role]
     if (!tier) return { reason: "no tier configured; use agent pin", skipped: [] }
     const tierConfig = this.config.tiers[tier]
@@ -309,7 +330,9 @@ export class ModelRouter {
       // reports exhausted is never tried, not even once (observed 2026-09-24:
       // children kept spawning onto a dead provider and burned whole turns).
       // A reserve still skips when KNOWN-low (1-2% left keeps trying unless a
-      // reservePercent says otherwise); UNKNOWN never blocks on its own.
+      // reservePercent says otherwise). UNKNOWN blocks only under explicit
+      // fail-closed (allowUnknownQuota: false): EVERY plans candidate skips —
+      // reserved or not — while PAYG stays blind unless it carries a reserve.
       if (pool === "plans" || entry.reservePercent !== undefined) {
         const feed = entry.capacityPool ?? this.config.quotaIDs?.[model.providerID] ?? model.providerID
         if (!observed.has(feed)) {
@@ -320,7 +343,7 @@ export class ModelRouter {
         const remaining = observed.get(feed)?.remainingPercent
         if (pool === "plans" && remaining === 0) { skipped.push(`${entry.model}: quota exhausted`); return }
         if (remaining !== undefined && entry.reservePercent !== undefined && remaining <= entry.reservePercent) { skipped.push(`${entry.model}: quota reserve`); return }
-        if (remaining === undefined && entry.reservePercent !== undefined && !this.config.allowUnknownQuota) { skipped.push(`${entry.model}: quota unknown`); return }
+        if (remaining === undefined && !this.config.allowUnknownQuota && (pool === "plans" || entry.reservePercent !== undefined)) { skipped.push(`${entry.model}: quota unknown`); return }
       }
       return { model, pin: entry.model, weight: entry.weight ?? 1 }
     }

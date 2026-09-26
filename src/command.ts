@@ -9,7 +9,8 @@ import type { GraphNode, GraphSpec } from "./graph.ts"
 import { MAX_CHECKPOINTS } from "./registry.ts"
 import { compactStringify, safeSlice } from "./serialize.ts"
 import { reduceToolEvent, toolCallsFor, type ToolEvent, type ToolEventState } from "./run-events.ts"
-import { GRAPH_ARTIFACT_SUFFIX, WORKFLOW_NAME_RE, normalizePath, sha256 } from "./storage.ts"
+import { ownershipFields, runLivenessSuffix } from "./run-status.ts"
+import { GRAPH_ARTIFACT_SUFFIX, WORKFLOW_NAME_RE, normalizePath, refreshRunsIfStale, sha256 } from "./storage.ts"
 import { paramsFromArgs, paramsValue } from "./params.ts"
 import type {
   Json,
@@ -244,10 +245,16 @@ export function runStatusPayload(run: RunRecord): RunStatusPayload {
 }
 
 /** Compact human-facing `/ultracode status` line. */
-export function formatStatusRun(run: RunRecord, now = Date.now()): string {
+export function formatStatusRun(
+  run: RunRecord,
+  now = Date.now(),
+  ownership?: { isLive: boolean; bootID?: string },
+): string {
   const payload = runStatusPayload(run)
   const elapsed = compactElapsed((run.endedAt ?? now) - run.startedAt)
-  return `${payload.runID} · ${payload.status} · agents ${payload.agents.done}/${payload.agents.total} · ${elapsed}`
+  const fields = ownership ? ownershipFields(run, ownership) : {}
+  const suffix = runLivenessSuffix({ status: run.status, ...fields }, now)
+  return `${payload.runID} · ${payload.status} · agents ${payload.agents.done}/${payload.agents.total} · ${elapsed}${suffix}`
 }
 
 export function resolveRunStatus(
@@ -826,6 +833,15 @@ export interface CommandStorage {
   workflowTrustState(name: string): "trusted" | "untrusted" | "unknown"
   refreshWorkflows(): Promise<void>
   loadResultArtifactFresh(key: string): Promise<Json | undefined>
+  /**
+   * Refresh-if-stale hooks for the status path (optional — test doubles omit):
+   * a run owned by another process exists only in the KV cache, so the status
+   * verb re-scans when `lastScanAt()` is older than the TTL before serving and
+   * falls back to `loadRuns()` when this registry does not own the run.
+   */
+  loadRunsAsync?(): Promise<readonly RunRecord[]>
+  lastScanAt?(): number
+  loadRuns?(): readonly RunRecord[]
 }
 
 export interface CommandSupervisor {
@@ -894,6 +910,8 @@ export interface CommandDeps {
   say(sessionID: string, text: string): Promise<void>
   projectRoot: string
   personalWorkflowDir: string
+  /** This process's runtime bootID — ownership truth for runs served from the persisted view. */
+  bootID?: string
   pendingPermissions?: (sessionID: string) => Promise<string | undefined>
   prepare?: () => Promise<void>
   listAgents: () => Promise<AgentListResult>
@@ -1057,17 +1075,30 @@ export async function handleUltracodeCommand(invocation: CommandInvocation, deps
   }
 
   if (sub === "status") {
+    // A run owned by another process is not in this registry: refresh the
+    // persisted view (TTL-gated) and serve it when this process has no record.
+    await refreshRunsIfStale(deps.storage)
     const target = resolveActiveTarget(rest, activeList(deps))
     if (!target.ok) {
       await deps.say(sessionID, target.error)
       return
     }
-    const run = deps.registry.get(target.runID)
+    const persisted = deps.storage.loadRuns?.() ?? []
+    const live = deps.registry.get(target.runID)
+    // Newer record wins (owner.updatedAt, else startedAt): an ADOPTED remote
+    // run has a registry record here that never tracks its owner's later
+    // writes, so a fresher persisted snapshot must not be shadowed by it.
+    const persistedRun = persisted.find((r) => r.id === target.runID)
+    const freshness = (r: RunRecord): number => r.owner?.updatedAt ?? r.startedAt
+    const run =
+      live !== undefined && (persistedRun === undefined || freshness(live) >= freshness(persistedRun))
+        ? live
+        : persistedRun
     if (!run) {
       await deps.say(sessionID, `Run \`${target.runID}\` not found. See /ultracode for known runs.`)
       return
     }
-    await deps.say(sessionID, formatStatusRun(run))
+    await deps.say(sessionID, formatStatusRun(run, Date.now(), { isLive: live !== undefined && run === live, bootID: deps.bootID }))
     return
   }
 

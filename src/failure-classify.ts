@@ -15,6 +15,11 @@
  * - "quota": plan quota ("usage limit", "quota", "1-week", "5 hour", or a
  *   parseable reset clearly >2 min away). Account-level and hours long —
  *   same-model AND same-provider retries are guaranteed to fail instantly.
+ * - "refusal": provider content-policy rejection ("content filter",
+ *   "considered high risk", "usage policy"). Prompt-specific and
+ *   deterministic on the same provider — no same-model retry and no window
+ *   wait; callers fail over to a DIFFERENT provider, and the breaker is never
+ *   told (the provider itself is healthy).
  * - "other": no provider-shaped signal — callers keep their existing behavior.
  *
  * Reset timestamps are advisory: returned only when parseable AND clearly in
@@ -24,7 +29,7 @@
  */
 import type { ContextMessageError } from "./types.ts"
 
-export type FailureClass = "quota" | "burst" | "other"
+export type FailureClass = "quota" | "burst" | "refusal" | "other"
 
 export interface FailureClassification {
   class: FailureClass
@@ -71,6 +76,20 @@ const QUOTA_MARKERS: ReadonlyArray<Marker> = [
   { re: /5[\s_-]?hour/, label: "5 hour" },
 ]
 
+/**
+ * Content-policy refusals, checked BEFORE quota markers: they are
+ * prompt-specific rejections by a healthy provider ("usage policy" is a
+ * policy, not a usage limit), so they must never read as quota — the provider
+ * must not be quarantined, and recovery means a different provider, not a
+ * window wait.
+ */
+const REFUSAL_MARKERS: ReadonlyArray<Marker> = [
+  { re: /content[\s_-]?filter/i, label: "content filter" },
+  { re: /considered\s+high[\s_-]?risk/i, label: "high-risk rejection" },
+  { re: /usage\s+polic(?:y|ies)/i, label: "usage policy" },
+  { re: /polic(?:y|ies)[\s_-]?violation/i, label: "policy violation" },
+]
+
 const BURST_MARKERS: ReadonlyArray<Marker> = [
   { re: /rate[\s_-]?limit/, label: "rate limit" },
   { re: /\b429\b/, label: "429" },
@@ -107,6 +126,7 @@ export function classifyFailure(error?: ContextMessageError, text?: string): Fai
 
   const quotaMarker = firstMarker(QUOTA_MARKERS, lowered)
   const burstMarker = firstMarker(BURST_MARKERS, lowered)
+  const refusalMarker = firstMarker(REFUSAL_MARKERS, lowered)
   const typeIsRateLimit = /rate[\s_-]?limit/.test(type.toLowerCase())
   const statusIs429 = status === 429
 
@@ -126,6 +146,12 @@ export function classifyFailure(error?: ContextMessageError, text?: string): Fai
   const base: Pick<FailureClassification, "message" | "status"> = {}
   if (structuredMessage.length > 0) base.message = structuredMessage
   if (status !== undefined) base.status = status
+
+  // Refusals win over every rate/quota shape: "content filter … usage quota"
+  // word salad still means the provider declined the PROMPT.
+  if (refusalMarker !== undefined) {
+    return { class: "refusal", ...base, reason: `content-policy refusal ("${refusalMarker.label}")` }
+  }
 
   if (resetAt !== undefined) {
     const minutes = Math.round((resetAt - now) / 60_000)

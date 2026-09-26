@@ -2,10 +2,11 @@
  * Shared run-inspect cell values (plugin-free, no markdown). Surfaces render.
  *
  * Agent row order (D11): status, ord+label, phase, agent, model, ctx, tools.
- * `ctx` is the statusline-style CURRENT REQUEST CONTEXT (input + cache read +
- * write of the child's last completed request) — the same quantity the
- * childLimits guard caps, so the table and the cap finally speak one metric.
- * Cumulative per-child spend stays visible in detail panes / settle notices.
+ * `ctx` is the statusline-style CURRENT REQUEST CONTEXT ("the most recent
+ * request that exposed usage": input + cache read + write) — the same
+ * quantity the childLimits guard caps, so the table and the cap finally speak
+ * one metric. Cumulative per-child spend stays visible in detail panes /
+ * settle notices.
  */
 import type { AgentRecord, RunRecord, TokenUsage } from "./types.ts"
 import { countAgents } from "./types.ts"
@@ -56,7 +57,11 @@ export function agentCells(a: AgentRecord): string[] {
   ) {
     model += ` (spawn: ${a.spawnModel.providerID}/${a.spawnModel.id})`
   }
-  const ctx = a.contextTokens !== undefined && Number.isFinite(a.contextTokens) ? compactCount(a.contextTokens) : "-"
+  // Context-first: the cell carries the "(last known)" wording so it reads
+  // as strongly as the detail pane's headline line — the statusline metric of
+  // the most recent request that exposed usage (the final request's own
+  // usage when available, else the latest earlier one).
+  const ctx = a.contextTokens !== undefined && Number.isFinite(a.contextTokens) ? `${compactCount(a.contextTokens)} (last known)` : "-"
   const tools = a.toolCalls === undefined ? "-" : String(a.toolCalls)
   return [a.status, ordLabel, phase, agent, model, ctx, tools]
 }

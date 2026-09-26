@@ -27,7 +27,7 @@ No command opens the interactive menu. Edits apply to Ultracode plugin options o
   tier remove <tier> <model>
   tier create <tier> | tier delete <tier> | tier show <tier>
   role set <agent> <tier> | role remove <agent> | role defaults [--force] [--all-known]
-  routing init <IANA timezone> | routing timezone <IANA timezone>
+  routing init <IANA timezone> | routing timezone <IANA timezone> | routing enable | routing disable
   quota-id set <provider> <feed-id> | quota-id remove <provider>
   capacity source <pool> <capacity-v1|check-rate> <executable> [args...]
   capacity status [pool] | capacity remove <pool> | capacity bind <tier> <model> <pool|none>
@@ -37,6 +37,7 @@ No command opens the interactive menu. Edits apply to Ultracode plugin options o
 Group indices are zero-based. Groups run in order; models within one group rotate.
 --weight applies in weighted tiers; --main-weight lets a PAYG model join the plans draw.
 role defaults maps canonical agents (explore, general, reviewer) to lite/standard/strong.
+routing disable keeps every child on its agent pin; roles and tiers stay configured.
 Existing /ultracode set overlays for concurrency, maxAgents, timeoutMs, permissions
 and providerconcurrency take precedence over plugin defaults in their project.
 Changes to the copied plugin require an OpenCode service restart when safe.
@@ -102,7 +103,11 @@ async function configure(opts, command) {
       opts.routing = { timezone: rest[0], roles: {}, tiers: Object.fromEntries(["lite", "standard", "strong", "frontier"].map((name) =>
         [name, { plans: [], payg: [] }])) }
     } else if (verb === "timezone" && rest.length === 1) ensureRouting(opts).timezone = rest[0]
-    else fail("usage: routing init <timezone> | routing timezone <timezone>")
+    else if (verb === "enable" && !rest.length) {
+      // enabled is the default: clearing the key keeps pre-switch configs identical.
+      delete ensureRouting(opts).enabled
+    } else if (verb === "disable" && !rest.length) ensureRouting(opts).enabled = false
+    else fail("usage: routing init <timezone> | routing timezone <timezone> | routing enable | routing disable")
     return
   }
   if (area === "quota-id") {
@@ -384,9 +389,10 @@ function formatSummary(opts) {
     `  Permissions: ${options.permissions}     Failover: ${options.failover}`,
     `  Provider child caps: ${Object.entries(options.providerConcurrency).map(([id, cap]) => `${id}=${cap}`).join(", ") || "none"}`, "", "Roles"]
   const roles = options.routing?.roles ?? {}
+  if (options.routing?.enabled === false) lines.push("  (routing disabled; every child keeps its agent pin — `routing enable` to resume)")
   for (const [role, tier] of Object.entries(roles)) lines.push(`  ${role.padEnd(20)} ${tier}`)
   if (!options.routing) lines.push("  (routing off; agent pins decide)")
-  else if (!Object.keys(roles).length) lines.push("  (no roles mapped; agent pins decide)")
+  else if (!Object.keys(roles).length && options.routing.enabled !== false) lines.push("  (no roles mapped; agent pins decide)")
   lines.push("", "Tiers (plans before payg; groups run in order, or weight-drawn when weighted)")
   for (const [name, tier] of Object.entries(options.routing?.tiers ?? {})) {
     lines.push(`  ${name}:  ${tierSelection(tier)}${tier.fallback ? `  fallback: ${tier.fallback}` : ""}`)
@@ -401,7 +407,7 @@ function formatSummary(opts) {
       lines.push(`    ${kind} ${i + 1}. ${group.map((e) => `${e.model}${e.capacityPool ? ` [${e.capacityPool}]` : ""}${e.reservePercent === undefined ? "" : ` (keep ${e.reservePercent}%)`}${e.hours ? ` ${e.hours.join(":00–")}:00` : ""}${e.blockedWeekdayHours ? ` (weekday blocked ${e.blockedWeekdayHours.map((range) => `${range[0]}–${range[1]}`).join(", ")})` : ""}${weightAnnotation(e, kind, tier, mainPct, fallbackPct)}`).join(" ⇄ ")}`)
     })
   }
-  if (options.routing) lines.push("  Set any agent with `role set <agent> <tier>`; pass `{ tier }` per call in a workflow to override.")
+  if (options.routing && options.routing.enabled !== false) lines.push("  Set any agent with `role set <agent> <tier>`; pass `{ tier }` per call in a workflow to override.")
   lines.push("", "Model input limits (target → hard)")
   for (const [pin, limit] of Object.entries(options.childLimits)) lines.push(`  ${pin.padEnd(43)} ${limit.targetInput.toLocaleString()} → ${limit.hardInput.toLocaleString()}`)
   if (!Object.keys(options.childLimits).length) lines.push("  (none)")
@@ -437,13 +443,15 @@ async function execute(file, args) {
     // unknown keys, invalid pin) fails loudly here instead of in the raw router.
     const validated = loadOptions(opts)
     if (validated.warnings.length) fail(validated.warnings.join("; "))
+    const policy = ensureRouting(validated.options)
     const quota = capacityFeed(validated.options)
     let available
     try { available = new Set((await liveModels()).map((m) => `${m.providerID}/${m.id}`)) } catch { /* offline explanation still useful */ }
-    const decision = await new ModelRouter(ensureRouting(validated.options)).select({ role, ...(tier ? { tier } : {}), now: at, quota, ...(available ? { available } : {}) })
+    const decision = await new ModelRouter(policy).select({ role, ...(tier ? { tier } : {}), now: at, quota, ...(available ? { available } : {}) })
     // Mirror primitives: an explicit hint that yields no model is an empty tier, and
     // the same hint in a workflow is a hard error. A role-based empty tier stays exit 0.
-    if (tier !== undefined && decision.model === undefined) fail(`routing tier ${tier} is empty — configure it or drop the tier hint`)
+    // A disabled policy is neither: the hint degrades to the pin like every other call.
+    if (tier !== undefined && decision.model === undefined && policy.enabled !== false) fail(`routing tier ${tier} is empty — configure it or drop the tier hint`)
     if (json) console.log(JSON.stringify({ time: at.toISOString(), ...decision }))
     else {
       const pool = decision.pool ? `\nPool:\n${decision.pool.map((entry) => `  - ${entry.model}  w${entry.weight} (${Math.round(entry.percent)}%)`).join("\n")}` : ""

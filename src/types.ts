@@ -667,12 +667,19 @@ export interface AgentResult {
   model?: { providerID: string; id: string } | null
   tokens?: TokenUsage
   /**
-   * Usage of the LAST model request only (message-level tokens: its input +
-   * cache.read + cache.write is the statusline-style "current request
-   * context"). Distinct from `tokens`, which is session-cumulative. Absent
-   * when the host exposes no message-level usage.
+   * Usage of the most recent model request that exposed usage (message-level
+   * tokens: its input + cache.read + cache.write is the statusline-style
+   * "current request context"). Distinct from `tokens`, which is
+   * session-cumulative. Absent when the host exposes no message-level usage.
    */
   requestTokens?: TokenUsage
+  /**
+   * True when `requestTokens` fell back to an earlier request because the
+   * final assistant message exposed no usage. Display surfaces still use the
+   * value; the child-context calibration fold skips such a sample because the
+   * stored bytes describe the LAST request, not the one this usage came from.
+   */
+  requestTokensStale?: boolean
   /** Parsed structured output (present when opts.schema was given and validation succeeded). */
   data?: Json
   /** Present when this result was replayed from a prior run's warm cache. */
@@ -683,12 +690,13 @@ export interface AgentResult {
    * actually finished, and why. Informational — the registry row keeps
    * spawnModel (intended) and effectiveModel (what ran) alongside it. `class`
    * is the triggering failure class: `"quota"` for quota/quarantine routing,
-   * `"burst"` when the same-model burst budget was exhausted and the ladder ran.
+   * `"burst"` when the same-model burst budget was exhausted and the ladder
+   * ran, `"refusal"` when a content-policy filter forced a provider switch.
    */
   failover?: {
     from: ModelRef
     to: ModelRef
-    class: "quota" | "burst"
+    class: "quota" | "burst" | "refusal"
     reason: string
   }
 }
@@ -1117,7 +1125,8 @@ export interface RunOutcome {
 /**
  * Provider-failure class as the run-level breaker consumes it (a mirror of
  * `FailureClassification.class` values that matter to admission — "other" is
- * never reported).
+ * never reported, and "refusal" is deliberately excluded too: a content-
+ * policy rejection is prompt-specific, not provider health).
  */
 export type ProviderFailureClass = "quota" | "burst"
 

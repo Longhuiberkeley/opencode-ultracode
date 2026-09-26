@@ -788,7 +788,11 @@ export class SupervisorImpl implements Supervisor {
 
       // 3.-4. AgentRunner over a driver wrapper that tracks child sessions,
       // registry ownership (ambient phase tracked via state) and late children.
-      const routerForRun = state.effective.routing
+      // Master switch: routing.enabled === false wires no router at all, so a
+      // role mapping cannot select and an explicit tier hint degrades silently
+      // to the agent pin (primitives' empty-tier throw is never reached). The
+      // pin-path failover shelf is untouched.
+      const routerForRun = state.effective.routing && state.effective.routing.enabled !== false
         ? (state.effective.routing === this.options.routing ? this.router : undefined) ?? new ModelRouter(state.effective.routing)
         : undefined
       const runner = new AgentRunner({

@@ -20,6 +20,7 @@ import {
 import {
   isFallbackExpired,
   isFinalRunStatus,
+  runLivenessSuffix,
   sessionActivityMs,
   type AuthoritativeSnapshot,
 } from "./run-status.ts"
@@ -135,6 +136,10 @@ export type RunView = {
   runningCount?: number
   projectID?: string
   directory?: string
+  /** Ownership honesty: another runtime owns this running run (snapshot.external). */
+  external?: boolean
+  /** Owner heartbeat timestamp; the stale badge is decided against the render clock. */
+  ownerUpdatedAt?: number
 }
 
 export type PhaseColumn = { phase: string; done: number; total: number }
@@ -540,6 +545,8 @@ function overlaySnapshot(run: RunView, snap: AuthoritativeSnapshot): RunView {
     runningCount: snap.runningCount,
     projectID: snap.projectID ?? run.projectID,
     directory: snap.directory ?? run.directory,
+    external: snap.external ?? run.external,
+    ownerUpdatedAt: snap.ownerUpdatedAt ?? run.ownerUpdatedAt,
     paused,
     settled,
     counts: { total: snap.agents.total, done: snap.agents.done, failed: snap.agents.failed },
@@ -564,6 +571,8 @@ function runViewFromSnapshot(snap: AuthoritativeSnapshot): RunView {
     runningCount: snap.runningCount,
     projectID: snap.projectID,
     directory: snap.directory,
+    external: snap.external,
+    ownerUpdatedAt: snap.ownerUpdatedAt,
     agents: snapshotAgents(snap),
     phases: [...new Set(snapshotAgents(snap).flatMap((a) => a.phase ? [a.phase] : []))],
     counts: { total: snap.agents.total, done: snap.agents.done, failed: snap.agents.failed },
@@ -1096,11 +1105,12 @@ export function toggleFollowPin(sel: InspectSelection): InspectSelection {
   return { ...sel, pinned: sel.pinned !== true }
 }
 
-/** Visible run chooser: mark + short id + name/status + done/total. */
+/** Visible run chooser: mark + short id + name/status + done/total + liveness badges. */
 export function runStripLines(
   runs: readonly RunView[],
   selectedRunID: string | undefined,
   opts?: { pinned?: boolean; limit?: number },
+  now: number = Date.now(),
 ): string[] {
   if (runs.length === 0) return []
   const limit = Math.max(1, opts?.limit ?? 8)
@@ -1112,7 +1122,8 @@ export function runStripLines(
     const mark = run.runID === selectedRunID ? "*" : " "
     const name = run.name ?? run.workflowName ?? shortRunID(run.runID)
     const dot = run.paused ? "■" : run.settled ? "○" : runHasRunningAgent(run) ? "●" : "◌"
-    lines.push(`${mark} ${shortRunID(run.runID)} ${name} ${dot} ${run.status ?? (run.settled ? "finished" : "active")} ${run.counts.done}/${run.counts.total}`)
+    const badges = runLivenessSuffix(run, now)
+    lines.push(`${mark} ${shortRunID(run.runID)} ${name} ${dot} ${run.status ?? (run.settled ? "finished" : "active")} ${run.counts.done}/${run.counts.total}${badges}`)
   }
   if (runs.length > limit) lines.push(`  … +${runs.length - limit} more`)
   return lines
@@ -1133,15 +1144,14 @@ export function inspectSelFromSelection(sel: InspectSelection, runs: readonly Ru
   return next
 }
 
-function phaseTokenSum(agents: readonly RunAgentView[]): string {
-  let any = false
-  let sum = 0
+/** Max last-request context across a phase's agents; undefined when none measured. */
+function phaseMaxContext(agents: readonly RunAgentView[]): number | undefined {
+  let max: number | undefined
   for (const a of agents) {
-    if (!a.tokens) continue
-    any = true
-    sum += a.tokens.input + a.tokens.output + a.tokens.reasoning
+    if (a.contextTokens === undefined || !Number.isFinite(a.contextTokens)) continue
+    max = max === undefined ? a.contextTokens : Math.max(max, a.contextTokens)
   }
-  return any ? compactCount(sum) : "-"
+  return max
 }
 
 function phaseAgents(run: RunView, phaseId: string): RunAgentView[] {
@@ -1151,9 +1161,9 @@ function phaseAgents(run: RunView, phaseId: string): RunAgentView[] {
 
 function phaseLineLabel(name: string, agents: readonly RunAgentView[]): string {
   const done = agents.filter((a) => isFinalStatus(a.status)).length
-  const tokens = phaseTokenSum(agents)
+  const maxCtx = phaseMaxContext(agents)
   const counts = `${name} ${done}/${agents.length}`
-  return tokens === "-" ? counts : `${counts}  ${tokens}`
+  return maxCtx === undefined ? counts : `${counts}  ctx ≤ ${compactCount(maxCtx)}`
 }
 
 function agentLineLabel(a: RunAgentView): string {
@@ -1327,15 +1337,17 @@ export function agentDetailLines(agent: RunAgentView): string[] {
     // Absent when nothing drifted — an explicit-model child that waited for
     // its provider window keeps one model throughout.
     ...(drifted ? [`spawn   ${rec.spawnModel!.providerID}/${rec.spawnModel!.id}`] : []),
-    // The statusline-standard metric: input + cache of the child's LAST
-    // COMPLETED request — the same quantity childLimits caps. Absent while
-    // the first request is in flight.
-    `context ${agent.contextTokens !== undefined && Number.isFinite(agent.contextTokens) ? compactCount(agent.contextTokens) : "-"} (last request)`,
-    // Cumulative across the child's model turns (each turn re-sends the
-    // conversation) — NOT a single request's context size.
-    `tokens  ${compactTokens(agent.tokens)}${agent.tokens ? " (spent, sum of turns)" : ""}`,
+    // The statusline-standard metric: input + cache of the most recent
+    // request that exposed usage — the final request when it reports usage,
+    // else the latest earlier one (the fallback case), which is why the
+    // label says "last known" rather than "last request".
+    `context ${agent.contextTokens !== undefined && Number.isFinite(agent.contextTokens) ? compactCount(agent.contextTokens) : "-"} (last known)`,
     `session ${agent.sessionID}`,
     `tools   ${agent.toolCalls === undefined ? "-" : String(agent.toolCalls)}`,
+    // Cumulative across the child's model turns (each turn re-sends the
+    // conversation) — secondary: the last-request context above is the
+    // headline metric.
+    ...(agent.tokens ? [`spent   ${compactTokens(agent.tokens)} (cumulative, all turns)`] : []),
   ]
 }
 
@@ -1343,11 +1355,12 @@ export function phaseDetailLines(run: RunView, phaseId: string): string[] {
   const agents = phaseAgents(run, phaseId)
   const done = agents.filter((a) => isFinalStatus(a.status)).length
   const agg = phaseAggregateStatus(agents)
+  const maxCtx = phaseMaxContext(agents)
   const lines = [
     phaseId,
     ...(agg ? [`status  ${statusDot(agg)} ${agg}`] : []),
     `agents  ${done}/${agents.length}`,
-    `tokens  ${phaseTokenSum(agents)} (spent, sum of turns)`,
+    maxCtx === undefined ? "context - (max last request)" : `context ≤ ${compactCount(maxCtx)} (max last request)`,
   ]
   // Child rows make a phase row reachable/informative on its own (the tree is
   // the only other place its agents appear).
@@ -1355,8 +1368,8 @@ export function phaseDetailLines(run: RunView, phaseId: string): string[] {
   for (const a of shown) {
     const dot = STATUS_DOT[a.status]
     const label = agentLineLabel(a)
-    const tok = a.tokens ? compactCount(a.tokens.input + a.tokens.output + a.tokens.reasoning) : "-"
-    lines.push(`${dot} ${label} · ${tok}`)
+    const ctx = a.contextTokens !== undefined && Number.isFinite(a.contextTokens) ? compactCount(a.contextTokens) : "-"
+    lines.push(`${dot} ${label} · ${ctx}`)
   }
   if (agents.length > shown.length) lines.push(`… +${agents.length - shown.length} more`)
   return lines
@@ -1820,7 +1833,7 @@ export function inspectModel(
   const more = page.window.length > 0 && page.offset + page.window.length < rows.length
   const pageLabel = more ? `${page.label} ↓` : page.label
   const elapsed = compactElapsed(Math.max(0, nowTs - run.startedAt))
-  const header = `${shortRunID(run.runID)} · run ${runIndex + 1}/${n} · ${run.counts.done}/${run.counts.total} agents · ${elapsed}`
+  const header = `${shortRunID(run.runID)} · run ${runIndex + 1}/${n} · ${run.counts.done}/${run.counts.total} agents · ${elapsed}${runLivenessSuffix(run, nowTs)}`
 
   const left: string[] = ["Phases"]
   for (let i = 0; i < phases.length; i++) {
@@ -1982,7 +1995,7 @@ export function footerHints(bound: string[]): string {
 export function twoColumn(runView: RunView, opts: TwoColumnOpts): TwoColumnView {
   const now = opts.now ?? Date.now()
   const elapsed = compactElapsed(Math.max(0, now - runView.startedAt))
-  const headerLine = `${shortRunID(runView.runID)} · ${runView.counts.done}/${runView.counts.total} agents · ${elapsed}`
+  const headerLine = `${shortRunID(runView.runID)} · ${runView.counts.done}/${runView.counts.total} agents · ${elapsed}${runLivenessSuffix(runView, now)}`
   const cols = phaseColumns(runView)
   const phaseCount = cols.length
   const selPh = phaseCount === 0 ? 0 : Math.min(Math.max(0, Math.floor(opts.selectedPhase)), phaseCount - 1)

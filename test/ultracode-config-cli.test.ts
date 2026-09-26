@@ -292,6 +292,45 @@ test("CLI refuses an invalid edit without claiming routing was disabled", async 
   } finally { await rm(dir, { recursive: true, force: true }) }
 })
 
+test("routing disable/enable round-trips the master switch; list and explain reflect it", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "ultracode-switch-"))
+  const file = path.join(dir, "opencode.json")
+  const original = { plugins: [{ package: "./plugins/ultracode", options: { routing: { timezone: "UTC",
+    roles: { general: "strong" }, tiers: { strong: { plans: [[{ model: "p/a" }]], payg: [] } } } } }] }
+  try {
+    await writeFile(file, JSON.stringify(original, null, 2) + "\n")
+    const on = runIn(offline(dir), file, "explain", "general", "--json")
+    assert.equal(on.status, 0, on.stderr)
+    assert.equal(JSON.parse(on.stdout).model.id, "a")
+    const disabled = runIn(offline(dir), file, "routing", "disable")
+    assert.equal(disabled.status, 0, disabled.stderr)
+    assert.equal(JSON.parse(await readFile(file, "utf8")).plugins[0].options.routing.enabled, false)
+    const listed = runIn(offline(dir), file, "list")
+    assert.equal(listed.status, 0, listed.stderr)
+    assert.match(listed.stdout, /routing disabled; every child keeps its agent pin/)
+    assert.match(listed.stdout, /general\s+strong/)
+    assert.equal(JSON.parse(runIn(offline(dir), file, "list", "--json").stdout).routing.enabled, false)
+    // A role mapping and an explicit tier hint both report the agent pin at exit 0.
+    const role = runIn(offline(dir), file, "explain", "general")
+    assert.equal(role.status, 0, role.stderr)
+    assert.match(role.stdout, /Selected: agent pin/)
+    assert.match(role.stdout, /routing disabled; use agent pin/)
+    const hint = runIn(offline(dir), file, "explain", "general", "strong")
+    assert.equal(hint.status, 0, hint.stderr)
+    assert.match(hint.stdout, /Selected: agent pin/)
+    assert.match(hint.stdout, /routing disabled; use agent pin/)
+    // enable clears the default key, restoring the original policy and routing.
+    assert.equal(runIn(offline(dir), file, "routing", "enable").status, 0)
+    const restored = JSON.parse(await readFile(file, "utf8")).plugins[0].options.routing
+    assert.equal(restored.enabled, undefined)
+    assert.equal(JSON.parse(runIn(offline(dir), file, "explain", "general", "--json").stdout).model.id, "a")
+    // The switch lives inside an existing policy: a policy-less config refuses.
+    const bare = path.join(dir, "bare.json")
+    await writeFile(bare, JSON.stringify({ plugins: [{ package: "./plugins/ultracode", options: {} }] }))
+    assert.notEqual(runIn(offline(dir), bare, "routing", "disable").status, 0)
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
+
 test("role defaults names the available tiers when a target tier is missing", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "ultracode-role-skip-"))
   const file = path.join(dir, "opencode.json")

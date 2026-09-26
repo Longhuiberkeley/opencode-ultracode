@@ -46,6 +46,10 @@ test("runAgent: happy path — create, register sessionID immediately, extract t
   assert.equal(result.agent, "general")
   assert.deepEqual(result.model, { providerID: "openrouter", id: "m/1" })
   assert.deepEqual(result.tokens, TOKENS)
+  // The final assistant message exposes usage => requestTokens come from it,
+  // so the sample is not stale (calibration may fold it).
+  assert.deepEqual(result.requestTokens, TOKENS)
+  assert.equal(result.requestTokensStale, undefined)
 
   const session = fake.sessions.get(result.sessionID)
   assert.ok(session)
@@ -238,6 +242,17 @@ test("runAgent: happy path extracts the last assistant text", async () => {
   assert.equal(result.text, "first")
 })
 
+// ---------------------------------------------------------------------------
+// Request-token resolution (most recent assistant message exposing usage)
+// ---------------------------------------------------------------------------
+
+test("runAgent: no assistant message exposes usage => requestTokens stays undefined", async () => {
+  const { driver } = makeDriver([{ text: "no usage here" }])
+  const result = await driver.runAgent(input(), ["general"], hooks())
+  assert.equal(result.text, "no usage here")
+  assert.equal(result.requestTokens, undefined)
+})
+
 test("text extraction: concatenated multi-part text parts (verified rule)", async () => {
   const { assistantText } = await import("../src/sessions.ts")
   const message = {
@@ -309,6 +324,25 @@ test("runAgent: schema repair refreshes text/model/tokens from the REPAIRED resp
   assert.equal(result.text, '{"answer": "42"}')
   assert.deepEqual(result.model, { providerID: "p", id: "attempt-2" })
   assert.deepEqual(result.tokens, { input: 99, output: 5, reasoning: 0, cache: { read: 0, write: 0 } })
+  // The repaired reply exposes usage => requestTokens describe it, like .tokens.
+  assert.deepEqual(result.requestTokens, { input: 99, output: 5, reasoning: 0, cache: { read: 0, write: 0 } })
+  assert.equal(result.requestTokensStale, undefined)
+})
+
+test("runAgent: schema repair — repaired reply without usage keeps requestTokens from the latest reply that exposed it", async () => {
+  const attempt1: TokenUsage = { input: 11, output: 7, reasoning: 1, cache: { read: 5, write: 2 } }
+  const { driver } = makeDriver([
+    { text: "not json at all", tokens: attempt1 },
+    { text: '{"answer": "42"}' }, // repaired reply exposes no usage
+  ])
+  const result = await driver.runAgent(input({ schema: SCHEMA }), ["general"], hooks())
+  assert.deepEqual(result.data, { answer: "42" })
+  // .tokens stays session-cumulative (the fake's session total is attempt1).
+  assert.deepEqual(result.tokens, attempt1)
+  // .requestTokens fall back past the usage-less repaired reply, marked stale
+  // so calibration never pairs the older usage with the repaired request bytes.
+  assert.deepEqual(result.requestTokens, attempt1)
+  assert.equal(result.requestTokensStale, true)
 })
 
 test("runAgent: schema mode — valid first reply keeps attempt-1 metadata", async () => {
@@ -693,6 +727,27 @@ test("continueAgent: continues the SAME session — no create, history reused, n
   assert.match(userMsgs[1]!.text ?? "", /interrupted by a provider failure/)
   assert.match(userMsgs[1]!.text ?? "", /may be EMPTY/)
   assert.match(userMsgs[1]!.text ?? "", /Original request:\ndo it/)
+})
+
+test("continueAgent: usage-less final reply keeps requestTokens from the earlier turn", async () => {
+  const earlier: TokenUsage = { input: 50, output: 7, reasoning: 1, cache: { read: 10, write: 2 } }
+  const { fake, driver } = makeDriver([
+    { text: "first", tokens: earlier },
+    { text: "second" }, // continued (final) assistant message exposes no usage
+  ])
+  const first = await driver.runAgent(input(), ["general"], hooks())
+  const result = await driver.continueAgent(
+    { sessionID: first.sessionID, continuationPrompt: "keep going" },
+    { signal: CONTINUE_SIGNAL },
+  )
+  assert.equal(result.text, "second")
+  // `tokens` stays session-cumulative; requestTokens fall back to the most
+  // recent assistant message that exposed usage — flagged stale, because that
+  // was an EARLIER turn than the final (usage-less) one.
+  assert.deepEqual(result.tokens, earlier)
+  assert.deepEqual(result.requestTokens, earlier)
+  assert.equal(result.requestTokensStale, true)
+  assert.equal(fake.sessions.get(first.sessionID)!.prompts, 2)
 })
 
 test("continueAgent: requested model is switched BEFORE the continuation prompt", async () => {

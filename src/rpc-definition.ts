@@ -82,6 +82,9 @@ export const ULTRACODE_RPC = {
                 endedAt: NUMBER,
                 runningCount: NUMBER,
                 queuedCount: NUMBER,
+                // Ownership honesty (additive): foreign-owned / heartbeat age.
+                external: { type: "boolean" as const },
+                ownerUpdatedAt: NUMBER,
                 agentDetails: {
                   type: "array" as const,
                   items: {

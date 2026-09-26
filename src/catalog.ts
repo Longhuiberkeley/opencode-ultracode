@@ -72,9 +72,11 @@ export interface CatalogCaps {
    * unless the tier carries a fallback); roles stay visible either way because
    * a role mapped to an empty tier silently keeps the agent pin. Absent when
    * no routing policy is configured — then tier hints are inert and authors
-   * should not emit them.
+   * should not emit them. `enabled: false` means the master switch is off:
+   * tiers is empty (hints are inert), roles stay visible for later re-enable.
    */
   routing?: {
+    enabled?: boolean
     tiers: Array<{ name: string; models: number }>
     roles: Record<string, string>
   }

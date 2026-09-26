@@ -217,7 +217,7 @@ export function resolveFallbacks(input: ResolveFallbacksInput): FallbackCandidat
   for (const candidate of candidates) {
     const providerID = candidate.model.providerID
     if (input.disabledProviders?.has(providerID)) continue
-    if (input.failureClass === "quota" && providerID === input.dead.providerID) continue
+    if ((input.failureClass === "quota" || input.failureClass === "refusal") && providerID === input.dead.providerID) continue
     const meta = catalog.get(modelKey(candidate.model))
     if (meta?.enabled === false) continue
     // Context-fit only when the limit AND the session's token total are known

@@ -73,6 +73,64 @@ test("unknown quotas allow reserved plans by default; explicit false fails close
   assert.ok(decision.skipped.some((s) => s.includes("quota exhausted")), decision.skipped.join("; "))
 })
 
+test("enabled: false returns the pin decision before any tier work, even for explicit hints", async () => {
+  const router = new ModelRouter(parseModelRouting({
+    timezone: "UTC",
+    enabled: false,
+    roles: { general: "strong" },
+    tiers: { strong: { plans: [[{ model: "p/plan" }]], payg: [] } },
+  }))
+  // A role-mapped agent keeps its pin.
+  assert.deepEqual(await router.select({ role: "general" }),
+    { reason: "routing disabled; use agent pin", skipped: [] })
+  // An explicit hint does not throw the empty-tier error either: same pin decision.
+  assert.deepEqual(await router.select({ role: "general", tier: "strong" }),
+    { reason: "routing disabled; use agent pin", skipped: [] })
+  // The check runs FIRST: even an unknown tier name is never resolved.
+  assert.deepEqual(await router.select({ role: "unmapped", tier: "missing" }),
+    { reason: "routing disabled; use agent pin", skipped: [] })
+  // Omitted enabled defaults to on; a non-boolean is rejected at parse time.
+  assert.equal(parseModelRouting({ timezone: "UTC", roles: {}, tiers: {} }).enabled, true)
+  assert.throws(() => parseModelRouting({ timezone: "UTC", enabled: "off", roles: {}, tiers: {} }),
+    /routing\.enabled must be a boolean/)
+  const on = new ModelRouter(parseModelRouting({
+    timezone: "UTC", enabled: true, roles: { general: "strong" },
+    tiers: { strong: { plans: [[{ model: "p/plan" }]], payg: [] } },
+  }))
+  assert.equal((await on.select({ role: "general" })).model?.id, "plan")
+})
+
+test("fail-closed skips every plans candidate on an unknown feed, reserved or not", async () => {
+  const strict = new ModelRouter(parseModelRouting({
+    timezone: "UTC", roles: { general: "strong" }, allowUnknownQuota: false,
+    tiers: { strong: { plans: [[{ model: "p/unreserved" }]], payg: [[{ model: "p/paid" }]] } },
+  }))
+  // Unknown feed + fail-closed: the unreserved plan skips; PAYG stays blind.
+  const unknown = await strict.select({ role: "general" })
+  assert.equal(unknown.model?.id, "paid")
+  assert.ok(unknown.skipped.includes("p/unreserved: quota unknown"), unknown.skipped.join("; "))
+  // Same unknown feed with the default (allow): the unreserved plan is eligible.
+  const lenient = new ModelRouter(parseModelRouting({
+    timezone: "UTC", roles: { general: "strong" },
+    tiers: { strong: { plans: [[{ model: "p/unreserved" }]], payg: [] } },
+  }))
+  assert.equal((await lenient.select({ role: "general" })).model?.id, "unreserved")
+  // Reserved+unknown PAYG still fail-closes (unchanged).
+  const reservedPayg = new ModelRouter(parseModelRouting({
+    timezone: "UTC", roles: { general: "strong" }, allowUnknownQuota: false,
+    tiers: { strong: { plans: [], payg: [[{ model: "p/reserved", reservePercent: 20 }]] } },
+  }))
+  await assert.rejects(reservedPayg.select({ role: "general" }), /p\/reserved: quota unknown/)
+  // A known zero stays a hard stop for plans even with the default (allow).
+  const known = new ModelRouter(parseModelRouting({
+    timezone: "UTC", roles: { general: "strong" },
+    tiers: { strong: { plans: [[{ model: "p/unreserved" }]], payg: [[{ model: "p/paid" }]] } },
+  }))
+  const dead = await known.select({ role: "general", quota: async () => ({ remainingPercent: 0 }) })
+  assert.equal(dead.model?.id, "paid")
+  assert.ok(dead.skipped.includes("p/unreserved: quota exhausted"), dead.skipped.join("; "))
+})
+
 test("routing validation rejects unsafe hours and unknown role tiers", () => {
   assert.throws(() => parseModelRouting({ timezone: "Asia/Hong_Kong", roles: { reviewer: "missing" }, tiers: {} }), /routing.roles/)
   assert.throws(() => parseModelRouting({ timezone: "Asia/Hong_Kong", roles: {}, tiers: {

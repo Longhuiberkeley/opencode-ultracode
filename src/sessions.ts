@@ -6,6 +6,7 @@
  * executors (deadlock rule).
  */
 import type { AgentResult, ContextMessage, ContextMessageError, Json, SessionCtx, TokenUsage } from "./types.ts"
+import { requestContext } from "./types.ts"
 import { extractJson, validateJsonSchemaValue } from "./serialize.ts"
 import { classifyFailure, readFailureStatus, type FailureClassification } from "./failure-classify.ts"
 
@@ -152,8 +153,13 @@ interface StructuredOutcome {
   text?: string
   model?: AgentResult["model"]
   tokens?: TokenUsage
-  /** Message-level usage of the repair turn's request, when available. */
+  /**
+   * Message-level usage of the most recent request that exposed any (the
+   * repair turn's when it has usage, else the latest earlier turn).
+   */
   requestTokens?: TokenUsage
+  /** True when requestTokens came from an earlier reply than the final one (see AgentResult.requestTokensStale). */
+  requestTokensStale?: boolean
 }
 
 // ---------------------------------------------------------------------------
@@ -281,9 +287,13 @@ export function createSessionDriver(sessions: SessionCtx, options: SessionDriver
       agent: first.message?.agent,
       model: first.message?.model ?? null,
       tokens: info.tokens ?? first.message?.tokens,
-      // Message-level usage = THIS request's context (statusline-style
-      // current-request metric), distinct from session-cumulative `tokens`.
-      requestTokens: first.message?.tokens,
+      // Message-level usage = the most recent request that exposed usage
+      // (statusline-style current-request metric), distinct from
+      // session-cumulative `tokens`.
+      requestTokens: first.requestTokens,
+      // A fallback past the final assistant message is display-only: the fold
+      // in primitives.ts must not pair it with the latest request's bytes.
+      ...(first.requestTokensStale === true ? { requestTokensStale: true } : {}),
     }
 
     // Schema mode: tolerant extraction + validate + BOUNDED repair rounds.
@@ -297,6 +307,8 @@ export function createSessionDriver(sessions: SessionCtx, options: SessionDriver
         result.model = structured.model ?? null
         result.tokens = structured.tokens
         result.requestTokens = structured.requestTokens
+        if (structured.requestTokensStale === true) result.requestTokensStale = true
+        else delete result.requestTokensStale
       }
     }
     return result
@@ -336,12 +348,28 @@ export function createSessionDriver(sessions: SessionCtx, options: SessionDriver
   interface AssistantReply {
     text: string
     message: ContextMessage | undefined
+    /**
+     * Message-level usage of the most recent assistant message whose token
+     * usage yields a request context (input + cache.read + cache.write > 0).
+     * The final assistant message may expose no usage at all, so this scans
+     * backwards instead of leaving the metric undefined. The text/model/agent
+     * fields above still describe the TRUE last assistant message.
+     */
+    requestTokens?: TokenUsage
+    /**
+     * True when requestTokens came from an EARLIER assistant message than the
+     * final one: the metric still displays, but it cannot be paired with the
+     * latest request's stored bytes for calibration (see AgentResult).
+     */
+    requestTokensStale?: boolean
   }
 
   /**
-   * Read the last assistant message of a settled turn. Throws typed extraction
-   * errors when the context fetch fails or no assistant message exists — but
-   * only for succeeded outcomes (callers surface the outcome error first).
+   * Read the last assistant message of a settled turn (its text/model/agent)
+   * plus the most recent message-level usage exposed by ANY assistant message
+   * in the session. Throws typed extraction errors when the context fetch
+   * fails or no assistant message exists — but only for succeeded outcomes
+   * (callers surface the outcome error first).
    */
   async function readAssistantReply(
     sessions: SessionCtx,
@@ -358,16 +386,23 @@ export function createSessionDriver(sessions: SessionCtx, options: SessionDriver
       return { text: "", message: undefined }
     }
     let last: ContextMessage | undefined
+    let usage: ContextMessage | undefined
     for (let i = messages.length - 1; i >= 0; i--) {
-      if (messages[i].type === "assistant") {
-        last = messages[i]
-        break
-      }
+      const message = messages[i]
+      if (message.type !== "assistant") continue
+      if (last === undefined) last = message
+      if (usage === undefined && requestContext(message.tokens) !== undefined) usage = message
+      if (last !== undefined && usage !== undefined) break
     }
     if (!last && outcome === "succeeded") {
       throw new AgentCallError("extraction", `no assistant message in session ${sessionID} (outcome "succeeded")`)
     }
-    return { text: assistantText(last), message: last }
+    return {
+      text: assistantText(last),
+      message: last,
+      requestTokens: usage?.tokens,
+      ...(usage !== undefined && usage !== last ? { requestTokensStale: true } : {}),
+    }
   }
 
   /**
@@ -435,7 +470,8 @@ export function createSessionDriver(sessions: SessionCtx, options: SessionDriver
             text: reply.text,
             model: reply.message?.model ?? null,
             tokens: info.tokens ?? reply.message?.tokens,
-            requestTokens: reply.message?.tokens,
+            requestTokens: reply.requestTokens,
+            requestTokensStale: reply.requestTokensStale,
           }
         }
         problem = check.error

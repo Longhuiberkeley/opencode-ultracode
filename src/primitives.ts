@@ -29,6 +29,7 @@ import type { FailureClassification } from "./failure-classify.ts"
 import { isReadOnlyChild, resolveFallbacks } from "./failover.ts"
 import type { FallbackCandidate, PinPoolEntry } from "./failover.ts"
 import { modelPinString } from "./agent-pins.ts"
+import { recordMeasuredContext } from "./child-context.ts"
 import { validateScriptSource } from "./worker-script.ts"
 import { createHash } from "node:crypto"
 
@@ -836,6 +837,25 @@ export class AgentRunner {
             }
             throw err
           }
+          // Content-policy refusal (provider content filter): prompt-specific
+          // and deterministic on the same provider — a same-model continue is
+          // guaranteed to hit the same filter again, and there is no quota
+          // window to wait for. Fail over to a different provider; explicit-
+          // model children keep their literal contract and surface the typed
+          // error. Deliberately NOT reported to the breaker: the provider is
+          // healthy, the prompt+provider pair is not (observed 2026-09-26: a
+          // skeptic child died on "provider.content-filter" and took the run
+          // with it instead of failing over).
+          if (err.failure?.class === "refusal") {
+            const failedOver = failoverOn && !this.explicitLiteral(failoverContext)
+              ? await this.tryFailover(err, "refusal", failoverContext, continuedSessionID, providerHold)
+              : undefined
+            if (failedOver !== undefined) {
+              result = failedOver
+              break
+            }
+            throw err
+          }
           // A continue that died with 0 new work is the observed 0-token
           // instant-death shape: treat it as quota and stop probing.
           if (attempt > 0 && err.noProgress === true) {
@@ -914,12 +934,28 @@ export class AgentRunner {
               },
             }
           : agentResult
+      // The provider-measured context of the last completed request doubles as
+      // a calibration sample for this pin: fold it against the serialized bytes
+      // the context hook stored for this session (child-context.ts). A result
+      // with no measured usage teaches nothing — and neither does a STALE
+      // measurement (usage that fell back to an earlier request), which
+      // recordMeasuredContext consumes without folding. contextTokens still
+      // displays the fallback value.
+      const measuredContext = requestContext(finalResult.requestTokens)
+      if (measuredContext !== undefined && finalResult.model !== undefined && finalResult.model !== null) {
+        recordMeasuredContext(
+          finalResult.sessionID,
+          `${finalResult.model.providerID}/${finalResult.model.id}`,
+          measuredContext,
+          finalResult.requestTokensStale === true,
+        )
+      }
       this.registry.updateAgent(this.runID, record.id, {
         status: "succeeded",
         effectiveAgent: finalResult.agent,
         effectiveModel: finalResult.model,
         tokens: finalResult.tokens,
-        ...(requestContext(finalResult.requestTokens) !== undefined ? { contextTokens: requestContext(finalResult.requestTokens) } : {}),
+        ...(measuredContext !== undefined ? { contextTokens: measuredContext } : {}),
         data: finalResult.data,
         endedAt: Date.now(),
         // Keyed calls persist replay identity (and the text a future warm
@@ -968,7 +1004,7 @@ export class AgentRunner {
    */
   private async tryFailover(
     err: AgentCallError,
-    failureClass: "quota" | "burst",
+    failureClass: "quota" | "burst" | "refusal",
     context: FailoverContext,
     sessionID: string | undefined,
     hold: ProviderHold,
@@ -1202,7 +1238,7 @@ export class AgentRunner {
    * another agent's pin (observed live: every explicit glm-5.3 child silently
    * rerouted onto the default agent's max-effort pin for a whole day).
    */
-  private async resolveLadder(context: FailoverContext, failureClass: "quota" | "burst"): Promise<FallbackCandidate[]> {
+  private async resolveLadder(context: FailoverContext, failureClass: "quota" | "burst" | "refusal"): Promise<FallbackCandidate[]> {
     if (context.dead === undefined) return []
     const override = this.fallbackOverride?.()
     // A routed child normally stays inside the routing policy: it cannot escape
@@ -1304,7 +1340,10 @@ export class AgentRunner {
    * Report one classified child failure into the run-level breaker. The
    * breaking model is the one that produced the failure (intended model, or a
    * routed/replaced candidate). Never throws; unclassified failures are
-   * ignored.
+   * ignored, and "refusal" is deliberately not reported — a content-filter
+   * rejection is prompt-specific, not provider health, so striking the
+   * provider would quarantine a healthy subscription for one bad
+   * prompt+provider pair.
    */
   private reportProviderFailure(model: ModelRef | undefined, failure: FailureClassification | undefined): void {
     if (this.providerHealth === undefined || model === undefined || failure === undefined) return

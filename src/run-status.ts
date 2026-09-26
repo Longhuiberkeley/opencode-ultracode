@@ -8,6 +8,9 @@ import { parsePanelSettings, type PanelSettings, type SettingsAck } from "./sett
 /** Bounded staleness window for session-derived "still running" heuristics. */
 export const FALLBACK_STALE_MS = 15 * 60 * 1000
 
+/** Owner heartbeat age past which a RUNNING row renders the " stale" badge. */
+export const OWNER_STALE_MS = 60 * 1000
+
 export type AuthoritativeSource = "live" | "persisted"
 
 export type AuthoritativeSnapshot = {
@@ -42,13 +45,22 @@ export type AuthoritativeSnapshot = {
     > & { stalledMs?: number }
   >
   queuedCount?: number
+  /**
+   * Ownership honesty for running rows: true when the record carries an owner
+   * whose bootID is not this process's, or the run has no live registry entry
+   * here while carrying an owner (owned elsewhere / by a dead process). A
+   * running row must never look locally healthy when it is not.
+   */
+  external?: boolean
+  /** Epoch ms of the owner's last persist heartbeat (record.owner?.updatedAt). */
+  ownerUpdatedAt?: number
 }
 
 /** Default cap for the no-id inventory (newest-first). */
 export const RUN_STATUS_LIST_LIMIT = 50
 export const RUN_STATUS_LIST_LIMIT_MAX = 100
 
-export type RunStateReason = "agent-finished" | "run-completed" | "run-failed"
+export type RunStateReason = "agent-finished" | "run-completed" | "run-failed" | "state-changed"
 
 export type RunStateEvent = {
   runID: string
@@ -187,6 +199,40 @@ function stampStalled(snap: AuthoritativeSnapshot, activityFor: (sessionID: stri
   }
 }
 
+/**
+ * Ownership honesty fields derived from a record's owner: the last persist
+ * heartbeat and whether the run is external (foreign bootID, or no live
+ * registry entry here while carrying an owner). Owner-less records stay empty.
+ */
+export function ownershipFields(
+  record: Pick<RunRecord, "owner">,
+  opts: { bootID?: string; isLive: boolean },
+): { external?: boolean; ownerUpdatedAt?: number } {
+  const owner = record.owner
+  if (!owner) return {}
+  const fields: { external?: boolean; ownerUpdatedAt?: number } = {}
+  const updatedAt = optionalFiniteNumber(owner.updatedAt)
+  if (updatedAt !== undefined) fields.ownerUpdatedAt = updatedAt
+  if ((opts.bootID !== undefined && owner.bootID !== opts.bootID) || !opts.isLive) fields.external = true
+  return fields
+}
+
+/**
+ * " ext"/" stale" suffix for a RUNNING row: external ownership, plus a stale
+ * owner heartbeat (older than OWNER_STALE_MS). Empty for every other status —
+ * status/dot semantics are untouched.
+ */
+export function runLivenessSuffix(
+  run: { status?: string; external?: boolean; ownerUpdatedAt?: number },
+  now: number,
+): string {
+  if (run.status !== "running") return ""
+  let suffix = ""
+  if (run.external === true) suffix += " ext"
+  if (run.ownerUpdatedAt !== undefined && now - run.ownerUpdatedAt > OWNER_STALE_MS) suffix += " stale"
+  return suffix
+}
+
 export function collectRunStatus(input: {
   runID?: string
   sessionID?: string
@@ -198,6 +244,13 @@ export function collectRunStatus(input: {
   projectID?: string
   directory?: string
   /**
+   * This process's runtime bootID, for owner comparison. When present, a
+   * record whose owner.bootID differs is marked external; absent, liveness
+   * alone decides (a record carrying an owner with no live registry entry is
+   * still external).
+   */
+  bootID?: string
+  /**
    * Last-observed activity per child session (epoch ms) — live supervisor
    * knowledge. When present, RUNNING children gain stalledMs = now - activity
    * so orchestrators/TUI can flag silent hangs. Fire-and-forget safe.
@@ -208,6 +261,9 @@ export function collectRunStatus(input: {
   const now = Date.now()
   const stamp = (record: RunRecord, source: AuthoritativeSource): AuthoritativeSnapshot => {
     const snap = authoritativeFromRecord(record, source, scope)
+    const ownership = ownershipFields(record, { bootID: input.bootID, isLive: input.liveGet(record.id) !== undefined })
+    if (ownership.ownerUpdatedAt !== undefined) snap.ownerUpdatedAt = ownership.ownerUpdatedAt
+    if (ownership.external === true) snap.external = true
     if (input.activityFor !== undefined) stampStalled(snap, input.activityFor, now)
     return snap
   }
@@ -229,22 +285,31 @@ export function collectRunStatus(input: {
   const matches = (snap: AuthoritativeSnapshot): boolean =>
     input.runID !== undefined ? matchesLocation(snap) : matchesSession(snap) && matchesLocation(snap)
   const persistedGet = (id: string): RunRecord | undefined => input.persistedList().find((r) => r.id === id)
+  // Owner-heartbeat recency (else startedAt) — the same freshness key the
+  // storage merge uses. A registry record ADOPTED from a remote owner can be
+  // older than the KV snapshot a later re-scan refreshed; the newer record
+  // must win the view or the panel would pin the adopted state forever.
+  const freshness = (record: RunRecord): number => record.owner?.updatedAt ?? record.startedAt
   if (input.runID) {
     const live = input.liveGet(input.runID)
-    if (live) {
-      const snap = stamp(live, "live")
-      return matches(snap) ? [snap] : []
-    }
     const persisted = persistedGet(input.runID)
-    if (persisted) {
-      const snap = stamp(persisted, "persisted")
+    const chosen = live !== undefined && (persisted === undefined || freshness(live) >= freshness(persisted)) ? live : persisted
+    if (chosen) {
+      const snap = stamp(chosen, chosen === live ? "live" : "persisted")
       return matches(snap) ? [snap] : []
     }
     return []
   }
   const byID = new Map<string, AuthoritativeSnapshot>()
   for (const record of input.persistedList()) byID.set(record.id, stamp(record, "persisted"))
-  for (const record of input.liveList()) byID.set(record.id, stamp(record, "live"))
+  for (const record of input.liveList()) {
+    const prev = byID.get(record.id)
+    // Live wins ties (this process's own authoritative state); a strictly
+    // newer persisted record (a remote owner progressed) wins instead.
+    if (prev === undefined || freshness(record) >= (prev.ownerUpdatedAt ?? prev.startedAt)) {
+      byID.set(record.id, stamp(record, "live"))
+    }
+  }
   let items = [...byID.values()].filter(matches)
   if (input.includeFinished === false) {
     items = items.filter((s) => s.status === "running" || s.status === "stopping" || s.status === "paused")
@@ -327,6 +392,60 @@ export function runStateTransition(
   return undefined
 }
 
+/** runState payload for a run owned by another process (panel parity with the local persist emit). */
+export type RemoteRunStatePayload = RunStateEvent & {
+  parentSessionID?: string
+  projectID?: string
+  directory?: string
+  runningCount?: number
+}
+
+/**
+ * Diff the pre-refresh persisted snapshot against the freshly scanned records:
+ * a run that is NOT live in this process (isLive false — owned elsewhere) and
+ * whose status / per-agent status moved produces the same runState payload the
+ * local persist callback builds. runStateTransition gates which moves are
+ * event-worthy; a change it does not model (running→paused, paused→running,
+ * a pending agent appearing) still emits a "state-changed" fallback so a
+ * listening panel re-renders on every real move. Newly-seen records have no
+ * prior state to transition from, and locally-owned runs emit through their
+ * own persist callback, so both are skipped — a scan with nothing moved emits
+ * nothing.
+ */
+export function collectRemoteRunChanges(input: {
+  before: readonly RunRecord[]
+  after: readonly RunRecord[]
+  isLive: (runID: string) => boolean
+  projectID?: string
+  directory?: string
+}): RemoteRunStatePayload[] {
+  const before = new Map(input.before.map((record) => [record.id, record]))
+  const out: RemoteRunStatePayload[] = []
+  for (const fresh of input.after) {
+    if (input.isLive(fresh.id)) continue
+    const prev = before.get(fresh.id)
+    if (!prev) continue
+    const prevKey = agentStatusKey(prev.agents)
+    const event: RunStateEvent | undefined =
+      runStateTransition({ status: prev.status, agentKey: prevKey }, fresh) ??
+      (prev.status !== fresh.status || prevKey !== agentStatusKey(fresh.agents)
+        ? { runID: fresh.id, status: fresh.status, reason: "state-changed" }
+        : undefined)
+    if (!event) continue
+    const payload: RemoteRunStatePayload = {
+      ...event,
+      parentSessionID: fresh.parentSessionID,
+      runningCount: runningAgentCount(fresh),
+    }
+    const pid = input.projectID ?? fresh.projectID
+    if (pid !== undefined) payload.projectID = pid
+    const dir = fresh.directory ?? input.directory
+    if (dir !== undefined) payload.directory = dir
+    out.push(payload)
+  }
+  return out
+}
+
 export function parseRunStatusResponse(raw: unknown): AuthoritativeSnapshot[] | undefined {
   if (raw === null || raw === undefined || typeof raw !== "object" || Array.isArray(raw)) return undefined
   const runs = (raw as { runs?: unknown }).runs
@@ -375,6 +494,11 @@ function parseSnapshot(raw: unknown): AuthoritativeSnapshot | undefined {
   if (runningCount !== undefined) snap.runningCount = runningCount
   const queuedCount = optionalFiniteNumber(rec.queuedCount)
   if (queuedCount !== undefined) snap.queuedCount = Math.max(0, queuedCount)
+  // Ownership honesty (optional/additive): old payloads lack these and still
+  // parse; wrong-typed values are ignored, never guessed.
+  if (rec.external === true) snap.external = true
+  const ownerUpdatedAt = optionalFiniteNumber(rec.ownerUpdatedAt)
+  if (ownerUpdatedAt !== undefined) snap.ownerUpdatedAt = ownerUpdatedAt
   if (Array.isArray(rec.agentDetails)) {
     snap.agentDetails = rec.agentDetails.flatMap((value) => {
       if (!value || typeof value !== "object") return []

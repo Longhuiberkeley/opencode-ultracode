@@ -37,7 +37,8 @@ import {
 import { loadOptions } from "./config.ts"
 import { capacityFeed } from "./quota-command.ts"
 import { defaultProviderQuarantineDir } from "./provider-quarantine.ts"
-import { estimateRequestInput } from "./child-context.ts"
+import { maybeRefreshOwnerLiveness, ownerAliveProbe, removeOwnerLiveness, writeOwnerLiveness } from "./owner-liveness.ts"
+import { estimateAndRecordRequestInput } from "./child-context.ts"
 import { CATALOG_RUN_LIMIT, CATALOG_RUN_SCAN, buildCatalog } from "./catalog.ts"
 import { applyResumeRemember, controlRun, controlToolContent } from "./control.ts"
 import {
@@ -54,6 +55,7 @@ import { ULTRACODE_RPC } from "./rpc-definition.ts"
 import { steerRun } from "./steer.ts"
 import {
   agentStatusKey,
+  collectRemoteRunChanges,
   collectRunStatus,
   hasRpcRegister,
   isFinalRunStatus,
@@ -67,7 +69,7 @@ import { EMPTY_CATALOG, SKILL_CONTENT, SKILL_DESCRIPTION, SKILL_NAME, buildSkill
 import { compileGraphSpec, validateGraphSpec } from "./graph.ts"
 import type { GraphSpec } from "./graph.ts"
 import { SCRIPT_TEMPLATES, scriptTemplate } from "./script-templates.ts"
-import { StorageImpl, normalizePath, readProjectWorkflowFile, resolveContainedPath, sha256 } from "./storage.ts"
+import { StorageImpl, normalizePath, readProjectWorkflowFile, refreshRunsIfStale, resolveContainedPath, sha256 } from "./storage.ts"
 import {
   resolveBackground,
   validateCatalogToolInput,
@@ -536,6 +538,10 @@ export default Plugin.define({
     const projectID = String(ctx.location?.project?.id ?? projectRoot)
     const installDir = pluginInstallDir()
     const bootID = randomBootID()
+    // Machine-wide owner liveness: lets sibling processes tell "owner still
+    // running elsewhere" from "owner died with the last restart" when they
+    // reconcile persisted runs at startup. Removed on graceful dispose.
+    writeOwnerLiveness(bootID)
     const personalWorkflowDir = normalizePath(
       `${process.env["HOME"] ?? homedir()}/.config/opencode/workflows`,
     )
@@ -660,6 +666,9 @@ export default Plugin.define({
     const registry = new RegistryImpl({
       persist: (record) => {
         storage.saveRun(record)
+        // Piggyback the owner-liveness refresh on run persists (throttled):
+        // an idle-but-alive lane keeps its marker fresh without a timer.
+        maybeRefreshOwnerLiveness(bootID)
         const prev = emitPrev.get(record.id)
         const event = runStateTransition(prev, record)
         if (isFinalRunStatus(record.status)) emitPrev.delete(record.id)
@@ -679,7 +688,36 @@ export default Plugin.define({
       },
       loader: () => storage.loadRuns(),
       bootID,
+      ownerAlive: ownerAliveProbe(),
     })
+
+    /**
+     * Refresh-if-stale persisted runs before a panel/command read and push a
+     * runState event for every remote-owned run that moved on the refresh.
+     * `isLive` means OWNED by this process (registry.ownsRun), not merely
+     * present: a run adopted at reconcile from a live remote owner is
+     * readable in this registry but its owner's writes still arrive via the
+     * KV, so those changes push here too. This process's own runs emit
+     * through their persist callback instead. `emitRunState` is assigned
+     * after RPC registration; handlers run later, so it is populated by call
+     * time (a missing channel just skips the push).
+     */
+    const refreshPersistedRuns = async (): Promise<void> => {
+      const before = storage.loadRuns()
+      if (!(await refreshRunsIfStale(storage))) return
+      const emit = emitRunState
+      if (!emit) return
+      const changes = collectRemoteRunChanges({
+        before,
+        after: storage.loadRuns(),
+        isLive: (id) => registry.ownsRun(id),
+        projectID,
+        directory: ctx.location.directory,
+      })
+      for (const data of changes) {
+        void emit("runState", data).catch(() => {})
+      }
+    }
 
     const controller = new AbortController()
     const registrations: RegistrationLike[] = []
@@ -1195,7 +1233,7 @@ export default Plugin.define({
             name: "status",
             options: { namespace: "ultracode" },
             description:
-              "Read-only status of an ultracode run owned by this conversation. Input { runID?, waitMs? } (omit runID → single active owned run). Returns { runID, status, agents: { done, total, failed }, startedAt, elapsedMs, children: [{ agentID, sessionID?, label?, phase?, status, contextTokens? (input+cache of the child's LAST completed request — the statusline-style current context), tokens? (cumulative), toolCalls?, stalledMs?, waitingForPermission? }] } and, once settled, the full result inline when it fits the size cap, else resultPreview + resultTruncated + resultChars (fetch the rest with ultracode_result). While RUNNING the payload carries retryAfterMs + hint: do NOT busy-poll — a settle notice wakes this session on completion; pass waitMs to block, or wait ≥ retryAfterMs between checks. Re-polls faster than retryAfterMs are throttled (throttled: true).",
+              "Read-only status of an ultracode run owned by this conversation. Input { runID?, waitMs? } (omit runID → single active owned run). Returns { runID, status, agents: { done, total, failed }, startedAt, elapsedMs, children: [{ agentID, sessionID?, label?, phase?, status, contextTokens? (input+cache of the child's most recent request that exposed usage — the statusline-style current context), tokens? (cumulative), toolCalls?, stalledMs?, waitingForPermission? }] } and, once settled, the full result inline when it fits the size cap, else resultPreview + resultTruncated + resultChars (fetch the rest with ultracode_result). While RUNNING the payload carries retryAfterMs + hint: do NOT busy-poll — a settle notice wakes this session on completion; pass waitMs to block, or wait ≥ retryAfterMs between checks. Re-polls faster than retryAfterMs are throttled (throttled: true).",
             input: STATUS_TOOL_INPUT_SCHEMA,
             execute: async (rawInput: unknown, tool) => {
               try {
@@ -1383,11 +1421,14 @@ export default Plugin.define({
                   maxLoopIterations: MAX_LOOP_ITERATIONS,
                   // Routing summary for authoring-time tier hints: only
                   // non-empty tiers are hintable (an explicit hint on an empty
-                  // tier without a fallback throws at spawn).
+                  // tier without a fallback throws at spawn). With the master
+                  // switch off, list no hintable tiers and say so explicitly
+                  // so authoring agents stop emitting tier hints.
                   ...(options.routing
                     ? {
                         routing: {
-                          tiers: Object.entries(options.routing.tiers)
+                          ...(options.routing.enabled === false ? { enabled: false } : {}),
+                          tiers: options.routing.enabled === false ? [] : Object.entries(options.routing.tiers)
                             .filter(([, tier]) => tier.plans.length > 0 || tier.payg.length > 0)
                             .map(([name, tier]) => ({
                               name,
@@ -1461,6 +1502,7 @@ export default Plugin.define({
           say,
           projectRoot,
           personalWorkflowDir,
+          bootID,
           pendingPermissions,
           prepare: async () => {
             await runsReconciled
@@ -1601,6 +1643,10 @@ export default Plugin.define({
             includeFinished?: boolean
           } | undefined) => {
             await runsReconciled
+            // Cross-process visibility: runs owned by another opencode process
+            // live only in the KV, so refresh-if-stale before serving (and push
+            // runState for any remote run that moved since the last scan).
+            await refreshPersistedRuns()
             const runID = typeof input?.runID === "string" && input.runID !== "" ? input.runID : undefined
             const sessionID = typeof input?.sessionID === "string" && input.sessionID !== "" ? input.sessionID : undefined
             const limit = typeof input?.limit === "number" && Number.isFinite(input.limit) ? input.limit : undefined
@@ -1616,6 +1662,7 @@ export default Plugin.define({
                 persistedList: () => storage.loadRuns(),
                 projectID,
                 directory: ctx.location.directory,
+                bootID,
                 activityFor: (sid) => supervisor?.childActivity(sid),
               }),
             }
@@ -1647,7 +1694,12 @@ export default Plugin.define({
         if (!registry.isOwnedActive(event.sessionID)) return
         const limit = supervisor?.contextLimitFor?.(event.sessionID, event.model)
         if (!limit) return
-        const estimate = estimateRequestInput(event.system, event.messages, event.tools)
+        // Calibration is per provider/model: a variant picks a different limit
+        // entry but not a different bytes->context ratio for the same model.
+        // The hook stores the serialized bytes for the measured sample that
+        // lands in primitives.ts once this request settles.
+        const pin = `${event.model.providerID}/${event.model.id}`
+        const estimate = estimateAndRecordRequestInput(event.sessionID, pin, event.system, event.messages, event.tools)
         if (estimate >= limit.hardInput) {
           // Message contract, not a class: the worker bridge serializes errors to
           // e.message, so the stable greppable prefix is the typing.
@@ -1944,6 +1996,7 @@ export default Plugin.define({
         }
       }
       registry.dispose()
+      removeOwnerLiveness(bootID)
       if (supervisor) void supervisor.dispose()
     }
   },

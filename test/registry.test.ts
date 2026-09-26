@@ -17,6 +17,7 @@ function makeRegistry(overrides: {
   loader?: () => RunRecord[]
   throttleMs?: number
   now?: () => number
+  ownerAlive?: (bootID: string) => boolean
 } = {}) {
   const persisted: RunRecord[] = []
   const persist = overrides.persist ?? ((r: RunRecord) => persisted.push(r))
@@ -25,6 +26,7 @@ function makeRegistry(overrides: {
     loader: overrides.loader,
     throttleMs: overrides.throttleMs,
     now: overrides.now,
+    ownerAlive: overrides.ownerAlive,
   })
   return { registry, persisted }
 }
@@ -393,6 +395,80 @@ test("reconcileOrphans without a loader, or with a throwing loader, is a no-op",
   assert.equal(noLoader.registry.reconcileOrphans(), 0)
   const throwing = makeRegistry({ loader: () => { throw new Error("storage down") } })
   assert.equal(throwing.registry.reconcileOrphans(), 0)
+})
+
+test("reconcileOrphans adopts a remote-owned run only with fresh heartbeat AND live marker; flips otherwise", () => {
+  let clock = 10_000_000
+  const alive = persistedRun({
+    id: "run_alive",
+    status: "running",
+    startedAt: 1,
+    owner: { bootID: "boot_alive_elsewhere", updatedAt: clock - 60_000 },
+  })
+  const deadMarker = persistedRun({
+    id: "run_dead_marker",
+    status: "running",
+    startedAt: 1,
+    owner: { bootID: "boot_dead_marker", updatedAt: clock - 60_000 },
+  })
+  const staleHeartbeat = persistedRun({
+    id: "run_stale",
+    status: "running",
+    startedAt: 1,
+    owner: { bootID: "boot_alive_elsewhere", updatedAt: clock - (30 * 60_000 + 1) },
+  })
+  const { registry, persisted } = makeRegistry({
+    now: () => clock,
+    throttleMs: 0,
+    loader: () => [alive, deadMarker, staleHeartbeat],
+    ownerAlive: (bootID) => bootID === "boot_alive_elsewhere",
+  })
+
+  const flipped = registry.reconcileOrphans()
+  assert.equal(flipped, 2)
+
+  // Fresh heartbeat + live owner-liveness marker: the owner process is alive
+  // in another lane — adopt as-is, no write-back.
+  const a = registry.get("run_alive")
+  assert.equal(a?.status, "running")
+  assert.equal(a?.stopReason, undefined)
+  // Fresh heartbeat but the marker says the boot is dead (or absent):
+  // legacy flip-on-restart semantics.
+  const d = registry.get("run_dead_marker")
+  assert.equal(d?.status, "interrupted")
+  assert.equal(d?.stopReason, "server restart")
+  // Live marker cannot outvote a heartbeat stale beyond the orphan window.
+  const s = registry.get("run_stale")
+  assert.equal(s?.status, "interrupted")
+  assert.equal(s?.stopReason, "server restart")
+  // Only flipped records are written back to storage.
+  assert.deepEqual(persisted.map((r) => r.id), ["run_dead_marker", "run_stale"])
+})
+
+test("ownsRun is provenance, not presence: created runs own, adopted remote runs do not", () => {
+  let clock = 10_000_000
+  const remote = persistedRun({
+    id: "run_adopted",
+    status: "running",
+    startedAt: 1,
+    owner: { bootID: "boot_elsewhere", updatedAt: clock - 1_000 },
+  })
+  const { registry } = makeRegistry({
+    now: () => clock,
+    throttleMs: 0,
+    loader: () => [remote],
+    ownerAlive: () => true,
+  })
+  assert.equal(registry.reconcileOrphans(), 0)
+  // Adopted: readable in this registry but owned by the other process.
+  assert.equal(registry.get("run_adopted") !== undefined, true)
+  assert.equal(registry.ownsRun("run_adopted"), false)
+
+  const created = registry.create({ parentSessionID: "ses_p", script: "return 1" })
+  assert.equal(registry.ownsRun(created.id), true)
+  registry.finish(created.id, { status: "succeeded" })
+  // Durable past completion — the persist-vs-live freshness decisions rely on it.
+  assert.equal(registry.ownsRun(created.id), true)
 })
 
 test("reconcileOrphans never overwrites live in-memory runs", () => {
