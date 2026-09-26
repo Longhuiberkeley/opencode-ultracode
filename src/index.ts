@@ -61,6 +61,7 @@ import {
   isFinalRunStatus,
   runStateTransition,
   settingsPayload,
+  stepEventContext,
 } from "./run-status.ts"
 import { agentUsable, collectAgentPins, lookupAgentPin, normalizeModelRef, parseModelPin, readDisabledProviders } from "./agent-pins.ts"
 import { RegistryImpl } from "./registry.ts"
@@ -1713,6 +1714,40 @@ export default Plugin.define({
       })
       registrations.push(reg as unknown as RegistrationLike)
     } catch (err) { warn("child context guard unavailable", err) }
+
+    // ---- live per-request context feed: session.step.ended → contextTokens ----
+    // Every completed model step carries its own usage; requestContext() of it
+    // is the statusline-style "current context" of the child's latest request.
+    // Feeding it live means RUNNING children show a real number (not "-") and
+    // INTERRUPTED children keep the last one — registry patches merge, so the
+    // terminal status write never clears it. Only primary agent-loop steps fire
+    // this event (title/compaction have their own event types), so the value is
+    // taken as-is; a step with no usable usage is skipped by stepEventContext.
+    try {
+      const stream = (ctx as unknown as {
+        event?: { subscribe?: () => AsyncIterable<unknown> }
+      }).event?.subscribe?.()
+      if (stream && typeof stream[Symbol.asyncIterator] === "function") {
+        void (async () => {
+          try {
+            for await (const ev of stream) {
+              if (disposed) break
+              const step = stepEventContext(ev)
+              if (step === undefined) continue
+              const owned = registry.agentForSession(step.sessionID)
+              if (owned === undefined) continue
+              const agent = registry.getAgent(owned.runID, owned.agentID)
+              if (agent === undefined || agent.status !== "running") continue
+              registry.updateAgent(owned.runID, owned.agentID, { contextTokens: step.contextTokens })
+            }
+          } catch {
+            // stream ended or transport dropped — terminal paths still record context
+          }
+        })()
+      }
+    } catch (err) {
+      warn("step context feed unavailable", err)
+    }
 
     // ---- prompt hook: attach the authoring skill on a standalone "ultracode" keyword ----
     try {

@@ -581,3 +581,89 @@ test("runLivenessSuffix: running-only ext/stale at the 60s heartbeat boundary", 
   assert.equal(runLivenessSuffix({ status: "succeeded", external: true, ownerUpdatedAt: 1_000 }, 1_000_000), "")
   assert.equal(runLivenessSuffix({ status: "running" }, 1_000_000), "")
 })
+
+// ---------------------------------------------------------------------------
+// rpc.invalid_output regression (observed 2026-09-26): every field the
+// runStatus payload emits MUST be declared in the RPC output schema, or the
+// host rejects the WHOLE call with HTTP 500 once any record carries the field
+// (200k+ failed polls in production before this guard existed).
+// ---------------------------------------------------------------------------
+
+test("runStatus RPC output schema declares every field the payload emits", async () => {
+  const { ULTRACODE_RPC } = await import("../src/rpc-definition.ts")
+  const output = ULTRACODE_RPC.methods.runStatus.output as {
+    properties: { runs: { items: { properties: Record<string, unknown> } } }
+  }
+  const runProps = output.properties.runs!.items.properties!
+  const agentProps = (runProps.agentDetails as { items: { properties: Record<string, unknown> } }).items.properties
+  const tokenProps = (agentProps.tokens as { properties: Record<string, unknown> }).properties
+
+  // Build a record with EVERY optional agent field set (the richest payload).
+  const snaps = collectRunStatus({
+    runID: "run_rpc1",
+    liveGet: (id) =>
+      id === "run_rpc1"
+        ? record({
+            id: "run_rpc1",
+            owner: { bootID: "b2", updatedAt: 123 },
+            agents: [
+              {
+                id: "a1",
+                status: "running",
+                sessionID: "ses_rpc1",
+                phase: "scan",
+                label: "seeker",
+                requestedAgent: "explore",
+                effectiveAgent: "explore",
+                effectiveModel: { providerID: "openrouter", id: "kimi" },
+                spawnModel: { providerID: "openrouter", id: "kimi" },
+                tokens: { input: 10, output: 20, reasoning: 30, cache: { read: 40, write: 50 } },
+                contextTokens: 100,
+                toolCalls: 7,
+              },
+            ],
+          })
+        : undefined,
+    liveList: () => [],
+    persistedList: () => [],
+    bootID: "b1",
+    activityFor: () => 456,
+  })
+  const agent = snaps[0]!.agentDetails![0]!
+
+  // Top-level run fields.
+  for (const key of Object.keys(snaps[0]!)) {
+    if (key === "agentDetails" || key === "agents") continue
+    assert.ok(key in runProps, `payload run field "${key}" missing from runStatus output schema`)
+  }
+  // agentDetails item fields.
+  for (const key of Object.keys(agent)) {
+    assert.ok(key in agentProps, `payload agentDetails field "${key}" missing from runStatus output schema`)
+  }
+  // tokens sub-object fields (cache caused the same 500 class when undeclared).
+  for (const key of Object.keys(agent.tokens!)) {
+    assert.ok(key in tokenProps, `payload tokens field "${key}" missing from runStatus output schema`)
+  }
+})
+
+test("stepEventContext: session.step.ended usage becomes the live context number", async () => {
+  const { stepEventContext } = await import("../src/run-status.ts")
+  // Real shape: input + cache read + write sum to the statusline context.
+  assert.deepEqual(
+    stepEventContext({
+      type: "session.step.ended",
+      data: { sessionID: "ses_a", tokens: { input: 1000, output: 9, reasoning: 0, cache: { read: 74000, write: 2000 } } },
+    }),
+    { sessionID: "ses_a", contextTokens: 77_000 },
+  )
+  // Other events, missing session, or zero/no usage are ignored.
+  assert.equal(stepEventContext({ type: "session.usage.updated", data: { sessionID: "s", tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } } } }), undefined)
+  assert.equal(stepEventContext({ type: "session.step.ended", data: { tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } } } }), undefined)
+  assert.equal(
+    stepEventContext({ type: "session.step.ended", data: { sessionID: "ses_a", tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } } } }),
+    undefined,
+    "all-zero usage exposes no request context",
+  )
+  assert.equal(stepEventContext(undefined), undefined)
+  assert.equal(stepEventContext("nope"), undefined)
+})

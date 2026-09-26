@@ -127,8 +127,25 @@ export const ULTRACODE_RPC = {
                           input: NUMBER,
                           output: NUMBER,
                           reasoning: NUMBER,
+                          cache: {
+                            type: "object" as const,
+                            required: ["read", "write"],
+                            properties: {
+                              read: NUMBER,
+                              write: NUMBER,
+                            },
+                          },
                         },
                       },
+                      // Statusline-style current request context (input +
+                      // cache read + write of the child's most recent completed
+                      // request). MUST stay declared: the host validates output
+                      // against this schema and a payload key without a
+                      // declaration fails the WHOLE call with rpc.invalid_output
+                      // (observed 2026-09-26: 200k+ runStatus 500s).
+                      contextTokens: NUMBER,
+                      /** Milliseconds since last observed activity (running children). */
+                      stalledMs: NUMBER,
                       toolCalls: NUMBER,
                     },
                   },

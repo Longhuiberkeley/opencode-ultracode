@@ -6,7 +6,7 @@
  * status dot.
  */
 import { parseChildTitle } from "./sessions.ts"
-import { agentCells, compactCount, compactElapsed, compactTokens } from "./run-format.ts"
+import { agentCells, compactCount, compactElapsed } from "./run-format.ts"
 import { CONCURRENCY_CAP } from "./types.ts"
 import type { AgentRecord, AgentStatus, RunStatus, TokenUsage } from "./types.ts"
 import {
@@ -1337,17 +1337,13 @@ export function agentDetailLines(agent: RunAgentView): string[] {
     // Absent when nothing drifted — an explicit-model child that waited for
     // its provider window keeps one model throughout.
     ...(drifted ? [`spawn   ${rec.spawnModel!.providerID}/${rec.spawnModel!.id}`] : []),
-    // The statusline-standard metric: input + cache of the most recent
-    // request that exposed usage — the final request when it reports usage,
-    // else the latest earlier one (the fallback case), which is why the
-    // label says "last known" rather than "last request".
-    `context ${agent.contextTokens !== undefined && Number.isFinite(agent.contextTokens) ? compactCount(agent.contextTokens) : "-"} (last known)`,
+    // The statusline-standard metric and the ONLY context number shown: input
+    // + cache read + write of the most recent completed request (fed live by
+    // the session.step.ended subscription; the success path records it too).
+    // "-" is honest: no completed request ever exposed usage.
+    `context ${agent.contextTokens !== undefined && Number.isFinite(agent.contextTokens) ? compactCount(agent.contextTokens) : "-"}`,
     `session ${agent.sessionID}`,
     `tools   ${agent.toolCalls === undefined ? "-" : String(agent.toolCalls)}`,
-    // Cumulative across the child's model turns (each turn re-sends the
-    // conversation) — secondary: the last-request context above is the
-    // headline metric.
-    ...(agent.tokens ? [`spent   ${compactTokens(agent.tokens)} (cumulative, all turns)`] : []),
   ]
 }
 
@@ -1360,7 +1356,7 @@ export function phaseDetailLines(run: RunView, phaseId: string): string[] {
     phaseId,
     ...(agg ? [`status  ${statusDot(agg)} ${agg}`] : []),
     `agents  ${done}/${agents.length}`,
-    maxCtx === undefined ? "context - (max last request)" : `context ≤ ${compactCount(maxCtx)} (max last request)`,
+    maxCtx === undefined ? "context -" : `context ≤ ${compactCount(maxCtx)}`,
   ]
   // Child rows make a phase row reachable/informative on its own (the tree is
   // the only other place its agents appear).

@@ -2,7 +2,7 @@
  * Host-free run status: live/persisted snapshots, fallback expiry, RPC parse.
  * TUI heuristics live in tui-render; this module is the merge/lookup core.
  */
-import { countAgents, isActiveRunStatus, type AgentRecord, type RunRecord, type RunStatus, type TokenUsage } from "./types.ts"
+import { countAgents, isActiveRunStatus, requestContext, type AgentRecord, type RunRecord, type RunStatus, type TokenUsage } from "./types.ts"
 import { parsePanelSettings, type PanelSettings, type SettingsAck } from "./settings.ts"
 
 /** Bounded staleness window for session-derived "still running" heuristics. */
@@ -231,6 +231,24 @@ export function runLivenessSuffix(
   if (run.external === true) suffix += " ext"
   if (run.ownerUpdatedAt !== undefined && now - run.ownerUpdatedAt > OWNER_STALE_MS) suffix += " stale"
   return suffix
+}
+
+/**
+ * Extract the statusline-style current request context from a
+ * `session.step.ended` host event: the step's own usage (input + cache read +
+ * write) is the measured context of the request that just completed. Returns
+ * undefined for every other event shape (wrong type, missing session, no
+ * usable usage) — callers ignore those silently.
+ */
+export function stepEventContext(ev: unknown): { sessionID: string; contextTokens: number } | undefined {
+  if (!ev || typeof ev !== "object") return undefined
+  const rec = ev as { type?: unknown; data?: unknown }
+  if (rec.type !== "session.step.ended") return undefined
+  const data = rec.data as { sessionID?: unknown; tokens?: unknown } | undefined
+  if (!data || typeof data.sessionID !== "string" || data.sessionID === "") return undefined
+  const context = requestContext(data.tokens as Partial<TokenUsage> | null | undefined)
+  if (context === undefined) return undefined
+  return { sessionID: data.sessionID, contextTokens: context }
 }
 
 export function collectRunStatus(input: {

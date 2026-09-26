@@ -38,7 +38,7 @@ test("agentCells golden rows", () => {
     "extract",
     "explore",
     "openrouter/kimi",
-    "18k (last known)",
+    "18k",
     "4",
   ])
 

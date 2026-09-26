@@ -265,7 +265,7 @@ test("phaseColumns + agentRows D11 parity (status dot replaces status cell)", ()
   assert.deepEqual(agentRows(run, "missing"), [])
 
   // Explicit golden strings — populated agent/model/ctx/tools (sparse "-" must not pass).
-  assert.deepEqual(expectedFull, ["●", "a3 seeker", "extract", "explore", "openrouter/kimi", "18k (last known)", "4"])
+  assert.deepEqual(expectedFull, ["●", "a3 seeker", "extract", "explore", "openrouter/kimi", "18k", "4"])
   assert.deepEqual(expectedSparse, ["○", "a1", "verify", "general", "anthropic/sonnet", "-", "1"])
   assert.deepEqual(expectedFailed, ["✗", "a2 judge", "verify", "general", "anthropic/sonnet", "-", "2"])
 })
@@ -443,7 +443,7 @@ test("twoColumn: phases left, D11 right, pagination ↓, header", () => {
   assert.deepEqual(page0.header, ["run_abc123def456 · 1/3 agents · 1.5s"])
   assert.deepEqual(page0.left, ["Phases", "> 1 extract 0/1", "  2 verify 1/2"])
   assert.equal(page0.right[0]![0], "extract · 1 agents")
-  assert.deepEqual(page0.right[1], ["●", "a3 seeker", "extract", "explore", "openrouter/kimi", "18k (last known)", "4"])
+  assert.deepEqual(page0.right[1], ["●", "a3 seeker", "extract", "explore", "openrouter/kimi", "18k", "4"])
   assert.equal(page0.page, "1–1 of 1")
   assert.deepEqual(page0.footer, [])
 
@@ -971,7 +971,7 @@ test("phase aggregate status, dots, and detail status line (phase-row color mode
   assert.ok(detail.includes("agents  2/2"))
   // Detail: max context replaces the cumulative tokens row; child chips carry
   // each agent's own last-request context (never the cumulative sum).
-  assert.ok(detail.includes("context ≤ 200k (max last request)"), detail.join(" | "))
+  assert.ok(detail.includes("context ≤ 200k"), detail.join(" | "))
   assert.ok(detail.includes("✗ a1 · 12k"), detail.join(" | "))
   assert.ok(detail.includes("✓ a1 · 200k"), detail.join(" | "))
 })
@@ -1045,7 +1045,7 @@ test("phase detail lists its children (status, label, last-request context) — 
   assert.match(lines[2]!, /agents  \d+\/\d+/)
   // No child measured yet → the aggregate row has no number; the phase row's
   // label drops the ctx fragment entirely.
-  assert.equal(lines[3], "context - (max last request)")
+  assert.equal(lines[3], "context -")
   // child rows: status dot + label + last-request context chip ("-" until measured)
   assert.ok(lines.slice(4).some((l) => l.includes("seeker")), "child labels appear in phase detail")
   assert.ok(lines.slice(4).some((l) => /✓|●|○|✗|■/.test(l)), "child status dots appear")
@@ -1053,7 +1053,7 @@ test("phase detail lists its children (status, label, last-request context) — 
   assert.ok(!model.tree.find((r) => r.kind === "phase" && r.id === "research")!.label.includes("ctx"), "no ctx fragment without a measurement")
 })
 
-test("agentDetailLines: last-request context headlines; cumulative spend is one trailing line", () => {
+test("agentDetailLines: the statusline context is the one headline number; no cumulative spend row", () => {
   const agent: RunAgentView = {
     sessionID: "ses_ctx",
     ord: "a3",
@@ -1073,23 +1073,22 @@ test("agentDetailLines: last-request context headlines; cumulative spend is one 
     `status  ${STATUS_DOT.running} running`,
     "agent   explore",
     "model   openrouter/kimi",
-    "context 18k (last known)",
+    "context 18k",
     "session ses_ctx",
     "tools   4",
-    "spent   42.6k (cumulative, all turns)",
   ])
-  // The cumulative line is secondary: strictly last, and absent without tokens.
-  assert.equal(lines.at(-1)!.startsWith("spent "), true)
+  // Cumulative spend never renders in the TUI (ultracode_status JSON keeps it).
+  assert.equal(lines.some((l) => l.startsWith("spent")), false)
   const sparse: RunAgentView = { sessionID: "ses_new", status: "pending", title: "t" }
   const sparseLines = agentDetailLines(sparse)
-  assert.equal(sparseLines.includes("context - (last known)"), true)
+  assert.equal(sparseLines.includes("context -"), true)
   assert.equal(sparseLines.some((l) => l.startsWith("spent")), false)
   // Drift inserts the spawn provenance line after model, before context.
   const drifted = agentDetailLines({ ...agent, spawnModel: { providerID: "xai", id: "grok-4.7" } })
   assert.deepEqual(drifted.slice(3, 7), [
     "model   openrouter/kimi",
     "spawn   xai/grok-4.7",
-    "context 18k (last known)",
+    "context 18k",
     "session ses_ctx",
   ])
 })

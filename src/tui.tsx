@@ -487,6 +487,17 @@ export default Plugin.define({
       const currentParentID = (): string | undefined =>
         transportSessionID(context.ui?.panel?.current?.()?.sessionID, context.ui?.router)
 
+      // Failure backoff for the runStatus poll: without it a persistently
+      // failing endpoint (observed 2026-09-26: rpc.invalid_output schema
+      // rejects → HTTP 500) is retried on every 1s tick AND every session
+      // event — hundreds of thousands of dead calls per day. Healthy polls
+      // are never delayed; failures gate exponentially up to 15s.
+      let rpcFailures = 0
+      let rpcAllowedAt = 0
+      const noteRpcFailure = (): void => {
+        rpcFailures += 1
+        rpcAllowedAt = Date.now() + Math.min(1000 * 2 ** Math.min(rpcFailures, 4), 15_000)
+      }
       const refreshAuth = async (runID?: string, sessionID?: string): Promise<void> => {
         if (disposed) return
         const gen = ++authGen
@@ -498,6 +509,7 @@ export default Plugin.define({
             bump()
             return
           }
+          if (Date.now() < rpcAllowedAt) return
           const parent = sessionID ?? currentParentID()
           if (!parent) return
           const raw = await call(
@@ -507,7 +519,15 @@ export default Plugin.define({
             { location: { directory: chipScopeFromContext(context)?.directory } },
           )
           const parsed = parseRunStatusResponse(raw)
-          if (!parsed || gen !== authGen || parent !== currentParentID()) return
+          if (!parsed) {
+            // 200 but unparseable payload: same failure class as a 500 for
+            // polling purposes — gate it too, never reset the backoff.
+            noteRpcFailure()
+            return
+          }
+          if (gen !== authGen || parent !== currentParentID()) return
+          rpcFailures = 0
+          rpcAllowedAt = 0
           if (runID) {
             // MERGE per run (a backfill batch fetches several): other runs'
             // targeted snapshots survive, same-run results are replaced.
@@ -516,6 +536,7 @@ export default Plugin.define({
           } else liveSnaps = parsed
           bump()
         } catch {
+          noteRpcFailure()
           // silent: keep session heuristics
         }
       }
