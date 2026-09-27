@@ -479,6 +479,13 @@ export interface AgentRecord {
   key?: string
   /** sha256 over prompt + schema + agent — warm-rerun cache identity. */
   promptDigest?: string
+  /**
+   * The opts.schema this child was spawned with, persisted AT START (not only
+   * on success) so a post-crash harvest pass can validate a recovered
+   * session's final assistant message against the exact contract the caller
+   * asked for before replaying it warm. Additive; absent for schema-less calls.
+   */
+  schema?: Json
   /** True when this record was replayed from a prior run (no session spawned). */
   cached?: boolean
   /** Final text (stored only for keyed calls, so future warm reruns can replay it). */

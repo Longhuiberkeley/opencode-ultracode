@@ -599,6 +599,14 @@ export class AgentRunner {
       requestedAgent: opts.agent ?? this.defaultAgent,
       status: "pending",
       startedAt: Date.now(),
+      // Replay identity persists AT START, not only on success: a crash
+      // between spawn and completion leaves the row running with its key,
+      // digest and schema already durable, so the post-restart harvest pass
+      // can salvage a recovered session's result into a warm-replayable row
+      // (buildWarmCache still gates on status === "succeeded" — persisting
+      // early never makes an unfinished row replayable by itself).
+      ...(key && digest ? { key, promptDigest: digest } : {}),
+      ...(opts.schema !== undefined ? { schema: opts.schema } : {}),
     })
     if (!record) {
       this.semaphore.release()

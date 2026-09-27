@@ -726,6 +726,31 @@ test("AgentRunner warm cache: same key + different prompt (digest mismatch) spaw
   assert.equal(rec.resultText, "done")
 })
 
+test("AgentRunner: replay identity + schema persist AT START, while the child is still running", async () => {
+  // Harvest precondition: a crash between spawn and success must leave the
+  // row with its key, digest and schema already durable — the post-restart
+  // harvest validates the recovered session against exactly this schema.
+  const schema = { type: "object", required: ["summary"], properties: { summary: { type: "string" } } }
+  const { registry, run, calls, runner } = makeRunner()
+  const pending = runner.call("scout the area", { key: "scout:1", schema })
+  await tick()
+  assert.equal(calls.length, 1)
+  calls[0]!.hooks.onSessionID("ses_inflight")
+  // STILL in flight: the row already carries replay identity + schema.
+  const mid = registry.getAgent(run.id, "a1")!
+  assert.equal(mid.status, "running")
+  assert.equal(mid.key, "scout:1")
+  assert.equal(mid.promptDigest, agentCacheDigest("scout the area", { schema }, "general"))
+  assert.deepEqual(mid.schema, schema)
+  assert.equal(mid.resultText, undefined, "no result text before completion")
+  // And an in-flight row is NOT warm-replayable — buildWarmCache gates on
+  // succeeded status, so persisting early never fakes a replayable row.
+  const cache = buildWarmCache(registry.get(run.id))
+  assert.equal(cache.size, 0)
+  calls[0]!.resolve(okResult("ses_inflight"))
+  await pending
+})
+
 test("AgentRunner: keyed real-path success persists replay identity; unkeyed does not", async () => {
   const { registry, run, calls, runner } = makeRunner()
   const p1 = runner.call("step one", { key: "lane1" })
