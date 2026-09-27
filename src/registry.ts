@@ -58,6 +58,14 @@ interface ThrottleState {
   dirty: boolean
 }
 
+/** A persisted active record whose owner is gone: interrupt it (harvest first). */
+export interface OrphanPlan {
+  /** The in-memory record (seeded clone or adopted mirror) that must be interrupted. */
+  record: RunRecord
+  /** Truthful stopReason persisted with the flip (names the dead owner). */
+  reason: string
+}
+
 export class RegistryImpl implements Registry {
   private runs = new Map<string, RunRecord>()
   /** sessionID -> runID for runs still active (released on finalize). */
@@ -296,43 +304,58 @@ export class RegistryImpl implements Registry {
   }
 
   // ------------------------------------------------------------------
-  // Orphan reconciliation (plugin load after crash/restart)
+  // Orphan reconciliation (startup + periodic; see index.ts reconcileOnce)
   // ------------------------------------------------------------------
 
   /**
    * A record owned by another process is treated as orphaned only once its
-   * owner heartbeat is this stale. Generous on purpose: a single long child
-   * can legitimately go many minutes between persists, and flipping a live
-   * remote run is worse than adopting a dead one for a while (the TUI's
-   * `stale` badge already flags old heartbeats in the meantime).
+   * owner heartbeat is this stale — and only when the owner's pid cannot be
+   * verified live (pid-verified boots override a stale heartbeat entirely).
+   * Generous on purpose: a single long child can legitimately go many minutes
+   * between persists, and flipping a live remote run is worse than adopting a
+   * dead one for a while (the TUI's `stale` badge flags old heartbeats in the
+   * meantime).
    */
   private static readonly ORPHAN_HEARTBEAT_MS = 30 * 60_000
 
   /**
-   * Seed the registry from persisted records. Owner-less records (legacy) and
-   * records whose owner is provably gone flip `running|stopping|paused` →
-   * `interrupted` with stopReason "server restart". Records with a proven live
-   * owner in this process share that owner's record, so completion remains
-   * visible across location loads. A record carrying a REMOTE owner (different
-   * bootID) with a fresh heartbeat is flipped only when the owner-liveness
-   * probe is absent or says the boot is dead — flipping a live remote run
-   * would write a terminal "interrupted" record back to the KV and shadow the
-   * owner's subsequent updates in every panel. Returns the number of flipped
-   * runs.
+   * Seed + classify persisted records WITHOUT flipping: returns one plan per
+   * active record whose owner is gone. Two-phase on purpose — the caller
+   * harvests salvageable succeeded children (src/harvest.ts) BETWEEN
+   * classifyOrphans() and applyOrphanInterrupt(), so a dead owner's finished
+   * work is warm-replayable instead of being flipped away as interrupted.
+   *
+   * Seeding matches reconcileOrphans(): live same-process records win; a
+   * record with a live in-process owner registry SHARES that record; the rest
+   * are cloned into this registry and classified. With `recheckAdopted`, ids
+   * already seeded here are re-classified too — EXCEPT runs this process
+   * created (createdRuns), whose live supervisor state is authoritative.
+   * Rechecking adopted mirrors is the fix for the 2026-09-27 wedge: the
+   * replacement process adopted a dead owner's record as `running` and the
+   * old `runs.has(id) → skip` guard then froze it forever, because reconcile
+   * ran only at startup. Adoption is not a verdict.
    */
-  reconcileOrphans(): number {
-    if (!this.loader) return 0
+  classifyOrphans(opts: { recheckAdopted?: boolean } = {}): OrphanPlan[] {
+    if (!this.loader) return []
     let persisted: RunRecord[]
     try {
       persisted = this.loader()
     } catch {
-      return 0
+      return []
     }
-    let flipped = 0
+    const plans: OrphanPlan[] = []
     const now = this.now()
     for (const raw of persisted) {
       if (typeof raw?.id !== "string" || typeof raw.status !== "string") continue
-      if (this.runs.has(raw.id)) continue // live state wins (not reachable at startup)
+      const existing = this.runs.get(raw.id)
+      if (existing !== undefined) {
+        // Live state wins for runs this process supervises; adopted mirrors
+        // are re-classified on periodic passes (see above).
+        if (!opts.recheckAdopted || this.createdRuns.has(raw.id)) continue
+        const plan = this.classifyOrphanRecord(existing, now)
+        if (plan) plans.push(plan)
+        continue
+      }
       const liveOwner = raw.owner?.bootID ? runtimeOwners.get(raw.owner.bootID) : undefined
       const liveRecord = liveOwner && liveOwner !== this ? liveOwner.get(raw.id) : undefined
       if (liveRecord) {
@@ -348,47 +371,86 @@ export class RegistryImpl implements Registry {
         ...raw,
         agents: Array.isArray(raw.agents) ? raw.agents.map((a) => ({ ...a })) : [],
       }
-      // Owner evidence, strongest first: (1) a pid-verified LIVE boot owns
-      // the run even when the record heartbeat went stale (a live owner with
-      // one long silent child is not an orphan — this was the flip that
-      // produced the 2026-09-27 wedge class); (2) a marker whose pid is
-      // provably gone (ESRCH) is dead no matter how fresh the marker/heartbeat
-      // look — a SIGKILL leaves the marker behind, and the incident's
-      // replacement process adopted exactly such a record as running;
-      // (3) a marker without a checkable pid (legacy marker, EPERM) is alive
-      // only while the record heartbeat stays inside the orphan window;
-      // (4) no probe (legacy/unit) or no marker = dead — the historical
-      // "flip on restart" crash-recovery semantics.
-      const heartbeat = raw.owner?.updatedAt
-      const liveness =
-        typeof raw.owner?.bootID === "string" && heartbeat !== undefined
-          ? this.probeBoot(raw.owner.bootID)
-          : undefined
-      const ownerGone =
-        heartbeat === undefined ||
-        liveness === undefined ||
-        liveness === "dead" ||
-        liveness === "dead-pid" ||
-        (liveness === "alive-marker" && now - heartbeat > RegistryImpl.ORPHAN_HEARTBEAT_MS)
-      let wasActive = false
-      if (ownerGone && isActiveRunStatus(record.status)) {
-        record.status = "interrupted"
-        record.stopReason = "server restart"
-        if (record.endedAt === undefined) record.endedAt = now
-        for (const agent of record.agents) {
-          if (agent.status === "pending" || agent.status === "running") {
-            agent.status = "interrupted"
-            if (agent.endedAt === undefined) agent.endedAt = record.endedAt
-          }
-        }
-        wasActive = true
-      }
       this.runs.set(record.id, record)
-      if (wasActive) {
-        flipped++
-        // Write the corrected record back so a second restart doesn't re-flip.
-        this.persistNow(record.id)
+      const plan = this.classifyOrphanRecord(record, now)
+      if (plan) plans.push(plan)
+    }
+    return plans
+  }
+
+  /**
+   * Owner evidence for one record, strongest first: (1) a pid-verified LIVE
+   * boot owns the run even when the record heartbeat went stale (a live owner
+   * with one long silent child is not an orphan — the old logic flipped
+   * exactly that); (2) a marker whose pid is provably gone (ESRCH) is dead no
+   * matter how fresh the marker/heartbeat look — a SIGKILL leaves the marker
+   * behind, and the 2026-09-27 replacement process adopted exactly such a
+   * record as running; (3) a marker without a checkable pid (legacy marker,
+   * EPERM) is alive only while the record heartbeat stays inside the orphan
+   * window; (4) no probe (legacy/unit) or no marker = dead — the historical
+   * "flip on restart" crash-recovery semantics.
+   */
+  private classifyOrphanRecord(record: RunRecord, now: number): OrphanPlan | undefined {
+    if (!isActiveRunStatus(record.status)) return undefined
+    const heartbeat = record.owner?.updatedAt
+    const liveness =
+      typeof record.owner?.bootID === "string" && heartbeat !== undefined
+        ? this.probeBoot(record.owner.bootID)
+        : undefined
+    const ownerGone =
+      heartbeat === undefined ||
+      liveness === undefined ||
+      liveness === "dead" ||
+      liveness === "dead-pid" ||
+      (liveness === "alive-marker" && now - heartbeat > RegistryImpl.ORPHAN_HEARTBEAT_MS)
+    if (!ownerGone) return undefined
+    return { record, reason: RegistryImpl.orphanStopReason(record) }
+  }
+
+  /** Truthful, actionable stopReason for an orphan flip (bounded length). */
+  private static orphanStopReason(record: RunRecord): string {
+    const owner = record.owner
+    const who =
+      owner !== undefined
+        ? ` (owner ${owner.bootID}${typeof owner.pid === "number" ? ` pid ${owner.pid}` : ""} gone)`
+        : ""
+    return `server restart${who} — resumable: /ultracode rerun ${record.id} --warm`
+  }
+
+  /**
+   * Apply a classifyOrphans() plan: run and its running/pending children flip
+   * to `interrupted`, then the corrected record is persisted immediately (a
+   * second restart must not re-flip). Idempotent: a record that reached a
+   * final state after classification is left alone — between classify and
+   * apply the live owner may legitimately have finished it.
+   */
+  applyOrphanInterrupt(plan: OrphanPlan, reasonOverride?: string): boolean {
+    const record = plan.record
+    if (!isActiveRunStatus(record.status)) return false
+    const now = this.now()
+    record.status = "interrupted"
+    record.stopReason = reasonOverride ?? plan.reason
+    if (record.endedAt === undefined) record.endedAt = now
+    for (const agent of record.agents) {
+      if (agent.status === "pending" || agent.status === "running") {
+        agent.status = "interrupted"
+        if (agent.endedAt === undefined) agent.endedAt = record.endedAt
       }
+    }
+    this.persistNow(record.id)
+    return true
+  }
+
+  /**
+   * Legacy one-shot reconcile: classify and apply immediately (no harvest
+   * window). Startup and tests; the periodic path calls classifyOrphans +
+   * applyOrphanInterrupt so harvest can run between them. Returns the number
+   * of flipped runs.
+   */
+  reconcileOrphans(): number {
+    let flipped = 0
+    for (const plan of this.classifyOrphans()) {
+      if (this.applyOrphanInterrupt(plan)) flipped++
     }
     return flipped
   }

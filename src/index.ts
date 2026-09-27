@@ -71,7 +71,7 @@ import {
   stripUndefined,
 } from "./run-status.ts"
 import { agentUsable, collectAgentPins, lookupAgentPin, normalizeModelRef, parseModelPin, readDisabledProviders } from "./agent-pins.ts"
-import { RegistryImpl } from "./registry.ts"
+import { RegistryImpl, type OrphanPlan } from "./registry.ts"
 import { emptyToolEventState } from "./run-events.ts"
 import { EMPTY_CATALOG, SKILL_CONTENT, SKILL_DESCRIPTION, SKILL_NAME, buildSkillContent } from "./skill-content.ts"
 import { compileGraphSpec, validateGraphSpec } from "./graph.ts"
@@ -748,14 +748,63 @@ export default Plugin.define({
     const controller = new AbortController()
     const registrations: RegistrationLike[] = []
 
+    /**
+     * One reconcile pass (startup AND periodic): refresh persisted runs from
+     * the KV, then re-classify every active record this process does NOT
+     * supervise. Runs whose owner is provably gone (dead pid after SIGKILL,
+     * dead/absent marker, or a pid-less marker past the orphan heartbeat
+     * window) flip to `interrupted` carrying a resume hint. Locally
+     * supervised runs are never touched here — their live RunState and run
+     * watchdog are authoritative — and mirrors of provably live remote owners
+     * are left to that owner. This is the fix for the frozen-`running` wedge:
+     * reconcile used to run at startup only, so an adopted record outlived
+     * every TTL as a zombie.
+     */
+    const reconcileOnce = async (): Promise<number> => {
+      try {
+        await refreshPersistedRuns()
+      } catch {
+        // best effort — a refresh failure must not block classification
+      }
+      let plans: OrphanPlan[] = []
+      try {
+        plans = registry.classifyOrphans({ recheckAdopted: true })
+      } catch {
+        return 0
+      }
+      let flipped = 0
+      for (const plan of plans) {
+        if (registry.applyOrphanInterrupt(plan)) flipped++
+      }
+      return flipped
+    }
+
     // Async warm-up (never blocks setup on session admission; kv only).
     const runsReconciled = storage
       .loadRunsAsync()
-      .then(() => {
-        const flipped = registry.reconcileOrphans()
-        if (flipped > 0) warn(`marked ${flipped} orphaned run(s) as interrupted (server restart)`)
+      .then(async () => {
+        const flipped = await reconcileOnce()
+        if (flipped > 0) warn(`marked ${flipped} orphaned run(s) as interrupted (owner gone; resumable via /ultracode rerun --warm)`)
       })
       .catch((err) => warn("failed to reconcile persisted runs", err))
+
+    // Periodic reconcile: no active record may stay `running` without a live
+    // owner, no matter how long this process lives. Unref'd; 0 disables.
+    // (baseOptions: the runtime overlay never carries this key.)
+    let reconcileTimer: ReturnType<typeof setInterval> | undefined
+    if (baseOptions.reconcileIntervalMs > 0) {
+      reconcileTimer = setInterval(
+        () => {
+          void reconcileOnce()
+            .then((flipped) => {
+              if (flipped > 0) warn(`periodic reconcile marked ${flipped} orphaned run(s) as interrupted`)
+            })
+            .catch(() => {})
+        },
+        baseOptions.reconcileIntervalMs,
+      )
+      reconcileTimer.unref?.()
+    }
 
     void (async () => {
       try {
@@ -1490,6 +1539,7 @@ export default Plugin.define({
               supervisor: supervisor ?? undefined,
               supervisorError,
               reconciled: runsReconciled,
+              reconcileNow: () => reconcileOnce(),
               rememberFallback: rememberFallbackEntry,
             }),
         })
@@ -1633,6 +1683,7 @@ export default Plugin.define({
             input: { action?: unknown; runID?: unknown; model?: unknown; remember?: unknown } | undefined,
           ) => {
             await runsReconciled
+            await reconcileOnce().catch(() => {})
             const parsed = validateControlToolInput(input)
             if (!parsed.ok) throw new Error(parsed.error)
             if (!supervisor) throw new Error(supervisorError ?? "workflow tool unavailable")
@@ -2051,6 +2102,7 @@ export default Plugin.define({
       skillInstalled = false
       controller.abort()
       clearInterval(heartbeatTimer)
+      if (reconcileTimer !== undefined) clearInterval(reconcileTimer)
       for (const timer of stallTimers.values()) clearTimeout(timer)
       stallTimers.clear()
       for (const reg of registrations) {

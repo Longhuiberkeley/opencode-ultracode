@@ -46,6 +46,7 @@ test("loadOptions: empty object gives all defaults", () => {
     quotaCommand: null,
     quotaSources: {},
     childLimits: {},
+    reconcileIntervalMs: 60_000,
   })
   assert.deepEqual(warnings, [])
 })
@@ -72,6 +73,7 @@ test("loadOptions: fully valid options round-trip", () => {
     quotaCommand: null,
     quotaSources: {},
     childLimits: {},
+    reconcileIntervalMs: 60_000,
   }
   const { options, warnings } = loadOptions(raw)
   assert.deepEqual(options, raw)

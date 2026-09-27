@@ -43,7 +43,8 @@ const RANGES: Record<
   | "agentRetryBackoffMs"
   | "childStallMs"
   | "maxLoopDepth"
-  | "askTimeoutMs",
+  | "askTimeoutMs"
+  | "reconcileIntervalMs",
   NumRange
 > = {
   concurrency: { min: 1, max: 64 },
@@ -62,6 +63,8 @@ const RANGES: Record<
   maxLoopDepth: { min: MIN_LOOP_DEPTH, max: MAX_LOOP_DEPTH },
   // Ask-mode auto-proceed timeout: 0 = wait indefinitely while paused.
   askTimeoutMs: { min: 0, max: 86_400_000 },
+  // Periodic orphan reconcile: 0 = startup-only (historical behavior).
+  reconcileIntervalMs: { min: 0, max: 3_600_000 },
 }
 
 const PERMISSION_MODES: ReadonlySet<string> = new Set(["ask", "autoEditsWorkflow", "noEditTools"])

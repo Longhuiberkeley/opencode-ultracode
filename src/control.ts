@@ -145,6 +145,13 @@ export interface ControlDeps {
   /** Boot reconciliation; awaited best-effort so persisted dead runs report their real status. */
   reconciled?: Promise<unknown>
   /**
+   * On-demand reconcile pass (periodic machinery, run NOW): control decisions
+   * must be truthful immediately, not one interval late — a dead owner's run
+   * should already read `interrupted` when controlRun evaluates it. Optional
+   * and awaited best-effort, same as `reconciled`.
+   */
+  reconcileNow?: () => Promise<unknown>
+  /**
    * `remember: true` persistence: merge the chosen model into the stored
    * modelFallbacks entry for the run's quarantined provider, through the same
    * settings path `/ultracode set` uses (never agent pin files). Returns the
@@ -177,6 +184,13 @@ export async function controlToolContent(
       await deps.reconciled
     } catch {
       // best-effort: reconciliation failures must not block control
+    }
+  }
+  if (deps.reconcileNow) {
+    try {
+      await deps.reconcileNow()
+    } catch {
+      // best-effort: a failed pass leaves the periodic tick as the backstop
     }
   }
   if (!deps.supervisor) {

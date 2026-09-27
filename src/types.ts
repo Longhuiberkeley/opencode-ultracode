@@ -143,6 +143,15 @@ export interface UltracodeOptions {
   quotaSources?: Record<string, { command: string[]; format: "capacity-v1" | "check-rate" }>
   /** Only models named here receive the approximate active-input guard. */
   childLimits?: Record<string, ChildContextLimit>
+  /**
+   * Periodic orphan-reconcile cadence in ms: refresh persisted runs and
+   * re-classify active records whose owner is gone (dead pid, dead marker, or
+   * a pid-less marker past the orphan heartbeat window), flipping them to
+   * `interrupted` with a resume hint and harvesting salvageable children.
+   * Startup always reconciles once regardless. 0 disables the periodic pass
+   * (startup-only, the historical behavior). Default 60_000.
+   */
+  reconcileIntervalMs?: number
 }
 
 export const DEFAULT_OPTIONS: Required<UltracodeOptions> = {
@@ -166,6 +175,7 @@ export const DEFAULT_OPTIONS: Required<UltracodeOptions> = {
   quotaCommand: null,
   quotaSources: {},
   childLimits: {},
+  reconcileIntervalMs: 60_000,
 }
 
 /** Local admission clamp (this repo default). Not a host API. */
