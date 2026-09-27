@@ -37,7 +37,13 @@ import {
 import { loadOptions } from "./config.ts"
 import { capacityFeed } from "./quota-command.ts"
 import { defaultProviderQuarantineDir } from "./provider-quarantine.ts"
-import { maybeRefreshOwnerLiveness, ownerAliveProbe, removeOwnerLiveness, writeOwnerLiveness } from "./owner-liveness.ts"
+import {
+  OWNER_HEARTBEAT_INTERVAL_MS,
+  maybeRefreshOwnerLiveness,
+  ownerLivenessProbe,
+  removeOwnerLiveness,
+  writeOwnerLiveness,
+} from "./owner-liveness.ts"
 import { estimateAndRecordRequestInput } from "./child-context.ts"
 import { CATALOG_RUN_LIMIT, CATALOG_RUN_SCAN, buildCatalog } from "./catalog.ts"
 import { applyResumeRemember, controlRun, controlToolContent } from "./control.ts"
@@ -690,8 +696,26 @@ export default Plugin.define({
       },
       loader: () => storage.loadRuns(),
       bootID,
-      ownerAlive: ownerAliveProbe(),
+      ownerProbe: ownerLivenessProbe(),
     })
+
+    /**
+     * Owner heartbeat, independent of child progress: refresh this boot's
+     * machine-wide marker and every active owned run's `owner.updatedAt` on a
+     * fixed cadence. Before this existed both refreshed only on run persists,
+     * so one legitimately silent long-running child starved the heartbeat —
+     * live owners rendered "ext stale" and drifted toward the orphan window.
+     * Unref'd: the timer must never hold the event loop open.
+     */
+    const heartbeatTimer = setInterval(() => {
+      try {
+        writeOwnerLiveness(bootID)
+        registry.touchActiveOwned()
+      } catch {
+        // best effort — never throw from the event loop
+      }
+    }, OWNER_HEARTBEAT_INTERVAL_MS)
+    heartbeatTimer.unref?.()
 
     /**
      * Refresh-if-stale persisted runs before a panel/command read and push a
@@ -2026,6 +2050,7 @@ export default Plugin.define({
       disposed = true
       skillInstalled = false
       controller.abort()
+      clearInterval(heartbeatTimer)
       for (const timer of stallTimers.values()) clearTimeout(timer)
       stallTimers.clear()
       for (const reg of registrations) {

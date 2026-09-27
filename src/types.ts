@@ -551,9 +551,10 @@ export interface RunRecord {
   allowDisabledProviders?: boolean
   /**
    * Process ownership for orphan reconciliation. Optional/additive: records
-   * without owner keep the legacy "flip on restart" behavior.
+   * without owner keep the legacy "flip on restart" behavior. `pid` (additive)
+   * lets reconciliation prove a fresh-but-orphaned marker dead after SIGKILL.
    */
-  owner?: { bootID: string; updatedAt: number }
+  owner?: { bootID: string; updatedAt: number; pid?: number }
 }
 
 export function emptyTokens(): TokenUsage {

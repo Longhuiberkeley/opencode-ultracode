@@ -17,7 +17,9 @@ function makeRegistry(overrides: {
   loader?: () => RunRecord[]
   throttleMs?: number
   now?: () => number
+  bootID?: string
   ownerAlive?: (bootID: string) => boolean
+  ownerProbe?: (bootID: string) => "alive-pid" | "alive-marker" | "dead-pid" | "dead"
 } = {}) {
   const persisted: RunRecord[] = []
   const persist = overrides.persist ?? ((r: RunRecord) => persisted.push(r))
@@ -26,7 +28,9 @@ function makeRegistry(overrides: {
     loader: overrides.loader,
     throttleMs: overrides.throttleMs,
     now: overrides.now,
+    bootID: overrides.bootID,
     ownerAlive: overrides.ownerAlive,
+    ownerProbe: overrides.ownerProbe,
   })
   return { registry, persisted }
 }
@@ -443,6 +447,110 @@ test("reconcileOrphans adopts a remote-owned run only with fresh heartbeat AND l
   assert.equal(s?.stopReason, "server restart")
   // Only flipped records are written back to storage.
   assert.deepEqual(persisted.map((r) => r.id), ["run_dead_marker", "run_stale"])
+})
+
+test("reconcileOrphans (pid-aware): a pid-verified live owner is NEVER flipped, even on a stale heartbeat", () => {
+  let clock = 10_000_000
+  // The 2026-09-27 wedge shape inverted: a live owner whose single child sat
+  // in one long silent provider request for >30 min starved the heartbeat and
+  // the old logic flipped a LIVE run. A pid-verified boot must outvote the
+  // stale heartbeat.
+  const silentChild = persistedRun({
+    id: "run_silent_child",
+    status: "running",
+    startedAt: 1,
+    owner: { bootID: "boot_alive_pid", updatedAt: clock - (30 * 60_000 + 60_000) },
+    agents: [{ id: "a1", status: "running", sessionID: "ses_child" }],
+  })
+  const { registry, persisted } = makeRegistry({
+    now: () => clock,
+    throttleMs: 0,
+    loader: () => [silentChild],
+    ownerProbe: (bootID) => (bootID === "boot_alive_pid" ? "alive-pid" : "dead"),
+  })
+  assert.equal(registry.reconcileOrphans(), 0)
+  assert.equal(registry.get("run_silent_child")?.status, "running")
+  assert.equal(persisted.length, 0, "no write-back for an adopted live run")
+})
+
+test("reconcileOrphans (pid-aware): a dead pid flips IMMEDIATELY despite fresh marker and heartbeat (the SIGKILL case)", () => {
+  let clock = 10_000_000
+  const killed = persistedRun({
+    id: "run_killed",
+    status: "running",
+    startedAt: 1,
+    owner: { bootID: "boot_killed", updatedAt: clock - 1_000 },
+    agents: [
+      { id: "a1", status: "running", sessionID: "ses_a" },
+      { id: "a2", status: "pending" },
+      { id: "a3", status: "succeeded" },
+    ],
+  })
+  const { registry, persisted } = makeRegistry({
+    now: () => clock,
+    throttleMs: 0,
+    loader: () => [killed],
+    ownerProbe: () => "dead-pid",
+  })
+  assert.equal(registry.reconcileOrphans(), 1)
+  const run = registry.get("run_killed")!
+  assert.equal(run.status, "interrupted")
+  assert.equal(run.stopReason, "server restart")
+  assert.equal(run.agents.find((a) => a.id === "a1")?.status, "interrupted")
+  assert.equal(run.agents.find((a) => a.id === "a2")?.status, "interrupted")
+  assert.equal(run.agents.find((a) => a.id === "a3")?.status, "succeeded", "terminal children untouched")
+  assert.equal(typeof run.endedAt, "number")
+  assert.deepEqual(persisted.map((r) => r.id), ["run_killed"])
+})
+
+test("reconcileOrphans (pid-aware): alive-marker still falls back to the heartbeat window", () => {
+  let clock = 10_000_000
+  const freshHeartbeat = persistedRun({
+    id: "run_fresh",
+    status: "running",
+    startedAt: 1,
+    owner: { bootID: "boot_marker_only", updatedAt: clock - 60_000 },
+  })
+  const staleHeartbeat = persistedRun({
+    id: "run_over",
+    status: "running",
+    startedAt: 1,
+    owner: { bootID: "boot_marker_only", updatedAt: clock - (30 * 60_000 + 1) },
+  })
+  const { registry } = makeRegistry({
+    now: () => clock,
+    throttleMs: 0,
+    loader: () => [freshHeartbeat, staleHeartbeat],
+    ownerProbe: () => "alive-marker",
+  })
+  assert.equal(registry.reconcileOrphans(), 1)
+  assert.equal(registry.get("run_fresh")?.status, "running")
+  assert.equal(registry.get("run_over")?.status, "interrupted")
+})
+
+test("persistNow stamps the full owner identity (bootID, pid, updatedAt); touchActiveOwned refreshes only active owned runs", () => {
+  let clock = 5_000
+  const snapshots: RunRecord[] = []
+  const { registry } = makeRegistry({
+    bootID: "boot_me",
+    now: () => clock,
+    throttleMs: 0,
+    persist: (r) => snapshots.push({ ...r, owner: r.owner ? { ...r.owner } : undefined, agents: [...r.agents] }),
+  })
+  const active = registry.create({ parentSessionID: "ses", script: "s" })
+  const finished = registry.create({ parentSessionID: "ses", script: "s" })
+  registry.finish(finished.id, { status: "succeeded" })
+
+  clock = 9_000
+  const touched = registry.touchActiveOwned()
+  assert.equal(touched, 1, "only the active run created by this registry")
+  const last = snapshots.filter((r) => r.id === active.id).at(-1)!
+  assert.equal(last.owner?.bootID, "boot_me")
+  assert.equal(last.owner?.pid, process.pid)
+  assert.equal(last.owner?.updatedAt, 9_000)
+  // A finished run keeps its last snapshot; no new persist for it.
+  const finishedSnaps = snapshots.filter((r) => r.id === finished.id)
+  assert.equal(finishedSnaps.at(-1)!.owner?.updatedAt, 5_000)
 })
 
 test("ownsRun is provenance, not presence: created runs own, adopted remote runs do not", () => {

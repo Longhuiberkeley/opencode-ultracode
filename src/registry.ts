@@ -11,6 +11,7 @@
  */
 import type { AgentRecord, Json, Registry, RunRecord, RunStatus, WorkflowMeta } from "./types.ts"
 import { addTokens, emptyTokens, isActiveRunStatus, randomRunID } from "./types.ts"
+import type { OwnerBootLiveness } from "./owner-liveness.ts"
 
 export interface RegistryInit {
   /** Persist a run snapshot (Storage.saveRun — throw-safe). */
@@ -25,9 +26,16 @@ export interface RegistryInit {
   bootID?: string
   /**
    * Machine-wide liveness probe for remote owner boots (owner-liveness
-   * markers). Absent ⇒ legacy semantics: any different-boot owner counts as
-   * dead at reconcile ("flip on restart"). Present ⇒ a boot with a live
-   * marker keeps its runs running in this registry's view.
+   * markers). Preferred over `ownerAlive`: the richer verdict lets a provably
+   * dead pid flip a run immediately (SIGKILL leaves the marker behind) while a
+   * pid-verified live owner is NEVER flipped, even on a stale run heartbeat.
+   * Absent ⇒ falls back to `ownerAlive`; both absent ⇒ legacy semantics: any
+   * different-boot owner counts as dead at reconcile ("flip on restart").
+   */
+  ownerProbe?: (bootID: string) => OwnerBootLiveness
+  /**
+   * Legacy boolean liveness probe (true ⇒ "alive-marker", false ⇒ "dead").
+   * Superseded by `ownerProbe`; kept so existing injections keep working.
    */
   ownerAlive?: (bootID: string) => boolean
 }
@@ -66,12 +74,11 @@ export class RegistryImpl implements Registry {
   private readonly now: () => number
   private readonly bootID?: string
   /**
-   * Machine-wide liveness probe for REMOTE owner boots (owner-liveness
-   * markers). Absent ⇒ legacy semantics: any different-boot owner counts as
-   * dead ("flip on restart"). Present (production wiring) ⇒ a boot with a
-   * live marker owns its runs and they are adopted, not flipped.
+   * Resolved owner-liveness probe: `ownerProbe` when injected, else the legacy
+   * `ownerAlive` mapped onto verdicts, else undefined (legacy unit semantics:
+   * any different-boot owner counts as dead - "flip on restart").
    */
-  private readonly ownerAlive?: (bootID: string) => boolean
+  private readonly ownerProbe?: (bootID: string) => OwnerBootLiveness
 
   constructor(init: RegistryInit) {
     this.persist = init.persist
@@ -79,8 +86,20 @@ export class RegistryImpl implements Registry {
     this.throttleMs = init.throttleMs ?? 1000
     this.now = init.now ?? Date.now
     this.bootID = init.bootID
-    this.ownerAlive = init.ownerAlive
+    this.ownerProbe =
+      init.ownerProbe ??
+      (init.ownerAlive !== undefined
+        ? (bootID: string) => (init.ownerAlive!(bootID) ? ("alive-marker" as const) : ("dead" as const))
+        : undefined)
     if (this.bootID) runtimeOwners.set(this.bootID, this)
+  }
+
+  /**
+   * Liveness verdict for a boot id under the resolved probe. No probe injected
+   * means "dead": the historical flip-on-restart crash-recovery semantics.
+   */
+  private probeBoot(bootID: string): OwnerBootLiveness {
+    return this.ownerProbe ? this.ownerProbe(bootID) : "dead"
   }
 
   // ------------------------------------------------------------------
@@ -329,18 +348,28 @@ export class RegistryImpl implements Registry {
         ...raw,
         agents: Array.isArray(raw.agents) ? raw.agents.map((a) => ({ ...a })) : [],
       }
-      // Owner evidence, strongest first: (1) an owner heartbeat stale beyond
-      // ORPHAN_HEARTBEAT_MS says the owner is gone no matter what; (2) with a
-      // liveness probe (production wiring — machine-wide owner-liveness
-      // markers), a REMOTE boot with a live marker is another process still
-      // running: adopt, don't flip; (3) without a probe (legacy/unit), or
-      // with a dead/missing marker, a different-boot owner counts as dead —
-      // the historical "flip on restart" crash-recovery semantics.
+      // Owner evidence, strongest first: (1) a pid-verified LIVE boot owns
+      // the run even when the record heartbeat went stale (a live owner with
+      // one long silent child is not an orphan — this was the flip that
+      // produced the 2026-09-27 wedge class); (2) a marker whose pid is
+      // provably gone (ESRCH) is dead no matter how fresh the marker/heartbeat
+      // look — a SIGKILL leaves the marker behind, and the incident's
+      // replacement process adopted exactly such a record as running;
+      // (3) a marker without a checkable pid (legacy marker, EPERM) is alive
+      // only while the record heartbeat stays inside the orphan window;
+      // (4) no probe (legacy/unit) or no marker = dead — the historical
+      // "flip on restart" crash-recovery semantics.
       const heartbeat = raw.owner?.updatedAt
-      const remoteBootAlive =
-        this.ownerAlive !== undefined && typeof raw.owner?.bootID === "string" && this.ownerAlive(raw.owner.bootID)
+      const liveness =
+        typeof raw.owner?.bootID === "string" && heartbeat !== undefined
+          ? this.probeBoot(raw.owner.bootID)
+          : undefined
       const ownerGone =
-        heartbeat === undefined || now - heartbeat > RegistryImpl.ORPHAN_HEARTBEAT_MS || !remoteBootAlive
+        heartbeat === undefined ||
+        liveness === undefined ||
+        liveness === "dead" ||
+        liveness === "dead-pid" ||
+        (liveness === "alive-marker" && now - heartbeat > RegistryImpl.ORPHAN_HEARTBEAT_MS)
       let wasActive = false
       if (ownerGone && isActiveRunStatus(record.status)) {
         record.status = "interrupted"
@@ -384,7 +413,10 @@ export class RegistryImpl implements Registry {
     const record = this.runs.get(runID)
     if (record) {
       if (this.bootID) {
-        record.owner = { bootID: this.bootID, updatedAt: this.now() }
+        // Full owner identity on every persist: boot + pid lets ANY process
+        // reading the KV prove liveness (marker) or death (ESRCH) without a
+        // heartbeat grace period, and name the owner in truthful refusals.
+        record.owner = { bootID: this.bootID, updatedAt: this.now(), pid: process.pid }
       }
       try {
         this.persist(record)
@@ -392,6 +424,26 @@ export class RegistryImpl implements Registry {
         // Storage.saveRun is throw-safe; belt and braces for other injectors.
       }
     }
+  }
+
+  /**
+   * Heartbeat every ACTIVE run this registry created (persistNow refreshes
+   * `owner.updatedAt`), independent of child progress. Called from the
+   * plugin's fixed heartbeat timer so a run whose children are all inside one
+   * long silent provider request never renders "stale" or drifts into the
+   * orphan window while its owner is alive. Adopted (foreign) records are
+   * never touched — their owner heartbeats for itself. Returns the number of
+   * runs refreshed.
+   */
+  touchActiveOwned(): number {
+    let touched = 0
+    for (const run of this.runs.values()) {
+      if (!isActiveRunStatus(run.status)) continue
+      if (!this.createdRuns.has(run.id)) continue
+      this.persistNow(run.id)
+      touched++
+    }
+    return touched
   }
 
   private requestPersist(runID: string): void {
