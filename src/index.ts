@@ -65,6 +65,7 @@ import {
   collectRunStatus,
   hasRpcRegister,
   isFinalRunStatus,
+  persistedActivityFor,
   runStateTransition,
   settingsPayload,
   stepEventContext,
@@ -72,7 +73,8 @@ import {
 } from "./run-status.ts"
 import { agentUsable, collectAgentPins, lookupAgentPin, normalizeModelRef, parseModelPin, readDisabledProviders } from "./agent-pins.ts"
 import { RegistryImpl } from "./registry.ts"
-import type { OrphanPlan } from "./types.ts"
+import { REMOTE_DEADLINE_GRACE_MS } from "./registry.ts"
+import type { OrphanPlan, RunRecord } from "./types.ts"
 import { harvestOrphanedRun } from "./harvest.ts"
 import { emptyToolEventState } from "./run-events.ts"
 import { EMPTY_CATALOG, SKILL_CONTENT, SKILL_DESCRIPTION, SKILL_NAME, buildSkillContent } from "./skill-content.ts"
@@ -747,6 +749,10 @@ export default Plugin.define({
       }
     }
 
+    // Persisted-activity fallback (stalledMs across restarts): the live map
+    // dies with the owner process; the throttled record does not.
+    const persistedActivity = persistedActivityFor(registry)
+
     const controller = new AbortController()
     const registrations: RegistrationLike[] = []
 
@@ -792,6 +798,35 @@ export default Plugin.define({
           // best effort — the flip below still bounds the record
         }
         if (registry.applyOrphanInterrupt(plan)) flipped++
+      }
+      // Deadline enforcement for records whose owner is ALIVE but stopped
+      // enforcing its own timeout (wedged watchdog — the heartbeat timer
+      // outlives it): the run's 90-minute timeout must fire even when the
+      // arming process died with the timer (the second incident's zombie).
+      // The grace makes the owner's own watchdog win whenever it works.
+      let expired: Array<{ record: RunRecord; deadlineAt: number }> = []
+      try {
+        expired = registry.expiredRemoteRuns(Date.now(), REMOTE_DEADLINE_GRACE_MS)
+      } catch {
+        expired = []
+      }
+      for (const item of expired) {
+        const overdueMs = Date.now() - item.deadlineAt
+        const reason =
+          `timeout — run deadline passed ${Math.round(overdueMs / 1000)}s ago while its owner stopped enforcing it; ` +
+          `resumable via /ultracode rerun ${item.record.id} --warm`
+        try {
+          await harvestOrphanedRun(item.record, {
+            sessions,
+            updateAgent: (runID, agentID, patch) => registry.updateAgent(runID, agentID, patch),
+          })
+        } catch {
+          // best effort
+        }
+        if (registry.applyOrphanInterrupt({ record: item.record, reason })) {
+          flipped++
+          warn(`periodic reconcile timed out run ${item.record.id} (deadline passed, owner unresponsive)`)
+        }
       }
       return flipped
     }
@@ -1349,7 +1384,7 @@ export default Plugin.define({
                     registry.get(runID),
                     Date.now(),
                     options.maxResultChars,
-                    (sid) => supervisor?.childActivity(sid),
+                     (sid) => supervisor?.childActivity(sid) ?? persistedActivity(sid),
                   )
                   const children = await Promise.all(
                     (payload.children as Array<StatusChildView & { sessionID?: string }>).map(async (c) =>
@@ -1776,7 +1811,7 @@ export default Plugin.define({
                 projectID,
                 directory: ctx.location.directory,
                 bootID,
-                activityFor: (sid) => supervisor?.childActivity(sid),
+                activityFor: (sid) => supervisor?.childActivity(sid) ?? persistedActivity(sid),
               }).map(stripUndefined),
             }
           },

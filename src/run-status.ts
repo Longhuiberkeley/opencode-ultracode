@@ -2,7 +2,7 @@
  * Host-free run status: live/persisted snapshots, fallback expiry, RPC parse.
  * TUI heuristics live in tui-render; this module is the merge/lookup core.
  */
-import { countAgents, isActiveRunStatus, requestContext, type AgentRecord, type RunRecord, type RunStatus, type TokenUsage } from "./types.ts"
+import { countAgents, isActiveRunStatus, requestContext, type AgentRecord, type Registry, type RunRecord, type RunStatus, type TokenUsage } from "./types.ts"
 import { parsePanelSettings, type PanelSettings, type SettingsAck } from "./settings.ts"
 
 /** Bounded staleness window for session-derived "still running" heuristics. */
@@ -220,6 +220,24 @@ export function ownershipFields(
   if (updatedAt !== undefined) fields.ownerUpdatedAt = updatedAt
   if ((opts.bootID !== undefined && owner.bootID !== opts.bootID) || !opts.isLive) fields.external = true
   return fields
+}
+
+/**
+ * Persisted-activity fallback for stampStalled: `lastActivityAt` on the
+ * agent row (written throttled by the supervisor's activity feed) stands in
+ * when no live in-memory map knows the session — the map dies with the owner
+ * process, the record does not. Returns undefined when nothing is recorded
+ * ("unknown" must never render as stalled).
+ */
+export function persistedActivityFor(
+  registry: Pick<Registry, "agentForSession" | "getAgent">,
+): (sessionID: string) => number | undefined {
+  return (sessionID: string): number | undefined => {
+    const owned = registry.agentForSession(sessionID)
+    if (!owned) return undefined
+    const at = registry.getAgent(owned.runID, owned.agentID)?.lastActivityAt
+    return typeof at === "number" && Number.isFinite(at) ? at : undefined
+  }
 }
 
 /**

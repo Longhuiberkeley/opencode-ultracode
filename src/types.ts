@@ -429,7 +429,6 @@ export type ActiveRunStatus = "running" | "stopping" | "paused"
 export function isActiveRunStatus(s: RunStatus): s is ActiveRunStatus {
   return s === "running" || s === "stopping" || s === "paused"
 }
-
 export type AgentStatus = "pending" | "running" | "succeeded" | "failed" | "interrupted"
 
 export interface TokenUsage {
@@ -490,6 +489,12 @@ export interface AgentRecord {
   cached?: boolean
   /** True when a succeeded row was SALVAGED by the post-crash harvest pass (owner death), not returned by a live worker. */
   harvested?: boolean
+  /**
+   * Last observed child activity (host events), persisted THROTTLED so any
+   * process reading the record can compute stalledMs across restarts — the
+   * in-memory activity map dies with the owner process.
+   */
+  lastActivityAt?: number
   /** Final text (stored only for keyed calls, so future warm reruns can replay it). */
   resultText?: string
 }
@@ -574,6 +579,15 @@ export interface RunRecord {
    * lets reconciliation prove a fresh-but-orphaned marker dead after SIGKILL.
    */
   owner?: { bootID: string; updatedAt: number; pid?: number }
+  /**
+   * Absolute wall-clock deadline this run's watchdog enforced at last arm
+   * (additive). Present only while a deadline is actually burning — cleared
+   * on pause, re-armed on resume — so ANY process can enforce the run
+   * timeout for a record whose owner is alive-but-wedged (its heartbeat
+   * timer keeps running even when nothing else does) or dead. Absent on
+   * records predating this field and on final records.
+   */
+  deadlineAt?: number
 }
 
 export function emptyTokens(): TokenUsage {
@@ -1018,6 +1032,18 @@ export interface Registry {
   getAgent(runID: string, agentID: string): AgentRecord | undefined
   /** Append a phase-boundary checkpoint (bounded — oldest dropped). */
   addCheckpoint(runID: string, name: string, value?: Json): void
+  /**
+   * Persist the run's wall-clock deadline as seen by its live watchdog
+   * (undefined = no deadline burning, e.g. paused). Called at every arm/clear
+   * so any process can enforce the timeout for an owner that stopped
+   * enforcing it.
+   */
+  noteRunDeadline(runID: string, deadlineAt: number | undefined): void
+  /**
+   * Persist a child's last-activity timestamp (callers throttle; cheap map
+   * write + throttled persist) so stalledMs survives restarts.
+   */
+  noteAgentActivity(runID: string, agentID: string, at: number): void
   /** Record final result + totals. */
   finish(runID: string, outcome: {
     status: RunStatus
@@ -1058,6 +1084,13 @@ export interface Registry {
     | { kind: "local" | "remote-live" | "dead"; record: RunRecord; owner?: { bootID: string; pid?: number; updatedAt?: number }; detail?: string }
   /** On plugin load: mark persisted running/stopping/paused runs as interrupted (no auto-replay). */
   reconcileOrphans(): void
+  /**
+   * Active records this process does NOT supervise whose persisted
+   * `deadlineAt` is older than `graceMs` — the owner may still be ALIVE
+   * (its heartbeat timer outlives its watchdog) but has stopped enforcing
+   * the run timeout. Harvest + flip candidates for the periodic pass.
+   */
+  expiredRemoteRuns(now: number, graceMs: number): Array<{ record: RunRecord; deadlineAt: number }>
   /** Persist the current in-memory record immediately (effective snapshot, etc.). */
   persistNow(runID: string): void
 }

@@ -14,6 +14,7 @@ import {
   isFallbackExpired,
   parseRunStatusResponse,
   parseSettingsResponse,
+  persistedActivityFor,
   runLivenessSuffix,
   runStateTransition,
   selectAuthoritative,
@@ -684,4 +685,18 @@ test("stepEventContext: session.step.ended usage becomes the live context number
   )
   assert.equal(stepEventContext(undefined), undefined)
   assert.equal(stepEventContext("nope"), undefined)
+})
+
+test("persistedActivityFor: falls back to the agent row's lastActivityAt; unknown stays unknown", () => {
+  const agents = new Map<string, { lastActivityAt?: number }>()
+  const registry = {
+    agentForSession: (sid: string) => (sid === "ses_known" ? { runID: "run_x", agentID: "a1" } : undefined),
+    getAgent: (runID: string, agentID: string) =>
+      runID === "run_x" && agentID === "a1" ? (agents.get("a1") as { lastActivityAt?: number } | undefined) : undefined,
+  }
+  const forFn = persistedActivityFor(registry as unknown as Parameters<typeof persistedActivityFor>[0])
+  assert.equal(forFn("ses_unknown"), undefined)
+  assert.equal(forFn("ses_known"), undefined, "no recorded activity stays unknown")
+  agents.set("a1", { lastActivityAt: 1234 })
+  assert.equal(forFn("ses_known"), 1234)
 })

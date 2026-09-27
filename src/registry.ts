@@ -58,6 +58,14 @@ interface ThrottleState {
   dirty: boolean
 }
 
+/**
+ * Grace past a persisted deadlineAt before the periodic pass enforces it on
+ * a remote-owned record: the owner's OWN watchdog fires at the deadline, so
+ * this only bites when that watchdog is gone or wedged — generous on purpose,
+ * and heartbeat-staleness detection (pid) covers the dead case faster.
+ */
+export const REMOTE_DEADLINE_GRACE_MS = 5 * 60_000
+
 export class RegistryImpl implements Registry {
   private runs = new Map<string, RunRecord>()
   /** sessionID -> runID for runs still active (released on finalize). */
@@ -275,6 +283,52 @@ export class RegistryImpl implements Registry {
       run.checkpoints.splice(0, run.checkpoints.length - MAX_CHECKPOINTS)
     }
     this.requestPersist(runID)
+  }
+
+  noteRunDeadline(runID: string, deadlineAt: number | undefined): void {
+    const run = this.runs.get(runID)
+    if (!run) return
+    if (deadlineAt === undefined) {
+      if (run.deadlineAt !== undefined) delete run.deadlineAt
+      else return
+    } else {
+      if (run.deadlineAt === deadlineAt) return
+      run.deadlineAt = deadlineAt
+    }
+    this.requestPersist(runID)
+  }
+
+  noteAgentActivity(runID: string, agentID: string, at: number): void {
+    const run = this.runs.get(runID)
+    if (!run) return
+    const agent = run.agents.find((a) => a.id === agentID)
+    if (!agent) return
+    if (agent.lastActivityAt === at) return
+    agent.lastActivityAt = at
+    this.requestPersist(runID)
+  }
+
+  expiredRemoteRuns(now: number, graceMs: number): Array<{ record: RunRecord; deadlineAt: number }> {    if (!this.loader) return []
+    let persisted: RunRecord[]
+    try {
+      persisted = this.loader()
+    } catch {
+      return []
+    }
+    const out: Array<{ record: RunRecord; deadlineAt: number }> = []
+    for (const raw of persisted) {
+      if (typeof raw?.id !== "string" || typeof raw.status !== "string") continue
+      if (this.createdRuns.has(raw.id)) continue // locally supervised: its own watchdog owns the deadline
+      if (!isActiveRunStatus(raw.status) || raw.status === "paused") continue // paused runs burn no deadline
+      const deadlineAt = raw.deadlineAt
+      if (typeof deadlineAt !== "number" || !Number.isFinite(deadlineAt)) continue
+      if (now - deadlineAt <= graceMs) continue
+      // Serve the in-memory copy when one exists (adoption may have seeded it).
+      const record = this.runs.get(raw.id) ?? raw
+      if (!isActiveRunStatus(record.status)) continue
+      out.push({ record, deadlineAt })
+    }
+    return out
   }
 
   finish(

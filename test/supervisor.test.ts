@@ -1451,3 +1451,47 @@ test("supervisor: unconfigured provider does not touch the slots dir", async () 
     await rm(tmp, { recursive: true, force: true })
   }
 })
+
+// ---------------------------------------------------------------------------
+// Persisted deadline + activity (P1-3): survive restarts, enforce ownerless
+// ---------------------------------------------------------------------------
+
+test("supervisor persists deadlineAt on arm, clears on pause, re-arms on resume", async () => {
+  const ctx = makeSupervisor({ timeoutMs: 60_000 })
+  ctx.sessions.hangWait = true
+  const pending = ctx.supervisor.startDetached(
+    { script: `const r = await agent("slow"); return r.text;` },
+    { sessionID: "ses_p", report: () => {} },
+  )
+  await waitFor(() => ctx.registry.activeRuns().length > 0, "run creation")
+  const runID = ctx.registry.activeRuns()[0].id
+  await waitFor(() => typeof ctx.registry.get(runID)?.deadlineAt === "number", "deadline persisted at arm")
+  const armedAt = ctx.registry.get(runID)!.deadlineAt!
+  assert.ok(armedAt > Date.now() - 1_000 && armedAt <= Date.now() + 60_000)
+
+  assert.deepEqual(ctx.supervisor.pause(runID), { ok: true })
+  assert.equal(ctx.registry.get(runID)?.deadlineAt, undefined, "paused runs burn no deadline")
+
+  // While paused the wall clock does not burn: resuming after 50ms must move
+  // the deadline forward by (at least) that pause.
+  await tick(60)
+  assert.deepEqual(ctx.supervisor.resume(runID), { ok: true })
+  await waitFor(() => typeof ctx.registry.get(runID)?.deadlineAt === "number", "deadline re-armed on resume")
+  assert.ok(
+    ctx.registry.get(runID)!.deadlineAt! >= armedAt + 50,
+    "resume re-arms with the REMAINING budget forward (pause did not burn it)",
+  )
+
+  // activity persistence (throttled) feeds the persisted stalledMs fallback
+  await waitFor(() => ctx.sessions.sessions.size > 0, "child session created")
+  ctx.supervisor.noteChildActivity([...ctx.sessions.sessions.keys()][0]!)
+  await waitFor(() => {
+    const row = ctx.registry.get(runID)?.agents[0]
+    return typeof row?.lastActivityAt === "number"
+  }, "lastActivityAt persisted")
+  void pending
+  ctx.sessions.hangWait = false
+  ctx.sessions.releaseHangs()
+  ctx.supervisor.stop(runID, "test done")
+  await pending
+})

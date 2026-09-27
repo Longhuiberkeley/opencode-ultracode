@@ -575,6 +575,22 @@ export class FakeRegistry implements Registry {
     return { kind: "local", record: run }
   }
 
+  noteRunDeadline(runID: string, deadlineAt: number | undefined): void {
+    const run = this.runs.get(runID)
+    if (!run) return
+    if (deadlineAt === undefined) delete run.deadlineAt
+    else run.deadlineAt = deadlineAt
+  }
+
+  noteAgentActivity(runID: string, agentID: string, at: number): void {
+    this.updateAgent(runID, agentID, { lastActivityAt: at })
+  }
+
+  expiredRemoteRuns(_now: number, _graceMs: number): Array<{ record: RunRecord; deadlineAt: number }> {
+    // The fake holds only locally-created runs — nothing is remote.
+    return []
+  }
+
   persistNow(runID: string): void {
     const run = this.runs.get(runID)
     if (run) this.saveCalls.push(run)

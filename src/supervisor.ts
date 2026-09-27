@@ -527,6 +527,8 @@ interface RunState {
   stallTimer: ReturnType<typeof setInterval> | undefined
   /** sessionID -> last activity timestamp (spawn time seeds it). */
   childLastActivity: Map<string, number>
+  /** sessionID -> last time lastActivityAt was PERSISTED (throttle). */
+  activityPersistedAt: Map<string, number>
   /** sessionIDs already stall-interrupted (never re-fired for one child). */
   stallNotified: Set<string>
   pauseWaiters: PauseWaiter[]
@@ -1097,6 +1099,9 @@ export class SupervisorImpl implements Supervisor {
     state.paused = true
     state.pausedAt = Date.now()
     this.clearWatchdog(state)
+    // A paused run burns no wall-clock budget: the persisted deadline must
+    // not read as burning while held (resume re-arms and re-persists).
+    this.registry.noteRunDeadline(runID, undefined)
     this.safeParentReport(state, `paused ${runID}`)
     return { ok: true }
   }
@@ -1217,6 +1222,7 @@ export class SupervisorImpl implements Supervisor {
       watchdog: undefined,
       stallTimer: undefined,
       childLastActivity: new Map<string, number>(),
+      activityPersistedAt: new Map<string, number>(),
       stallNotified: new Set<string>(),
       pauseWaiters: [],
       effective,
@@ -1456,6 +1462,11 @@ export class SupervisorImpl implements Supervisor {
       this.stop(state.runID, "timeout")
       return
     }
+    // Persist the deadline the live watchdog enforces: a record whose owner
+    // later wedges (alive pid, dead watchdog — the heartbeat timer outlives
+    // it) can then be timed out by ANY process's reconcile pass. Re-armed
+    // (and re-persisted) on every resume.
+    this.registry.noteRunDeadline(state.runID, Date.now() + remaining)
     state.watchdog = setTimeout(() => {
       this.stop(state.runID, "timeout")
     }, remaining)
@@ -1481,13 +1492,27 @@ export class SupervisorImpl implements Supervisor {
 
   /**
    * Bump a child's last-activity timestamp. Called from the host event
-   * subscription (message/part events per session); cheap map writes.
+   * subscription (message/part events per session); cheap map writes. The
+   * timestamp is ALSO persisted (throttled to ACTIVITY_PERSIST_MS per child)
+   * so stalledMs survives restarts and other processes can see liveness.
    */
   noteChildActivity(sessionID: string): void {
+    const now = Date.now()
     for (const state of this.runs.values()) {
-      if (state.children.has(sessionID)) state.childLastActivity.set(sessionID, Date.now())
+      if (!state.children.has(sessionID)) continue
+      state.childLastActivity.set(sessionID, now)
+      // Throttled durable record: the in-memory map dies with this process.
+      const last = state.activityPersistedAt.get(sessionID) ?? 0
+      if (now - last >= SupervisorImpl.ACTIVITY_PERSIST_MS) {
+        state.activityPersistedAt.set(sessionID, now)
+        const owned = this.registry.agentForSession(sessionID)
+        if (owned) this.registry.noteAgentActivity(owned.runID, owned.agentID, now)
+      }
     }
   }
+
+  /** Per-child cadence for persisting lastActivityAt (cheap, throttled). */
+  private static readonly ACTIVITY_PERSIST_MS = 5_000
 
   /**
    * Last-observed activity for a live child (epoch ms), for status surfaces:

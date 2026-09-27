@@ -703,3 +703,48 @@ test("addCheckpoint: unknown run and blank names are ignored", () => {
   registry.addCheckpoint(run.id, "ok")
   assert.equal(registry.get(run.id)!.checkpoints!.length, 1)
 })
+
+// ---------------------------------------------------------------------------
+// expiredRemoteRuns (deadline enforcement input)
+// ---------------------------------------------------------------------------
+
+test("expiredRemoteRuns: active remote records past deadline+grace only", () => {
+  const now = 1_000_000
+  const mk = (id: string, over: Partial<RunRecord> = {}): RunRecord =>
+    persistedRun({ id, status: "running", startedAt: 1, ...over })
+  const past = mk("run_past", { deadlineAt: now - 10 * 60_000 })
+  const insideGrace = mk("run_grace", { deadlineAt: now - 60_000 })
+  const paused = mk("run_paused", { status: "paused", deadlineAt: now - 10 * 60_000 })
+  const noDeadline = mk("run_nodeadline")
+  const finished = mk("run_done", { status: "succeeded", deadlineAt: now - 10 * 60_000 })
+  const { registry } = makeRegistry({
+    now: () => now,
+    throttleMs: 0,
+    loader: () => [past, insideGrace, paused, noDeadline, finished],
+  })
+  const expired = registry.expiredRemoteRuns(now, 5 * 60_000)
+  assert.deepEqual(expired.map((e) => e.record.id), ["run_past"])
+  assert.equal(expired[0]!.deadlineAt, now - 10 * 60_000)
+})
+
+test("expiredRemoteRuns skips runs this process created (its own watchdog owns them)", () => {
+  const now = 1_000_000
+  const other = persistedRun({ id: "run_remote2", status: "running", startedAt: 1, deadlineAt: now - 10 * 60_000 })
+  const { registry } = makeRegistry({ now: () => now, throttleMs: 0, loader: () => [other] })
+  const local = registry.create({ parentSessionID: "ses", script: "s" })
+  registry.noteRunDeadline(local.id, now - 10 * 60_000)
+  const expired = registry.expiredRemoteRuns(now, 5 * 60_000)
+  assert.deepEqual(expired.map((e) => e.record.id), ["run_remote2"])
+})
+
+test("noteRunDeadline / noteAgentActivity persist onto the record", () => {
+  const { registry } = makeRegistry({ throttleMs: 0 })
+  const run = registry.create({ parentSessionID: "ses", script: "s" })
+  registry.addAgent(run.id, { status: "running", sessionID: "ses_c" })
+  registry.noteRunDeadline(run.id, 42_000)
+  assert.equal(registry.get(run.id)?.deadlineAt, 42_000)
+  registry.noteRunDeadline(run.id, undefined)
+  assert.equal(registry.get(run.id)?.deadlineAt, undefined)
+  registry.noteAgentActivity(run.id, "a1", 77_000)
+  assert.equal(registry.getAgent(run.id, "a1")?.lastActivityAt, 77_000)
+})
