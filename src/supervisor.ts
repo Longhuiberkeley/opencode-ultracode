@@ -1161,6 +1161,11 @@ export class SupervisorImpl implements Supervisor {
     return this.registry.isOwnedActive(sessionID)
   }
 
+  /** True when this process supervises the run's worker (has a live RunState). Steer pre-flight. */
+  hasLiveState(runID: string): boolean {
+    return this.runs.has(runID)
+  }
+
   activeRuns(): RunRecord[] {
     return this.registry.activeRuns()
   }

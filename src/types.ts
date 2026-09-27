@@ -1274,6 +1274,8 @@ export interface Supervisor {
    * run prefer it over the configured ladder.
    */
   resume(runID: string, opts?: { model?: ModelRef }): PauseResumeOutcome
+  /** True when this process supervises the run's worker (has a live RunState). Steer pre-flight. */
+  hasLiveState?(runID: string): boolean
   stopAll(reason: string): void
   /** Currently quarantined providers (ask-mode diagnostics + remember keying). */
   providerQuarantines(): ProviderQuarantineSnapshot[]

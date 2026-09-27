@@ -1571,7 +1571,22 @@ export default Plugin.define({
           execute: async (raw, tool) => {
             try {
               const input = raw as { runID: string; text: string; agentID?: string }
-              const target = await steerRun(registry.get(input.runID), tool.sessionID, input, (request) => ctx.session.prompt(request))
+              // On-demand reconcile first: an orphaned run must read
+              // interrupted here, so the refusal is truthful immediately.
+              await runsReconciled
+              await reconcileOnce().catch(() => {})
+              const target = await steerRun(registry.get(input.runID), tool.sessionID, input, {
+                prompt: (request) => ctx.session.prompt(request),
+                sessionState: async (sessionID) => {
+                  try {
+                    const info = await sessions.get({ sessionID })
+                    return { outcome: info.outcome }
+                  } catch {
+                    return undefined // unreadable ⇒ no evidence of idle: never block on a probe failure
+                  }
+                },
+                isLocallyLive: (runID) => supervisor?.hasLiveState?.(runID) === true,
+              })
               return { content: JSON.stringify({ ...target, accepted: true, delivery: "steer" }) }
             } catch (error) {
               return { content: `error: ${describeError(error)}` }
