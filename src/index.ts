@@ -62,6 +62,7 @@ import {
   runStateTransition,
   settingsPayload,
   stepEventContext,
+  stripUndefined,
 } from "./run-status.ts"
 import { agentUsable, collectAgentPins, lookupAgentPin, normalizeModelRef, parseModelPin, readDisabledProviders } from "./agent-pins.ts"
 import { RegistryImpl } from "./registry.ts"
@@ -678,13 +679,13 @@ export default Plugin.define({
         if (event && emit) {
           let runningCount = 0
           for (const agent of record.agents) if (agent.status === "running") runningCount++
-          void emit("runState", {
+          void emit("runState", stripUndefined({
             ...event,
             parentSessionID: record.parentSessionID,
             projectID,
             directory: record.directory ?? ctx.location.directory,
             runningCount,
-          }).catch(() => {})
+          })).catch(() => {})
         }
       },
       loader: () => storage.loadRuns(),
@@ -1653,6 +1654,10 @@ export default Plugin.define({
             const limit = typeof input?.limit === "number" && Number.isFinite(input.limit) ? input.limit : undefined
             const includeFinished = typeof input?.includeFinished === "boolean" ? input.includeFinished : undefined
             return {
+              // stripUndefined: the host validates this object against the RPC
+              // output schema as a live JS value; any key present with value
+              // undefined (e.g. contextTokens on an agent that never completed
+              // a request) fails the whole call with rpc.invalid_output.
               runs: collectRunStatus({
                 runID,
                 sessionID,
@@ -1665,7 +1670,7 @@ export default Plugin.define({
                 directory: ctx.location.directory,
                 bootID,
                 activityFor: (sid) => supervisor?.childActivity(sid),
-              }),
+              }).map(stripUndefined),
             }
           },
           settings: async (input: { runID?: string } | undefined) => {

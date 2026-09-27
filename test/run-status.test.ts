@@ -644,6 +644,24 @@ test("runStatus RPC output schema declares every field the payload emits", async
   for (const key of Object.keys(agent.tokens!)) {
     assert.ok(key in tokenProps, `payload tokens field "${key}" missing from runStatus output schema`)
   }
+
+  // The dual failure class (observed 2026-09-27): the host validates the LIVE
+  // object, so a key present with value undefined ("Expected number") fails
+  // even when declared. A sparse agent (pending, nothing measured) must carry
+  // NO present-undefined keys anywhere in its snapshot.
+  const sparse = collectRunStatus({
+    runID: "run_rpc2",
+    liveGet: (id) => (id === "run_rpc2" ? record({ id: "run_rpc2", agents: [{ id: "a1", status: "pending" }] }) : undefined),
+    liveList: () => [],
+    persistedList: () => [],
+  })
+  const sparseSnap = sparse[0]!
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(sparseSnap)),
+    sparseSnap,
+    "snapshot must survive an undefined-stripping round-trip unchanged (no present-undefined keys)",
+  )
+  assert.equal("contextTokens" in (sparseSnap.agentDetails![0] as object), false, "unmeasured agent has no contextTokens KEY at all")
 })
 
 test("stepEventContext: session.step.ended usage becomes the live context number", async () => {

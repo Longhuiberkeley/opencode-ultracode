@@ -143,29 +143,34 @@ export function authoritativeFromRecord(
     },
     startedAt: record.startedAt,
     source,
-    parentSessionID: record.parentSessionID,
+    ...(record.parentSessionID !== undefined ? { parentSessionID: record.parentSessionID } : {}),
     runningCount: runningAgentCount(record),
     queuedCount: record.agents.filter((a) => a.status === "pending").length,
     // Provenance fields ride along so warm-replayed (cached) children — which
     // have no session in THIS run for the panel's heuristic join — still
-    // render agent/model/tokens/toolCalls instead of "-". Undefined-valued
-    // keys drop at serialization, so unfinished children stay lean.
-    agentDetails: record.agents.map(
-      ({ id, sessionID, status, phase, label, requestedAgent, effectiveAgent, effectiveModel, spawnModel, tokens, contextTokens, toolCalls }) => ({
-        id,
-        sessionID,
-        status,
-        phase,
-        label,
-        requestedAgent,
-        effectiveAgent,
-        effectiveModel,
-        spawnModel,
-        tokens,
-        contextTokens,
-        toolCalls,
-      }),
-    ),
+    // render agent/model/tokens/toolCalls instead of "-". Every optional key
+    // is assigned CONDITIONALLY: the host validates the live JS object
+    // against the RPC schema before serialization, and a key present with
+    // value undefined fails validation ("Expected number", observed
+    // 2026-09-27) even though JSON.stringify would drop it. Absent must mean
+    // truly absent.
+    agentDetails: record.agents.map((agent) => {
+      const detail: NonNullable<AuthoritativeSnapshot["agentDetails"]>[number] = {
+        id: agent.id,
+        status: agent.status,
+      }
+      if (agent.sessionID !== undefined) detail.sessionID = agent.sessionID
+      if (agent.phase !== undefined) detail.phase = agent.phase
+      if (agent.label !== undefined) detail.label = agent.label
+      if (agent.requestedAgent !== undefined) detail.requestedAgent = agent.requestedAgent
+      if (agent.effectiveAgent !== undefined) detail.effectiveAgent = agent.effectiveAgent
+      if (agent.effectiveModel !== undefined) detail.effectiveModel = agent.effectiveModel
+      if (agent.spawnModel !== undefined) detail.spawnModel = agent.spawnModel
+      if (agent.tokens !== undefined) detail.tokens = agent.tokens
+      if (agent.contextTokens !== undefined) detail.contextTokens = agent.contextTokens
+      if (agent.toolCalls !== undefined) detail.toolCalls = agent.toolCalls
+      return detail
+    }),
   }
   if (record.name) snap.name = record.name
   if (record.workflowName) snap.workflowName = record.workflowName
@@ -231,6 +236,17 @@ export function runLivenessSuffix(
   if (run.external === true) suffix += " ext"
   if (run.ownerUpdatedAt !== undefined && now - run.ownerUpdatedAt > OWNER_STALE_MS) suffix += " stale"
   return suffix
+}
+
+/**
+ * Deep-copy with every undefined-valued key removed. RPC outputs and pushed
+ * events are validated by the host against their schema as LIVE JS objects —
+ * a key present with value undefined fails validation ("Expected number",
+ * observed 2026-09-27) even though JSON serialization would drop it. Every
+ * payload that crosses an RPC/event boundary goes through this.
+ */
+export function stripUndefined<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T
 }
 
 /**
@@ -450,11 +466,11 @@ export function collectRemoteRunChanges(input: {
         ? { runID: fresh.id, status: fresh.status, reason: "state-changed" }
         : undefined)
     if (!event) continue
-    const payload: RemoteRunStatePayload = {
+    const payload: RemoteRunStatePayload = stripUndefined({
       ...event,
       parentSessionID: fresh.parentSessionID,
       runningCount: runningAgentCount(fresh),
-    }
+    })
     const pid = input.projectID ?? fresh.projectID
     if (pid !== undefined) payload.projectID = pid
     const dir = fresh.directory ?? input.directory
