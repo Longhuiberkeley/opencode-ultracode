@@ -1495,3 +1495,33 @@ test("supervisor persists deadlineAt on arm, clears on pause, re-arms on resume"
   ctx.supervisor.stop(runID, "test done")
   await pending
 })
+
+test("pause gate stamps pending rows with waitReason; resume clears, start clears", async () => {
+  const ctx = makeSupervisor({ concurrency: 1, timeoutMs: 60_000 })
+  ctx.sessions.hangWait = true
+  const pending = ctx.supervisor.startDetached(
+    { script: `const [a, b] = await Promise.all([agent("one"), agent("two")]); return a.text + b.text;` },
+    { sessionID: "ses_p", report: () => {} },
+  )
+  await waitFor(() => ctx.registry.activeRuns().length > 0, "run creation")
+  const runID = ctx.registry.activeRuns()[0].id
+  // Both rows exist while the first child hangs; the second is queued.
+  await waitFor(() => ctx.registry.get(runID)?.agents.length === 2, "both child rows admitted")
+  assert.match(String(ctx.registry.get(runID)?.agents[1]?.waitReason), /run queue/)
+  assert.deepEqual(ctx.supervisor.pause(runID), { ok: true })
+  // First child finishes (released) while paused; the second then acquires
+  // the semaphore and parks AT the pause gate with a stamped pending row.
+  ctx.sessions.hangWait = false
+  ctx.sessions.releaseHangs()
+  // A scripted reply so the second child completes instead of failing on an
+  // empty fake queue.
+  ctx.sessions.push({ text: "two done" })
+  await waitFor(() => ctx.registry.get(runID)?.agents[1]?.waitReason === "pause gate (run paused)", "pause-gate stamp")
+  assert.equal(ctx.registry.get(runID)?.agents[1]?.status, "pending")
+  assert.deepEqual(ctx.supervisor.resume(runID), { ok: true })
+  // Resume clears the stamp immediately (no stale pause reason while running).
+  assert.equal(ctx.registry.get(runID)?.agents[1]?.waitReason, undefined)
+  await waitFor(() => ctx.registry.get(runID)?.agents[1]?.status === "succeeded", "second child runs and completes after resume")
+  ctx.supervisor.stop(runID, "test done")
+  await pending
+})

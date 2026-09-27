@@ -42,6 +42,7 @@ export type AuthoritativeSnapshot = {
       | "tokens"
       | "contextTokens"
       | "toolCalls"
+      | "waitReason"
     > & { stalledMs?: number }
   >
   queuedCount?: number
@@ -169,6 +170,7 @@ export function authoritativeFromRecord(
       if (agent.tokens !== undefined) detail.tokens = agent.tokens
       if (agent.contextTokens !== undefined) detail.contextTokens = agent.contextTokens
       if (agent.toolCalls !== undefined) detail.toolCalls = agent.toolCalls
+      if (agent.waitReason !== undefined) detail.waitReason = agent.waitReason
       return detail
     }),
   }
@@ -570,6 +572,7 @@ function parseSnapshot(raw: unknown): AuthoritativeSnapshot | undefined {
         contextTokens: optionalFiniteNumber(a.contextTokens),
         toolCalls: optionalFiniteNumber(a.toolCalls),
         stalledMs: optionalFiniteNumber(a.stalledMs),
+        waitReason: optionalNonEmptyString(a.waitReason),
       }]
     })
   }

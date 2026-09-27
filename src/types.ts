@@ -495,6 +495,13 @@ export interface AgentRecord {
    * in-memory activity map dies with the owner process.
    */
   lastActivityAt?: number
+  /**
+   * Why a PENDING child is not running yet: the admission gate it is parked
+   * at ("run queue (cap N)" | "provider=X; cap=N" | "quarantine window ..." |
+   * "pause gate"). Stamped by the gate, cleared the moment the child starts
+   * (onSessionID) — a pending row must never look like a mystery.
+   */
+  waitReason?: string
   /** Final text (stored only for keyed calls, so future warm reruns can replay it). */
   resultText?: string
 }
@@ -1044,6 +1051,8 @@ export interface Registry {
    * write + throttled persist) so stalledMs survives restarts.
    */
   noteAgentActivity(runID: string, agentID: string, at: number): void
+  /** Stamp/clear why every PENDING child of the run is parked (pause gate). */
+  setPendingWaitReason(runID: string, reason: string | undefined): void
   /** Record final result + totals. */
   finish(runID: string, outcome: {
     status: RunStatus

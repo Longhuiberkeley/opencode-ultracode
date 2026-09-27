@@ -748,3 +748,16 @@ test("noteRunDeadline / noteAgentActivity persist onto the record", () => {
   registry.noteAgentActivity(run.id, "a1", 77_000)
   assert.equal(registry.getAgent(run.id, "a1")?.lastActivityAt, 77_000)
 })
+
+test("setPendingWaitReason stamps only pending rows; clear deletes the key", () => {
+  const { registry } = makeRegistry({ throttleMs: 0 })
+  const run = registry.create({ parentSessionID: "ses", script: "s" })
+  registry.addAgent(run.id, { status: "pending", startedAt: 1 })
+  registry.addAgent(run.id, { status: "running", startedAt: 1, sessionID: "ses_r" })
+  registry.setPendingWaitReason(run.id, "pause gate (run paused)")
+  const rows = registry.get(run.id)!.agents
+  assert.equal(rows[0]!.waitReason, "pause gate (run paused)")
+  assert.equal(rows[1]!.waitReason, undefined, "running rows keep their own story")
+  registry.setPendingWaitReason(run.id, undefined)
+  assert.equal(rows[0]!.waitReason, undefined)
+})

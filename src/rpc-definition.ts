@@ -146,6 +146,9 @@ export const ULTRACODE_RPC = {
                       contextTokens: NUMBER,
                       /** Milliseconds since last observed activity (running children). */
                       stalledMs: NUMBER,
+                      // Admission gate a PENDING child is parked at (additive:
+                      // queue/permit/quarantine/pause visibility).
+                      waitReason: { type: "string" as const },
                       toolCalls: NUMBER,
                     },
                   },

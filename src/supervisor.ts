@@ -1139,6 +1139,9 @@ export class SupervisorImpl implements Supervisor {
     // configured ladder. A resume without one proceeds in auto-mode policy.
     if (opts?.model !== undefined) state.fallbackOverride = opts.model
     this.clearAskTimer(state)
+    // Clear the pause-gate stamps: pending children re-stamp at whichever
+    // gate they park at next (queue/permit/quarantine), and start clears all.
+    this.registry.setPendingWaitReason(runID, undefined)
     this.armWatchdog(state)
     this.armStallScanner(state)
     this.resumePauseWaiters(state)
@@ -1775,6 +1778,10 @@ export class SupervisorImpl implements Supervisor {
       return Promise.reject(new Error("run stopping"))
     }
     if (!state.paused) return Promise.resolve()
+    // The pause gate parks PENDING children (and hold-point failovers);
+    // the rows must say so. Not cleared here — the child's start
+    // (onSessionID) clears it, so a resumed sibling never reads stale.
+    this.registry.setPendingWaitReason(state.runID, "pause gate (run paused)")
     return new Promise<void>((resolve, reject) => {
       const waiter: PauseWaiter = {
         resolve: () => resolve(),

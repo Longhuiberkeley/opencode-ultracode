@@ -590,15 +590,18 @@ export class AgentRunner {
       throw new Error(`agent cap reached (${this.maxAgents})`)
     }
     this.started++
-    await this.semaphore.acquire(this.signal)
 
     const phase = opts.phase ?? this.ambientPhase() ?? "workflow"
+    // The row exists BEFORE admission: a queued child is a real, visible
+    // pending child (waitReason names the gate), and an abort while queued
+    // still lands a terminal row instead of vanishing.
     const record = this.registry.addAgent(this.runID, {
       label: opts.label,
       phase,
       requestedAgent: opts.agent ?? this.defaultAgent,
       status: "pending",
       startedAt: Date.now(),
+      waitReason: `run queue (cap ${this.semaphore.limit})`,
       // Replay identity persists AT START, not only on success: a crash
       // between spawn and completion leaves the row running with its key,
       // digest and schema already durable, so the post-restart harvest pass
@@ -609,8 +612,19 @@ export class AgentRunner {
       ...(opts.schema !== undefined ? { schema: opts.schema } : {}),
     })
     if (!record) {
-      this.semaphore.release()
       throw new Error(`run ${this.runID} not found`)
+    }
+    try {
+      await this.semaphore.acquire(this.signal)
+    } catch (err) {
+      // Queued waiter aborted/rejected: the row must not linger pending.
+      this.registry.updateAgent(this.runID, record.id, {
+        status: "failed",
+        error: `aborted while queued: ${err instanceof Error ? err.message : String(err)}`,
+        endedAt: Date.now(),
+        waitReason: undefined,
+      })
+      throw err
     }
     this.maybeReport()
 
@@ -744,6 +758,14 @@ export class AgentRunner {
       // two provider permits). Unconfigured providers skip both the instance
       // semaphore and the machine slot dir.
       providerHold.providerID = activeModel?.providerID
+      // Provider-permit gate: name the provider and cap while waiting — the
+      // row is pending and must say why (cleared when the session starts).
+      const permitWaitCap = this.permitCap(providerHold.providerID)
+      if (this.providerLimiter !== undefined && providerHold.providerID !== undefined && permitWaitCap !== undefined) {
+        this.registry.updateAgent(this.runID, record.id, {
+          waitReason: `provider=${providerHold.providerID}; cap=${permitWaitCap}`,
+        })
+      }
       providerHold.permit = await this.acquireConfiguredPermit(providerHold.providerID, abortSignal)
       // Attempt-0 spawn as a closure: the explicit-model window recovery below
       // re-runs it when a quota failure raced session creation (no session to
@@ -770,6 +792,9 @@ export class AgentRunner {
                 status: "running",
                 sessionID,
                 startedAt: Date.now(),
+                // Start clears every admission-gate reason (queue/permit/
+                // quarantine/pause) — the child is now actually running.
+                waitReason: undefined,
               })
               try {
                 this.registry.bindAgentSession(this.runID, record.id, sessionID)
@@ -1130,6 +1155,11 @@ export class AgentRunner {
           `${context.phase} — ${context.label ?? context.recordID} explicit model ${modelPinString(model)}: ` +
             `provider ${model.providerID} quota window closed — waiting${until !== undefined ? ` until ~${new Date(until).toLocaleTimeString()}` : ""} (no substitution)`,
         )
+        // The pending row must name the window it is parked at (cleared when
+        // the session starts on the other side of the gate).
+        this.registry.updateAgent(this.runID, context.recordID, {
+          waitReason: `quarantine window (provider ${model.providerID})`,
+        })
       }
       budget.deadline ??= this.now() + this.maxWindowWaitMs
       const now = this.now()

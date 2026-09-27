@@ -1768,3 +1768,86 @@ test("AgentRunner failover: abort during permit swap leaves no partial holds", a
   assert.equal(registry.getAgent(run.id, "a1")!.status, "interrupted")
   assert.equal(held.size, 0, "run stop during the swap leaves no partial holds")
 })
+
+// ---------------------------------------------------------------------------
+// waitReason: every admission gate names itself on the pending row (P2-1)
+// ---------------------------------------------------------------------------
+
+test("waitReason: a queued child's pending row names the run queue; start clears it", async () => {
+  const { registry, run, calls, runner } = makeRunner({ concurrency: 1 })
+  const first = runner.call("a")
+  await tick()
+  assert.equal(calls.length, 1)
+  assert.equal(registry.getAgent(run.id, "a1")?.status, "pending")
+  assert.equal(registry.getAgent(run.id, "a1")?.waitReason, "run queue (cap 1)")
+
+  const second = runner.call("b")
+  await tick()
+  assert.equal(calls.length, 1, "second child queues behind the run semaphore")
+  assert.equal(registry.getAgent(run.id, "a2")?.status, "pending")
+  assert.equal(registry.getAgent(run.id, "a2")?.waitReason, "run queue (cap 1)")
+
+  calls[0]!.hooks.onSessionID("ses_a")
+  assert.equal(registry.getAgent(run.id, "a1")?.waitReason, undefined, "start clears the reason")
+  calls[0]!.resolve(okResult("ses_a"))
+  await first
+  await tick()
+  assert.equal(calls.length, 2, "second child acquires after the first settles")
+  calls[1]!.hooks.onSessionID("ses_b")
+  assert.equal(registry.getAgent(run.id, "a2")?.waitReason, undefined)
+  calls[1]!.resolve(okResult("ses_b"))
+  await second
+})
+
+test("waitReason: a child parked on the provider permit names provider and cap", async () => {
+  const limiter: ProviderLimiter = {
+    async acquire(_providerID, _cap, signal) {
+      await new Promise<void>((resolve, reject) => {
+        const onAbort = () => reject(new Error("run stopping"))
+        if (signal?.aborted) {
+          reject(new Error("run stopping"))
+          return
+        }
+        signal?.addEventListener("abort", onAbort, { once: true })
+        setTimeout(resolve, 40)
+      })
+      return { release: async () => {} }
+    },
+  }
+  const { registry, run, calls, runner } = makeRunner({
+    concurrency: 4,
+    pinForAgent: async () => ({ providerID: "anthropic", id: "claude" }),
+    providerLimiter: limiter,
+    providerConcurrency: { anthropic: 1 },
+  })
+  const first = runner.call("a")
+  const second = runner.call("b")
+  await tick(60) // first acquires; second parks on the permit
+  assert.match(String(registry.getAgent(run.id, "a2")?.waitReason), /^provider=anthropic; cap=1$/)
+  calls[0]!.hooks.onSessionID("ses_a")
+  calls[0]!.resolve(okResult("ses_a"))
+  await first
+  await tick(60)
+  calls[1]!.hooks.onSessionID("ses_b")
+  calls[1]!.resolve(okResult("ses_b"))
+  await second
+  assert.equal(registry.getAgent(run.id, "a2")?.waitReason, undefined)
+})
+
+test("waitReason: abort while queued lands a terminal row, never a pending zombie", async () => {
+  const ctrl = new AbortController()
+  const { registry, run, calls, runner } = makeRunner({ concurrency: 1, signal: ctrl.signal })
+  const first = runner.call("a")
+  await tick()
+  const second = runner.call("b")
+  await tick()
+  assert.equal(registry.getAgent(run.id, "a2")?.status, "pending")
+  ctrl.abort()
+  await assert.rejects(second, /run stopping/)
+  const row = registry.getAgent(run.id, "a2")
+  assert.equal(row?.status, "failed")
+  assert.match(String(row?.error), /aborted while queued/)
+  calls[0]!.hooks.onSessionID("ses_a")
+  calls[0]!.resolve(okResult("ses_a"))
+  await first
+})

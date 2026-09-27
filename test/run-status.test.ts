@@ -700,3 +700,35 @@ test("persistedActivityFor: falls back to the agent row's lastActivityAt; unknow
   agents.set("a1", { lastActivityAt: 1234 })
   assert.equal(forFn("ses_known"), 1234)
 })
+
+test("waitReason rides agentDetails (authoritative snapshot) and parses from an RPC payload", () => {
+  const record: RunRecord = {
+    id: "run_w", parentSessionID: "ses_p", status: "running", startedAt: 1, script: "s",
+    agents: [
+      { id: "a1", status: "pending", startedAt: 1, waitReason: "provider=anthropic; cap=1" },
+      { id: "a2", status: "running", startedAt: 1, sessionID: "ses_c" },
+    ],
+  }
+  const snap = authoritativeFromRecord(record, "persisted")
+  assert.equal(snap.agentDetails?.[0]?.waitReason, "provider=anthropic; cap=1")
+  assert.equal(snap.agentDetails?.[1]?.waitReason, undefined)
+
+  const parsed = parseRunStatusResponse({
+    runs: [{
+      runID: "run_w", status: "running", startedAt: 1, source: "live",
+      agents: { done: 0, total: 1, failed: 0 },
+      agentDetails: [{ id: "a1", status: "pending", waitReason: "pause gate (run paused)" }],
+    }],
+  })
+  assert.equal(parsed?.[0]?.agentDetails?.[0]?.waitReason, "pause gate (run paused)")
+})
+
+test("agentDetailLines shows the waiting gate for a pending child only", () => {
+  const base = { sessionID: "ses_c", ord: "a1", title: "t" }
+  const pending = agentDetailLines({ ...base, status: "pending", waitReason: "run queue (cap 4)" } as never)
+  assert.ok(pending.some((l) => l.includes("waiting") && l.includes("run queue (cap 4)")))
+  const started = agentDetailLines({ ...base, status: "running", waitReason: "stale reason" } as never)
+  assert.ok(!started.some((l) => l.includes("waiting")), "running rows never show an admission gate")
+  const plainPending = agentDetailLines({ ...base, status: "pending" } as never)
+  assert.ok(!plainPending.some((l) => l.includes("waiting")), "no reason recorded → no line")
+})

@@ -334,6 +334,8 @@ export type StatusChildView = {
   stalledMs?: number
   /** True when this child was replayed from a prior run's warm cache. */
   cached?: boolean
+  /** Admission gate a pending child is parked at (queue/permit/quarantine/pause). */
+  waitReason?: string
 }
 
 /**
@@ -411,6 +413,7 @@ export function enrichStatusPayload(
     if (typeof a.contextTokens === "number" && Number.isFinite(a.contextTokens)) child.contextTokens = a.contextTokens
     if (typeof a.toolCalls === "number") child.toolCalls = a.toolCalls
     if (a.cached) child.cached = true
+    if (a.waitReason) child.waitReason = a.waitReason
     if (a.status === "running" && a.sessionID) {
       const at = activityFor(a.sessionID)
       if (at !== undefined) child.stalledMs = Math.max(0, now - at)

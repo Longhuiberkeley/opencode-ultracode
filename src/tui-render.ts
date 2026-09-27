@@ -113,6 +113,8 @@ export type RunAgentView = {
   contextTokens?: number
   /** Milliseconds since last observed activity (running children, live runs). */
   stalledMs?: number
+  /** Admission gate a pending child is parked at (record provenance). */
+  waitReason?: string
   toolCalls?: number
 }
 
@@ -517,6 +519,7 @@ function snapshotAgents(snap: AuthoritativeSnapshot, cached: readonly RunAgentVi
       tokens: a.tokens ?? prev?.tokens,
       contextTokens: a.contextTokens ?? prev?.contextTokens,
       stalledMs: a.stalledMs,
+      waitReason: a.waitReason,
       toolCalls: a.toolCalls ?? prev?.toolCalls,
     }
   })
@@ -1331,6 +1334,9 @@ export function agentDetailLines(agent: RunAgentView): string[] {
   return [
     title,
     `status  ${STATUS_DOT[agent.status]} ${agent.status}${agent.stalledMs !== undefined && agent.stalledMs > 600_000 ? ` (stalled ${compactElapsed(agent.stalledMs)})` : ""}`,
+    // Admission gate a pending child is parked at — the answer to "why is
+    // this child not running yet" (queue/permit/quarantine/pause).
+    ...(agent.status === "pending" && agent.waitReason ? [`waiting  ${agent.waitReason}`] : []),
     `agent   ${rec.effectiveAgent || rec.requestedAgent || "-"}`,
     `model   ${model}`,
     // Intended vs actual model (tier-aware failover / quarantine routing).

@@ -586,6 +586,16 @@ export class FakeRegistry implements Registry {
     this.updateAgent(runID, agentID, { lastActivityAt: at })
   }
 
+  setPendingWaitReason(runID: string, reason: string | undefined): void {
+    const run = this.runs.get(runID)
+    if (!run) return
+    for (const agent of run.agents) {
+      if (agent.status !== "pending") continue
+      if (reason === undefined) delete agent.waitReason
+      else agent.waitReason = reason
+    }
+  }
+
   expiredRemoteRuns(_now: number, _graceMs: number): Array<{ record: RunRecord; deadlineAt: number }> {
     // The fake holds only locally-created runs — nothing is remote.
     return []
