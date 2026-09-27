@@ -488,6 +488,8 @@ export interface AgentRecord {
   schema?: Json
   /** True when this record was replayed from a prior run (no session spawned). */
   cached?: boolean
+  /** True when a succeeded row was SALVAGED by the post-crash harvest pass (owner death), not returned by a live worker. */
+  harvested?: boolean
   /** Final text (stored only for keyed calls, so future warm reruns can replay it). */
   resultText?: string
 }

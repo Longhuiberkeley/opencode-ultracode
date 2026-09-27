@@ -72,6 +72,7 @@ import {
 } from "./run-status.ts"
 import { agentUsable, collectAgentPins, lookupAgentPin, normalizeModelRef, parseModelPin, readDisabledProviders } from "./agent-pins.ts"
 import { RegistryImpl, type OrphanPlan } from "./registry.ts"
+import { harvestOrphanedRun } from "./harvest.ts"
 import { emptyToolEventState } from "./run-events.ts"
 import { EMPTY_CATALOG, SKILL_CONTENT, SKILL_DESCRIPTION, SKILL_NAME, buildSkillContent } from "./skill-content.ts"
 import { compileGraphSpec, validateGraphSpec } from "./graph.ts"
@@ -774,6 +775,21 @@ export default Plugin.define({
       }
       let flipped = 0
       for (const plan of plans) {
+        // Harvest BEFORE flipping: salvage children the dead owner's sessions
+        // finished on their own (OpenCode recovery completes mid-flight
+        // children). Validated successes become warm-replayable rows; the
+        // flip then interrupts only what genuinely never finished.
+        try {
+          const report = await harvestOrphanedRun(plan.record, {
+            sessions,
+            updateAgent: (runID, agentID, patch) => registry.updateAgent(runID, agentID, patch),
+          })
+          if (report.harvested > 0) {
+            warn(`harvested ${report.harvested} succeeded child(ren) from ${plan.record.id} before interrupt (warm-resumable)`)
+          }
+        } catch {
+          // best effort — the flip below still bounds the record
+        }
         if (registry.applyOrphanInterrupt(plan)) flipped++
       }
       return flipped
