@@ -14,7 +14,7 @@ import { classifyFailure, readFailureStatus, type FailureClassification } from "
 // Errors
 // ---------------------------------------------------------------------------
 
-export type AgentErrorKind = "agent" | "outcome" | "abort" | "schema" | "extraction"
+export type AgentErrorKind = "agent" | "outcome" | "abort" | "schema" | "extraction" | "timeout"
 
 /** Typed agent-call failure (registry records `error`, callers may branch on kind). */
 export class AgentCallError extends Error {
@@ -144,7 +144,35 @@ export interface AgentContinueHooks {
 export interface SessionDriverOptions {
   /** Cap on text length embedded into error messages (default 500 chars). */
   errorTextSnippetChars?: number
+  /**
+   * Per-RPC deadline for control-shaped calls (create/get/context/switchModel)
+   * in ms. These are host RPCs that should return in milliseconds; a hang here
+   * is a stuck transport. Default SESSION_CONTROL_TIMEOUT_MS (60s). <=0 disables.
+   */
+  controlTimeoutMs?: number
+  /**
+   * Per-RPC deadline for prompt/wait in ms — the backstop for a hung session
+   * RPC on a child that is legitimately ALLOWED to run for minutes. The
+   * childStallMs watchdog owns "silent child" intervention; this owns
+   * "transport never returned". Default SESSION_AWAIT_TIMEOUT_MS (15 min).
+   * <=0 disables.
+   */
+  awaitTimeoutMs?: number
 }
+
+/**
+ * Default control-RPC deadline (create/get/context/switchModel). 60s: enough
+ * for a loaded host, far below any legitimate business logic duration.
+ */
+export const SESSION_CONTROL_TIMEOUT_MS = 60_000
+
+/**
+ * Default prompt/wait deadline. 15 minutes: comfortably above a normal long
+ * child turn (the childStallMs scanner interrupts silent children well before
+ * this), while guaranteeing a genuinely hung RPC lands in a TERMINAL child
+ * status instead of wedging the run until the wall-clock watchdog.
+ */
+export const SESSION_AWAIT_TIMEOUT_MS = 15 * 60_000
 
 /** Result of structured-output resolution (fields present when repaired). */
 interface StructuredOutcome {
@@ -182,6 +210,8 @@ export const SCHEMA_REPAIR_ROUNDS = 2
  */
 export function createSessionDriver(sessions: SessionCtx, options: SessionDriverOptions = {}): Required<SessionDriver> {
   const snippetChars = options.errorTextSnippetChars ?? 500
+  const controlMs = options.controlTimeoutMs ?? SESSION_CONTROL_TIMEOUT_MS
+  const awaitMs = options.awaitTimeoutMs ?? SESSION_AWAIT_TIMEOUT_MS
 
   async function runAgent(
     input: AgentRunInput,
@@ -194,12 +224,17 @@ export function createSessionDriver(sessions: SessionCtx, options: SessionDriver
     // 2. Create the child session; register the ID immediately. A pinned
     // model (from the user's agent config) rides along at create time —
     // server-side session.create does not apply global agent pins itself.
-    const created = await sessions.create({
-      title: buildChildTitle(input),
-      agent,
-      ...(input.model !== undefined ? { model: input.model } : {}),
-      metadata: stampChildMetadata(input),
-    })
+    const created = await withDeadline(
+      "session.create",
+      undefined,
+      sessions.create({
+        title: buildChildTitle(input),
+        agent,
+        ...(input.model !== undefined ? { model: input.model } : {}),
+        metadata: stampChildMetadata(input),
+      }),
+      controlMs,
+    )
     const sessionID = created.id
     const registration = hooks.onSessionID(sessionID)
     if (registration === "rejected") {
@@ -262,12 +297,12 @@ export function createSessionDriver(sessions: SessionCtx, options: SessionDriver
     signal: AbortSignal,
     turn: TurnContext = {},
   ): Promise<AgentResult> {
-    await promptAndWait(sessions, sessionID, promptText, signal)
+    await promptAndWait(sessions, sessionID, promptText, signal, awaitMs)
 
     // Outcome + last assistant message. A failed outcome is the primary
     // error; a succeeded outcome with a missing/unreadable assistant message
     // is a typed extraction error (never an empty successful reply).
-    const info = await sessions.get({ sessionID })
+    const info = await withDeadline("session.get", sessionID, sessions.get({ sessionID }), controlMs)
     const first = await readAssistantReply(sessions, sessionID, info.outcome)
     if (info.outcome !== "succeeded") {
       const detail = describeSessionFailure(info, first.message)
@@ -332,13 +367,18 @@ export function createSessionDriver(sessions: SessionCtx, options: SessionDriver
         `session.switchModel is unavailable — cannot continue session ${sessionID} on ${model.providerID}/${model.id}`,
       )
     }
-    await switchModel.call(sessions, { sessionID, model })
+    await withDeadline(
+      "session.switchModel",
+      sessionID,
+      switchModel.call(sessions, { sessionID, model }),
+      controlMs,
+    )
   }
 
   /** Best-effort session token total; undefined when unavailable. Never throws. */
   async function readTokenTotal(sessionID: string): Promise<number | undefined> {
     try {
-      const info = await sessions.get({ sessionID })
+      const info = await withDeadline("session.get", sessionID, sessions.get({ sessionID }), controlMs)
       return tokenTotal(info.tokens)
     } catch {
       return undefined
@@ -378,7 +418,7 @@ export function createSessionDriver(sessions: SessionCtx, options: SessionDriver
   ): Promise<AssistantReply> {
     let messages: ReadonlyArray<ContextMessage>
     try {
-      messages = await sessions.context({ sessionID })
+      messages = await withDeadline("session.context", sessionID, sessions.context({ sessionID }), controlMs)
     } catch (err) {
       if (outcome === "succeeded") {
         throw new AgentCallError("extraction", `failed to read session context: ${errorMessage(err)}`)
@@ -447,8 +487,8 @@ export function createSessionDriver(sessions: SessionCtx, options: SessionDriver
             ? "\nStart your reply with { or [ and end with the matching closing bracket. No prose, no markdown fences, no trailing commas, no comments."
             : "\nOutput the bare JSON value only — a quoted string, a number, true/false, or null. No prose, no markdown fences."
           : "")
-      await promptAndWait(sessions, sessionID, buildPromptText(repairPrompt, schema), signal)
-      const info = await sessions.get({ sessionID })
+      await promptAndWait(sessions, sessionID, buildPromptText(repairPrompt, schema), signal, awaitMs)
+      const info = await withDeadline("session.get", sessionID, sessions.get({ sessionID }), controlMs)
       reply = await readAssistantReply(sessions, sessionID, info.outcome)
       if (info.outcome !== "succeeded") {
         const detail = describeSessionFailure(info, reply.message)
@@ -636,12 +676,125 @@ function turnProgressed(before: number | undefined, after: number | undefined, t
   return after !== undefined && after > 0
 }
 
-async function promptAndWait(sessions: SessionCtx, sessionID: string, text: string, signal: AbortSignal): Promise<void> {
+async function promptAndWait(
+  sessions: SessionCtx,
+  sessionID: string,
+  text: string,
+  signal: AbortSignal,
+  awaitMs: number = SESSION_AWAIT_TIMEOUT_MS,
+): Promise<void> {
   const interrupt = () => {
     void interruptSafe(sessions, sessionID)
   }
-  await raceAbort(sessions.prompt({ sessionID, text }), signal, interrupt)
-  await raceAbort(sessions.wait({ sessionID }), signal, interrupt)
+  // Per-await deadline: a hung prompt/wait RPC rejects typed (`timeout`) and
+  // best-effort interrupts the session, so the child lands in a TERMINAL
+  // status instead of wedging the run until the wall-clock watchdog. The
+  // signal and the deadline race in ONE combinator so an abort clears the
+  // deadline timer — an abandoned timer would hold the loop for its full
+  // window.
+  await raceDeadline("session.prompt", sessionID, sessions.prompt({ sessionID, text }), signal, awaitMs, interrupt)
+  await raceDeadline("session.wait", sessionID, sessions.wait({ sessionID }), signal, awaitMs, interrupt)
+}
+
+/**
+ * Race a session promise against BOTH an AbortSignal and a deadline. On
+ * abort: the typed abort error (existing semantics). On deadline: the typed
+ * timeout error. Either way `onFire` runs best-effort FIRST (interrupt) and
+ * every arm is cleared on any settle — a ref'd deadline timer must never be
+ * abandoned by an early abort rejection (it would hold the event loop for
+ * the full window).
+ */
+function raceDeadline<T>(
+  label: string,
+  sessionID: string,
+  p: Promise<T>,
+  signal: AbortSignal,
+  ms: number,
+  onFire: () => void,
+): Promise<T> {
+  if (!(ms > 0)) return raceAbort(p, signal, onFire)
+  return new Promise<T>((resolve, reject) => {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const cleanup = () => {
+      if (timer !== undefined) clearTimeout(timer)
+      signal.removeEventListener("abort", onAbortFn)
+    }
+    const onAbortFn = () => {
+      cleanup()
+      onFire()
+      reject(new AgentCallError("abort", "agent aborted: run stopping"))
+    }
+    if (signal.aborted) {
+      onAbortFn()
+      return
+    }
+    signal.addEventListener("abort", onAbortFn, { once: true })
+    timer = setTimeout(() => {
+      cleanup()
+      onFire()
+      reject(
+        new AgentCallError(
+          "timeout",
+          `${label} on session ${sessionID} exceeded ${ms}ms — the host session RPC appears hung`,
+        ),
+      )
+    }, ms)
+    p.then(
+      (v) => {
+        cleanup()
+        resolve(v)
+      },
+      (err) => {
+        cleanup()
+        reject(err)
+      },
+    )
+  })
+}
+
+/**
+ * Reject with a typed timeout error once `ms` elapses without `p` settling.
+ * `ms <= 0` disables the deadline (p passthrough). `onTimeout` fires
+ * best-effort BEFORE the rejection (e.g. session.interrupt) and must never
+ * throw. The timer is REF'd deliberately: an unref'd deadline lets a quiet
+ * event loop resolve before it fires (see delay() in supervisor.ts) — the
+ * rejection must always land, and settling `p` (or abort) clears it.
+ */
+function withDeadline<T>(
+  label: string,
+  sessionID: string | undefined,
+  p: Promise<T>,
+  ms: number,
+  onTimeout?: () => void,
+): Promise<T> {
+  if (!(ms > 0)) return p
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      if (onTimeout !== undefined) {
+        try {
+          onTimeout()
+        } catch {
+          // best-effort
+        }
+      }
+      reject(
+        new AgentCallError(
+          "timeout",
+          `${label}${sessionID !== undefined ? ` on session ${sessionID}` : ""} exceeded ${ms}ms — the host session RPC appears hung`,
+        ),
+      )
+    }, ms)
+    p.then(
+      (v) => {
+        clearTimeout(timer)
+        resolve(v)
+      },
+      (err) => {
+        clearTimeout(timer)
+        reject(err)
+      },
+    )
+  })
 }
 
 /**

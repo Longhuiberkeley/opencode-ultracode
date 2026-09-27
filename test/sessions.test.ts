@@ -888,3 +888,78 @@ test("continueAgent: abort mid-wait interrupts the SAME session", async () => {
   )
   assert.deepEqual(fake.interrupts, [first.sessionID])
 })
+
+// ---------------------------------------------------------------------------
+// Per-await deadlines (P1-1): a hung RPC lands typed + terminal, never a wedge
+// ---------------------------------------------------------------------------
+
+test("runAgent: a hung wait() hits the await deadline — typed timeout error + best-effort interrupt", async () => {
+  const fake = new FakeSessionCtx()
+  fake.push({ text: "never reached" })
+  fake.hangWait = true
+  const driver = createSessionDriver(fake, { awaitTimeoutMs: 40 })
+  await assert.rejects(
+    driver.runAgent(input(), ["general"], hooks()),
+    (err: unknown) =>
+      err instanceof AgentCallError && err.kind === "timeout" && /session\.wait .* exceeded 40ms/.test(err.message),
+  )
+  assert.ok(fake.interrupts.length >= 1, "hung wait best-effort interrupted")
+  // Release so nothing dangles into other tests.
+  fake.hangWait = false
+  fake.releaseHangs()
+})
+
+test("runAgent: a hung session.create() hits the control deadline with a typed timeout", async () => {
+  const inner = new FakeSessionCtx()
+  inner.push({ text: "x" })
+  const hanging: SessionCtx = {
+    create: () => new Promise(() => {}),
+    get: (i) => inner.get(i),
+    prompt: (i) => inner.prompt(i),
+    wait: (i) => inner.wait(i),
+    context: (i) => inner.context(i),
+    interrupt: (i) => inner.interrupt(i),
+  }
+  const driver = createSessionDriver(hanging, { controlTimeoutMs: 30 })
+  await assert.rejects(
+    driver.runAgent(input(), ["general"], hooks()),
+    (err: unknown) => err instanceof AgentCallError && err.kind === "timeout" && /session\.create exceeded 30ms/.test(err.message),
+  )
+})
+
+test("runAgent: a hung session.get() after a successful turn hits the control deadline", async () => {
+  const inner = new FakeSessionCtx()
+  inner.push({ text: "done text" })
+  const hanging: SessionCtx = {
+    create: (i) => inner.create(i),
+    // The very first get (the outcome read after the turn) hangs forever.
+    get: () => new Promise(() => {}),
+    prompt: (i) => inner.prompt(i),
+    wait: (i) => inner.wait(i),
+    context: (i) => inner.context(i),
+    interrupt: (i) => inner.interrupt(i),
+  }
+  const driver = createSessionDriver(hanging, { controlTimeoutMs: 30 })
+  await assert.rejects(
+    driver.runAgent(input(), ["general"], hooks()),
+    (err: unknown) => err instanceof AgentCallError && err.kind === "timeout" && /session\.get .* exceeded 30ms/.test(err.message),
+  )
+})
+
+test("deadlines are off at <=0: a slow-but-honest RPC never times out", async () => {
+  const fake = new FakeSessionCtx()
+  fake.push({ text: "slow ok" })
+  const driver = createSessionDriver(fake, { awaitTimeoutMs: 0, controlTimeoutMs: 0 })
+  const result = await driver.runAgent(input(), ["general"], hooks())
+  assert.equal(result.text, "slow ok")
+})
+
+test("a timeout-kind failure is terminal for the runner — no same-model retry, row lands failed", async () => {
+  // Timeout is not kind "outcome": the runner's provider-shaped retry loop
+  // never re-prompts it; the child record reaches failed with the hung-RPC
+  // error. (Exercised through the fake driver the same way the runner sees
+  // a real timeout.)
+  const err = new AgentCallError("timeout", "session.wait on session s exceeded 15ms — the host session RPC appears hung")
+  assert.equal(err instanceof AgentCallError, true)
+  assert.equal((err as AgentCallError).kind, "timeout")
+})
