@@ -10,20 +10,28 @@
  */
 import { resolveActiveTarget } from "./command.ts"
 import { normalizeModelRef } from "./agent-pins.ts"
-import { isActiveRunStatus, type ModelRef, type RunRecord, type RunStatus } from "./types.ts"
+import { isActiveRunStatus, type ModelRef, type PauseResumeOutcome, type RunRecord, type RunStatus, type StopOutcome } from "./types.ts"
 
 export type ControlAction = "stop" | "pause" | "resume"
 
 export const CONTROL_ACTIONS: readonly ControlAction[] = ["stop", "pause", "resume"]
 
 export interface ControlImpl {
-  stop(runID: string, reason: string): boolean
-  pause(runID: string): boolean
+  /**
+   * Truthful stop: { mode: "local" } when a live worker took it,
+   * { mode: "orphan", stopReason } when the record was marked interrupted
+   * (dead owner, no local worker), or a refusal — including `remote-owner`
+   * naming the live owning process. Never a bare boolean for an active run.
+   */
+  stop(runID: string, reason: string): StopOutcome
   /**
    * Reopen a paused run. Ask mode: `opts.model` becomes the run-level fallback
-   * override consulted by every later failover/quarantine route.
+   * override consulted by every later failover/quarantine route. Refusals
+   * carry an actionable error (orphaned / remote-owned / wrong status).
    */
-  resume(runID: string, opts?: { model?: ModelRef }): boolean
+  resume(runID: string, opts?: { model?: ModelRef }): PauseResumeOutcome
+  /** Pause: ok:false with an actionable error when not locally live. */
+  pause(runID: string): PauseResumeOutcome
 }
 
 /** Status the run is expected to show immediately after an accepted action. */
@@ -36,6 +44,10 @@ const EXPECTED_STATUS: Record<ControlAction, RunStatus> = {
 export type ControlResult = { runID: string; action: ControlAction; status: RunStatus } & {
   /** Ask-mode resume: the applied fallback override pin, when one was given. */
   model?: string
+  /** Stop only: true when the run was orphaned and marked interrupted (no local worker). */
+  orphaned?: boolean
+  /** Stop only, orphaned runs: the persisted stopReason (includes the resume hint). */
+  stopReason?: string
 }
 
 /**
@@ -111,22 +123,39 @@ export function controlRun(
     if (!isActiveRunStatus(run.status) || run.status === "stopping") {
       throw new Error(`cannot stop a ${run.status} run`)
     }
-    if (!impl.stop(run.id, `orchestrator stop via ultracode_control`)) {
-      throw new Error(`supervisor refused to stop ${run.id} (status ${run.status})`)
+    const outcome = impl.stop(run.id, `orchestrator stop via ultracode_control`)
+    if (!outcome.ok) {
+      if (outcome.reason === "remote-owner") {
+        const pid = outcome.owner.pid !== undefined ? ` pid ${outcome.owner.pid}` : ""
+        throw new Error(
+          `run ${run.id} is owned by a live process (${outcome.owner.bootID}${pid}) — control it from that instance`,
+        )
+      }
+      throw new Error(
+        `supervisor refused to stop ${run.id} (${outcome.reason}${outcome.reason === "not-active" ? `, status ${outcome.status}` : ""})`,
+      )
+    }
+    // Truthful status: a local stop transitions through `stopping`; an
+    // orphan stop already marked the record `interrupted`.
+    if (outcome.mode === "orphan") {
+      const result: ControlResult = { runID: run.id, action, status: "interrupted", orphaned: true, stopReason: outcome.stopReason }
+      return result
     }
   } else if (action === "pause") {
     if (run.status !== "running") {
       throw new Error(`cannot pause a ${run.status} run`)
     }
-    if (!impl.pause(run.id)) {
-      throw new Error(`supervisor refused to pause ${run.id} (status ${run.status})`)
+    const outcome = impl.pause(run.id)
+    if (!outcome.ok) {
+      throw new Error(outcome.error ?? `supervisor refused to pause ${run.id} (status ${run.status})`)
     }
   } else {
     if (run.status !== "paused") {
       throw new Error(`cannot resume a ${run.status} run`)
     }
-    if (!impl.resume(run.id, input.model !== undefined ? { model: input.model } : undefined)) {
-      throw new Error(`supervisor refused to resume ${run.id} (status ${run.status})`)
+    const outcome = impl.resume(run.id, input.model !== undefined ? { model: input.model } : undefined)
+    if (!outcome.ok) {
+      throw new Error(outcome.error ?? `supervisor refused to resume ${run.id} (status ${run.status})`)
     }
   }
   const result: ControlResult = { runID: run.id, action, status: EXPECTED_STATUS[action] }

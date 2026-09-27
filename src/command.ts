@@ -16,6 +16,7 @@ import type {
   Json,
   ModelRef,
   ParentContext,
+  PauseResumeOutcome,
   Registry,
   RunEnvelope,
   RunLaunchInput,
@@ -24,6 +25,7 @@ import type {
   RunStatus,
   SaveWorkflowManifestInput,
   SavedWorkflow,
+  StopOutcome,
   Supervisor,
   UltracodeOptions,
   WorkflowKind,
@@ -845,10 +847,11 @@ export interface CommandStorage {
 }
 
 export interface CommandSupervisor {
-  pause(runID: string): boolean
+  pause(runID: string): PauseResumeOutcome
   /** Ask-mode resume: an optional model becomes the run-level fallback override. */
-  resume(runID: string, opts?: { model?: ModelRef }): boolean
-  stop(runID: string, reason: string): boolean
+  resume(runID: string, opts?: { model?: ModelRef }): PauseResumeOutcome
+  /** Truthful stop: local / orphan-marked-interrupted / refusal naming a live remote owner. */
+  stop(runID: string, reason: string): StopOutcome
   startDetached(
     input: Parameters<Supervisor["startDetached"]>[0],
     parent: ParentContext,
@@ -1128,12 +1131,20 @@ export async function handleUltracodeCommand(invocation: CommandInvocation, deps
       return
     }
     const stopped = deps.supervisor.stop(target.runID, "user requested (/ultracode stop)")
-    await deps.say(
-      sessionID,
-      stopped
-        ? `Stopping run \`${target.runID}\` — in-flight agents will be interrupted.`
-        : `Run \`${target.runID}\` is unknown or already finished. See /ultracode for the list.`,
-    )
+    let message: string
+    if (stopped.ok && stopped.mode === "local") {
+      message = `Stopping run \`${target.runID}\` — in-flight agents will be interrupted.`
+    } else if (stopped.ok && stopped.mode === "orphan") {
+      message = `Run \`${target.runID}\` was orphaned (no local worker) — marked interrupted. Resume with \`/ultracode rerun ${target.runID} --warm\`.`
+    } else if (!stopped.ok && stopped.reason === "remote-owner") {
+      const pid = stopped.owner.pid !== undefined ? ` pid ${stopped.owner.pid}` : ""
+      message = `Run \`${target.runID}\` is owned by a live process (${stopped.owner.bootID}${pid}) — control it from that instance.`
+    } else if (!stopped.ok && stopped.reason === "not-active") {
+      message = `Run \`${target.runID}\` is already ${stopped.status}. See /ultracode for the list.`
+    } else {
+      message = `Run \`${target.runID}\` is unknown or already finished. See /ultracode for the list.`
+    }
+    await deps.say(sessionID, message)
     return
   }
 
@@ -1479,9 +1490,9 @@ async function pauseRun(deps: CommandDeps, sessionID: string, runID: string): Pr
     await deps.say(sessionID, `error: ${deps.supervisorError ?? "supervisor unavailable"}`)
     return
   }
-  const ok = deps.supervisor.pause(runID)
-  if (!ok) {
-    await deps.say(sessionID, `cannot pause run \`${runID}\` (status: ${run.status})`)
+  const outcome = deps.supervisor.pause(runID)
+  if (!outcome.ok) {
+    await deps.say(sessionID, outcome.error ?? `cannot pause run \`${runID}\` (status: ${run.status})`)
     return
   }
   const next = deps.registry.get(runID)
@@ -1523,9 +1534,9 @@ async function resumeRun(
     await deps.say(sessionID, "error: --remember requires --model <pin> — nothing to remember without one")
     return
   }
-  const ok = deps.supervisor.resume(runID, model !== undefined ? { model } : undefined)
-  if (!ok) {
-    await deps.say(sessionID, `cannot resume run \`${runID}\` (status: ${run.status})`)
+  const outcome = deps.supervisor.resume(runID, model !== undefined ? { model } : undefined)
+  if (!outcome.ok) {
+    await deps.say(sessionID, outcome.error ?? `cannot resume run \`${runID}\` (status: ${run.status})`)
     return
   }
   let line = `Resumed run \`${runID}\` — status: ${deps.registry.get(runID)?.status ?? "running"}`

@@ -71,7 +71,8 @@ import {
   stripUndefined,
 } from "./run-status.ts"
 import { agentUsable, collectAgentPins, lookupAgentPin, normalizeModelRef, parseModelPin, readDisabledProviders } from "./agent-pins.ts"
-import { RegistryImpl, type OrphanPlan } from "./registry.ts"
+import { RegistryImpl } from "./registry.ts"
+import type { OrphanPlan } from "./types.ts"
 import { harvestOrphanedRun } from "./harvest.ts"
 import { emptyToolEventState } from "./run-events.ts"
 import { EMPTY_CATALOG, SKILL_CONTENT, SKILL_DESCRIPTION, SKILL_NAME, buildSkillContent } from "./skill-content.ts"

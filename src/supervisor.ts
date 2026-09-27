@@ -15,6 +15,7 @@ import type {
   Json,
   ModelRef,
   ParentContext,
+  PauseResumeOutcome,
   ProviderFailureClass,
   ProviderHealth,
   ProviderQuarantineSnapshot,
@@ -25,6 +26,7 @@ import type {
   RunStatus,
   SavedWorkflow,
   SessionCtx,
+  StopOutcome,
   Storage,
   Supervisor,
   UltracodeOptions,
@@ -1003,12 +1005,17 @@ export class SupervisorImpl implements Supervisor {
   // stop / stopAll / dispose
   // -------------------------------------------------------------------------
 
-  stop(runID: string, reason: string): boolean {
+  stop(runID: string, reason: string): StopOutcome {
     const state = this.runs.get(runID)
-    if (!state) return false
+    if (!state) return this.stopOrphaned(runID, reason)
     const run = this.registry.get(runID)
-    if (!run || !isActiveRunStatus(run.status) || run.status === "stopping") return false
-    if (!this.registry.setStatus(runID, "stopping", { stopReason: reason })) return false
+    if (!run) return { ok: false, reason: "not-found" }
+    if (!isActiveRunStatus(run.status) || run.status === "stopping") {
+      return { ok: false, reason: "not-active", status: run.status }
+    }
+    if (!this.registry.setStatus(runID, "stopping", { stopReason: reason })) {
+      return { ok: false, reason: "not-active", status: this.registry.get(runID)?.status ?? "failed" }
+    }
     state.paused = false
     this.clearAskTimer(state)
     this.clearWatchdog(state)
@@ -1036,28 +1043,87 @@ export class SupervisorImpl implements Supervisor {
     if (typeof (state.killTimer as { unref?: () => void }).unref === "function") {
       ;(state.killTimer as { unref: () => void }).unref()
     }
-    return true
+    return { ok: true, mode: "local" }
   }
 
-  pause(runID: string): boolean {
+  /**
+   * Stop a run with NO local RunState — the orphaned-record paths the
+   * 2026-09-27 incident wedged ("supervisor refused" while the record said
+   * running). Exactly one truthful outcome: dead owner (or state lost) ⇒
+   * mark the run and its running/pending children interrupted with a resume
+   * hint; live remote owner ⇒ refuse and name it; unknown/finished ⇒ say so.
+   * The control paths run an on-demand reconcile first, so by the time this
+   * fires the genuinely dead are usually already flipped — this covers the
+   * races and the reconcileIntervalMs=0 configuration.
+   */
+  private stopOrphaned(runID: string, reason: string): StopOutcome {
+    const status = this.registry.ownerStatus(runID)
+    if (status.kind === "not-found") return { ok: false, reason: "not-found" }
+    const record = status.record
+    if (!isActiveRunStatus(record.status) || record.status === "stopping") {
+      return { ok: false, reason: "not-active", status: record.status }
+    }
+    if (status.kind === "remote-live") {
+      return { ok: false, reason: "remote-owner", owner: status.owner ?? { bootID: "unknown" } }
+    }
+    const detail = status.detail ?? "owner gone"
+    const stopReason = `${reason} — orphaned: ${detail}. Marked interrupted; resumable via /ultracode rerun ${runID} --warm`
+    this.registry.applyOrphanInterrupt({ record, reason: stopReason })
+    // The persist callback pushes the runState transition; no parent channel
+    // exists for an orphaned run (its worker died with the old process).
+    return { ok: true, mode: "orphan", stopReason }
+  }
+
+  pause(runID: string): PauseResumeOutcome {
     const state = this.runs.get(runID)
-    if (!state) return false
+    if (!state) {
+      // No local worker: pausing is meaningless. Be truthful about why and
+      // what to do instead — never accept a pause nothing can honor.
+      const status = this.registry.ownerStatus(runID)
+      if (status.kind === "not-found") return { ok: false, error: `run ${runID} not found` }
+      if (status.kind === "remote-live") {
+        const pid = status.owner?.pid !== undefined ? ` pid ${status.owner.pid}` : ""
+        return { ok: false, error: `run ${runID} is owned by a live process (${status.owner?.bootID ?? "unknown"}${pid}) — pause it from that instance` }
+      }
+      return {
+        ok: false,
+        error: `run ${runID} is orphaned (${status.detail ?? "owner gone"}) — there is no worker to hold; stop marks it interrupted, /ultracode rerun ${runID} --warm restarts it warm`,
+      }
+    }
     const run = this.registry.get(runID)
-    if (!run || run.status !== "running") return false
-    if (!this.registry.setStatus(runID, "paused")) return false
+    if (!run) return { ok: false, error: `run ${runID} not found` }
+    if (run.status !== "running") return { ok: false, error: `run ${runID} is ${run.status}, not running` }
+    if (!this.registry.setStatus(runID, "paused")) return { ok: false, error: `run ${runID} could not transition from ${run.status} to paused` }
     state.paused = true
     state.pausedAt = Date.now()
     this.clearWatchdog(state)
     this.safeParentReport(state, `paused ${runID}`)
-    return true
+    return { ok: true }
   }
 
-  resume(runID: string, opts?: { model?: ModelRef }): boolean {
+  resume(runID: string, opts?: { model?: ModelRef }): PauseResumeOutcome {
     const state = this.runs.get(runID)
-    if (!state) return false
+    if (!state) {
+      // No local worker to reopen: truthful refusal with the warm-resume path
+      // (an orphaned paused record can never be resumed in place — the
+      // worker's script state died with the old process).
+      const status = this.registry.ownerStatus(runID)
+      if (status.kind === "not-found") return { ok: false, error: `run ${runID} not found` }
+      if (status.kind === "remote-live") {
+        const pid = status.owner?.pid !== undefined ? ` pid ${status.owner.pid}` : ""
+        return { ok: false, error: `run ${runID} is owned by a live process (${status.owner?.bootID ?? "unknown"}${pid}) — resume it from that instance` }
+      }
+      return {
+        ok: false,
+        error: `run ${runID} has no local worker to reopen (orphaned: ${status.detail ?? "owner gone"}) — /ultracode rerun ${runID} --warm restarts it warm`,
+      }
+    }
     const run = this.registry.get(runID)
-    if (!run || run.status !== "paused") return false
-    if (!this.registry.setStatus(runID, "running")) return false
+    if (!run) return { ok: false, error: `run ${runID} not found` }
+    if (run.status !== "paused") return { ok: false, error: `run ${runID} is ${run.status}, not paused` }
+    if (!this.registry.setStatus(runID, "running")) {
+      return { ok: false, error: `run ${runID} could not transition from paused to running` }
+    }
     if (state.pausedAt !== undefined) {
       state.pausedMs += Date.now() - state.pausedAt
       state.pausedAt = undefined
@@ -1077,7 +1143,7 @@ export class SupervisorImpl implements Supervisor {
         ? `resumed ${runID} — fallback override ${modelPinString(opts.model)}`
         : `resumed ${runID}`,
     )
-    return true
+    return { ok: true }
   }
 
   /** Currently quarantined providers (ask-mode diagnostics + remember keying). */
@@ -1516,7 +1582,7 @@ export class SupervisorImpl implements Supervisor {
         if (state.askNotified.has(key)) continue
         if (affected === 0) continue // no child of this run would fail over: nothing to ask
         if (!state.paused) {
-          if (!this.pause(state.runID)) continue // already stopping/final: cannot hold the run
+          if (!this.pause(state.runID).ok) continue // already stopping/final: cannot hold the run
         }
         state.askNotified.add(key)
         this.emitAskReport(state, event, affected)

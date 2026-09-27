@@ -1040,10 +1040,32 @@ export interface Registry {
   bindAgentSession(runID: string, agentID: string, sessionID: string): void
   /** Reverse lookup for event routing. Survives finalize. */
   agentForSession(sessionID: string): { runID: string; agentID: string } | undefined
+  /**
+   * On plugin load AND periodically: seed + classify persisted records
+   * (two-phase so harvest can run between classify and apply). See
+   * RegistryImpl for the canonical implementation and semantics.
+   */
+  classifyOrphans(opts?: { recheckAdopted?: boolean }): OrphanPlan[]
+  /** Apply a classifyOrphans() plan: flip to interrupted + persist. */
+  applyOrphanInterrupt(plan: OrphanPlan, reasonOverride?: string): boolean
+  /**
+   * Who may speak for a run right now (local / remote-live / dead /
+   * not-found) — the input to truthful control on records without a local
+   * RunState.
+   */
+  ownerStatus(runID: string):
+    | { kind: "not-found" }
+    | { kind: "local" | "remote-live" | "dead"; record: RunRecord; owner?: { bootID: string; pid?: number; updatedAt?: number }; detail?: string }
   /** On plugin load: mark persisted running/stopping/paused runs as interrupted (no auto-replay). */
   reconcileOrphans(): void
   /** Persist the current in-memory record immediately (effective snapshot, etc.). */
   persistNow(runID: string): void
+}
+
+/** A classifyOrphans() output: an active record whose owner is gone. */
+export interface OrphanPlan {
+  record: RunRecord
+  reason: string
 }
 
 // ---------------------------------------------------------------------------
@@ -1201,6 +1223,23 @@ export interface ProviderHealth {
   }): void
 }
 
+/**
+ * Truthful stop outcome: exactly one of — accepted locally (a live RunState
+ * took the stop), accepted as an ORPHAN (no local worker; record marked
+ * interrupted with a resume hint), or refused with a reason (`not-found`,
+ * `not-active` with the current status, or `remote-owner` naming the live
+ * owning process so the caller can say WHERE to control the run).
+ */
+export type StopOutcome =
+  | { ok: true; mode: "local" }
+  | { ok: true; mode: "orphan"; stopReason: string }
+  | { ok: false; reason: "not-found" }
+  | { ok: false; reason: "not-active"; status: RunStatus }
+  | { ok: false; reason: "remote-owner"; owner: { bootID: string; pid?: number; updatedAt?: number } }
+
+/** Truthful pause/resume outcome: ok plus an actionable error when false. */
+export type PauseResumeOutcome = { ok: boolean; error?: string }
+
 export interface Supervisor {
   /** Child-only context guard. Undefined for ordinary sessions. */
   contextLimitFor?(sessionID: string, model: ModelRef): ChildContextLimit | undefined
@@ -1216,16 +1255,25 @@ export interface Supervisor {
   startDetached(input: RunLaunchInput, parent: ParentContext): { runID: string; done: Promise<RunOutcome> }
   /** Replace next-run defaults. In-flight runs keep their startDetached snapshot. */
   updateDefaults(next: Required<UltracodeOptions>): void
-  /** Idempotent stop. Returns false if runID unknown or already final. */
-  stop(runID: string, reason: string): boolean
-  /** Close admission of new agent() calls. Returns false if not running. */
-  pause(runID: string): boolean
   /**
-   * Reopen admission. Returns false if not paused. Ask mode: the optional
-   * `model` pin becomes the run-level fallback OVERRIDE — failovers (and
-   * quarantine routing) for this run prefer it over the configured ladder.
+   * Idempotent, truthful stop. Never returns a bare boolean lie for a run the
+   * record says is active: an orphaned run (owner dead, no local worker) is
+   * MARKED INTERRUPTED with a resume hint ({ mode: "orphan" }); a run owned by
+   * a live remote process is refused naming that owner.
    */
-  resume(runID: string, opts?: { model?: ModelRef }): boolean
+  stop(runID: string, reason: string): StopOutcome
+  /**
+   * Close admission of new agent() calls. Returns ok:false with an actionable
+   * error when the run is not locally live (orphaned, remote-owned, finished).
+   */
+  pause(runID: string): PauseResumeOutcome
+  /**
+   * Reopen admission. Returns ok:false with an actionable error when there is
+   * no local worker to reopen. Ask mode: the optional `model` pin becomes the
+   * run-level fallback OVERRIDE — failovers (and quarantine routing) for this
+   * run prefer it over the configured ladder.
+   */
+  resume(runID: string, opts?: { model?: ModelRef }): PauseResumeOutcome
   stopAll(reason: string): void
   /** Currently quarantined providers (ask-mode diagnostics + remember keying). */
   providerQuarantines(): ProviderQuarantineSnapshot[]

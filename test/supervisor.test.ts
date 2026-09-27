@@ -374,8 +374,9 @@ test("supervisor: stop() is idempotent and interrupts live children", async () =
   const runID = ctx.registry.activeRuns()[0].id
   assert.equal(ctx.supervisor.isOwnedSession([...ctx.sessions.sessions.keys()][0]), true)
 
-  assert.equal(ctx.supervisor.stop(runID, "user request"), true)
-  assert.equal(ctx.supervisor.stop(runID, "user request"), false) // idempotent no-op
+  assert.deepEqual(ctx.supervisor.stop(runID, "user request"), { ok: true, mode: "local" })
+  // Idempotent no-op once already stopping.
+  assert.deepEqual(ctx.supervisor.stop(runID, "user request"), { ok: false, reason: "not-active", status: "stopping" })
   const outcome = await pending
 
   assert.equal(outcome.envelope.status, "stopped")
@@ -392,6 +393,112 @@ test("supervisor: dispose stops active runs", async () => {
   const outcome = await pending
   assert.equal(outcome.envelope.status, "stopped")
   assert.equal(outcome.envelope.stopReason, "plugin unload")
+})
+
+// ---------------------------------------------------------------------------
+// Orphaned-record control (no local RunState): the 2026-09-27 wedge class.
+// ---------------------------------------------------------------------------
+
+function makeOrphanSupervisor(persisted: RunRecord[], ownerProbe: (bootID: string) => "alive-pid" | "alive-marker" | "dead-pid" | "dead") {
+  const registry = new RegistryImpl({
+    persist: () => {},
+    loader: () => persisted,
+    throttleMs: 0,
+    bootID: "boot_new",
+    ownerProbe,
+  })
+  // Seed the registry from the persisted records (classify without applying,
+  // so the dead-owner record stays running — the control path must handle it).
+  const plans = registry.classifyOrphans()
+  const supervisor = new SupervisorImpl({
+    registry,
+    storage: new FakeStorage(),
+    sessions: new FakeSessionCtx(),
+    options: { ...DEFAULT_OPTIONS, timeoutMs: 5_000 },
+    settleGraceMs: 100,
+    stopKillGraceMs: 50,
+  })
+  return { registry, supervisor, plans }
+}
+
+test("supervisor.stop on an ORPHANED run marks it interrupted with a resume hint — never 'refused'", () => {
+  const orphan: RunRecord = {
+    id: "run_orphaned",
+    parentSessionID: "ses_parent",
+    status: "running",
+    script: "return 1",
+    startedAt: 1,
+    owner: { bootID: "boot_dead", updatedAt: Date.now() - 1_000, pid: 4312 },
+    agents: [
+      { id: "a1", status: "running", sessionID: "ses_child" },
+      { id: "a2", status: "pending" },
+    ],
+  }
+  const { registry, supervisor, plans } = makeOrphanSupervisor([orphan], () => "dead-pid")
+  assert.equal(plans.length, 1, "classification sees the dead owner")
+  // The wedge: record says running, no local RunState exists.
+  assert.equal(registry.get("run_orphaned")?.status, "running")
+  const outcome = supervisor.stop("run_orphaned", "orchestrator stop via ultracode_control")
+  assert.ok(outcome.ok)
+  assert.equal(outcome.mode, "orphan")
+  if (outcome.mode === "orphan") {
+    assert.match(outcome.stopReason, /orphaned: owner process gone/)
+    assert.match(outcome.stopReason, /rerun run_orphaned --warm/)
+  }
+  const run = registry.get("run_orphaned")!
+  assert.equal(run.status, "interrupted")
+  assert.deepEqual(run.agents.map((a) => a.status), ["interrupted", "interrupted"])
+  // A second stop is truthfully not-active now.
+  const again = supervisor.stop("run_orphaned", "again")
+  assert.deepEqual(again, { ok: false, reason: "not-active", status: "interrupted" })
+})
+
+test("supervisor.stop on a LIVE remote-owned run refuses naming the owning process", () => {
+  const remote: RunRecord = {
+    id: "run_remote",
+    parentSessionID: "ses_parent",
+    status: "running",
+    script: "return 1",
+    startedAt: 1,
+    owner: { bootID: "boot_elsewhere", updatedAt: Date.now() - 1_000, pid: 999 },
+    agents: [],
+  }
+  const { registry, supervisor, plans } = makeOrphanSupervisor([remote], (bootID) =>
+    bootID === "boot_elsewhere" ? "alive-pid" : "dead",
+  )
+  assert.equal(plans.length, 0, "a pid-verified live owner is never flipped")
+  const outcome = supervisor.stop("run_remote", "orchestrator stop via ultracode_control")
+  assert.ok(!outcome.ok)
+  if (!outcome.ok && outcome.reason === "remote-owner") {
+    assert.equal(outcome.owner.bootID, "boot_elsewhere")
+    assert.equal(outcome.owner.pid, 999)
+  } else {
+    assert.fail("expected a remote-owner refusal")
+  }
+  assert.equal(registry.get("run_remote")?.status, "running", "refusal does not touch a live owner's run")
+})
+
+test("supervisor.pause on an orphaned run refuses with guidance; resume on an orphaned paused record too", () => {
+  const orphan: RunRecord = {
+    id: "run_orphan2",
+    parentSessionID: "ses_parent",
+    status: "running",
+    script: "return 1",
+    startedAt: 1,
+    owner: { bootID: "boot_dead", updatedAt: Date.now() - 40 * 60_000 },
+    agents: [],
+  }
+  const pausedOrphan: RunRecord = { ...orphan, id: "run_orphan3", status: "paused" }
+  const { registry, supervisor } = makeOrphanSupervisor([orphan, pausedOrphan], () => "dead")
+  const pause = supervisor.pause("run_orphan2")
+  assert.equal(pause.ok, false)
+  assert.match(pause.error ?? "", /orphaned/)
+  assert.match(pause.error ?? "", /rerun run_orphan2 --warm/)
+  assert.equal(registry.get("run_orphan2")?.status, "running", "pause never mutates an orphaned record")
+  const resume = supervisor.resume("run_orphan3")
+  assert.equal(resume.ok, false)
+  assert.match(resume.error ?? "", /no local worker/)
+  assert.equal(registry.get("run_orphan3")?.status, "paused")
 })
 
 // ---------------------------------------------------------------------------
@@ -529,7 +636,7 @@ test("supervisor: stop during settle grace reports stopped, not succeeded", asyn
   await waitFor(() => ctx.sessions.sessions.size > 0, "child session created")
   await tick(120) // script returned + done received; settle is now waiting on the dangling call
   const runID = ctx.registry.activeRuns()[0].id
-  assert.equal(ctx.supervisor.stop(runID, "user request"), true)
+  assert.deepEqual(ctx.supervisor.stop(runID, "user request"), { ok: true, mode: "local" })
 
   const outcome = await pending
   assert.equal(outcome.envelope.status, "stopped")
@@ -552,7 +659,7 @@ test("supervisor: normal completion cancels the delayed interrupt — no interru
   const runID = ctx.registry.activeRuns()[0].id
   // Stop while the script sleeps: kill timer (600ms) is scheduled, but the
   // script completes first and the run must cancel it before it fires.
-  assert.equal(ctx.supervisor.stop(runID, "wrapping up"), true)
+  assert.deepEqual(ctx.supervisor.stop(runID, "wrapping up"), { ok: true, mode: "local" })
   const outcome = await pending
   assert.equal(outcome.envelope.status, "stopped")
   assert.equal(outcome.envelope.stopReason, "wrapping up")
@@ -628,12 +735,12 @@ test("supervisor: pause queues new agent() until resume; in-flight completes", a
     ctx.parent,
   )
   await waitFor(() => ctx.registry.activeRuns().length > 0, "run creation")
-  assert.equal(ctx.supervisor.pause(runID), true)
+  assert.deepEqual(ctx.supervisor.pause(runID), { ok: true })
   assert.equal(ctx.registry.get(runID)?.status, "paused")
   assert.ok(ctx.reports.some((s) => s.startsWith("paused ")))
   await tick(200) // sleep finished; agent() blocked on pause gate
   assert.equal(ctx.sessions.sessions.size, 0, "new agent() not admitted while paused")
-  assert.equal(ctx.supervisor.resume(runID), true)
+  assert.deepEqual(ctx.supervisor.resume(runID), { ok: true })
   assert.equal(ctx.registry.get(runID)?.status, "running")
   assert.ok(ctx.reports.some((s) => s.startsWith("resumed ")))
   const outcome = await done
@@ -651,7 +758,7 @@ test("supervisor: in-flight agent completes while paused", async () => {
     ctx.parent,
   )
   await waitFor(() => ctx.sessions.sessions.size > 0, "in-flight child")
-  assert.equal(ctx.supervisor.pause(runID), true)
+  assert.deepEqual(ctx.supervisor.pause(runID), { ok: true })
   const outcome = await done
   assert.equal(outcome.envelope.status, "succeeded")
   assert.equal(outcome.envelope.result, "INFLIGHT")
@@ -689,7 +796,7 @@ test("supervisor: queued semaphore waiter stays queued while paused, runs on res
   const promptsAfterFirst = prompts
   assert.equal(createsAfterFirst, 1)
   assert.equal(promptsAfterFirst, 1)
-  assert.equal(ctx.supervisor.pause(runID), true)
+  assert.deepEqual(ctx.supervisor.pause(runID), { ok: true })
   ctx.sessions.hangWait = false
   ctx.sessions.releaseHangs()
   await waitFor(
@@ -700,7 +807,7 @@ test("supervisor: queued semaphore waiter stays queued while paused, runs on res
   assert.equal(creates, createsAfterFirst, "second never created during pause")
   assert.equal(prompts, promptsAfterFirst, "second never prompted during pause")
   assert.equal(ctx.sessions.sessions.size, 1, "queued waiter did not start a session")
-  assert.equal(ctx.supervisor.resume(runID), true)
+  assert.deepEqual(ctx.supervisor.resume(runID), { ok: true })
   const outcome = await done
   assert.equal(outcome.envelope.status, "succeeded")
   const result = outcome.envelope.result as { a?: string; b?: string }
@@ -724,8 +831,8 @@ test("supervisor: stop during pause finalizes stopped with no cleanup-pending ma
     ctx.parent,
   )
   await waitFor(() => ctx.sessions.sessions.size === 1, "first child")
-  assert.equal(ctx.supervisor.pause(runID), true)
-  assert.equal(ctx.supervisor.stop(runID, "user request"), true)
+  assert.deepEqual(ctx.supervisor.pause(runID), { ok: true })
+  assert.deepEqual(ctx.supervisor.stop(runID, "user request"), { ok: true, mode: "local" })
   const outcome = await done
   assert.equal(outcome.envelope.status, "stopped")
   assert.equal(outcome.envelope.stopReason, "user request")
@@ -739,11 +846,11 @@ test("supervisor: watchdog suspends while paused then settles after resume", asy
     ctx.parent,
   )
   await waitFor(() => ctx.registry.activeRuns().length > 0, "run creation")
-  assert.equal(ctx.supervisor.pause(runID), true)
+  assert.deepEqual(ctx.supervisor.pause(runID), { ok: true })
   await tick(400) // past the original 180ms deadline
   assert.equal(ctx.registry.get(runID)?.status, "paused")
   assert.equal(ctx.registry.get(runID)?.endedAt, undefined)
-  assert.equal(ctx.supervisor.resume(runID), true)
+  assert.deepEqual(ctx.supervisor.resume(runID), { ok: true })
   const outcome = await done
   assert.equal(outcome.envelope.status, "stopped")
   assert.equal(outcome.envelope.stopReason, "timeout")
@@ -775,8 +882,8 @@ test("supervisor: mutating defaults after startDetached does not rewrite remaini
   await waitFor(() => ctx.registry.activeRuns().length > 0, "run creation")
   ctx.supervisor.updateDefaults({ ...DEFAULT_OPTIONS, timeoutMs: 1 })
   assert.equal(ctx.registry.get(runID)?.effective?.timeoutMs, 5_000)
-  assert.equal(ctx.supervisor.pause(runID), true)
-  assert.equal(ctx.supervisor.resume(runID), true)
+  assert.deepEqual(ctx.supervisor.pause(runID), { ok: true })
+  assert.deepEqual(ctx.supervisor.resume(runID), { ok: true })
   ctx.supervisor.stop(runID, "user request")
   const outcome = await done
   assert.equal(outcome.envelope.status, "stopped")
@@ -788,10 +895,10 @@ test("resume remainingTimeoutMs is pinned to the frozen effective timeout", asyn
   await waitFor(() => ctx.registry.activeRuns().length > 0, "run creation")
   const frozen = ctx.registry.get(runID)?.effective?.timeoutMs
   assert.equal(frozen, 5_000)
-  assert.equal(ctx.supervisor.pause(runID), true)
+  assert.deepEqual(ctx.supervisor.pause(runID), { ok: true })
   ctx.supervisor.updateDefaults({ ...DEFAULT_OPTIONS, timeoutMs: 1 })
   await tick(40)
-  assert.equal(ctx.supervisor.resume(runID), true)
+  assert.deepEqual(ctx.supervisor.resume(runID), { ok: true })
   const left = ctx.supervisor.remainingTimeoutFor(runID)
   assert.equal(typeof left, "number")
   assert.ok(left! > 1_000, `remaining ${left} should still track frozen 5000ms`)
@@ -1293,7 +1400,7 @@ test("supervisor: abort of a waiting run releases nothing partially", async () =
     await tick(80)
     assert.equal(sessions.sessions.size, 1)
     assert.deepEqual(await listProviderSlots(slotsDir, "anthropic"), ["slot-0"])
-    assert.equal(supervisor.stop(waiter.runID, "user request"), true)
+    assert.deepEqual(supervisor.stop(waiter.runID, "user request"), { ok: true, mode: "local" })
     const waited = await waiter.done
     assert.equal(waited.envelope.status, "stopped")
     assert.equal(sessions.sessions.size, 1, "stopped waiter must not have created a session")

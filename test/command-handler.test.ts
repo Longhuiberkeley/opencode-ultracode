@@ -33,11 +33,13 @@ import type {
   AgentRecord,
   Json,
   ParentContext,
+  PauseResumeOutcome,
   RunLaunchInput,
   RunOutcome,
   RunRecord,
   SaveWorkflowManifestInput,
   SavedWorkflow,
+  StopOutcome,
 } from "../src/types.ts"
 import { DEFAULT_OPTIONS } from "../src/types.ts"
 import { applyOverlay, overlayFromPanel, panelSettingsFrom, parseSettingsAckPayload, type SettingsOverlay } from "../src/settings.ts"
@@ -199,21 +201,25 @@ class MemorySupervisor implements CommandSupervisor {
   constructor(registry: FakeRegistry) {
     this.registry = registry
   }
-  pause(runID: string): boolean {
+  pause(runID: string): PauseResumeOutcome {
     const run = this.registry.get(runID)
-    if (!run || run.status !== "running") return false
-    return this.registry.setStatus(runID, "paused")
+    if (!run || run.status !== "running") return { ok: false, error: `run ${runID} not running` }
+    return { ok: this.registry.setStatus(runID, "paused") }
   }
-  resume(runID: string, opts?: { model?: { providerID: string; id: string; variant?: string } }): boolean {
+  resume(runID: string, opts?: { model?: { providerID: string; id: string; variant?: string } }): PauseResumeOutcome {
     this.resumeCalls.push({ runID, ...(opts !== undefined ? { opts } : {}) })
     const run = this.registry.get(runID)
-    if (!run || run.status !== "paused") return false
-    return this.registry.setStatus(runID, "running")
+    if (!run || run.status !== "paused") return { ok: false, error: `run ${runID} not paused` }
+    return { ok: this.registry.setStatus(runID, "running") }
   }
-  stop(runID: string, reason: string): boolean {
+  stop(runID: string, reason: string): StopOutcome {
     const run = this.registry.get(runID)
-    if (!run || (run.status !== "running" && run.status !== "paused" && run.status !== "stopping")) return false
-    return this.registry.setStatus(runID, "stopped", { stopReason: reason })
+    if (!run) return { ok: false, reason: "not-found" }
+    if (run.status !== "running" && run.status !== "paused" && run.status !== "stopping") {
+      return { ok: false, reason: "not-active", status: run.status }
+    }
+    this.registry.setStatus(runID, "stopped", { stopReason: reason })
+    return { ok: true, mode: "local" }
   }
   startDetached(input: RunLaunchInput, parent: ParentContext): { runID: string; done: Promise<RunOutcome> } {
     this.startCalls.push({ input, parent })

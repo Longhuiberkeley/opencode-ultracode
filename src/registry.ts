@@ -9,7 +9,7 @@
  *
  * Single-threaded JS — no locks needed (CONTRACTS.md).
  */
-import type { AgentRecord, Json, Registry, RunRecord, RunStatus, WorkflowMeta } from "./types.ts"
+import type { AgentRecord, Json, OrphanPlan, Registry, RunRecord, RunStatus, WorkflowMeta } from "./types.ts"
 import { addTokens, emptyTokens, isActiveRunStatus, randomRunID } from "./types.ts"
 import type { OwnerBootLiveness } from "./owner-liveness.ts"
 
@@ -58,14 +58,6 @@ interface ThrottleState {
   dirty: boolean
 }
 
-/** A persisted active record whose owner is gone: interrupt it (harvest first). */
-export interface OrphanPlan {
-  /** The in-memory record (seeded clone or adopted mirror) that must be interrupted. */
-  record: RunRecord
-  /** Truthful stopReason persisted with the flip (names the dead owner). */
-  reason: string
-}
-
 export class RegistryImpl implements Registry {
   private runs = new Map<string, RunRecord>()
   /** sessionID -> runID for runs still active (released on finalize). */
@@ -108,6 +100,55 @@ export class RegistryImpl implements Registry {
    */
   private probeBoot(bootID: string): OwnerBootLiveness {
     return this.ownerProbe ? this.ownerProbe(bootID) : "dead"
+  }
+
+  /**
+   * Who may speak for a run right now — the input to truthful control:
+   * - `local`       — this process created it (a live RunState should exist);
+   * - `remote-live` — another process owns it (pid-verified, or a pid-less
+   *   marker with a heartbeat still inside the orphan window): refuse and
+   *   name the owner;
+   * - `dead`        — owner provably gone (or no owner recorded): an orphan;
+   * - `not-found`   — unknown id.
+   * `detail` explains a `dead` verdict for stopReason strings.
+   */
+  ownerStatus(runID: string):
+    | { kind: "not-found" }
+    | { kind: "local" | "remote-live" | "dead"; record: RunRecord; owner?: { bootID: string; pid?: number; updatedAt?: number }; detail?: string } {
+    const record = this.runs.get(runID)
+    if (!record) return { kind: "not-found" }
+    const owner = record.owner
+    const ownerInfo = owner
+      ? {
+          bootID: owner.bootID,
+          ...(typeof owner.pid === "number" ? { pid: owner.pid } : {}),
+          updatedAt: owner.updatedAt,
+        }
+      : undefined
+    if (this.createdRuns.has(runID)) return { kind: "local", record, ...(ownerInfo ? { owner: ownerInfo } : {}) }
+    if (!owner) return { kind: "dead", record, detail: "no owner recorded (legacy record)" }
+    if (this.bootID !== undefined && owner.bootID === this.bootID) {
+      return {
+        kind: "dead",
+        record,
+        ...(ownerInfo ? { owner: ownerInfo } : {}),
+        detail: "owner boot is this process but no local run state exists (state lost across reload)",
+      }
+    }
+    const liveness = this.probeBoot(owner.bootID)
+    if (liveness === "alive-pid") return { kind: "remote-live", record, owner: ownerInfo }
+    if (liveness === "alive-marker") {
+      if (this.now() - owner.updatedAt <= RegistryImpl.ORPHAN_HEARTBEAT_MS) {
+        return { kind: "remote-live", record, owner: ownerInfo }
+      }
+      return { kind: "dead", record, owner: ownerInfo, detail: "owner marker alive but run heartbeat is past the orphan window" }
+    }
+    return {
+      kind: "dead",
+      record,
+      ...(ownerInfo ? { owner: ownerInfo } : {}),
+      detail: liveness === "dead-pid" ? `owner process gone (boot ${owner.bootID}${typeof owner.pid === "number" ? ` pid ${owner.pid}` : ""})` : `owner marker dead or absent (boot ${owner.bootID})`,
+    }
   }
 
   // ------------------------------------------------------------------

@@ -371,7 +371,7 @@ test("ask mode: quarantine pauses the run once, reports the resume invocation, r
   assert.match(asks[0]!, new RegExp(`ultracode_control \\{ "action": "resume", "runID": "${runID}", "model": "google/gemini-3.7-flash" \\}`))
 
   // Resume without a model: auto-mode policy (the configured ladder).
-  assert.equal(ctx.supervisor.resume(runID), true)
+  assert.deepEqual(ctx.supervisor.resume(runID), { ok: true })
   const outcome = await done
   assert.equal(outcome.envelope.status, "succeeded", outcome.run.error ?? "")
   assert.equal(outcome.envelope.result, "RECOVERED")
@@ -401,7 +401,7 @@ return { a: a.text, b: b.text };
   assert.equal(ctx.sessions.switches.length, 0, "the failover waits for the answer — no model switch while paused")
   assert.equal([...ctx.sessions.sessions.values()][0]!.prompts, 1, "no continuation prompt while paused")
 
-  assert.equal(ctx.supervisor.resume(runID, { model: { providerID: "openai", id: "gpt-6" } }), true)
+  assert.deepEqual(ctx.supervisor.resume(runID, { model: { providerID: "openai", id: "gpt-6" } }), { ok: true })
   const outcome = await done
   assert.equal(outcome.envelope.status, "succeeded", outcome.run.error ?? "")
   const result = outcome.envelope.result as { a?: string; b?: string }
@@ -478,7 +478,7 @@ test("ask mode: explore-agent child in autoEditsWorkflow gets a proposal", async
   const asks = ctx.reports.filter((r) => r.includes("provider ask —"))
   assert.equal(asks.length, 1)
   assert.match(asks[0]!, /proposed fallback: google\/gemini-3.7-flash/)
-  assert.equal(ctx.supervisor.resume(runID), true)
+  assert.deepEqual(ctx.supervisor.resume(runID), { ok: true })
   const outcome = await done
   assert.equal(outcome.envelope.status, "succeeded", outcome.run.error ?? "")
 })

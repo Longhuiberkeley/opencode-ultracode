@@ -10,6 +10,7 @@ import type {
   FsLike,
   Json,
   KvLike,
+  OrphanPlan,
   Registry,
   RunRecord,
   RunStatus,
@@ -538,6 +539,40 @@ export class FakeRegistry implements Registry {
         run.endedAt = Date.now()
       }
     }
+  }
+
+  /** Two-phase reconcile stub: every active run in the map is an orphan plan. */
+  classifyOrphans(opts?: { recheckAdopted?: boolean }): OrphanPlan[] {
+    void opts
+    const plans: OrphanPlan[] = []
+    for (const run of this.runs.values()) {
+      if (isActiveRunStatus(run.status)) {
+        plans.push({ record: run, reason: `server restart (fake) — resumable: /ultracode rerun ${run.id} --warm` })
+      }
+    }
+    return plans
+  }
+
+  applyOrphanInterrupt(plan: OrphanPlan, reasonOverride?: string): boolean {
+    const run = plan.record
+    if (!isActiveRunStatus(run.status)) return false
+    run.status = "interrupted"
+    run.stopReason = reasonOverride ?? plan.reason
+    if (run.endedAt === undefined) run.endedAt = Date.now()
+    for (const agent of run.agents) {
+      if (agent.status === "pending" || agent.status === "running") agent.status = "interrupted"
+    }
+    this.saveCalls.push(run)
+    return true
+  }
+
+  ownerStatus(runID: string):
+    | { kind: "not-found" }
+    | { kind: "local" | "remote-live" | "dead"; record: RunRecord; owner?: { bootID: string; pid?: number; updatedAt?: number }; detail?: string } {
+    const run = this.runs.get(runID)
+    if (!run) return { kind: "not-found" }
+    // The fake has no process identity: every run it holds counts as local.
+    return { kind: "local", record: run }
   }
 
   persistNow(runID: string): void {
