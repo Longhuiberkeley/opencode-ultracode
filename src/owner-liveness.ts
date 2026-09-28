@@ -102,6 +102,7 @@ export function isSafeBootID(bootID: string): boolean {
 function markerPath(dir: string, bootID: string): string {
   return path.join(dir, `${bootID}.json`)
 }
+export { markerPath }
 
 let lastWriteAt = 0
 let lastWriteBoot: string | undefined
