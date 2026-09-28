@@ -283,3 +283,69 @@ test("harvest: idempotent on already-harvested rows (running filter skips termin
   })
   assert.deepEqual(second, { harvested: 0, failed: 0, unresolvable: 0 })
 })
+
+// ---------------------------------------------------------------------------
+// Bounded harvest (review P1): count cap bounds children, deadlines bound TIME
+// ---------------------------------------------------------------------------
+
+test("harvest: a hung session.get() times out per-RPC and reads unresolvable — the flip proceeds", async () => {
+  const run = orphanRun([
+    { id: "a1", sessionID: "ses_hung", key: "k", promptDigest: "9".repeat(64) },
+    { id: "a2", sessionID: "ses_ok", key: "k2", promptDigest: "8".repeat(64) },
+  ])
+  const sessions: HarvestSessionCtx = {
+    get: async ({ sessionID }) => {
+      if (sessionID === "ses_hung") return new Promise(() => {}) // transport never returns
+      return { outcome: "succeeded" }
+    },
+    context: async ({ sessionID }) => {
+      if (sessionID === "ses_ok") return [assistantMessage("salvaged text")]
+      throw new Error("unreachable")
+    },
+  }
+  const report = await harvestOrphanedRun(run, {
+    sessions,
+    updateAgent: () => {},
+    now: () => 1_000,
+    rpcTimeoutMs: 40,
+  })
+  assert.deepEqual(report, { harvested: 1, failed: 0, unresolvable: 1 }, "hung probe bounded; sibling still salvaged")
+})
+
+test("harvest: a hung session.context() times out — succeeded child left unresolvable, not wedged", async () => {
+  const run = orphanRun([{ id: "a1", sessionID: "ses_ctx_hung", key: "k", promptDigest: "7".repeat(64) }])
+  const sessions: HarvestSessionCtx = {
+    get: async () => ({ outcome: "succeeded" }),
+    context: async () => new Promise(() => {}),
+  }
+  const report = await harvestOrphanedRun(run, {
+    sessions,
+    updateAgent: () => {},
+    now: () => 1_000,
+    rpcTimeoutMs: 40,
+  })
+  assert.deepEqual(report, { harvested: 0, failed: 0, unresolvable: 1 })
+})
+
+test("harvest: the overall budget stops the pass — remaining children counted unresolvable", async () => {
+  const agents: Array<Partial<AgentRecord> & { id: string }> = []
+  for (let i = 0; i < 6; i++) agents.push({ id: `a${i + 1}`, sessionID: `ses_b${i}` })
+  const run = orphanRun(agents)
+  let clock = 1_000
+  const sessions: HarvestSessionCtx = {
+    get: async () => {
+      clock += 100 // each probe advances the clock past the tiny budget
+      return { outcome: "succeeded" }
+    },
+    context: async () => [assistantMessage("x")],
+  }
+  const report = await harvestOrphanedRun(run, {
+    sessions,
+    updateAgent: () => {},
+    now: () => clock,
+    rpcTimeoutMs: 1_000,
+    budgetMs: 150,
+  })
+  assert.ok(report.harvested >= 1, "at least the first child salvaged before the budget")
+  assert.equal(report.harvested + report.failed + report.unresolvable, agents.length, "every child accounted for")
+})

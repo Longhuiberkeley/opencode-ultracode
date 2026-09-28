@@ -42,6 +42,10 @@ export interface HarvestDeps {
   sessions: HarvestSessionCtx
   updateAgent: (runID: string, agentID: string, patch: Partial<AgentRecord>) => void
   now?: () => number
+  /** Per-RPC deadline for session.get/context (default HARVEST_RPC_TIMEOUT_MS). */
+  rpcTimeoutMs?: number
+  /** Overall wall-clock budget for the whole pass (default HARVEST_BUDGET_MS). */
+  budgetMs?: number
 }
 
 export interface HarvestReport {
@@ -78,29 +82,72 @@ function lastAssistant(messages: ReadonlyArray<ContextMessage>): {
 }
 
 /**
+ * Deadline wrapper for harvest RPCs: reject (typed, cheap) once `ms` passes
+ * without the probe settling. The timer is cleared on settle — same
+ * no-abandoned-timer rule as raceDeadline in sessions.ts.
+ */
+function withHarvestDeadline<T>(p: Promise<T>, ms: number): Promise<T> {
+  if (!(ms > 0)) return p
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`harvest probe exceeded ${ms}ms`))
+    }, ms)
+    p.then(
+      (v) => {
+        clearTimeout(timer)
+        resolve(v)
+      },
+      (err) => {
+        clearTimeout(timer)
+        reject(err)
+      },
+    )
+  })
+}
+
+/**
  * Harvest one dead-owner run. Mutates rows through `updateAgent` only — the
  * caller then applies the orphan flip for whatever is still active. Safe to
  * call on a record whose children were already harvested (rows are terminal
  * and skipped by the `running` filter).
+ *
+ * BOUNDED (review P1): the 20-child cap bounds count, not time — a hung
+ * session RPC must never stall the reconciler (periodic pass, startup, or
+ * the on-demand control/steer paths awaiting it). Every RPC carries a
+ * deadline (timed-out probes read as unresolvable) and the whole pass has a
+ * wall-clock budget; children past the budget are left for the flip.
  */
+export const HARVEST_RPC_TIMEOUT_MS = 5_000
+export const HARVEST_BUDGET_MS = 30_000
+
 export async function harvestOrphanedRun(run: RunRecord, deps: HarvestDeps): Promise<HarvestReport> {
   const now = deps.now ?? Date.now
+  const rpcMs = deps.rpcTimeoutMs ?? HARVEST_RPC_TIMEOUT_MS
+  const budgetMs = deps.budgetMs ?? HARVEST_BUDGET_MS
+  const startedAt = now()
   const report: HarvestReport = { harvested: 0, failed: 0, unresolvable: 0 }
   const targets = run.agents
     .filter((a) => a.status === "running" && typeof a.sessionID === "string" && a.sessionID !== "")
     .slice(0, MAX_HARVEST_CHILDREN)
   for (const agent of targets) {
+    if (now() - startedAt >= budgetMs) {
+      // Budget spent: remaining children are left for the flip (interrupted)
+      // — a salvage pass must never hold the reconciler hostage.
+      const processed = report.harvested + report.failed + report.unresolvable
+      report.unresolvable += targets.length - processed
+      break
+    }
     const sessionID = agent.sessionID as string
     let info: { outcome?: string; tokens?: TokenUsage; error?: string }
     try {
-      info = await deps.sessions.get({ sessionID })
+      info = await withHarvestDeadline(deps.sessions.get({ sessionID }), rpcMs)
     } catch {
       report.unresolvable++
       continue
     }
     const outcome = info?.outcome
     if (outcome === "succeeded") {
-      const salvaged = await harvestSucceeded(run, agent, sessionID, info, deps, now)
+      const salvaged = await harvestSucceeded(run, agent, sessionID, info, deps, now, rpcMs)
       if (salvaged) report.harvested++
       else report.unresolvable++
     } else if (typeof outcome === "string" && outcome !== "") {
@@ -129,10 +176,11 @@ async function harvestSucceeded(
   info: { tokens?: TokenUsage },
   deps: HarvestDeps,
   now: () => number,
+  rpcMs: number,
 ): Promise<boolean> {
   let messages: ReadonlyArray<ContextMessage>
   try {
-    messages = await deps.sessions.context({ sessionID })
+    messages = await withHarvestDeadline(deps.sessions.context({ sessionID }), rpcMs)
   } catch {
     return false
   }

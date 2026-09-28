@@ -69,6 +69,11 @@ interface ThrottleState {
  */
 export const REMOTE_DEADLINE_GRACE_MS = 5 * 60_000
 
+/** Deep-enough clone of a persisted record for adoption/mirror sync (agents cloned; nested values are JSON-shaped). */
+function clonePersisted(raw: RunRecord): RunRecord {
+  return { ...raw, agents: Array.isArray(raw.agents) ? raw.agents.map((a) => ({ ...a })) : [] }
+}
+
 export class RegistryImpl implements Registry {
   private runs = new Map<string, RunRecord>()
   /** sessionID -> runID for runs still active (released on finalize). */
@@ -302,6 +307,27 @@ export class RegistryImpl implements Registry {
     this.requestPersist(runID)
   }
 
+  activityForSession(sessionID: string): number | undefined {
+    if (typeof sessionID !== "string" || sessionID === "") return undefined
+    // Bound index first (locally supervised children).
+    const bound = this.sessionAgents.get(sessionID)
+    if (bound !== undefined) {
+      const at = this.getAgent(bound.runID, bound.agentID)?.lastActivityAt
+      if (typeof at === "number" && Number.isFinite(at)) return at
+    }
+    // Adopted mirrors are never bound (review P2): scan active records'
+    // running/pending rows for the session. Read-only — no ownership change.
+    for (const run of this.runs.values()) {
+      for (const agent of run.agents) {
+        if (agent.sessionID !== sessionID) continue
+        if (typeof agent.lastActivityAt === "number" && Number.isFinite(agent.lastActivityAt)) {
+          return agent.lastActivityAt
+        }
+      }
+    }
+    return undefined
+  }
+
   getAgent(runID: string, agentID: string): AgentRecord | undefined {
     return this.runs.get(runID)?.agents.find((a) => a.id === agentID)
   }
@@ -342,7 +368,8 @@ export class RegistryImpl implements Registry {
     this.requestPersist(runID)
   }
 
-  expiredRemoteRuns(now: number, graceMs: number): Array<{ record: RunRecord; deadlineAt: number }> {    if (!this.loader) return []
+  expiredRemoteRuns(now: number, graceMs: number): Array<{ record: RunRecord; deadlineAt: number }> {
+    if (!this.loader) return []
     let persisted: RunRecord[]
     try {
       persisted = this.loader()
@@ -357,10 +384,19 @@ export class RegistryImpl implements Registry {
       const deadlineAt = raw.deadlineAt
       if (typeof deadlineAt !== "number" || !Number.isFinite(deadlineAt)) continue
       if (now - deadlineAt <= graceMs) continue
-      // Serve the in-memory copy when one exists (adoption may have seeded it).
-      const record = this.runs.get(raw.id) ?? raw
-      if (!isActiveRunStatus(record.status)) continue
-      out.push({ record, deadlineAt })
+      // Serve the in-memory copy when one exists (adoption may have seeded
+      // it) — but the PERSISTED snapshot decides (review P1): a mirror still
+      // saying `running` must never outrank the owner's fresher write, and
+      // enforcement always uses the persisted deadline.
+      const record = this.runs.get(raw.id)
+      if (record !== undefined) {
+        if (!isActiveRunStatus(record.status)) continue
+        if (raw.owner !== undefined) record.owner = raw.owner
+        record.deadlineAt = deadlineAt
+        out.push({ record, deadlineAt })
+        continue
+      }
+      out.push({ record: raw, deadlineAt })
     }
     return out
   }
@@ -481,6 +517,20 @@ export class RegistryImpl implements Registry {
         // Live state wins for runs this process supervises; adopted mirrors
         // are re-classified on periodic passes (see above).
         if (!opts.recheckAdopted || this.createdRuns.has(raw.id)) continue
+        // Freshness first (review P1): the remote owner may have FINISHED the
+        // run after we adopted our mirror — classifying the stale mirror
+        // would flip a completed run to interrupted and bury its result.
+        // The persisted snapshot is the owner's own write; sync the mirror
+        // from it before classifying. Only agent arrays are kept from the
+        // fresher side per field below (a same-pass local harvest write is
+        // newer than this snapshot and must not be clobbered).
+        if (!isActiveRunStatus(raw.status)) {
+          if (isActiveRunStatus(existing.status)) Object.assign(existing, clonePersisted(raw))
+          continue // final in persistence: nothing to classify, mirror updated
+        }
+        // Active in persistence: refresh the scalars the verdicts depend on.
+        if (raw.owner !== undefined) existing.owner = raw.owner
+        if (raw.deadlineAt !== existing.deadlineAt) existing.deadlineAt = raw.deadlineAt
         const plan = this.classifyOrphanRecord(existing, now)
         if (plan) plans.push(plan)
         continue
@@ -496,10 +546,7 @@ export class RegistryImpl implements Registry {
         this.createdRuns.add(raw.id)
         continue
       }
-      const record: RunRecord = {
-        ...raw,
-        agents: Array.isArray(raw.agents) ? raw.agents.map((a) => ({ ...a })) : [],
-      }
+      const record: RunRecord = clonePersisted(raw)
       this.runs.set(record.id, record)
       const plan = this.classifyOrphanRecord(record, now)
       if (plan) plans.push(plan)
@@ -556,6 +603,23 @@ export class RegistryImpl implements Registry {
   applyOrphanInterrupt(plan: OrphanPlan, reasonOverride?: string): boolean {
     const record = plan.record
     if (!isActiveRunStatus(record.status)) return false
+    // Final-write freshness recheck (review P1): the owner may have FINISHED
+    // the run (or a sibling process flipped it) between classification and
+    // this write. Persistence is the owner's own output — a final persisted
+    // status outranks our possibly-stale mirror, and flipping would bury a
+    // completed result. Sync the mirror to the truth and decline.
+    if (this.loader) {
+      let persistedNow: RunRecord | undefined
+      try {
+        persistedNow = this.loader().find((r) => r.id === record.id)
+      } catch {
+        persistedNow = undefined
+      }
+      if (persistedNow !== undefined && !isActiveRunStatus(persistedNow.status)) {
+        if (isActiveRunStatus(record.status)) Object.assign(record, clonePersisted(persistedNow))
+        return false
+      }
+    }
     const now = this.now()
     record.status = "interrupted"
     record.stopReason = reasonOverride ?? plan.reason
