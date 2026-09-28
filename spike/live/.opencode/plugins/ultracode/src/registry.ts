@@ -1,0 +1,755 @@
+/**
+ * Run registry (Builder A) — implements `Registry` from types.ts.
+ *
+ * In-memory `Map` of live + seeded run records, per-run agent ordinals
+ * ("a1", "a2", ...) and owned-session maps. Persistence goes through an
+ * injected `persist` callback (wired to Storage.saveRun in index.ts),
+ * throttled per-run to ~1s (trailing) and always flushed when a run reaches
+ * a final state or `finish()` is called.
+ *
+ * Single-threaded JS — no locks needed (CONTRACTS.md).
+ */
+import type { AgentRecord, Json, OrphanPlan, Registry, RunRecord, RunStatus, WorkflowMeta } from "./types.ts"
+import { addTokens, emptyTokens, isActiveRunStatus, randomRunID } from "./types.ts"
+import type { OwnerBootLiveness } from "./owner-liveness.ts"
+
+export interface RegistryInit {
+  /** Persist a run snapshot (Storage.saveRun — throw-safe). */
+  persist: (record: RunRecord) => void
+  /** Persisted records for reconcileOrphans() (Storage.loadRuns snapshot). */
+  loader?: () => RunRecord[]
+  /** Persist throttle window per run. Default 1000ms. 0 = always flush. */
+  throttleMs?: number
+  /** Clock seam for deterministic tests. Default Date.now. */
+  now?: () => number
+  /** Runtime identity stamped on persisted records and registered until dispose. */
+  bootID?: string
+  /**
+   * Machine-wide liveness probe for remote owner boots (owner-liveness
+   * markers). Preferred over `ownerAlive`: the richer verdict lets a provably
+   * dead pid flip a run immediately (SIGKILL leaves the marker behind) while a
+   * pid-verified live owner is NEVER flipped, even on a stale run heartbeat.
+   * Absent ⇒ falls back to `ownerAlive`; both absent ⇒ legacy semantics: any
+   * different-boot owner counts as dead at reconcile ("flip on restart").
+   */
+  ownerProbe?: (bootID: string) => OwnerBootLiveness
+  /**
+   * Legacy boolean liveness probe (true ⇒ "alive-marker", false ⇒ "dead").
+   * Superseded by `ownerProbe`; kept so existing injections keep working.
+   */
+  ownerAlive?: (bootID: string) => boolean
+}
+
+const FINAL_STATUSES: ReadonlySet<string> = new Set(["succeeded", "failed", "stopped", "interrupted"])
+
+/** Run record keeps at most this many checkpoints (oldest dropped). */
+export const MAX_CHECKPOINTS = 50
+
+/** Bounded lifecycle event ring on the run record (post-mortem trail). */
+export const MAX_RUN_EVENTS = 256
+// A timestamp is not proof of a live supervisor. Only a registered runtime owner
+// may keep a persisted active record alive across same-process location loads.
+const runtimeOwners = new Map<string, RegistryImpl>()
+
+function isFinal(status: RunStatus): boolean {
+  return FINAL_STATUSES.has(status)
+}
+
+interface ThrottleState {
+  lastPersist: number
+  timer?: ReturnType<typeof setTimeout>
+  dirty: boolean
+}
+
+/**
+ * Grace past a persisted deadlineAt before the periodic pass enforces it on
+ * a remote-owned record: the owner's OWN watchdog fires at the deadline, so
+ * this only bites when that watchdog is gone or wedged — generous on purpose,
+ * and heartbeat-staleness detection (pid) covers the dead case faster.
+ */
+export const REMOTE_DEADLINE_GRACE_MS = 5 * 60_000
+
+/** Deep-enough clone of a persisted record for adoption/mirror sync (agents cloned; nested values are JSON-shaped). */
+function clonePersisted(raw: RunRecord): RunRecord {
+  return { ...raw, agents: Array.isArray(raw.agents) ? raw.agents.map((a) => ({ ...a })) : [] }
+}
+
+export class RegistryImpl implements Registry {
+  private runs = new Map<string, RunRecord>()
+  /** sessionID -> runID for runs still active (released on finalize). */
+  private ownedActive = new Map<string, string>()
+  /** Durable provenance — survives run completion. */
+  private everOwned = new Set<string>()
+  /** sessionID -> { runID, agentID } — survives finalize (tool-count provenance). */
+  private sessionAgents = new Map<string, { runID: string; agentID: string }>()
+  private agentCounters = new Map<string, number>()
+  private throttles = new Map<string, ThrottleState>()
+  private readonly persist: (record: RunRecord) => void
+  private readonly loader?: () => RunRecord[]
+  private readonly throttleMs: number
+  private readonly now: () => number
+  private readonly bootID?: string
+  /**
+   * Resolved owner-liveness probe: `ownerProbe` when injected, else the legacy
+   * `ownerAlive` mapped onto verdicts, else undefined (legacy unit semantics:
+   * any different-boot owner counts as dead - "flip on restart").
+   */
+  private readonly ownerProbe?: (bootID: string) => OwnerBootLiveness
+
+  constructor(init: RegistryInit) {
+    this.persist = init.persist
+    this.loader = init.loader
+    this.throttleMs = init.throttleMs ?? 1000
+    this.now = init.now ?? Date.now
+    this.bootID = init.bootID
+    this.ownerProbe =
+      init.ownerProbe ??
+      (init.ownerAlive !== undefined
+        ? (bootID: string) => (init.ownerAlive!(bootID) ? ("alive-marker" as const) : ("dead" as const))
+        : undefined)
+    if (this.bootID) runtimeOwners.set(this.bootID, this)
+  }
+
+  /**
+   * Liveness verdict for a boot id under the resolved probe. No probe injected
+   * means "dead": the historical flip-on-restart crash-recovery semantics.
+   */
+  private probeBoot(bootID: string): OwnerBootLiveness {
+    return this.ownerProbe ? this.ownerProbe(bootID) : "dead"
+  }
+
+  /**
+   * Who may speak for a run right now — the input to truthful control:
+   * - `local`       — this process created it (a live RunState should exist);
+   * - `remote-live` — another process owns it (pid-verified, or a pid-less
+   *   marker with a heartbeat still inside the orphan window): refuse and
+   *   name the owner;
+   * - `dead`        — owner provably gone (or no owner recorded): an orphan;
+   * - `not-found`   — unknown id.
+   * `detail` explains a `dead` verdict for stopReason strings.
+   */
+  ownerStatus(runID: string):
+    | { kind: "not-found" }
+    | { kind: "local" | "remote-live" | "dead"; record: RunRecord; owner?: { bootID: string; pid?: number; updatedAt?: number }; detail?: string } {
+    const record = this.runs.get(runID)
+    if (!record) return { kind: "not-found" }
+    const owner = record.owner
+    const ownerInfo = owner
+      ? {
+          bootID: owner.bootID,
+          ...(typeof owner.pid === "number" ? { pid: owner.pid } : {}),
+          updatedAt: owner.updatedAt,
+        }
+      : undefined
+    if (this.createdRuns.has(runID)) return { kind: "local", record, ...(ownerInfo ? { owner: ownerInfo } : {}) }
+    if (!owner) return { kind: "dead", record, detail: "no owner recorded (legacy record)" }
+    if (this.bootID !== undefined && owner.bootID === this.bootID) {
+      return {
+        kind: "dead",
+        record,
+        ...(ownerInfo ? { owner: ownerInfo } : {}),
+        detail: "owner boot is this process but no local run state exists (state lost across reload)",
+      }
+    }
+    const liveness = this.probeBoot(owner.bootID)
+    if (liveness === "alive-pid") return { kind: "remote-live", record, owner: ownerInfo }
+    if (liveness === "alive-marker") {
+      if (this.now() - owner.updatedAt <= RegistryImpl.ORPHAN_HEARTBEAT_MS) {
+        return { kind: "remote-live", record, owner: ownerInfo }
+      }
+      return { kind: "dead", record, owner: ownerInfo, detail: "owner marker alive but run heartbeat is past the orphan window" }
+    }
+    return {
+      kind: "dead",
+      record,
+      ...(ownerInfo ? { owner: ownerInfo } : {}),
+      detail: liveness === "dead-pid" ? `owner process gone (boot ${owner.bootID}${typeof owner.pid === "number" ? ` pid ${owner.pid}` : ""})` : `owner marker dead or absent (boot ${owner.bootID})`,
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Run lifecycle
+  // ------------------------------------------------------------------
+
+  create(init: {
+    directory?: string
+    projectID?: string
+    parentSessionID: string
+    parentAgent?: string
+    script: string
+    meta?: WorkflowMeta
+    args?: Json
+    name?: string
+    workflowName?: string
+    graphSpec?: Json
+  }): RunRecord {
+    let id = randomRunID()
+    while (this.runs.has(id)) id = randomRunID()
+    const record: RunRecord = {
+      ...(init.directory ? { directory: init.directory } : {}),
+      ...(init.projectID ? { projectID: init.projectID } : {}),
+      id,
+      parentSessionID: init.parentSessionID,
+      parentAgent: init.parentAgent,
+      name: init.name,
+      workflowName: init.workflowName,
+      status: "running",
+      script: init.script,
+      meta: init.meta,
+      args: init.args,
+      ...(init.graphSpec !== undefined ? { graphSpec: init.graphSpec } : {}),
+      startedAt: this.now(),
+      agents: [],
+    }
+    this.runs.set(id, record)
+    this.createdRuns.add(id)
+    // First snapshot is durable immediately (crash visibility for /ultracode).
+    this.persistNow(id)
+    return record
+  }
+
+  get(runID: string): RunRecord | undefined {
+    return this.runs.get(runID)
+  }
+
+  listRecent(limit: number): RunRecord[] {
+    return [...this.runs.values()]
+      .sort((a, b) => b.startedAt - a.startedAt || (a.id < b.id ? 1 : -1))
+      .slice(0, Math.max(0, limit))
+  }
+
+  activeRuns(): RunRecord[] {
+    return [...this.runs.values()]
+      .filter((r) => isActiveRunStatus(r.status))
+      .sort((a, b) => b.startedAt - a.startedAt)
+  }
+
+  /** Durable runID provenance — runs CREATED by this registry instance (or shared from a same-process owner registry). Distinct from presence: reconcile seeds adopted/legacy records into `runs` without marking them here. */
+  private createdRuns = new Set<string>()
+
+  /**
+   * True when THIS process created the run — durable provenance, kept after
+   * completion. Distinct from get()/listRecent(): a run ADOPTED at reconcile
+   * from a live remote owner is readable here but never owned, so callers
+   * deciding "is this mine to speak for" (remote runState push, live-vs-
+   * persisted freshness) must use this, not a get() presence check.
+   */
+  ownsRun(runID: string): boolean {
+    return this.createdRuns.has(runID)
+  }
+
+  setStatus(runID: string, status: RunStatus, extra?: { error?: string; stopReason?: string }): boolean {
+    const run = this.runs.get(runID)
+    if (!run) return false
+    if (isFinal(run.status)) return true // already final — never resurrect
+    run.status = status
+    if (extra?.error !== undefined) run.error = extra.error
+    if (extra?.stopReason !== undefined) run.stopReason = extra.stopReason
+    if (isFinal(status)) {
+      run.endedAt = this.now()
+      this.releaseOwnership(runID)
+      this.persistNow(runID)
+    } else {
+      this.requestPersist(runID)
+    }
+    return true
+  }
+
+  addAgent(runID: string, init: Omit<AgentRecord, "id">): AgentRecord | undefined {
+    const run = this.runs.get(runID)
+    if (!run) return undefined
+    const next = (this.agentCounters.get(runID) ?? 0) + 1
+    this.agentCounters.set(runID, next)
+    const record: AgentRecord = { ...init, id: `a${next}` }
+    run.agents.push(record)
+    this.requestPersist(runID)
+    return record
+  }
+
+  updateAgent(runID: string, agentID: string, patch: Partial<AgentRecord>): void {
+    const run = this.runs.get(runID)
+    if (!run) return
+    const agent = run.agents.find((a) => a.id === agentID)
+    if (!agent) return
+    const { id: _id, ...rest } = patch // ids are stable ordinals
+    Object.assign(agent, rest)
+    this.requestPersist(runID)
+  }
+
+  setPendingWaitReason(runID: string, reason: string | undefined): void {
+    const run = this.runs.get(runID)
+    if (!run) return
+    let touched = false
+    for (const agent of run.agents) {
+      if (agent.status !== "pending") continue
+      if (agent.waitReason === reason) continue
+      if (reason === undefined) delete agent.waitReason
+      else agent.waitReason = reason
+      touched = true
+    }
+    if (touched) this.requestPersist(runID)
+  }
+
+  appendEvent(runID: string, kind: string, detail?: string): void {
+    const run = this.runs.get(runID)
+    if (!run) return
+    const trimmedKind = kind.trim().slice(0, 64)
+    if (!trimmedKind) return
+    run.events = run.events ?? []
+    run.events.push({
+      at: this.now(),
+      kind: trimmedKind,
+      ...(detail !== undefined && detail !== "" ? { detail: detail.slice(0, 300) } : {}),
+    })
+    if (run.events.length > MAX_RUN_EVENTS) {
+      run.events.splice(0, run.events.length - MAX_RUN_EVENTS)
+    }
+    this.requestPersist(runID)
+  }
+
+  activityForSession(sessionID: string): number | undefined {
+    if (typeof sessionID !== "string" || sessionID === "") return undefined
+    // Bound index first (locally supervised children).
+    const bound = this.sessionAgents.get(sessionID)
+    if (bound !== undefined) {
+      const at = this.getAgent(bound.runID, bound.agentID)?.lastActivityAt
+      if (typeof at === "number" && Number.isFinite(at)) return at
+    }
+    // Adopted mirrors are never bound (review P2): scan active records'
+    // running/pending rows for the session. Read-only — no ownership change.
+    for (const run of this.runs.values()) {
+      for (const agent of run.agents) {
+        if (agent.sessionID !== sessionID) continue
+        if (typeof agent.lastActivityAt === "number" && Number.isFinite(agent.lastActivityAt)) {
+          return agent.lastActivityAt
+        }
+      }
+    }
+    return undefined
+  }
+
+  getAgent(runID: string, agentID: string): AgentRecord | undefined {
+    return this.runs.get(runID)?.agents.find((a) => a.id === agentID)
+  }
+
+  addCheckpoint(runID: string, name: string, value?: Json): void {
+    const run = this.runs.get(runID)
+    if (!run) return
+    const trimmed = name.trim().slice(0, 128)
+    if (!trimmed) return
+    run.checkpoints = run.checkpoints ?? []
+    run.checkpoints.push({ name: trimmed, at: this.now(), ...(value !== undefined ? { value } : {}) })
+    if (run.checkpoints.length > MAX_CHECKPOINTS) {
+      run.checkpoints.splice(0, run.checkpoints.length - MAX_CHECKPOINTS)
+    }
+    this.requestPersist(runID)
+  }
+
+  noteRunDeadline(runID: string, deadlineAt: number | undefined): void {
+    const run = this.runs.get(runID)
+    if (!run) return
+    if (deadlineAt === undefined) {
+      if (run.deadlineAt !== undefined) delete run.deadlineAt
+      else return
+    } else {
+      if (run.deadlineAt === deadlineAt) return
+      run.deadlineAt = deadlineAt
+    }
+    this.requestPersist(runID)
+  }
+
+  noteAgentActivity(runID: string, agentID: string, at: number): void {
+    const run = this.runs.get(runID)
+    if (!run) return
+    const agent = run.agents.find((a) => a.id === agentID)
+    if (!agent) return
+    if (agent.lastActivityAt === at) return
+    agent.lastActivityAt = at
+    this.requestPersist(runID)
+  }
+
+  expiredRemoteRuns(now: number, graceMs: number): Array<{ record: RunRecord; deadlineAt: number }> {
+    if (!this.loader) return []
+    let persisted: RunRecord[]
+    try {
+      persisted = this.loader()
+    } catch {
+      return []
+    }
+    const out: Array<{ record: RunRecord; deadlineAt: number }> = []
+    for (const raw of persisted) {
+      if (typeof raw?.id !== "string" || typeof raw.status !== "string") continue
+      if (this.createdRuns.has(raw.id)) continue // locally supervised: its own watchdog owns the deadline
+      if (!isActiveRunStatus(raw.status) || raw.status === "paused") continue // paused runs burn no deadline
+      const deadlineAt = raw.deadlineAt
+      if (typeof deadlineAt !== "number" || !Number.isFinite(deadlineAt)) continue
+      if (now - deadlineAt <= graceMs) continue
+      // Serve the in-memory copy when one exists (adoption may have seeded
+      // it) — but the PERSISTED snapshot decides (review P1): a mirror still
+      // saying `running` must never outrank the owner's fresher write, and
+      // enforcement always uses the persisted deadline.
+      const record = this.runs.get(raw.id)
+      if (record !== undefined) {
+        if (!isActiveRunStatus(record.status)) continue
+        if (raw.owner !== undefined) record.owner = raw.owner
+        record.deadlineAt = deadlineAt
+        out.push({ record, deadlineAt })
+        continue
+      }
+      out.push({ record: raw, deadlineAt })
+    }
+    return out
+  }
+
+  finish(
+    runID: string,
+    outcome: {
+      status: RunStatus
+      result?: Json
+      resultTruncated?: boolean
+      resultArtifactKey?: string
+      error?: string
+      stopReason?: string
+    },
+  ): RunRecord | undefined {
+    const run = this.runs.get(runID)
+    if (!run) return undefined
+    run.status = outcome.status
+    if (outcome.result !== undefined) run.result = outcome.result
+    if (outcome.resultTruncated !== undefined) run.resultTruncated = outcome.resultTruncated
+    if (outcome.resultArtifactKey !== undefined) run.resultArtifactKey = outcome.resultArtifactKey
+    if (outcome.error !== undefined) run.error = outcome.error
+    if (outcome.stopReason !== undefined) run.stopReason = outcome.stopReason
+    run.endedAt = this.now()
+    const total = emptyTokens()
+    for (const agent of run.agents) addTokens(total, agent.tokens)
+    run.totalTokens = total
+    this.releaseOwnership(runID)
+    this.persistNow(runID)
+    return run
+  }
+
+  // ------------------------------------------------------------------
+  // Ownership (nested-run rejection, permission scoping)
+  // ------------------------------------------------------------------
+
+  markOwned(runID: string, sessionID: string): void {
+    // Only active runs can own sessions — a finalized (or unknown) run must
+    // never grant active-ownership rights (review fix: ownership leak).
+    const run = this.runs.get(runID)
+    if (!run || !isActiveRunStatus(run.status)) return
+    this.ownedActive.set(sessionID, runID)
+    this.everOwned.add(sessionID)
+  }
+
+  isOwnedActive(sessionID: string): boolean {
+    const runID = this.ownedActive.get(sessionID)
+    if (runID === undefined) return false
+    const run = this.runs.get(runID)
+    return run !== undefined && isActiveRunStatus(run.status)
+  }
+
+  wasEverOwned(sessionID: string): boolean {
+    return this.everOwned.has(sessionID)
+  }
+
+  runForActiveSession(sessionID: string): RunRecord | undefined {
+    const runID = this.ownedActive.get(sessionID)
+    if (runID === undefined) return undefined
+    const run = this.runs.get(runID)
+    return run !== undefined && isActiveRunStatus(run.status) ? run : undefined
+  }
+
+  bindAgentSession(runID: string, agentID: string, sessionID: string): void {
+    this.sessionAgents.set(sessionID, { runID, agentID })
+  }
+
+  agentForSession(sessionID: string): { runID: string; agentID: string } | undefined {
+    return this.sessionAgents.get(sessionID)
+  }
+
+  // ------------------------------------------------------------------
+  // Orphan reconciliation (startup + periodic; see index.ts reconcileOnce)
+  // ------------------------------------------------------------------
+
+  /**
+   * A record owned by another process is treated as orphaned only once its
+   * owner heartbeat is this stale — and only when the owner's pid cannot be
+   * verified live (pid-verified boots override a stale heartbeat entirely).
+   * Generous on purpose: a single long child can legitimately go many minutes
+   * between persists, and flipping a live remote run is worse than adopting a
+   * dead one for a while (the TUI's `stale` badge flags old heartbeats in the
+   * meantime).
+   */
+  private static readonly ORPHAN_HEARTBEAT_MS = 30 * 60_000
+
+  /**
+   * Seed + classify persisted records WITHOUT flipping: returns one plan per
+   * active record whose owner is gone. Two-phase on purpose — the caller
+   * harvests salvageable succeeded children (src/harvest.ts) BETWEEN
+   * classifyOrphans() and applyOrphanInterrupt(), so a dead owner's finished
+   * work is warm-replayable instead of being flipped away as interrupted.
+   *
+   * Seeding matches reconcileOrphans(): live same-process records win; a
+   * record with a live in-process owner registry SHARES that record; the rest
+   * are cloned into this registry and classified. With `recheckAdopted`, ids
+   * already seeded here are re-classified too — EXCEPT runs this process
+   * created (createdRuns), whose live supervisor state is authoritative.
+   * Rechecking adopted mirrors is the fix for the 2026-09-27 wedge: the
+   * replacement process adopted a dead owner's record as `running` and the
+   * old `runs.has(id) → skip` guard then froze it forever, because reconcile
+   * ran only at startup. Adoption is not a verdict.
+   */
+  classifyOrphans(opts: { recheckAdopted?: boolean } = {}): OrphanPlan[] {
+    if (!this.loader) return []
+    let persisted: RunRecord[]
+    try {
+      persisted = this.loader()
+    } catch {
+      return []
+    }
+    const plans: OrphanPlan[] = []
+    const now = this.now()
+    for (const raw of persisted) {
+      if (typeof raw?.id !== "string" || typeof raw.status !== "string") continue
+      const existing = this.runs.get(raw.id)
+      if (existing !== undefined) {
+        // Live state wins for runs this process supervises; adopted mirrors
+        // are re-classified on periodic passes (see above).
+        if (!opts.recheckAdopted || this.createdRuns.has(raw.id)) continue
+        // Freshness first (review P1): the remote owner may have FINISHED the
+        // run after we adopted our mirror — classifying the stale mirror
+        // would flip a completed run to interrupted and bury its result.
+        // The persisted snapshot is the owner's own write; sync the mirror
+        // from it before classifying. Only agent arrays are kept from the
+        // fresher side per field below (a same-pass local harvest write is
+        // newer than this snapshot and must not be clobbered).
+        if (!isActiveRunStatus(raw.status)) {
+          if (isActiveRunStatus(existing.status)) Object.assign(existing, clonePersisted(raw))
+          continue // final in persistence: nothing to classify, mirror updated
+        }
+        // Active in persistence: refresh the scalars the verdicts depend on.
+        if (raw.owner !== undefined) existing.owner = raw.owner
+        if (raw.deadlineAt !== existing.deadlineAt) existing.deadlineAt = raw.deadlineAt
+        const plan = this.classifyOrphanRecord(existing, now)
+        if (plan) plans.push(plan)
+        continue
+      }
+      const liveOwner = raw.owner?.bootID ? runtimeOwners.get(raw.owner.bootID) : undefined
+      const liveRecord = liveOwner && liveOwner !== this ? liveOwner.get(raw.id) : undefined
+      if (liveRecord) {
+        // Share the actual record, not a clone that will never receive completion.
+        this.runs.set(raw.id, liveRecord)
+        // Same-process provenance: the owning registry speaks for this run
+        // (its persist callback emits the runState push), so this mirror must
+        // not double-emit through the remote-refresh path either.
+        this.createdRuns.add(raw.id)
+        continue
+      }
+      const record: RunRecord = clonePersisted(raw)
+      this.runs.set(record.id, record)
+      const plan = this.classifyOrphanRecord(record, now)
+      if (plan) plans.push(plan)
+    }
+    return plans
+  }
+
+  /**
+   * Owner evidence for one record, strongest first: (1) a pid-verified LIVE
+   * boot owns the run even when the record heartbeat went stale (a live owner
+   * with one long silent child is not an orphan — the old logic flipped
+   * exactly that); (2) a marker whose pid is provably gone (ESRCH) is dead no
+   * matter how fresh the marker/heartbeat look — a SIGKILL leaves the marker
+   * behind, and the 2026-09-27 replacement process adopted exactly such a
+   * record as running; (3) a marker without a checkable pid (legacy marker,
+   * EPERM) is alive only while the record heartbeat stays inside the orphan
+   * window; (4) no probe (legacy/unit) or no marker = dead — the historical
+   * "flip on restart" crash-recovery semantics.
+   */
+  private classifyOrphanRecord(record: RunRecord, now: number): OrphanPlan | undefined {
+    if (!isActiveRunStatus(record.status)) return undefined
+    const heartbeat = record.owner?.updatedAt
+    const liveness =
+      typeof record.owner?.bootID === "string" && heartbeat !== undefined
+        ? this.probeBoot(record.owner.bootID)
+        : undefined
+    const ownerGone =
+      heartbeat === undefined ||
+      liveness === undefined ||
+      liveness === "dead" ||
+      liveness === "dead-pid" ||
+      (liveness === "alive-marker" && now - heartbeat > RegistryImpl.ORPHAN_HEARTBEAT_MS)
+    if (!ownerGone) return undefined
+    return { record, reason: RegistryImpl.orphanStopReason(record) }
+  }
+
+  /** Truthful, actionable stopReason for an orphan flip (bounded length). */
+  private static orphanStopReason(record: RunRecord): string {
+    const owner = record.owner
+    const who =
+      owner !== undefined
+        ? ` (owner ${owner.bootID}${typeof owner.pid === "number" ? ` pid ${owner.pid}` : ""} gone)`
+        : ""
+    return `server restart${who} — resumable: /ultracode rerun ${record.id} --warm`
+  }
+
+  /**
+   * Apply a classifyOrphans() plan: run and its running/pending children flip
+   * to `interrupted`, then the corrected record is persisted immediately (a
+   * second restart must not re-flip). Idempotent: a record that reached a
+   * final state after classification is left alone — between classify and
+   * apply the live owner may legitimately have finished it.
+   */
+  applyOrphanInterrupt(plan: OrphanPlan, reasonOverride?: string): boolean {
+    const record = plan.record
+    if (!isActiveRunStatus(record.status)) return false
+    // Final-write freshness recheck (review P1): the owner may have FINISHED
+    // the run (or a sibling process flipped it) between classification and
+    // this write. Persistence is the owner's own output — a final persisted
+    // status outranks our possibly-stale mirror, and flipping would bury a
+    // completed result. Sync the mirror to the truth and decline.
+    if (this.loader) {
+      let persistedNow: RunRecord | undefined
+      try {
+        persistedNow = this.loader().find((r) => r.id === record.id)
+      } catch {
+        persistedNow = undefined
+      }
+      if (persistedNow !== undefined && !isActiveRunStatus(persistedNow.status)) {
+        if (isActiveRunStatus(record.status)) Object.assign(record, clonePersisted(persistedNow))
+        return false
+      }
+    }
+    const now = this.now()
+    record.status = "interrupted"
+    record.stopReason = reasonOverride ?? plan.reason
+    if (record.endedAt === undefined) record.endedAt = now
+    for (const agent of record.agents) {
+      if (agent.status === "pending" || agent.status === "running") {
+        agent.status = "interrupted"
+        if (agent.endedAt === undefined) agent.endedAt = record.endedAt
+      }
+    }
+    this.persistNow(record.id)
+    return true
+  }
+
+  /**
+   * Legacy one-shot reconcile: classify and apply immediately (no harvest
+   * window). Startup and tests; the periodic path calls classifyOrphans +
+   * applyOrphanInterrupt so harvest can run between them. Returns the number
+   * of flipped runs.
+   */
+  reconcileOrphans(): number {
+    let flipped = 0
+    for (const plan of this.classifyOrphans()) {
+      if (this.applyOrphanInterrupt(plan)) flipped++
+    }
+    return flipped
+  }
+
+  // ------------------------------------------------------------------
+  // Throttled persistence
+  // ------------------------------------------------------------------
+
+  /** Immediately persist the current record state for a run. */
+  persistNow(runID: string): void {
+    let state = this.throttles.get(runID)
+    if (!state) {
+      state = { lastPersist: 0, dirty: false }
+      this.throttles.set(runID, state)
+    }
+    if (state.timer) {
+      clearTimeout(state.timer)
+      state.timer = undefined
+    }
+    state.lastPersist = this.now()
+    state.dirty = false
+    const record = this.runs.get(runID)
+    if (record) {
+      if (this.bootID) {
+        // Full owner identity on every persist: boot + pid lets ANY process
+        // reading the KV prove liveness (marker) or death (ESRCH) without a
+        // heartbeat grace period, and name the owner in truthful refusals.
+        record.owner = { bootID: this.bootID, updatedAt: this.now(), pid: process.pid }
+      }
+      try {
+        this.persist(record)
+      } catch {
+        // Storage.saveRun is throw-safe; belt and braces for other injectors.
+      }
+    }
+  }
+
+  /**
+   * Heartbeat every ACTIVE run this registry created (persistNow refreshes
+   * `owner.updatedAt`), independent of child progress. Called from the
+   * plugin's fixed heartbeat timer so a run whose children are all inside one
+   * long silent provider request never renders "stale" or drifts into the
+   * orphan window while its owner is alive. Adopted (foreign) records are
+   * never touched — their owner heartbeats for itself. Returns the number of
+   * runs refreshed.
+   */
+  touchActiveOwned(): number {
+    let touched = 0
+    for (const run of this.runs.values()) {
+      if (!isActiveRunStatus(run.status)) continue
+      if (!this.createdRuns.has(run.id)) continue
+      this.persistNow(run.id)
+      touched++
+    }
+    return touched
+  }
+
+  private requestPersist(runID: string): void {
+    if (this.throttleMs <= 0) {
+      this.persistNow(runID)
+      return
+    }
+    let state = this.throttles.get(runID)
+    if (!state) {
+      state = { lastPersist: 0, dirty: false }
+      this.throttles.set(runID, state)
+    }
+    const elapsed = this.now() - state.lastPersist
+    if (state.lastPersist === 0 || elapsed >= this.throttleMs) {
+      this.persistNow(runID)
+      return
+    }
+    state.dirty = true
+    if (state.timer === undefined) {
+      const delay = Math.max(0, this.throttleMs - elapsed)
+      state.timer = setTimeout(() => {
+        state.timer = undefined
+        if (state.dirty) this.persistNow(runID)
+      }, delay)
+      state.timer.unref?.()
+    }
+  }
+
+  /** Persist any pending (dirty/throttled) snapshots immediately. */
+  flushPending(): void {
+    for (const runID of [...this.throttles.keys()]) {
+      const state = this.throttles.get(runID)
+      if (state && (state.dirty || state.timer !== undefined)) this.persistNow(runID)
+    }
+  }
+
+  /** Clear pending timers without flushing (plugin unload). */
+  dispose(): void {
+    if (this.bootID && runtimeOwners.get(this.bootID) === this) runtimeOwners.delete(this.bootID)
+    for (const state of this.throttles.values()) {
+      if (state.timer) {
+        clearTimeout(state.timer)
+        state.timer = undefined
+      }
+    }
+    this.throttles.clear()
+  }
+
+  private releaseOwnership(runID: string): void {
+    for (const [sessionID, owned] of this.ownedActive) {
+      if (owned === runID) this.ownedActive.delete(sessionID)
+    }
+  }
+}
