@@ -6,7 +6,7 @@ import { normalizeModelRef } from "./agent-pins.ts"
 import { agentCells, compactCount, compactElapsed, compactTokens, runHeaderCells } from "./run-format.ts"
 import { canonicalGraphSpec, graphNodeCount, graphToAscii, graphToMermaid, validateGraphSpec } from "./graph.ts"
 import type { GraphNode, GraphSpec } from "./graph.ts"
-import { MAX_CHECKPOINTS } from "./registry.ts"
+import { MAX_CHECKPOINTS, MAX_RUN_EVENTS } from "./registry.ts"
 import { compactStringify, safeSlice } from "./serialize.ts"
 import { reduceToolEvent, toolCallsFor, type ToolEvent, type ToolEventState } from "./run-events.ts"
 import { ownershipFields, runLivenessSuffix } from "./run-status.ts"
@@ -457,6 +457,9 @@ export function enrichStatusPayload(
 /** Cap for the result brief inside the parent-session settle notice. */
 export const SETTLE_NOTICE_PREVIEW_CHARS = 300
 
+/** How many lifecycle events /ultracode show prints (tail of the ring). */
+export const SHOW_EVENTS_TAIL = 12
+
 /** One-line settle notice for a finished background run, delivered to the parent session. */
 export function formatSettleNotice(envelope: RunEnvelope): string {
   const agents = envelope.agents
@@ -649,6 +652,19 @@ export function formatShowRun(run: RunRecord, extra?: { pending?: readonly strin
           : ` — ${JSON.stringify(cp.value).slice(0, 120)}${JSON.stringify(cp.value).length > 120 ? "…" : ""}`
       const at = new Date(cp.at).toISOString().slice(11, 19)
       lines.push(`- \`${cp.name}\` (${at} UTC)${value}`)
+    }
+  }
+  if (run.events && run.events.length > 0) {
+    lines.push("")
+    // Tail only: the ring holds MAX_RUN_EVENTS for post-mortems, a chat
+    // message shows the last few — enough to see the wedge point without
+    // flooding the channel.
+    const tail = run.events.slice(-SHOW_EVENTS_TAIL)
+    lines.push(`### Events (last ${tail.length} of ${run.events.length}${run.events.length >= MAX_RUN_EVENTS ? ", capped" : ""})`)
+    lines.push("")
+    for (const ev of tail) {
+      const at = new Date(ev.at).toISOString().slice(11, 19)
+      lines.push(`- \`${ev.kind}\` (${at} UTC)${ev.detail ? ` — ${ev.detail}` : ""}`)
     }
   }
   if (run.result !== undefined && !run.resultTruncated) {

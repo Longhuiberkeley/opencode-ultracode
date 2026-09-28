@@ -1832,3 +1832,23 @@ test("rerun of a run without overrides launches without model fields", async () 
   assert.equal(input.model, undefined)
   assert.equal(input.allowDisabledProviders, undefined)
 })
+
+test("formatShowRun prints a bounded tail of the lifecycle event ring", () => {
+  const run = baseRun()
+  run.events = [
+    { at: 1_000, kind: "spawn", detail: "boot=b1 pid=4312" },
+    ...Array.from({ length: 20 }, (_, i) => ({ at: 1_100 + i, kind: `noise${i}` })),
+    { at: 2_000, kind: "reconcile", detail: "owner dead — interrupted" },
+  ]
+  const text = formatShowRun(run)
+  assert.match(text, /### Events \(last 12 of 22\)/)
+  assert.ok(text.includes("`reconcile`"), "newest events shown")
+  assert.ok(text.includes("owner dead — interrupted"))
+  assert.ok(!text.includes("`spawn` boot=b1"), "tail only — oldest beyond the tail is dropped")
+  assert.ok(!text.includes("noise0"), "ring noise beyond the tail is dropped")
+})
+
+test("formatShowRun omits the events section when the record has none", () => {
+  const text = formatShowRun(baseRun())
+  assert.ok(!text.includes("### Events"))
+})

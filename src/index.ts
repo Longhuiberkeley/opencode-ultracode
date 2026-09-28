@@ -794,10 +794,18 @@ export default Plugin.define({
           if (report.harvested > 0) {
             warn(`harvested ${report.harvested} succeeded child(ren) from ${plan.record.id} before interrupt (warm-resumable)`)
           }
+          registry.appendEvent(
+            plan.record.id,
+            "harvest",
+            `${report.harvested} succeeded, ${report.unresolvable} unresolvable`,
+          )
         } catch {
           // best effort — the flip below still bounds the record
         }
-        if (registry.applyOrphanInterrupt(plan)) flipped++
+        if (registry.applyOrphanInterrupt(plan)) {
+          registry.appendEvent(plan.record.id, "reconcile", `owner dead — interrupted`)
+          flipped++
+        }
       }
       // Deadline enforcement for records whose owner is ALIVE but stopped
       // enforcing its own timeout (wedged watchdog — the heartbeat timer
@@ -824,6 +832,11 @@ export default Plugin.define({
           // best effort
         }
         if (registry.applyOrphanInterrupt({ record: item.record, reason })) {
+          registry.appendEvent(
+            item.record.id,
+            "reconcile",
+            `deadline passed ${Math.round(overdueMs / 1000)}s ago, owner unresponsive — interrupted`,
+          )
           flipped++
           warn(`periodic reconcile timed out run ${item.record.id} (deadline passed, owner unresponsive)`)
         }

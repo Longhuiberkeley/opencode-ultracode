@@ -963,3 +963,55 @@ test("a timeout-kind failure is terminal for the runner — no same-model retry,
   assert.equal(err instanceof AgentCallError, true)
   assert.equal((err as AgentCallError).kind, "timeout")
 })
+
+// ---------------------------------------------------------------------------
+// Lifecycle event tap: every RPC boundary is visible (post-mortem trail)
+// ---------------------------------------------------------------------------
+
+test("driver onEvent emits the full RPC sequence for a schema-validated child", async () => {
+  const kinds: string[] = []
+  const fake = new FakeSessionCtx()
+  fake.push({ text: '{"answer": "42"}' })
+  const driver = createSessionDriver(fake, {
+    onEvent: (event) => kinds.push(event.detail !== undefined ? `${event.kind}:${event.detail}` : event.kind),
+  })
+  await driver.runAgent(input({ schema: SCHEMA }), ["general"], hooks())
+  assert.deepEqual(kinds, [
+    "session.create",
+    "prompt.start",
+    "prompt.return",
+    "wait.start",
+    "wait.return",
+    "session.get",
+    "session.context",
+    "schema.validate:ok",
+  ])
+})
+
+test("driver onEvent emits schema.repair per round and validates after repair", async () => {
+  const kinds: string[] = []
+  const fake = new FakeSessionCtx()
+  fake.push({ text: "not json" })
+  fake.push({ text: '{"answer": "42"}' })
+  const driver = createSessionDriver(fake, {
+    onEvent: (event) => kinds.push(event.kind),
+  })
+  await driver.runAgent(input({ schema: SCHEMA }), ["general"], hooks())
+  assert.deepEqual(kinds, [
+    "session.create",
+    "prompt.start", "prompt.return", "wait.start", "wait.return", "session.get", "session.context",
+    "schema.repair",
+    "prompt.start", "prompt.return", "wait.start", "wait.return", "session.get", "session.context",
+    "schema.validate",
+  ])
+})
+
+test("driver onEvent never breaks the child when the emitter throws", async () => {
+  const fake = new FakeSessionCtx()
+  fake.push({ text: "hello" })
+  const driver = createSessionDriver(fake, {
+    onEvent: () => { throw new Error("emitter down") },
+  })
+  const result = await driver.runAgent(input(), ["general"], hooks())
+  assert.equal(result.text, "hello")
+})

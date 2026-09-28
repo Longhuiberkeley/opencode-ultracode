@@ -158,6 +158,14 @@ export interface SessionDriverOptions {
    * <=0 disables.
    */
   awaitTimeoutMs?: number
+  /**
+   * Lifecycle event tap (optional): the driver emits one event per RPC
+   * boundary (session.create, prompt.start/return, wait.start/return,
+   * session.get, session.context, schema.validate/repair) so the caller can
+   * maintain the run's bounded post-mortem ring. Never throws into the
+   * driver: emitter failures are swallowed.
+   */
+  onEvent?: (event: { kind: string; sessionID?: string; detail?: string }) => void
 }
 
 /**
@@ -212,6 +220,15 @@ export function createSessionDriver(sessions: SessionCtx, options: SessionDriver
   const snippetChars = options.errorTextSnippetChars ?? 500
   const controlMs = options.controlTimeoutMs ?? SESSION_CONTROL_TIMEOUT_MS
   const awaitMs = options.awaitTimeoutMs ?? SESSION_AWAIT_TIMEOUT_MS
+  // Best-effort lifecycle tap: an emitter failure must never break a child.
+  const emit = (kind: string, sessionID?: string, detail?: string): void => {
+    if (options.onEvent === undefined) return
+    try {
+      options.onEvent({ kind, ...(sessionID !== undefined ? { sessionID } : {}), ...(detail !== undefined ? { detail } : {}) })
+    } catch {
+      // swallowed by contract
+    }
+  }
 
   async function runAgent(
     input: AgentRunInput,
@@ -235,6 +252,7 @@ export function createSessionDriver(sessions: SessionCtx, options: SessionDriver
       }),
       controlMs,
     )
+    emit("session.create", created.id)
     const sessionID = created.id
     const registration = hooks.onSessionID(sessionID)
     if (registration === "rejected") {
@@ -297,12 +315,13 @@ export function createSessionDriver(sessions: SessionCtx, options: SessionDriver
     signal: AbortSignal,
     turn: TurnContext = {},
   ): Promise<AgentResult> {
-    await promptAndWait(sessions, sessionID, promptText, signal, awaitMs)
+    await promptAndWait(sessions, sessionID, promptText, signal, awaitMs, emit)
 
     // Outcome + last assistant message. A failed outcome is the primary
     // error; a succeeded outcome with a missing/unreadable assistant message
     // is a typed extraction error (never an empty successful reply).
     const info = await withDeadline("session.get", sessionID, sessions.get({ sessionID }), controlMs)
+    emit("session.get", sessionID)
     const first = await readAssistantReply(sessions, sessionID, info.outcome)
     if (info.outcome !== "succeeded") {
       const detail = describeSessionFailure(info, first.message)
@@ -420,11 +439,13 @@ export function createSessionDriver(sessions: SessionCtx, options: SessionDriver
     try {
       messages = await withDeadline("session.context", sessionID, sessions.context({ sessionID }), controlMs)
     } catch (err) {
+      emit("session.context", sessionID, `unreadable: ${errorMessage(err)}`)
       if (outcome === "succeeded") {
         throw new AgentCallError("extraction", `failed to read session context: ${errorMessage(err)}`)
       }
       return { text: "", message: undefined }
     }
+    emit("session.context", sessionID)
     let last: ContextMessage | undefined
     let usage: ContextMessage | undefined
     for (let i = messages.length - 1; i >= 0; i--) {
@@ -464,7 +485,10 @@ export function createSessionDriver(sessions: SessionCtx, options: SessionDriver
     const extracted = extractJson(first.text)
     if (extracted.ok) {
       const check = validateJsonSchemaValue(schema, extracted.value)
-      if (check.ok) return { data: extracted.value, repaired: false }
+      if (check.ok) {
+        emit("schema.validate", sessionID, "ok")
+        return { data: extracted.value, repaired: false }
+      }
       problem = check.error
     } else {
       problem = extracted.error
@@ -478,6 +502,7 @@ export function createSessionDriver(sessions: SessionCtx, options: SessionDriver
     // object/array schemas; scalar schemas are told to stay bare values.
     let reply: AssistantReply = first
     for (let round = 0; round < SCHEMA_REPAIR_ROUNDS; round++) {
+      emit("schema.repair", sessionID, `round ${round + 1}: ${problem.slice(0, 120)}`)
       const repairPrompt =
         "Your previous reply was not a valid JSON value matching the required schema.\n" +
         `Problem: ${problem}\n` +
@@ -487,8 +512,9 @@ export function createSessionDriver(sessions: SessionCtx, options: SessionDriver
             ? "\nStart your reply with { or [ and end with the matching closing bracket. No prose, no markdown fences, no trailing commas, no comments."
             : "\nOutput the bare JSON value only — a quoted string, a number, true/false, or null. No prose, no markdown fences."
           : "")
-      await promptAndWait(sessions, sessionID, buildPromptText(repairPrompt, schema), signal, awaitMs)
+      await promptAndWait(sessions, sessionID, buildPromptText(repairPrompt, schema), signal, awaitMs, emit)
       const info = await withDeadline("session.get", sessionID, sessions.get({ sessionID }), controlMs)
+      emit("session.get", sessionID)
       reply = await readAssistantReply(sessions, sessionID, info.outcome)
       if (info.outcome !== "succeeded") {
         const detail = describeSessionFailure(info, reply.message)
@@ -504,6 +530,7 @@ export function createSessionDriver(sessions: SessionCtx, options: SessionDriver
       if (attempt.ok) {
         const check = validateJsonSchemaValue(schema, attempt.value)
         if (check.ok) {
+          emit("schema.validate", sessionID, `ok after repair round ${round + 1}`)
           return {
             data: attempt.value,
             repaired: true,
@@ -682,6 +709,7 @@ async function promptAndWait(
   text: string,
   signal: AbortSignal,
   awaitMs: number = SESSION_AWAIT_TIMEOUT_MS,
+  emit: (kind: string, sessionID?: string, detail?: string) => void = () => {},
 ): Promise<void> {
   const interrupt = () => {
     void interruptSafe(sessions, sessionID)
@@ -692,8 +720,12 @@ async function promptAndWait(
   // signal and the deadline race in ONE combinator so an abort clears the
   // deadline timer — an abandoned timer would hold the loop for its full
   // window.
+  emit("prompt.start", sessionID)
   await raceDeadline("session.prompt", sessionID, sessions.prompt({ sessionID, text }), signal, awaitMs, interrupt)
+  emit("prompt.return", sessionID)
+  emit("wait.start", sessionID)
   await raceDeadline("session.wait", sessionID, sessions.wait({ sessionID }), signal, awaitMs, interrupt)
+  emit("wait.return", sessionID)
 }
 
 /**

@@ -638,7 +638,17 @@ export class SupervisorImpl implements Supervisor {
     this.settleGraceMs = deps.settleGraceMs ?? SETTLE_GRACE_MS
     this.stopKillMs = deps.stopKillGraceMs ?? STOP_KILL_GRACE_MS
     // Driver construction performs no session calls — safe outside executors.
-    this.driver = createSessionDriver(deps.sessions)
+    // The driver's lifecycle tap lands in the owning run's event ring
+    // (resolved via the session→agent→run index; pre-bind events like
+    // session.create are dropped — the runner's own attempt event covers them).
+    this.driver = createSessionDriver(deps.sessions, {
+      onEvent: (event) => {
+        if (event.sessionID === undefined) return
+        const owned = this.registry.agentForSession(event.sessionID)
+        if (!owned) return
+        this.registry.appendEvent(owned.runID, event.kind, `${event.sessionID}${event.detail ? ` ${event.detail}` : ""}`)
+      },
+    })
     // Composition seam: injected fresh loader wins; else prefer
     // Storage.loadWorkflowFresh when present, else the cached loadWorkflow.
     this.workflowLoader = deps.loadWorkflowFresh ?? storageWorkflowLoader(deps.storage)
@@ -724,6 +734,12 @@ export class SupervisorImpl implements Supervisor {
       ...(input.maxLoopIterations !== undefined ? { maxLoopIterations: input.maxLoopIterations } : {}),
     }
     this.registry.persistNow(runID)
+    const owner = this.registry.get(runID)?.owner
+    this.registry.appendEvent(
+      runID,
+      "spawn",
+      `${input.workflowName ? `workflow=${input.workflowName} ` : ""}boot=${owner?.bootID ?? "?"} pid=${owner?.pid ?? process.pid}${record.resumedFrom ? ` warm-from=${record.resumedFrom}` : ""}`,
+    )
     const state = this.makeState(runID, parent, effective, input)
     this.runs.set(runID, state)
     const done = this.executeRun(record, input, parent, state)
@@ -1018,6 +1034,7 @@ export class SupervisorImpl implements Supervisor {
     if (!this.registry.setStatus(runID, "stopping", { stopReason: reason })) {
       return { ok: false, reason: "not-active", status: this.registry.get(runID)?.status ?? "failed" }
     }
+    this.registry.appendEvent(runID, "stop", reason.slice(0, 120))
     state.paused = false
     this.clearAskTimer(state)
     this.clearWatchdog(state)
@@ -1099,6 +1116,7 @@ export class SupervisorImpl implements Supervisor {
     state.paused = true
     state.pausedAt = Date.now()
     this.clearWatchdog(state)
+    this.registry.appendEvent(runID, "pause")
     // A paused run burns no wall-clock budget: the persisted deadline must
     // not read as burning while held (resume re-arms and re-persists).
     this.registry.noteRunDeadline(runID, undefined)
@@ -1134,6 +1152,7 @@ export class SupervisorImpl implements Supervisor {
       state.pausedAt = undefined
     }
     state.paused = false
+    this.registry.appendEvent(runID, "resume", opts?.model !== undefined ? `fallback override ${modelPinString(opts.model)}` : undefined)
     // Ask-mode answer: a resume WITH a model becomes this run's fallback
     // override — later failovers (and quarantine routing) prefer it over the
     // configured ladder. A resume without one proceeds in auto-mode policy.
@@ -1469,7 +1488,9 @@ export class SupervisorImpl implements Supervisor {
     // later wedges (alive pid, dead watchdog — the heartbeat timer outlives
     // it) can then be timed out by ANY process's reconcile pass. Re-armed
     // (and re-persisted) on every resume.
-    this.registry.noteRunDeadline(state.runID, Date.now() + remaining)
+    const deadlineAt = Date.now() + remaining
+    this.registry.noteRunDeadline(state.runID, deadlineAt)
+    this.registry.appendEvent(state.runID, "watchdog", `deadline ${new Date(deadlineAt).toISOString()}`)
     state.watchdog = setTimeout(() => {
       this.stop(state.runID, "timeout")
     }, remaining)
@@ -1567,6 +1588,7 @@ export class SupervisorImpl implements Supervisor {
         this.registry.updateAgent(owned.runID, owned.agentID, {
           error: `child stalled: no activity for ${Math.round(elapsed / 1000)}s (childStallMs ${stallMs}ms) — interrupting`,
         })
+        this.registry.appendEvent(owned.runID, "stall", `${owned.agentID} ${sessionID} silent ${Math.round(elapsed / 1000)}s`)
       }
       this.safeParentReport(
         state,
@@ -1874,6 +1896,11 @@ export class SupervisorImpl implements Supervisor {
       error: final.error,
       stopReason: final.stopReason,
     })
+    this.registry.appendEvent(
+      runID,
+      "settle",
+      `status=${final.status}${final.stopReason ? ` stop="${final.stopReason.slice(0, 120)}"` : ""}${final.error ? ` error="${String(final.error).slice(0, 120)}"` : ""}`,
+    )
 
     const finalRun = this.registry.get(runID)
     if (!finalRun) throw new Error(`run ${runID} disappeared during finalization`)

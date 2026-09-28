@@ -761,3 +761,17 @@ test("setPendingWaitReason stamps only pending rows; clear deletes the key", () 
   registry.setPendingWaitReason(run.id, undefined)
   assert.equal(rows[0]!.waitReason, undefined)
 })
+
+test("appendEvent keeps a bounded ring and piggybacks the persist throttle", () => {
+  const { registry, persisted } = makeRegistry({ throttleMs: 0 })
+  const run = registry.create({ parentSessionID: "ses", script: "s" })
+  registry.appendEvent(run.id, "first", "first detail")
+  for (let i = 1; i < 300; i++) registry.appendEvent(run.id, `kind${i}`)
+  const events = registry.get(run.id)!.events!
+  assert.equal(events.length, 256)
+  assert.equal(events[0]!.kind, "kind44", "oldest dropped")
+  assert.equal(events[255]!.kind, "kind299")
+  const last = events.at(-1)!
+  assert.deepEqual(Object.keys(last).sort(), ["at", "kind"], "no detail key when absent")
+  assert.ok(persisted.some((r) => r.id === run.id && (r.events?.length ?? 0) > 0), "events persisted")
+})

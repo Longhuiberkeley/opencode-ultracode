@@ -596,6 +596,14 @@ export class FakeRegistry implements Registry {
     }
   }
 
+  appendEvent(runID: string, kind: string, detail?: string): void {
+    const run = this.runs.get(runID)
+    if (!run) return
+    run.events = run.events ?? []
+    run.events.push({ at: Date.now(), kind, ...(detail !== undefined && detail !== "" ? { detail } : {}) })
+    if (run.events.length > 256) run.events.splice(0, run.events.length - 256)
+  }
+
   expiredRemoteRuns(_now: number, _graceMs: number): Array<{ record: RunRecord; deadlineAt: number }> {
     // The fake holds only locally-created runs — nothing is remote.
     return []

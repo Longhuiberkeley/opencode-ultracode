@@ -627,6 +627,7 @@ export class AgentRunner {
       throw err
     }
     this.maybeReport()
+    this.registry.appendEvent(this.runID, "admit", `${record.id} phase=${phase}${opts.label ? ` label=${opts.label}` : ""}`)
 
     const providerHold: ProviderHold = { permit: undefined, providerID: undefined }
     try {
@@ -767,9 +768,13 @@ export class AgentRunner {
         })
       }
       providerHold.permit = await this.acquireConfiguredPermit(providerHold.providerID, abortSignal)
+      if (providerHold.permit !== undefined && permitWaitCap !== undefined && providerHold.providerID !== undefined) {
+        this.registry.appendEvent(this.runID, "provider-queue.acquire", `${record.id} provider=${providerHold.providerID}; cap=${permitWaitCap}`)
+      }
       // Attempt-0 spawn as a closure: the explicit-model window recovery below
       // re-runs it when a quota failure raced session creation (no session to
       // continue yet). Reads `activeModel` at call time.
+      let spawnAttemptNo = 0
       const spawnAttempt = (): Promise<AgentResult> =>
         this.driver.runAgent(
           {
@@ -788,6 +793,7 @@ export class AgentRunner {
             signal: this.signal ?? NEVER_ABORTED.signal,
             onSessionID: (sessionID) => {
               continuedSessionID = sessionID
+              this.registry.appendEvent(this.runID, "attempt", `${record.id} try ${++spawnAttemptNo} ${sessionID}`)
               this.registry.updateAgent(this.runID, record.id, {
                 status: "running",
                 sessionID,

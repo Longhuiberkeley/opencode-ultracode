@@ -1525,3 +1525,22 @@ test("pause gate stamps pending rows with waitReason; resume clears, start clear
   ctx.supervisor.stop(runID, "test done")
   await pending
 })
+
+test("run records a lifecycle event trail: spawn, rpc boundaries, settle", async () => {
+  const ctx = makeSupervisor({})
+  const { runID, done } = ctx.supervisor.startDetached(
+    { script: `const r = await agent("hi"); return r.text;` },
+    ctx.parent,
+  )
+  const outcome = await done
+  assert.equal(outcome.envelope.status, "succeeded")
+  const run = ctx.registry.get(runID)!
+  const kinds = (run.events ?? []).map((e) => e.kind)
+  assert.equal(kinds[0], "spawn")
+  assert.ok(kinds.includes("admit"), `admit in ${kinds.join(",")}`)
+  assert.ok(kinds.includes("attempt"), "spawn attempt recorded (covers pre-bind session.create)")
+  assert.ok(kinds.includes("prompt.start") && kinds.includes("wait.return"), "post-bind rpc events land via the session→run index")
+  assert.equal(kinds.at(-1), "settle")
+  const spawnDetail = run.events![0]!.detail ?? ""
+  assert.match(spawnDetail, /pid=\d+/)
+})

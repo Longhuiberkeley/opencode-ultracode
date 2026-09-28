@@ -513,6 +513,20 @@ export interface CheckpointRecord {
   value?: Json
 }
 
+/**
+ * One lifecycle event in the run's bounded post-mortem ring: RPC boundaries
+ * (session.create / prompt.start|return / wait.start|return / session.get /
+ * session.context), admission (admit / attempt / provider-queue.acquire),
+ * schema.validate / schema.repair, watchdog / pause / resume / stop / settle,
+ * harvest, reconcile. `kind` is a stable dotted string; `detail` is a short
+ * human-readable one-liner (sessionID, provider, verdict).
+ */
+export interface RunEvent {
+  at: number
+  kind: string
+  detail?: string
+}
+
 export interface RunRecord {
   directory?: string
   projectID?: string
@@ -595,6 +609,13 @@ export interface RunRecord {
    * records predating this field and on final records.
    */
   deadlineAt?: number
+  /**
+   * Bounded lifecycle event ring (newest last, MAX_RUN_EVENTS): the
+   * post-mortem trail for "what was the last thing that actually happened"
+   * — RPC boundaries (session.create/prompt/wait/get/context), admission,
+   * schema validation/repair, watchdog/pause/stop, harvest, reconcile.
+   */
+  events?: RunEvent[]
 }
 
 export function emptyTokens(): TokenUsage {
@@ -1053,6 +1074,8 @@ export interface Registry {
   noteAgentActivity(runID: string, agentID: string, at: number): void
   /** Stamp/clear why every PENDING child of the run is parked (pause gate). */
   setPendingWaitReason(runID: string, reason: string | undefined): void
+  /** Append a bounded lifecycle event to the run's ring (piggybacked on the persist throttle). */
+  appendEvent(runID: string, kind: string, detail?: string): void
   /** Record final result + totals. */
   finish(runID: string, outcome: {
     status: RunStatus

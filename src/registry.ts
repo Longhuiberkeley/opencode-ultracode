@@ -44,6 +44,9 @@ const FINAL_STATUSES: ReadonlySet<string> = new Set(["succeeded", "failed", "sto
 
 /** Run record keeps at most this many checkpoints (oldest dropped). */
 export const MAX_CHECKPOINTS = 50
+
+/** Bounded lifecycle event ring on the run record (post-mortem trail). */
+export const MAX_RUN_EVENTS = 256
 // A timestamp is not proof of a live supervisor. Only a registered runtime owner
 // may keep a persisted active record alive across same-process location loads.
 const runtimeOwners = new Map<string, RegistryImpl>()
@@ -280,6 +283,23 @@ export class RegistryImpl implements Registry {
       touched = true
     }
     if (touched) this.requestPersist(runID)
+  }
+
+  appendEvent(runID: string, kind: string, detail?: string): void {
+    const run = this.runs.get(runID)
+    if (!run) return
+    const trimmedKind = kind.trim().slice(0, 64)
+    if (!trimmedKind) return
+    run.events = run.events ?? []
+    run.events.push({
+      at: this.now(),
+      kind: trimmedKind,
+      ...(detail !== undefined && detail !== "" ? { detail: detail.slice(0, 300) } : {}),
+    })
+    if (run.events.length > MAX_RUN_EVENTS) {
+      run.events.splice(0, run.events.length - MAX_RUN_EVENTS)
+    }
+    this.requestPersist(runID)
   }
 
   getAgent(runID: string, agentID: string): AgentRecord | undefined {
