@@ -687,18 +687,23 @@ test("stepEventContext: session.step.ended usage becomes the live context number
   assert.equal(stepEventContext("nope"), undefined)
 })
 
-test("persistedActivityFor: falls back to the agent row's lastActivityAt; unknown stays unknown", () => {
+test("persistedActivityFor: falls back to the agent row's lastActivityAt, adopted mirrors included; unknown stays unknown", () => {
   const agents = new Map<string, { lastActivityAt?: number }>()
   const registry = {
-    agentForSession: (sid: string) => (sid === "ses_known" ? { runID: "run_x", agentID: "a1" } : undefined),
-    getAgent: (runID: string, agentID: string) =>
-      runID === "run_x" && agentID === "a1" ? (agents.get("a1") as { lastActivityAt?: number } | undefined) : undefined,
+    activityForSession: (sid: string) => {
+      if (sid === "ses_known" || sid === "ses_adopted") {
+        return agents.get(sid === "ses_known" ? "a1" : "a9")?.lastActivityAt
+      }
+      return undefined
+    },
   }
   const forFn = persistedActivityFor(registry as unknown as Parameters<typeof persistedActivityFor>[0])
   assert.equal(forFn("ses_unknown"), undefined)
   assert.equal(forFn("ses_known"), undefined, "no recorded activity stays unknown")
   agents.set("a1", { lastActivityAt: 1234 })
   assert.equal(forFn("ses_known"), 1234)
+  agents.set("a9", { lastActivityAt: 5678 })
+  assert.equal(forFn("ses_adopted"), 5678, "adopted (unbound) sessions resolve through the registry scan")
 })
 
 test("waitReason rides agentDetails (authoritative snapshot) and parses from an RPC payload", () => {

@@ -604,6 +604,18 @@ export class FakeRegistry implements Registry {
     if (run.events.length > 256) run.events.splice(0, run.events.length - 256)
   }
 
+  activityForSession(sessionID: string): number | undefined {
+    for (const run of this.runs.values()) {
+      for (const agent of run.agents) {
+        if (agent.sessionID !== sessionID) continue
+        if (typeof agent.lastActivityAt === "number" && Number.isFinite(agent.lastActivityAt)) {
+          return agent.lastActivityAt
+        }
+      }
+    }
+    return undefined
+  }
+
   expiredRemoteRuns(_now: number, _graceMs: number): Array<{ record: RunRecord; deadlineAt: number }> {
     // The fake holds only locally-created runs — nothing is remote.
     return []

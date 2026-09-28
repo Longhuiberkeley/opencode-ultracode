@@ -669,6 +669,8 @@ test("rpc definition: control method carries the ask-mode resume surface", () =>
     "model",
     "remembered",
     "rememberError",
+    "orphaned",
+    "stopReason",
   ])
 })
 // ---------------------------------------------------------------------------

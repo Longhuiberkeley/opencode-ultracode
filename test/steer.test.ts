@@ -43,26 +43,35 @@ test("steer on a run with NO live local worker is rejected — the queue would r
   await assert.rejects(steerRun(run(), "ses_parent", { text: "adjust" }, d), /rerun run_test --warm/)
 })
 
-test("steer on an IDLE-succeeded child session is rejected as unconsumed, even while the record says running", async () => {
-  // The exact incident shape: OpenCode recovered the child, it finished with
-  // idle_outcome succeeded, but the record row (and the whole run) still said
-  // running because the awaiting worker died.
+test("steer on an IDLE-succeeded child of a LOCALLY-LIVE run delivers with an idleOutcome disclosure (review P2)", async () => {
+  // A live worker legitimately sits between turns (schema repair, retries,
+  // continuations re-use the session) — the next turn may consume the steer.
+  // Deliver, but never claim consumption: idleOutcome + consumed:false say
+  // exactly what is known.
+  const sent: unknown[] = []
   const d = {
     ...deps(),
     sessionState: async () => ({ outcome: "succeeded" }),
-    prompt: async () => { assert.fail("must not prompt") },
+    prompt: async (input: { sessionID: string; text: string; delivery: "steer"; resume: false }) => { sent.push(input) },
   }
-  await assert.rejects(steerRun(run(), "ses_parent", { text: "adjust" }, d), /idle \(outcome: succeeded\)/)
-  await assert.rejects(steerRun(run(), "ses_parent", { text: "adjust" }, d), /unconsumed/)
+  const target = await steerRun(run(), "ses_parent", { text: "adjust" }, d)
+  assert.deepEqual(target, {
+    sessionID: "ses_child",
+    agentID: "a1",
+    delivery: "queued (durable)",
+    consumed: false,
+    idleOutcome: "succeeded",
+  })
+  assert.equal(sent.length, 1)
 })
 
-test("steer treats a failed idle outcome the same — terminal is terminal", async () => {
-  const d = {
+test("steer with a failed idle outcome delivers with the same disclosure", async () => {
+  const target = await steerRun(run(), "ses_parent", { text: "adjust" }, {
     ...deps(),
     sessionState: async () => ({ outcome: "failed" }),
-    prompt: async () => { assert.fail("must not prompt") },
-  }
-  await assert.rejects(steerRun(run(), "ses_parent", { text: "adjust" }, d), /idle \(outcome: failed\)/)
+  })
+  assert.equal(target.idleOutcome, "failed")
+  assert.equal(target.consumed, false)
 })
 
 test("steer pre-flight probes degrade open: unreadable session or absent checks never block delivery", async () => {

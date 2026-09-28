@@ -1076,6 +1076,12 @@ export interface Registry {
   setPendingWaitReason(runID: string, reason: string | undefined): void
   /** Append a bounded lifecycle event to the run's ring (piggybacked on the persist throttle). */
   appendEvent(runID: string, kind: string, detail?: string): void
+  /**
+   * Persisted lastActivityAt for a child session (stalledMs input). Works
+   * for LOCALLY bound sessions AND adopted mirrors (whose session IDs are
+   * never bound here) — read-only lookup, no ownership semantics.
+   */
+  activityForSession(sessionID: string): number | undefined
   /** Record final result + totals. */
   finish(runID: string, outcome: {
     status: RunStatus

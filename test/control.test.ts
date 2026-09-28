@@ -76,7 +76,9 @@ test("control rejects foreign runs, unknown ids, and wrong transitions", () => {
     controlRun({ run: run({ status: "paused" }), parentSessionID: "ses_parent", action: "stop", activeOwned: [] }, fromPaused.impl).status,
     "stopping",
   )
-  for (const status of ["succeeded", "failed", "stopped", "interrupted", "stopping"] as const) {
+  // NOTE: `interrupted` is covered below — an already-reconciled orphan stop
+  // is now an informative idempotent outcome, not a refusal.
+  for (const status of ["succeeded", "failed", "stopped", "stopping"] as const) {
     assert.throws(
       () => controlRun({ run: run({ status }), parentSessionID: "ses_parent", action: "stop", activeOwned: [] }, impl),
       new RegExp(`cannot stop a ${status}`),
@@ -373,4 +375,45 @@ test("controlToolContent: a malformed model pin fails closed before the supervis
   )
   assert.match(out.content, /model must be/)
   assert.deepEqual(calls, [], "no resume attempt with an invalid pin")
+})
+
+// ---------------------------------------------------------------------------
+// Idempotent already-stopped (review P2): control reconciles first, so an
+// orphan usually reads `interrupted` with the hint — stop must REPORT it.
+// ---------------------------------------------------------------------------
+
+test("stop of an already-reconciled interrupted orphan reports the outcome + hint instead of an error", () => {
+  const r = run({ status: "interrupted", stopReason: "server restart (owner boot_x pid 4312 gone) — resumable: /ultracode rerun run_test --warm" })
+  const { impl } = implRecording()
+  const result = controlRun(
+    { run: r, runID: r.id, parentSessionID: "ses_parent", action: "stop", activeOwned: [] },
+    impl,
+  )
+  assert.deepEqual(result, {
+    runID: r.id,
+    action: "stop",
+    status: "interrupted",
+    orphaned: true,
+    stopReason: r.stopReason,
+  })
+})
+
+test("stop of a locally-stopped interrupted run reports the state without the orphan flag", () => {
+  const r = run({ status: "interrupted", stopReason: "orchestrator stop via ultracode_control" })
+  const { impl } = implRecording()
+  const result = controlRun(
+    { run: r, runID: r.id, parentSessionID: "ses_parent", action: "stop", activeOwned: [] },
+    impl,
+  )
+  assert.equal(result.status, "interrupted")
+  assert.equal(result.orphaned, undefined)
+  assert.equal(result.stopReason, "orchestrator stop via ultracode_control")
+})
+
+test("stop of a succeeded run still refuses (nothing to stop, no hint to lose)", () => {
+  const { impl } = implRecording()
+  assert.throws(
+    () => controlRun({ run: run({ status: "succeeded" }), runID: "run_test", parentSessionID: "ses_parent", action: "stop", activeOwned: [] }, impl),
+    /cannot stop a succeeded run/,
+  )
 })

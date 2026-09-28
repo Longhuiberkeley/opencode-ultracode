@@ -121,6 +121,22 @@ export function controlRun(
 
   if (action === "stop") {
     if (!isActiveRunStatus(run.status) || run.status === "stopping") {
+      // Idempotent already-stopped (review P2): the control paths run an
+      // on-demand reconcile FIRST, so a dead owner's record usually reads
+      // `interrupted` here with the resume hint already stamped. Refusing
+      // with "cannot stop a interrupted run" loses that guidance — report
+      // the truthful end state instead (it IS the requested outcome).
+      if (run.status === "interrupted" && typeof run.stopReason === "string" && run.stopReason !== "") {
+        const remoteFlip = /resumable/i.test(run.stopReason)
+        const result: ControlResult = {
+          runID: run.id,
+          action,
+          status: run.status,
+          ...(remoteFlip ? { orphaned: true } : {}),
+          stopReason: run.stopReason,
+        }
+        return result
+      }
       throw new Error(`cannot stop a ${run.status} run`)
     }
     const outcome = impl.stop(run.id, `orchestrator stop via ultracode_control`)

@@ -1635,7 +1635,7 @@ export default Plugin.define({
                 },
                 isLocallyLive: (runID) => supervisor?.hasLiveState?.(runID) === true,
               })
-              return { content: JSON.stringify({ ...target, accepted: true, delivery: "steer" }) }
+              return { content: JSON.stringify({ ...target, accepted: true }) }
             } catch (error) {
               return { content: `error: ${describeError(error)}` }
             }

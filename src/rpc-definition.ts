@@ -48,6 +48,12 @@ export const ULTRACODE_RPC = {
           model: { type: "string" as const },
           remembered: { type: "string" as const },
           rememberError: { type: "string" as const },
+          // Truthful stop outcomes (additive): an orphan flip (local or
+          // already-reconciled) carries the full stopReason with the warm
+          // rerun hint. MUST stay declared — undeclared output keys fail the
+          // whole RPC call (same lesson as runStatus, 2026-09-26).
+          orphaned: { type: "boolean" as const },
+          stopReason: { type: "string" as const },
         },
       },
     },

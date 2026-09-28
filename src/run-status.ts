@@ -228,16 +228,15 @@ export function ownershipFields(
  * Persisted-activity fallback for stampStalled: `lastActivityAt` on the
  * agent row (written throttled by the supervisor's activity feed) stands in
  * when no live in-memory map knows the session — the map dies with the owner
- * process, the record does not. Returns undefined when nothing is recorded
- * ("unknown" must never render as stalled).
+ * process, the record does not. Resolves through registry.activityForSession
+ * so ADOPTED mirrors (never locally bound) are covered too. Returns undefined
+ * when nothing is recorded ("unknown" must never render as stalled).
  */
 export function persistedActivityFor(
-  registry: Pick<Registry, "agentForSession" | "getAgent">,
+  registry: Pick<Registry, "activityForSession">,
 ): (sessionID: string) => number | undefined {
   return (sessionID: string): number | undefined => {
-    const owned = registry.agentForSession(sessionID)
-    if (!owned) return undefined
-    const at = registry.getAgent(owned.runID, owned.agentID)?.lastActivityAt
+    const at = registry.activityForSession(sessionID)
     return typeof at === "number" && Number.isFinite(at) ? at : undefined
   }
 }
