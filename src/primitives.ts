@@ -29,6 +29,7 @@ import type { FailureClassification } from "./failure-classify.ts"
 import { isReadOnlyChild, resolveFallbacks } from "./failover.ts"
 import type { FallbackCandidate, PinPoolEntry } from "./failover.ts"
 import { modelPinString } from "./agent-pins.ts"
+import { recordMeasuredContext } from "./child-context.ts"
 import { validateScriptSource } from "./worker-script.ts"
 import { createHash } from "node:crypto"
 
@@ -335,8 +336,11 @@ export interface AgentRunnerOptions {
    * missing from the map is unconfigured — no instance permit, no slot dir.
    */
   providerConcurrency?: Readonly<Record<string, number>>
-  /** Opt-in Ultracode-only selector; undefined preserves agent pins. */
-  selectModel?: (role: string, tier?: string, excluded?: ReadonlySet<string>) => Promise<ModelRef | undefined>
+  /**
+   * Opt-in Ultracode-only selector; undefined preserves agent pins. `failed` is
+   * the providers this child already died on (failover re-select only).
+   */
+  selectModel?: (role: string, tier?: string, failed?: ReadonlySet<string>, recordID?: string) => Promise<ModelRef | undefined>
 }
 
 /** Inputs shared by the runner's failover attempts (built once per agent call). */
@@ -493,6 +497,8 @@ export class AgentRunner {
   private readonly now: () => number
   private readonly windowWaitSliceMs: number
   private readonly maxWindowWaitMs: number
+  /** One report per run when tier hints arrive without a router. */
+  private tierHintNoticed = false
   /** Providers this runner already reported a window wait for (one report each). */
   private readonly windowWaitNotified = new Set<string>()
   private readonly providerLimiter: ProviderLimiter | undefined
@@ -589,28 +595,52 @@ export class AgentRunner {
       throw new Error(`agent cap reached (${this.maxAgents})`)
     }
     this.started++
-    await this.semaphore.acquire(this.signal)
 
     const phase = opts.phase ?? this.ambientPhase() ?? "workflow"
+    // The row exists BEFORE admission: a queued child is a real, visible
+    // pending child (waitReason names the gate), and an abort while queued
+    // still lands a terminal row instead of vanishing.
     const record = this.registry.addAgent(this.runID, {
       label: opts.label,
       phase,
       requestedAgent: opts.agent ?? this.defaultAgent,
       status: "pending",
       startedAt: Date.now(),
+      waitReason: `run queue (cap ${this.semaphore.limit})`,
+      // Replay identity persists AT START, not only on success: a crash
+      // between spawn and completion leaves the row running with its key,
+      // digest and schema already durable, so the post-restart harvest pass
+      // can salvage a recovered session's result into a warm-replayable row
+      // (buildWarmCache still gates on status === "succeeded" — persisting
+      // early never makes an unfinished row replayable by itself).
+      ...(key && digest ? { key, promptDigest: digest } : {}),
+      ...(opts.schema !== undefined ? { schema: opts.schema } : {}),
     })
     if (!record) {
-      this.semaphore.release()
       throw new Error(`run ${this.runID} not found`)
     }
+    try {
+      await this.semaphore.acquire(this.signal)
+    } catch (err) {
+      // Queued waiter aborted/rejected: the row must not linger pending.
+      this.registry.updateAgent(this.runID, record.id, {
+        status: "failed",
+        error: `aborted while queued: ${err instanceof Error ? err.message : String(err)}`,
+        endedAt: Date.now(),
+        waitReason: undefined,
+      })
+      throw err
+    }
     this.maybeReport()
+    this.registry.appendEvent(this.runID, "admit", `${record.id} phase=${phase}${opts.label ? ` label=${opts.label}` : ""}`)
 
     const providerHold: ProviderHold = { permit: undefined, providerID: undefined }
     try {
       const titlePhase = opts.phase ?? this.ambientPhase()
       const requestedAgent = opts.agent ?? this.defaultAgent
-      // Model precedence: per-call override > run-level override > agent-config
-      // pin > server default. Explicit overrides skip pin lookup entirely (the
+      // Model precedence: per-call override > run-level override > routing (tier
+      // hint, then role tier) > agent-config pin > default agent's pin > server
+      // default. Explicit overrides skip routing and pin lookup entirely (the
       // caller asked for THIS model), and carry their source so drift reports
       // can tell an intentional override from a config pin.
       let model: { providerID: string; id: string; variant?: string } | undefined
@@ -622,11 +652,18 @@ export class AgentRunner {
         model = this.runModel
         modelSource = "run"
       } else if (this.selectModel) {
-        model = await this.selectModel(requestedAgent, opts.tier)
-        if (model !== undefined) modelSource = "route"
-        // An explicit tier that yields no model is an empty tier (unknown tiers and
-        // all-gated tiers throw inside the router), so name it for the caller.
-        else if (opts.tier !== undefined) throw new Error(`routing tier ${opts.tier} is empty — configure it or drop the tier hint`)
+        // An unknown agent fails in the driver with the roster; routing it first
+        // would advance rotation state and read quota for a child that never runs.
+        if (this.availableAgents === undefined || this.availableAgents.includes(requestedAgent)) {
+          // A hint is a hint: a tier the user's policy cannot satisfy (unknown or
+          // empty) degrades inside the router, down to the pin chain below. Only a
+          // populated tier with every candidate gated out throws.
+          model = await this.selectModel(requestedAgent, opts.tier, undefined, record.id)
+          if (model !== undefined) modelSource = "route"
+        }
+      } else if (opts.tier !== undefined && !this.tierHintNoticed) {
+        this.tierHintNoticed = true
+        this.safeReport("tier hints ignored: routing is not configured or disabled; children use their agent pins")
       }
       if (model === undefined && opts.model === undefined && this.runModel === undefined && this.pinForAgent) {
         try {
@@ -735,10 +772,22 @@ export class AgentRunner {
       // two provider permits). Unconfigured providers skip both the instance
       // semaphore and the machine slot dir.
       providerHold.providerID = activeModel?.providerID
+      // Provider-permit gate: name the provider and cap while waiting — the
+      // row is pending and must say why (cleared when the session starts).
+      const permitWaitCap = this.permitCap(providerHold.providerID)
+      if (this.providerLimiter !== undefined && providerHold.providerID !== undefined && permitWaitCap !== undefined) {
+        this.registry.updateAgent(this.runID, record.id, {
+          waitReason: `provider=${providerHold.providerID}; cap=${permitWaitCap}`,
+        })
+      }
       providerHold.permit = await this.acquireConfiguredPermit(providerHold.providerID, abortSignal)
+      if (providerHold.permit !== undefined && permitWaitCap !== undefined && providerHold.providerID !== undefined) {
+        this.registry.appendEvent(this.runID, "provider-queue.acquire", `${record.id} provider=${providerHold.providerID}; cap=${permitWaitCap}`)
+      }
       // Attempt-0 spawn as a closure: the explicit-model window recovery below
       // re-runs it when a quota failure raced session creation (no session to
       // continue yet). Reads `activeModel` at call time.
+      let spawnAttemptNo = 0
       const spawnAttempt = (): Promise<AgentResult> =>
         this.driver.runAgent(
           {
@@ -757,10 +806,14 @@ export class AgentRunner {
             signal: this.signal ?? NEVER_ABORTED.signal,
             onSessionID: (sessionID) => {
               continuedSessionID = sessionID
+              this.registry.appendEvent(this.runID, "attempt", `${record.id} try ${++spawnAttemptNo} ${sessionID}`)
               this.registry.updateAgent(this.runID, record.id, {
                 status: "running",
                 sessionID,
                 startedAt: Date.now(),
+                // Start clears every admission-gate reason (queue/permit/
+                // quarantine/pause) — the child is now actually running.
+                waitReason: undefined,
               })
               try {
                 this.registry.bindAgentSession(this.runID, record.id, sessionID)
@@ -829,6 +882,25 @@ export class AgentRunner {
             }
             const failedOver = failoverOn
               ? await this.tryFailover(err, "quota", failoverContext, continuedSessionID, providerHold)
+              : undefined
+            if (failedOver !== undefined) {
+              result = failedOver
+              break
+            }
+            throw err
+          }
+          // Content-policy refusal (provider content filter): prompt-specific
+          // and deterministic on the same provider — a same-model continue is
+          // guaranteed to hit the same filter again, and there is no quota
+          // window to wait for. Fail over to a different provider; explicit-
+          // model children keep their literal contract and surface the typed
+          // error. Deliberately NOT reported to the breaker: the provider is
+          // healthy, the prompt+provider pair is not (observed 2026-09-26: a
+          // skeptic child died on "provider.content-filter" and took the run
+          // with it instead of failing over).
+          if (err.failure?.class === "refusal") {
+            const failedOver = failoverOn && !this.explicitLiteral(failoverContext)
+              ? await this.tryFailover(err, "refusal", failoverContext, continuedSessionID, providerHold)
               : undefined
             if (failedOver !== undefined) {
               result = failedOver
@@ -914,12 +986,28 @@ export class AgentRunner {
               },
             }
           : agentResult
+      // The provider-measured context of the last completed request doubles as
+      // a calibration sample for this pin: fold it against the serialized bytes
+      // the context hook stored for this session (child-context.ts). A result
+      // with no measured usage teaches nothing — and neither does a STALE
+      // measurement (usage that fell back to an earlier request), which
+      // recordMeasuredContext consumes without folding. contextTokens still
+      // displays the fallback value.
+      const measuredContext = requestContext(finalResult.requestTokens)
+      if (measuredContext !== undefined && finalResult.model !== undefined && finalResult.model !== null) {
+        recordMeasuredContext(
+          finalResult.sessionID,
+          `${finalResult.model.providerID}/${finalResult.model.id}`,
+          measuredContext,
+          finalResult.requestTokensStale === true,
+        )
+      }
       this.registry.updateAgent(this.runID, record.id, {
         status: "succeeded",
         effectiveAgent: finalResult.agent,
         effectiveModel: finalResult.model,
         tokens: finalResult.tokens,
-        ...(requestContext(finalResult.requestTokens) !== undefined ? { contextTokens: requestContext(finalResult.requestTokens) } : {}),
+        ...(measuredContext !== undefined ? { contextTokens: measuredContext } : {}),
         data: finalResult.data,
         endedAt: Date.now(),
         // Keyed calls persist replay identity (and the text a future warm
@@ -968,7 +1056,7 @@ export class AgentRunner {
    */
   private async tryFailover(
     err: AgentCallError,
-    failureClass: "quota" | "burst",
+    failureClass: "quota" | "burst" | "refusal",
     context: FailoverContext,
     sessionID: string | undefined,
     hold: ProviderHold,
@@ -1086,6 +1174,11 @@ export class AgentRunner {
           `${context.phase} — ${context.label ?? context.recordID} explicit model ${modelPinString(model)}: ` +
             `provider ${model.providerID} quota window closed — waiting${until !== undefined ? ` until ~${new Date(until).toLocaleTimeString()}` : ""} (no substitution)`,
         )
+        // The pending row must name the window it is parked at (cleared when
+        // the session starts on the other side of the gate).
+        this.registry.updateAgent(this.runID, context.recordID, {
+          waitReason: `quarantine window (provider ${model.providerID})`,
+        })
       }
       budget.deadline ??= this.now() + this.maxWindowWaitMs
       const now = this.now()
@@ -1202,7 +1295,7 @@ export class AgentRunner {
    * another agent's pin (observed live: every explicit glm-5.3 child silently
    * rerouted onto the default agent's max-effort pin for a whole day).
    */
-  private async resolveLadder(context: FailoverContext, failureClass: "quota" | "burst"): Promise<FallbackCandidate[]> {
+  private async resolveLadder(context: FailoverContext, failureClass: "quota" | "burst" | "refusal"): Promise<FallbackCandidate[]> {
     if (context.dead === undefined) return []
     const override = this.fallbackOverride?.()
     // A routed child normally stays inside the routing policy: it cannot escape
@@ -1213,7 +1306,7 @@ export class AgentRunner {
     if (context.routedTier !== undefined && this.selectModel &&
       context.callFallbacks === undefined && override === undefined) {
       try {
-        const next = await this.selectModel(context.requestedAgent, context.routedTier || undefined, new Set([context.dead.providerID]))
+        const next = await this.selectModel(context.requestedAgent, context.routedTier || undefined, new Set([context.dead.providerID]), context.recordID)
         return next ? [{ model: next, source: "option" }] : []
       } catch { return [] }
     }
@@ -1304,7 +1397,10 @@ export class AgentRunner {
    * Report one classified child failure into the run-level breaker. The
    * breaking model is the one that produced the failure (intended model, or a
    * routed/replaced candidate). Never throws; unclassified failures are
-   * ignored.
+   * ignored, and "refusal" is deliberately not reported — a content-filter
+   * rejection is prompt-specific, not provider health, so striking the
+   * provider would quarantine a healthy subscription for one bad
+   * prompt+provider pair.
    */
   private reportProviderFailure(model: ModelRef | undefined, failure: FailureClassification | undefined): void {
     if (this.providerHealth === undefined || model === undefined || failure === undefined) return

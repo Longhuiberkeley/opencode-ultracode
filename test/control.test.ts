@@ -24,15 +24,15 @@ const implRecording = (): { impl: ControlImpl; calls: Array<[string, string?]> }
     impl: {
       stop: (runID, reason) => {
         calls.push(["stop", reason])
-        return true
+        return { ok: true, mode: "local" }
       },
       pause: (runID) => {
         calls.push(["pause"])
-        return true
+        return { ok: true }
       },
       resume: (runID) => {
         calls.push(["resume"])
-        return true
+        return { ok: true }
       },
     },
   }
@@ -76,7 +76,9 @@ test("control rejects foreign runs, unknown ids, and wrong transitions", () => {
     controlRun({ run: run({ status: "paused" }), parentSessionID: "ses_parent", action: "stop", activeOwned: [] }, fromPaused.impl).status,
     "stopping",
   )
-  for (const status of ["succeeded", "failed", "stopped", "interrupted", "stopping"] as const) {
+  // NOTE: `interrupted` is covered below — an already-reconciled orphan stop
+  // is now an informative idempotent outcome, not a refusal.
+  for (const status of ["succeeded", "failed", "stopped", "stopping"] as const) {
     assert.throws(
       () => controlRun({ run: run({ status }), parentSessionID: "ses_parent", action: "stop", activeOwned: [] }, impl),
       new RegExp(`cannot stop a ${status}`),
@@ -94,13 +96,50 @@ test("control rejects foreign runs, unknown ids, and wrong transitions", () => {
 
 test("control refuses when the supervisor refuses", () => {
   const refusing: ControlImpl = {
-    stop: () => false,
-    pause: () => false,
-    resume: () => false,
+    stop: () => ({ ok: false as const, reason: "not-active" as const, status: "succeeded" as const }),
+    pause: () => ({ ok: false, error: "run gone" }),
+    resume: () => ({ ok: false, error: "run gone" }),
   }
   assert.throws(
     () => controlRun({ run: run(), parentSessionID: "ses_parent", action: "stop", activeOwned: [] }, refusing),
     /refused to stop/,
+  )
+})
+
+test("control on an ORPHANED run returns the truthful interrupted result, never 'supervisor refused'", () => {
+  const orphanStop: ControlImpl = {
+    stop: () => ({
+      ok: true as const,
+      mode: "orphan" as const,
+      stopReason: "orchestrator stop via ultracode_control — orphaned: owner process gone. Marked interrupted; resumable via /ultracode rerun run_test --warm",
+    }),
+    pause: () => ({ ok: true }),
+    resume: () => ({ ok: true }),
+  }
+  const result = controlRun({ run: run(), parentSessionID: "ses_parent", action: "stop", activeOwned: [] }, orphanStop)
+  assert.equal(result.status, "interrupted", "the record IS interrupted after an orphan stop")
+  assert.equal(result.orphaned, true)
+  assert.match(result.stopReason ?? "", /resumable via \/ultracode rerun run_test --warm/)
+})
+
+test("control on a live REMOTE-owned run refuses naming the owning process", () => {
+  const remoteStop: ControlImpl = {
+    stop: () => ({
+      ok: false as const,
+      reason: "remote-owner" as const,
+      owner: { bootID: "boot_elsewhere", pid: 4312 },
+    }),
+    pause: () => ({ ok: false, error: "remote" }),
+    resume: () => ({ ok: false, error: "remote" }),
+  }
+  assert.throws(
+    () => controlRun({ run: run(), parentSessionID: "ses_parent", action: "stop", activeOwned: [] }, remoteStop),
+    /owned by a live process \(boot_elsewhere pid 4312\)/,
+  )
+  // Pause/resume refusals surface the supervisor's actionable error verbatim.
+  assert.throws(
+    () => controlRun({ run: run({ status: "running" }), parentSessionID: "ses_parent", action: "pause", activeOwned: [] }, remoteStop),
+    /remote/,
   )
 })
 
@@ -166,10 +205,10 @@ const recording = () => {
     supervisor: {
       stop: (runID: string, reason: string) => {
         calls.push(["stop", reason])
-        return true
+        return { ok: true as const, mode: "local" as const }
       },
-      pause: () => true,
-      resume: () => true,
+      pause: () => ({ ok: true }),
+      resume: () => ({ ok: true }),
     },
   }
 }
@@ -237,11 +276,11 @@ test("controlToolContent: validator failures surface as error content", async ()
 test("controlRun resume-with-model passes the override to the supervisor and echoes the pin", () => {
   const calls: Array<{ runID: string; model?: { providerID: string; id: string; variant?: string } }> = []
   const impl: ControlImpl = {
-    stop: () => true,
-    pause: () => true,
+    stop: () => ({ ok: true as const, mode: "local" as const }),
+    pause: () => ({ ok: true }),
     resume: (runID, opts) => {
       calls.push({ runID, ...(opts?.model !== undefined ? { model: opts.model } : {}) })
-      return true
+      return { ok: true }
     },
   }
   const result = controlRun(
@@ -325,15 +364,56 @@ test("controlToolContent: a malformed model pin fails closed before the supervis
       getRun: () => run({ status: "paused" }),
       activeRuns: () => [run({ status: "paused" })],
       supervisor: {
-        stop: () => true,
-        pause: () => true,
+        stop: () => ({ ok: true as const, mode: "local" as const }),
+        pause: () => ({ ok: true }),
         resume: () => {
           calls.push("resume")
-          return true
+          return { ok: true }
         },
       },
     },
   )
   assert.match(out.content, /model must be/)
   assert.deepEqual(calls, [], "no resume attempt with an invalid pin")
+})
+
+// ---------------------------------------------------------------------------
+// Idempotent already-stopped (review P2): control reconciles first, so an
+// orphan usually reads `interrupted` with the hint — stop must REPORT it.
+// ---------------------------------------------------------------------------
+
+test("stop of an already-reconciled interrupted orphan reports the outcome + hint instead of an error", () => {
+  const r = run({ status: "interrupted", stopReason: "server restart (owner boot_x pid 4312 gone) — resumable: /ultracode rerun run_test --warm" })
+  const { impl } = implRecording()
+  const result = controlRun(
+    { run: r, runID: r.id, parentSessionID: "ses_parent", action: "stop", activeOwned: [] },
+    impl,
+  )
+  assert.deepEqual(result, {
+    runID: r.id,
+    action: "stop",
+    status: "interrupted",
+    orphaned: true,
+    stopReason: r.stopReason,
+  })
+})
+
+test("stop of a locally-stopped interrupted run reports the state without the orphan flag", () => {
+  const r = run({ status: "interrupted", stopReason: "orchestrator stop via ultracode_control" })
+  const { impl } = implRecording()
+  const result = controlRun(
+    { run: r, runID: r.id, parentSessionID: "ses_parent", action: "stop", activeOwned: [] },
+    impl,
+  )
+  assert.equal(result.status, "interrupted")
+  assert.equal(result.orphaned, undefined)
+  assert.equal(result.stopReason, "orchestrator stop via ultracode_control")
+})
+
+test("stop of a succeeded run still refuses (nothing to stop, no hint to lose)", () => {
+  const { impl } = implRecording()
+  assert.throws(
+    () => controlRun({ run: run({ status: "succeeded" }), runID: "run_test", parentSessionID: "ses_parent", action: "stop", activeOwned: [] }, impl),
+    /cannot stop a succeeded run/,
+  )
 })

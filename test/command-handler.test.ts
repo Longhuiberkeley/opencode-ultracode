@@ -33,14 +33,17 @@ import type {
   AgentRecord,
   Json,
   ParentContext,
+  PauseResumeOutcome,
   RunLaunchInput,
   RunOutcome,
   RunRecord,
   SaveWorkflowManifestInput,
   SavedWorkflow,
+  StopOutcome,
 } from "../src/types.ts"
 import { DEFAULT_OPTIONS } from "../src/types.ts"
 import { applyOverlay, overlayFromPanel, panelSettingsFrom, parseSettingsAckPayload, type SettingsOverlay } from "../src/settings.ts"
+import { RUNS_SCAN_TTL_MS } from "../src/storage.ts"
 import { FakeRegistry } from "./fakes.ts"
 
 function digest(script: string): string {
@@ -173,6 +176,21 @@ class MemoryStorage implements CommandStorage {
   async loadResultArtifactFresh(key: string): Promise<Json | undefined> {
     return this.artifacts.get(key)
   }
+  /** Persisted-run view for the status path (refresh-if-stale + not-owned fallback). */
+  runSnapshots: RunRecord[] = []
+  loadRunsAsyncCalls = 0
+  lastScan = 0
+  loadRuns(): RunRecord[] {
+    return this.runSnapshots
+  }
+  async loadRunsAsync(): Promise<readonly RunRecord[]> {
+    this.loadRunsAsyncCalls++
+    this.lastScan = Date.now()
+    return this.runSnapshots
+  }
+  lastScanAt(): number {
+    return this.lastScan
+  }
 }
 
 class MemorySupervisor implements CommandSupervisor {
@@ -183,21 +201,25 @@ class MemorySupervisor implements CommandSupervisor {
   constructor(registry: FakeRegistry) {
     this.registry = registry
   }
-  pause(runID: string): boolean {
+  pause(runID: string): PauseResumeOutcome {
     const run = this.registry.get(runID)
-    if (!run || run.status !== "running") return false
-    return this.registry.setStatus(runID, "paused")
+    if (!run || run.status !== "running") return { ok: false, error: `run ${runID} not running` }
+    return { ok: this.registry.setStatus(runID, "paused") }
   }
-  resume(runID: string, opts?: { model?: { providerID: string; id: string; variant?: string } }): boolean {
+  resume(runID: string, opts?: { model?: { providerID: string; id: string; variant?: string } }): PauseResumeOutcome {
     this.resumeCalls.push({ runID, ...(opts !== undefined ? { opts } : {}) })
     const run = this.registry.get(runID)
-    if (!run || run.status !== "paused") return false
-    return this.registry.setStatus(runID, "running")
+    if (!run || run.status !== "paused") return { ok: false, error: `run ${runID} not paused` }
+    return { ok: this.registry.setStatus(runID, "running") }
   }
-  stop(runID: string, reason: string): boolean {
+  stop(runID: string, reason: string): StopOutcome {
     const run = this.registry.get(runID)
-    if (!run || (run.status !== "running" && run.status !== "paused" && run.status !== "stopping")) return false
-    return this.registry.setStatus(runID, "stopped", { stopReason: reason })
+    if (!run) return { ok: false, reason: "not-found" }
+    if (run.status !== "running" && run.status !== "paused" && run.status !== "stopping") {
+      return { ok: false, reason: "not-active", status: run.status }
+    }
+    this.registry.setStatus(runID, "stopped", { stopReason: reason })
+    return { ok: true, mode: "local" }
   }
   startDetached(input: RunLaunchInput, parent: ParentContext): { runID: string; done: Promise<RunOutcome> } {
     this.startCalls.push({ input, parent })
@@ -291,6 +313,20 @@ for (const verb of RUN_SCOPED) {
 test("status unknown id uses the not-found line", async () => {
   const { texts } = await invoke("status run_missing")
   assert.match(texts[0]!, /Run `run_missing` not found/)
+})
+
+test("status re-scans the persisted view after the TTL and serves a run this registry does not own", async () => {
+  const storage = new MemoryStorage()
+  storage.runSnapshots.push(baseRun({ id: "run_remote", status: "succeeded", endedAt: 2_000, agents: [] }))
+  const first = await invoke("status run_remote", { storage })
+  assert.equal(storage.loadRunsAsyncCalls, 1) // never scanned → refresh
+  assert.match(first.texts[0]!, /^run_remote · succeeded · agents 0\/0 · /)
+  const second = await invoke("status run_remote", { storage })
+  assert.equal(storage.loadRunsAsyncCalls, 1) // inside the TTL → no re-scan
+  assert.match(second.texts[0]!, /^run_remote · succeeded · agents 0\/0 · /)
+  storage.lastScan = Date.now() - RUNS_SCAN_TTL_MS - 1
+  await invoke("status run_remote", { storage })
+  assert.equal(storage.loadRunsAsyncCalls, 2) // past the TTL → re-scan
 })
 
 test("status transitions: running → paused → running → interrupted via /ultracode status and ultracode_status", async () => {
@@ -1795,4 +1831,24 @@ test("rerun of a run without overrides launches without model fields", async () 
   const input = supervisor.startCalls[0]!.input as RunLaunchInput
   assert.equal(input.model, undefined)
   assert.equal(input.allowDisabledProviders, undefined)
+})
+
+test("formatShowRun prints a bounded tail of the lifecycle event ring", () => {
+  const run = baseRun()
+  run.events = [
+    { at: 1_000, kind: "spawn", detail: "boot=b1 pid=4312" },
+    ...Array.from({ length: 20 }, (_, i) => ({ at: 1_100 + i, kind: `noise${i}` })),
+    { at: 2_000, kind: "reconcile", detail: "owner dead — interrupted" },
+  ]
+  const text = formatShowRun(run)
+  assert.match(text, /### Events \(last 12 of 22\)/)
+  assert.ok(text.includes("`reconcile`"), "newest events shown")
+  assert.ok(text.includes("owner dead — interrupted"))
+  assert.ok(!text.includes("`spawn` boot=b1"), "tail only — oldest beyond the tail is dropped")
+  assert.ok(!text.includes("noise0"), "ring noise beyond the tail is dropped")
+})
+
+test("formatShowRun omits the events section when the record has none", () => {
+  const text = formatShowRun(baseRun())
+  assert.ok(!text.includes("### Events"))
 })

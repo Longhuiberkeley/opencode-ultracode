@@ -36,6 +36,33 @@ test("classify: production burst — provider.rate-limit / 429, no reset", () =>
   assert.match(c.reason, /rate-limit/)
 })
 
+test("classify: content-policy refusal — provider.content-filter beats every other shape", () => {
+  const c = classifyFailure(
+    { type: "provider.content-filter", message: "Provider blocked the response (provider.content-filter) | The request was rejected because it was considered high risk" },
+    "finish: tool-calls",
+  )
+  assert.equal(c.class, "refusal")
+  assert.match(c.reason, /content-policy refusal/)
+  assert.equal(c.resetAt, undefined)
+})
+
+test("classify: refusal markers — considered high-risk, usage policy, policy violation", () => {
+  assert.equal(classifyFailure(undefined, "The request was rejected because it was considered high risk").class, "refusal")
+  assert.equal(classifyFailure(undefined, "Your request violates our usage policy").class, "refusal")
+  assert.equal(classifyFailure(undefined, "content_policy_violation detected").class, "refusal")
+  // "usage policy" is a POLICY, not a usage LIMIT — it must not read as quota
+  // even though both start with "usage".
+  assert.notEqual(classifyFailure(undefined, "Your request violates our usage policy").class, "quota")
+})
+
+test("classify: refusal wins over quota-shaped wording in the same message", () => {
+  const c = classifyFailure(
+    { type: "provider.rate-limit", message: "content filter tripped; your quota for this request was rejected" },
+    undefined,
+  )
+  assert.equal(c.class, "refusal")
+})
+
 test("classify: production quota — 'Usage limit reached for 5 hour' with ISO reset", () => {
   const reset = Date.now() + 5 * HOUR
   const c = classifyFailure({

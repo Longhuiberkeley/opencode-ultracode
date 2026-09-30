@@ -15,6 +15,7 @@ import type {
   Json,
   ModelRef,
   ParentContext,
+  PauseResumeOutcome,
   ProviderFailureClass,
   ProviderHealth,
   ProviderQuarantineSnapshot,
@@ -25,6 +26,7 @@ import type {
   RunStatus,
   SavedWorkflow,
   SessionCtx,
+  StopOutcome,
   Storage,
   Supervisor,
   UltracodeOptions,
@@ -525,6 +527,8 @@ interface RunState {
   stallTimer: ReturnType<typeof setInterval> | undefined
   /** sessionID -> last activity timestamp (spawn time seeds it). */
   childLastActivity: Map<string, number>
+  /** sessionID -> last time lastActivityAt was PERSISTED (throttle). */
+  activityPersistedAt: Map<string, number>
   /** sessionIDs already stall-interrupted (never re-fired for one child). */
   stallNotified: Set<string>
   pauseWaiters: PauseWaiter[]
@@ -634,7 +638,17 @@ export class SupervisorImpl implements Supervisor {
     this.settleGraceMs = deps.settleGraceMs ?? SETTLE_GRACE_MS
     this.stopKillMs = deps.stopKillGraceMs ?? STOP_KILL_GRACE_MS
     // Driver construction performs no session calls — safe outside executors.
-    this.driver = createSessionDriver(deps.sessions)
+    // The driver's lifecycle tap lands in the owning run's event ring
+    // (resolved via the session→agent→run index; pre-bind events like
+    // session.create are dropped — the runner's own attempt event covers them).
+    this.driver = createSessionDriver(deps.sessions, {
+      onEvent: (event) => {
+        if (event.sessionID === undefined) return
+        const owned = this.registry.agentForSession(event.sessionID)
+        if (!owned) return
+        this.registry.appendEvent(owned.runID, event.kind, `${event.sessionID}${event.detail ? ` ${event.detail}` : ""}`)
+      },
+    })
     // Composition seam: injected fresh loader wins; else prefer
     // Storage.loadWorkflowFresh when present, else the cached loadWorkflow.
     this.workflowLoader = deps.loadWorkflowFresh ?? storageWorkflowLoader(deps.storage)
@@ -720,6 +734,12 @@ export class SupervisorImpl implements Supervisor {
       ...(input.maxLoopIterations !== undefined ? { maxLoopIterations: input.maxLoopIterations } : {}),
     }
     this.registry.persistNow(runID)
+    const owner = this.registry.get(runID)?.owner
+    this.registry.appendEvent(
+      runID,
+      "spawn",
+      `${input.workflowName ? `workflow=${input.workflowName} ` : ""}boot=${owner?.bootID ?? "?"} pid=${owner?.pid ?? process.pid}${record.resumedFrom ? ` warm-from=${record.resumedFrom}` : ""}`,
+    )
     const state = this.makeState(runID, parent, effective, input)
     this.runs.set(runID, state)
     const done = this.executeRun(record, input, parent, state)
@@ -788,7 +808,11 @@ export class SupervisorImpl implements Supervisor {
 
       // 3.-4. AgentRunner over a driver wrapper that tracks child sessions,
       // registry ownership (ambient phase tracked via state) and late children.
-      const routerForRun = state.effective.routing
+      // Master switch: routing.enabled === false wires no router at all, so a
+      // role mapping cannot select and an explicit tier hint degrades to the
+      // agent pin (the runner reports the ignored hints once per run). The
+      // pin-path failover shelf is untouched.
+      const routerForRun = state.effective.routing && state.effective.routing.enabled !== false
         ? (state.effective.routing === this.options.routing ? this.router : undefined) ?? new ModelRouter(state.effective.routing)
         : undefined
       const runner = new AgentRunner({
@@ -897,8 +921,8 @@ export class SupervisorImpl implements Supervisor {
         providerLimiter: this.providerLimiter,
         providerConcurrency: state.effective.providerConcurrency,
         ...(routerForRun ? {
-          selectModel: async (role: string, tier?: string, excluded?: ReadonlySet<string>) => {
-            const disabled = new Set(excluded)
+          selectModel: async (role: string, tier?: string, failed?: ReadonlySet<string>, recordID?: string) => {
+            const disabled = new Set<string>()
             if (this.disabledProviders) {
               try { for (const id of await this.disabledProviders()) disabled.add(id) } catch { /* existing disabled-provider behavior */ }
             }
@@ -911,19 +935,34 @@ export class SupervisorImpl implements Supervisor {
             // select() returns the no-model decision before reading it, so the
             // fetch would be wasted for unmapped children.
             const resolved = tier ?? state.effective.routing?.roles[role]
-            const available = resolved ? await this.availableModels?.() : undefined
+            let available: ReadonlySet<string> | undefined
+            if (resolved) {
+              // Fail open like every other lookup here: a catalog outage skips the
+              // catalog gate (the provider rejects a truly missing model) instead
+              // of killing every routed child.
+              try { available = await this.availableModels?.() } catch (error) {
+                this.safeParentReport(state,
+                  `routing ${role}${tier ? `/${tier}` : ""}: live catalog unavailable (${error instanceof Error ? error.message : String(error)}); catalog check skipped`.slice(0, 600))
+              }
+            }
             try {
               const decision = await routerForRun.select({ role, ...(tier ? { tier } : {}), disabled,
+                ...(failed && failed.size > 0 ? { failed } : {}),
                 ...(quarantined.size > 0 ? { quarantined } : {}),
                 ...(available ? { available } : {}), ...(this.quota ? { quota: this.quota } : {}) })
+              if (recordID) this.registry.updateAgent(runID, recordID, {
+                routing: { reason: decision.reason, skipped: decision.skipped },
+              })
               this.safeParentReport(state, `routing ${role}${tier ? `/${tier}` : ""}: ${decision.reason}` +
                 (decision.skipped.length ? `; skipped ${decision.skipped.join("; ").slice(0, 500)}` : ""))
               return decision.model
             } catch (error) {
               // A routing failure that kills a child must still be visible in the
-              // run log; rethrow so the caller sees the typed reason.
+              // run log and on the child's row; rethrow so the caller sees the typed reason.
+              const message = error instanceof Error ? error.message : String(error)
+              if (recordID) this.registry.updateAgent(runID, recordID, { routing: { reason: `FAILED: ${message}`.slice(0, 600), skipped: [] } })
               this.safeParentReport(state,
-                `routing ${role}${tier ? `/${tier}` : ""} FAILED: ${error instanceof Error ? error.message : String(error)}`.slice(0, 600))
+                `routing ${role}${tier ? `/${tier}` : ""} FAILED: ${message}`.slice(0, 600))
               throw error
             }
           },
@@ -999,12 +1038,18 @@ export class SupervisorImpl implements Supervisor {
   // stop / stopAll / dispose
   // -------------------------------------------------------------------------
 
-  stop(runID: string, reason: string): boolean {
+  stop(runID: string, reason: string): StopOutcome {
     const state = this.runs.get(runID)
-    if (!state) return false
+    if (!state) return this.stopOrphaned(runID, reason)
     const run = this.registry.get(runID)
-    if (!run || !isActiveRunStatus(run.status) || run.status === "stopping") return false
-    if (!this.registry.setStatus(runID, "stopping", { stopReason: reason })) return false
+    if (!run) return { ok: false, reason: "not-found" }
+    if (!isActiveRunStatus(run.status) || run.status === "stopping") {
+      return { ok: false, reason: "not-active", status: run.status }
+    }
+    if (!this.registry.setStatus(runID, "stopping", { stopReason: reason })) {
+      return { ok: false, reason: "not-active", status: this.registry.get(runID)?.status ?? "failed" }
+    }
+    this.registry.appendEvent(runID, "stop", reason.slice(0, 120))
     state.paused = false
     this.clearAskTimer(state)
     this.clearWatchdog(state)
@@ -1032,38 +1077,105 @@ export class SupervisorImpl implements Supervisor {
     if (typeof (state.killTimer as { unref?: () => void }).unref === "function") {
       ;(state.killTimer as { unref: () => void }).unref()
     }
-    return true
+    return { ok: true, mode: "local" }
   }
 
-  pause(runID: string): boolean {
+  /**
+   * Stop a run with NO local RunState — the orphaned-record paths the
+   * 2026-09-27 incident wedged ("supervisor refused" while the record said
+   * running). Exactly one truthful outcome: dead owner (or state lost) ⇒
+   * mark the run and its running/pending children interrupted with a resume
+   * hint; live remote owner ⇒ refuse and name it; unknown/finished ⇒ say so.
+   * The control paths run an on-demand reconcile first, so by the time this
+   * fires the genuinely dead are usually already flipped — this covers the
+   * races and the reconcileIntervalMs=0 configuration.
+   */
+  private stopOrphaned(runID: string, reason: string): StopOutcome {
+    const status = this.registry.ownerStatus(runID)
+    if (status.kind === "not-found") return { ok: false, reason: "not-found" }
+    const record = status.record
+    if (!isActiveRunStatus(record.status) || record.status === "stopping") {
+      return { ok: false, reason: "not-active", status: record.status }
+    }
+    if (status.kind === "remote-live") {
+      return { ok: false, reason: "remote-owner", owner: status.owner ?? { bootID: "unknown" } }
+    }
+    const detail = status.detail ?? "owner gone"
+    const stopReason = `${reason} — orphaned: ${detail}. Marked interrupted; resumable via /ultracode rerun ${runID} --warm`
+    this.registry.applyOrphanInterrupt({ record, reason: stopReason })
+    // The persist callback pushes the runState transition; no parent channel
+    // exists for an orphaned run (its worker died with the old process).
+    return { ok: true, mode: "orphan", stopReason }
+  }
+
+  pause(runID: string): PauseResumeOutcome {
     const state = this.runs.get(runID)
-    if (!state) return false
+    if (!state) {
+      // No local worker: pausing is meaningless. Be truthful about why and
+      // what to do instead — never accept a pause nothing can honor.
+      const status = this.registry.ownerStatus(runID)
+      if (status.kind === "not-found") return { ok: false, error: `run ${runID} not found` }
+      if (status.kind === "remote-live") {
+        const pid = status.owner?.pid !== undefined ? ` pid ${status.owner.pid}` : ""
+        return { ok: false, error: `run ${runID} is owned by a live process (${status.owner?.bootID ?? "unknown"}${pid}) — pause it from that instance` }
+      }
+      return {
+        ok: false,
+        error: `run ${runID} is orphaned (${status.detail ?? "owner gone"}) — there is no worker to hold; stop marks it interrupted, /ultracode rerun ${runID} --warm restarts it warm`,
+      }
+    }
     const run = this.registry.get(runID)
-    if (!run || run.status !== "running") return false
-    if (!this.registry.setStatus(runID, "paused")) return false
+    if (!run) return { ok: false, error: `run ${runID} not found` }
+    if (run.status !== "running") return { ok: false, error: `run ${runID} is ${run.status}, not running` }
+    if (!this.registry.setStatus(runID, "paused")) return { ok: false, error: `run ${runID} could not transition from ${run.status} to paused` }
     state.paused = true
     state.pausedAt = Date.now()
     this.clearWatchdog(state)
+    this.registry.appendEvent(runID, "pause")
+    // A paused run burns no wall-clock budget: the persisted deadline must
+    // not read as burning while held (resume re-arms and re-persists).
+    this.registry.noteRunDeadline(runID, undefined)
     this.safeParentReport(state, `paused ${runID}`)
-    return true
+    return { ok: true }
   }
 
-  resume(runID: string, opts?: { model?: ModelRef }): boolean {
+  resume(runID: string, opts?: { model?: ModelRef }): PauseResumeOutcome {
     const state = this.runs.get(runID)
-    if (!state) return false
+    if (!state) {
+      // No local worker to reopen: truthful refusal with the warm-resume path
+      // (an orphaned paused record can never be resumed in place — the
+      // worker's script state died with the old process).
+      const status = this.registry.ownerStatus(runID)
+      if (status.kind === "not-found") return { ok: false, error: `run ${runID} not found` }
+      if (status.kind === "remote-live") {
+        const pid = status.owner?.pid !== undefined ? ` pid ${status.owner.pid}` : ""
+        return { ok: false, error: `run ${runID} is owned by a live process (${status.owner?.bootID ?? "unknown"}${pid}) — resume it from that instance` }
+      }
+      return {
+        ok: false,
+        error: `run ${runID} has no local worker to reopen (orphaned: ${status.detail ?? "owner gone"}) — /ultracode rerun ${runID} --warm restarts it warm`,
+      }
+    }
     const run = this.registry.get(runID)
-    if (!run || run.status !== "paused") return false
-    if (!this.registry.setStatus(runID, "running")) return false
+    if (!run) return { ok: false, error: `run ${runID} not found` }
+    if (run.status !== "paused") return { ok: false, error: `run ${runID} is ${run.status}, not paused` }
+    if (!this.registry.setStatus(runID, "running")) {
+      return { ok: false, error: `run ${runID} could not transition from paused to running` }
+    }
     if (state.pausedAt !== undefined) {
       state.pausedMs += Date.now() - state.pausedAt
       state.pausedAt = undefined
     }
     state.paused = false
+    this.registry.appendEvent(runID, "resume", opts?.model !== undefined ? `fallback override ${modelPinString(opts.model)}` : undefined)
     // Ask-mode answer: a resume WITH a model becomes this run's fallback
     // override — later failovers (and quarantine routing) prefer it over the
     // configured ladder. A resume without one proceeds in auto-mode policy.
     if (opts?.model !== undefined) state.fallbackOverride = opts.model
     this.clearAskTimer(state)
+    // Clear the pause-gate stamps: pending children re-stamp at whichever
+    // gate they park at next (queue/permit/quarantine), and start clears all.
+    this.registry.setPendingWaitReason(runID, undefined)
     this.armWatchdog(state)
     this.armStallScanner(state)
     this.resumePauseWaiters(state)
@@ -1073,7 +1185,7 @@ export class SupervisorImpl implements Supervisor {
         ? `resumed ${runID} — fallback override ${modelPinString(opts.model)}`
         : `resumed ${runID}`,
     )
-    return true
+    return { ok: true }
   }
 
   /** Currently quarantined providers (ask-mode diagnostics + remember keying). */
@@ -1089,6 +1201,11 @@ export class SupervisorImpl implements Supervisor {
 
   isOwnedSession(sessionID: string): boolean {
     return this.registry.isOwnedActive(sessionID)
+  }
+
+  /** True when this process supervises the run's worker (has a live RunState). Steer pre-flight. */
+  hasLiveState(runID: string): boolean {
+    return this.runs.has(runID)
   }
 
   activeRuns(): RunRecord[] {
@@ -1142,6 +1259,7 @@ export class SupervisorImpl implements Supervisor {
       watchdog: undefined,
       stallTimer: undefined,
       childLastActivity: new Map<string, number>(),
+      activityPersistedAt: new Map<string, number>(),
       stallNotified: new Set<string>(),
       pauseWaiters: [],
       effective,
@@ -1381,6 +1499,13 @@ export class SupervisorImpl implements Supervisor {
       this.stop(state.runID, "timeout")
       return
     }
+    // Persist the deadline the live watchdog enforces: a record whose owner
+    // later wedges (alive pid, dead watchdog — the heartbeat timer outlives
+    // it) can then be timed out by ANY process's reconcile pass. Re-armed
+    // (and re-persisted) on every resume.
+    const deadlineAt = Date.now() + remaining
+    this.registry.noteRunDeadline(state.runID, deadlineAt)
+    this.registry.appendEvent(state.runID, "watchdog", `deadline ${new Date(deadlineAt).toISOString()}`)
     state.watchdog = setTimeout(() => {
       this.stop(state.runID, "timeout")
     }, remaining)
@@ -1406,13 +1531,27 @@ export class SupervisorImpl implements Supervisor {
 
   /**
    * Bump a child's last-activity timestamp. Called from the host event
-   * subscription (message/part events per session); cheap map writes.
+   * subscription (message/part events per session); cheap map writes. The
+   * timestamp is ALSO persisted (throttled to ACTIVITY_PERSIST_MS per child)
+   * so stalledMs survives restarts and other processes can see liveness.
    */
   noteChildActivity(sessionID: string): void {
+    const now = Date.now()
     for (const state of this.runs.values()) {
-      if (state.children.has(sessionID)) state.childLastActivity.set(sessionID, Date.now())
+      if (!state.children.has(sessionID)) continue
+      state.childLastActivity.set(sessionID, now)
+      // Throttled durable record: the in-memory map dies with this process.
+      const last = state.activityPersistedAt.get(sessionID) ?? 0
+      if (now - last >= SupervisorImpl.ACTIVITY_PERSIST_MS) {
+        state.activityPersistedAt.set(sessionID, now)
+        const owned = this.registry.agentForSession(sessionID)
+        if (owned) this.registry.noteAgentActivity(owned.runID, owned.agentID, now)
+      }
     }
   }
+
+  /** Per-child cadence for persisting lastActivityAt (cheap, throttled). */
+  private static readonly ACTIVITY_PERSIST_MS = 5_000
 
   /**
    * Last-observed activity for a live child (epoch ms), for status surfaces:
@@ -1464,6 +1603,7 @@ export class SupervisorImpl implements Supervisor {
         this.registry.updateAgent(owned.runID, owned.agentID, {
           error: `child stalled: no activity for ${Math.round(elapsed / 1000)}s (childStallMs ${stallMs}ms) — interrupting`,
         })
+        this.registry.appendEvent(owned.runID, "stall", `${owned.agentID} ${sessionID} silent ${Math.round(elapsed / 1000)}s`)
       }
       this.safeParentReport(
         state,
@@ -1512,7 +1652,7 @@ export class SupervisorImpl implements Supervisor {
         if (state.askNotified.has(key)) continue
         if (affected === 0) continue // no child of this run would fail over: nothing to ask
         if (!state.paused) {
-          if (!this.pause(state.runID)) continue // already stopping/final: cannot hold the run
+          if (!this.pause(state.runID).ok) continue // already stopping/final: cannot hold the run
         }
         state.askNotified.add(key)
         this.emitAskReport(state, event, affected)
@@ -1675,6 +1815,10 @@ export class SupervisorImpl implements Supervisor {
       return Promise.reject(new Error("run stopping"))
     }
     if (!state.paused) return Promise.resolve()
+    // The pause gate parks PENDING children (and hold-point failovers);
+    // the rows must say so. Not cleared here — the child's start
+    // (onSessionID) clears it, so a resumed sibling never reads stale.
+    this.registry.setPendingWaitReason(state.runID, "pause gate (run paused)")
     return new Promise<void>((resolve, reject) => {
       const waiter: PauseWaiter = {
         resolve: () => resolve(),
@@ -1767,6 +1911,11 @@ export class SupervisorImpl implements Supervisor {
       error: final.error,
       stopReason: final.stopReason,
     })
+    this.registry.appendEvent(
+      runID,
+      "settle",
+      `status=${final.status}${final.stopReason ? ` stop="${final.stopReason.slice(0, 120)}"` : ""}${final.error ? ` error="${String(final.error).slice(0, 120)}"` : ""}`,
+    )
 
     const finalRun = this.registry.get(runID)
     if (!finalRun) throw new Error(`run ${runID} disappeared during finalization`)

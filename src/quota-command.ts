@@ -53,6 +53,8 @@ export function parseCapacitySnapshot(raw: unknown): Map<string, RouteObservatio
 export function commandQuotaFeed(command: readonly string[], ttlMs = 60_000, format: "check-rate" | "capacity-v1" = "check-rate"): (id: string) => Promise<RouteObservation | undefined> {
   let expires = 0
   let pending: Promise<Map<string, RouteObservation>> | undefined
+  let retry: Promise<Map<string, RouteObservation>> | undefined
+  let missing = new Set<string>()
   const fetch = async (): Promise<Map<string, RouteObservation>> => {
     try {
       const { stdout } = await run(command[0]!, command.slice(1), { timeout: 5_000, maxBuffer: 1_000_000 })
@@ -65,8 +67,33 @@ export function commandQuotaFeed(command: readonly string[], ttlMs = 60_000, for
     if (!pending || Date.now() >= expires) {
       expires = Date.now() + ttlMs
       pending = fetch()
+      retry = undefined
+      missing = new Set()
     }
-    return (await pending).get(id)
+    const snapshot = await pending
+    if (snapshot.has(id)) return snapshot.get(id)
+    missing.add(id)
+    // A failed command or a partial provider snapshot is unknown, not zero.
+    // Retry once per shared snapshot so simultaneous children don't stampede
+    // the quota endpoint. Never use a previous positive reading in place of a
+    // confirmed zero or a still-unknown result.
+    if (!retry) {
+      const original = pending
+      retry = fetch().then((fresh) => {
+        if (pending === original) {
+          // Keep known readings from the first snapshot if only one provider
+          // failed on the retry. Unknowns get a short TTL, not a full minute.
+          pending = Promise.resolve(new Map([...snapshot, ...fresh]))
+          if ([...missing].some((pool) => !fresh.has(pool) && !snapshot.has(pool))) {
+            expires = Math.min(expires, Date.now() + 5_000)
+          }
+        }
+        return fresh
+      })
+    }
+    const fresh = await retry
+    if (!fresh.has(id)) expires = Math.min(expires, Date.now() + 5_000)
+    return fresh.get(id) ?? snapshot.get(id)
   }
 }
 

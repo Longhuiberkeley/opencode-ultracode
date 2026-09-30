@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
-import { ModelRouter, parseModelRouting } from "../src/model-routing.ts"
+import { ModelRouter, parseModelRouting, tierLadder } from "../src/model-routing.ts"
 
 const profile = parseModelRouting({
   timezone: "Asia/Hong_Kong",
@@ -71,6 +71,64 @@ test("unknown quotas allow reserved plans by default; explicit false fails close
   const decision = await unreserved.select({ role: "reviewer", now: night, quota: dead })
   assert.equal(decision.model?.providerID, "xiaomi")
   assert.ok(decision.skipped.some((s) => s.includes("quota exhausted")), decision.skipped.join("; "))
+})
+
+test("enabled: false returns the pin decision before any tier work, even for explicit hints", async () => {
+  const router = new ModelRouter(parseModelRouting({
+    timezone: "UTC",
+    enabled: false,
+    roles: { general: "strong" },
+    tiers: { strong: { plans: [[{ model: "p/plan" }]], payg: [] } },
+  }))
+  // A role-mapped agent keeps its pin.
+  assert.deepEqual(await router.select({ role: "general" }),
+    { reason: "routing disabled; use agent pin", skipped: [] })
+  // An explicit hint does not throw the empty-tier error either: same pin decision.
+  assert.deepEqual(await router.select({ role: "general", tier: "strong" }),
+    { reason: "routing disabled; use agent pin", skipped: [] })
+  // The check runs FIRST: even an unknown tier name is never resolved.
+  assert.deepEqual(await router.select({ role: "unmapped", tier: "missing" }),
+    { reason: "routing disabled; use agent pin", skipped: [] })
+  // Omitted enabled defaults to on; a non-boolean is rejected at parse time.
+  assert.equal(parseModelRouting({ timezone: "UTC", roles: {}, tiers: {} }).enabled, true)
+  assert.throws(() => parseModelRouting({ timezone: "UTC", enabled: "off", roles: {}, tiers: {} }),
+    /routing\.enabled must be a boolean/)
+  const on = new ModelRouter(parseModelRouting({
+    timezone: "UTC", enabled: true, roles: { general: "strong" },
+    tiers: { strong: { plans: [[{ model: "p/plan" }]], payg: [] } },
+  }))
+  assert.equal((await on.select({ role: "general" })).model?.id, "plan")
+})
+
+test("fail-closed skips every plans candidate on an unknown feed, reserved or not", async () => {
+  const strict = new ModelRouter(parseModelRouting({
+    timezone: "UTC", roles: { general: "strong" }, allowUnknownQuota: false,
+    tiers: { strong: { plans: [[{ model: "p/unreserved" }]], payg: [[{ model: "p/paid" }]] } },
+  }))
+  // Unknown feed + fail-closed: the unreserved plan skips; PAYG stays blind.
+  const unknown = await strict.select({ role: "general" })
+  assert.equal(unknown.model?.id, "paid")
+  assert.ok(unknown.skipped.includes("p/unreserved: quota unknown"), unknown.skipped.join("; "))
+  // Same unknown feed with the default (allow): the unreserved plan is eligible.
+  const lenient = new ModelRouter(parseModelRouting({
+    timezone: "UTC", roles: { general: "strong" },
+    tiers: { strong: { plans: [[{ model: "p/unreserved" }]], payg: [] } },
+  }))
+  assert.equal((await lenient.select({ role: "general" })).model?.id, "unreserved")
+  // Reserved+unknown PAYG still fail-closes (unchanged).
+  const reservedPayg = new ModelRouter(parseModelRouting({
+    timezone: "UTC", roles: { general: "strong" }, allowUnknownQuota: false,
+    tiers: { strong: { plans: [], payg: [[{ model: "p/reserved", reservePercent: 20 }]] } },
+  }))
+  await assert.rejects(reservedPayg.select({ role: "general" }), /p\/reserved: quota unknown/)
+  // A known zero stays a hard stop for plans even with the default (allow).
+  const known = new ModelRouter(parseModelRouting({
+    timezone: "UTC", roles: { general: "strong" },
+    tiers: { strong: { plans: [[{ model: "p/unreserved" }]], payg: [[{ model: "p/paid" }]] } },
+  }))
+  const dead = await known.select({ role: "general", quota: async () => ({ remainingPercent: 0 }) })
+  assert.equal(dead.model?.id, "paid")
+  assert.ok(dead.skipped.includes("p/unreserved: quota exhausted"), dead.skipped.join("; "))
 })
 
 test("routing validation rejects unsafe hours and unknown role tiers", () => {
@@ -395,4 +453,113 @@ test("ordered tiers stay permissive about a pin repeated across groups and rotat
   assert.throws(() => parseModelRouting({ timezone: "UTC", roles: {}, tiers: {
     a: { selection: "weighted", plans: [[{ model: "p/dup" }, { model: "p/dup" }]], payg: [] },
   } }), /routing tier a lists p\/dup twice/)
+})
+
+const shelf = (model: string) => ({ plans: [[{ model }]], payg: [] })
+const bare = { plans: [], payg: [] }
+
+test("ladder: defaults to tier key order; a configured ladder leads and unlisted tiers follow", () => {
+  const tiers = { lite: bare, standard: bare, strong: bare }
+  assert.deepEqual(tierLadder(parseModelRouting({ timezone: "UTC", roles: {}, tiers })), ["lite", "standard", "strong"])
+  assert.deepEqual(tierLadder(parseModelRouting({ timezone: "UTC", roles: {}, tiers, ladder: ["strong", "lite"] })), ["strong", "lite", "standard"])
+  assert.throws(() => parseModelRouting({ timezone: "UTC", roles: {}, tiers, ladder: ["lite", "nope"] }), /routing\.ladder must list defined tiers/)
+  assert.throws(() => parseModelRouting({ timezone: "UTC", roles: {}, tiers, ladder: ["lite", "lite"] }), /routing\.ladder must list defined tiers/)
+})
+
+test("validation: unknown top-level routing keys and bad descriptions are rejected", () => {
+  assert.throws(() => parseModelRouting({ timezone: "UTC", roles: {}, tiers: {}, allowUnknownQuotas: false }), /unknown routing key allowUnknownQuotas/)
+  assert.throws(() => parseModelRouting({ timezone: "UTC", roles: {}, tiers: { a: { ...bare, description: "" } } }), /description must be 1\.\.200 characters/)
+  assert.equal(parseModelRouting({ timezone: "UTC", roles: {}, tiers: { a: { ...bare, description: " hard review " } } }).tiers.a!.description, "hard review")
+})
+
+test("an unknown tier hint falls back to the role default, or the pin without one", async () => {
+  const router = new ModelRouter(parseModelRouting({ timezone: "UTC", roles: { reviewer: "strong" }, tiers: { strong: shelf("p/strong") } }))
+  const mapped = await router.select({ role: "reviewer", tier: "opus-class" })
+  assert.equal(mapped.model?.id, "strong")
+  assert.equal(mapped.reason, "unknown tier opus-class; using role default: plan strong: p/strong")
+  assert.deepEqual(await router.select({ role: "general", tier: "opus-class" }),
+    { reason: "unknown tier opus-class; using role default: no tier configured; use agent pin", skipped: [] })
+})
+
+test("a hint on an empty tier takes the nearest populated tier: lower first, then higher", async () => {
+  const lowerFirst = new ModelRouter(parseModelRouting({ timezone: "UTC", roles: {},
+    tiers: { lite: shelf("p/lite"), standard: shelf("p/standard"), strong: bare, frontier: shelf("p/frontier") } }))
+  const down = await lowerFirst.select({ role: "general", tier: "strong" })
+  assert.equal(down.model?.id, "standard")
+  assert.equal(down.reason, "strong empty -> standard: plan standard: p/standard")
+  assert.deepEqual(down.fallbackChain, ["strong", "standard"])
+  const up = await new ModelRouter(parseModelRouting({ timezone: "UTC", roles: {},
+    tiers: { lite: bare, standard: bare, strong: shelf("p/strong") } })).select({ role: "general", tier: "lite" })
+  assert.equal(up.model?.id, "strong")
+  // The configured ladder, not key order, decides what "lower" means.
+  const reordered = await new ModelRouter(parseModelRouting({ timezone: "UTC", roles: {}, ladder: ["cheap", "mid", "top"],
+    tiers: { top: shelf("p/top"), mid: bare, cheap: shelf("p/cheap") } })).select({ role: "general", tier: "mid" })
+  assert.equal(reordered.model?.id, "cheap")
+})
+
+test("degrade is for explicit hints only and never jumps past a gated tier", async () => {
+  const router = new ModelRouter(parseModelRouting({ timezone: "UTC", roles: { general: "strong" },
+    tiers: { standard: shelf("p/standard"), strong: bare, frontier: shelf("q/frontier") } }))
+  // A role mapped to an empty tier keeps its pin.
+  assert.deepEqual(await router.select({ role: "general" }), { reason: "tier strong is empty; use agent pin", skipped: [] })
+  // The nearest populated tier is gated: fail loud rather than spend the stronger shelf.
+  await assert.rejects(router.select({ role: "general", tier: "strong", disabled: new Set(["p"]) }),
+    /strong empty -> standard: no eligible standard model for general: p\/standard: provider offline/)
+})
+
+test("a failover re-select names the provider the child died on", async () => {
+  const router = new ModelRouter(parseModelRouting({ timezone: "UTC", roles: { general: "a" },
+    tiers: { a: { plans: [[{ model: "p/x" }], [{ model: "q/y" }]], payg: [] } } }))
+  const decision = await router.select({ role: "general", failed: new Set(["p"]) })
+  assert.equal(decision.model?.providerID, "q")
+  assert.deepEqual(decision.skipped, ["p/x: provider failed over"])
+})
+
+const windowed = (extra: Record<string, unknown> = {}) => parseModelRouting({
+  timezone: "Asia/Hong_Kong", roles: { general: "standard" }, ...extra,
+  tiers: { standard: { selection: "weighted", plans: [[
+    { model: "openai/a", weight: 14 },
+    { model: "xai/b", weight: 5, weightWindows: [{ hours: [22, 8], weight: 2 }, { hours: [0, 4], weight: 9 }] },
+  ]], payg: [] } },
+})
+const tally = async (router: ModelRouter, draws: number, input: { now: Date; quota?: (id: string) => Promise<{ remainingPercent?: number } | undefined> }) => {
+  const counts: Record<string, number> = {}
+  for (let i = 0; i < draws; i++) {
+    const id = (await router.select({ role: "general", ...input })).model!.providerID
+    counts[id] = (counts[id] ?? 0) + 1
+  }
+  return counts
+}
+
+test("weightWindows replace the weight inside the window (wrapping midnight); the first match wins", async () => {
+  const day = new Date("2026-09-23T06:00:00Z") // 14:00 HKT
+  const night = new Date("2026-09-23T18:00:00Z") // 02:00 HKT, inside both windows
+  assert.deepEqual(await tally(new ModelRouter(windowed()), 19, { now: day }), { openai: 14, xai: 5 })
+  assert.deepEqual(await tally(new ModelRouter(windowed()), 16, { now: night }), { openai: 14, xai: 2 })
+  const decision = await new ModelRouter(windowed()).select({ role: "general", now: night })
+  assert.deepEqual(decision.pool?.map((entry) => entry.weight), [14, 2])
+})
+
+test("routing validation rejects bad weightWindows and windows on an ordered tier", () => {
+  const withWindows = (weightWindows: unknown, selection?: string) => () => parseModelRouting({ timezone: "UTC", roles: {}, tiers: { t: {
+    ...(selection ? { selection } : {}), plans: [[{ model: "p/a", weightWindows }]], payg: [] } } })
+  assert.throws(withWindows([{ hours: [22, 22], weight: 2 }], "weighted"), /invalid routing weightWindows/)
+  assert.throws(withWindows([{ hours: [22, 8], weight: 0 }], "weighted"), /invalid routing weightWindows/)
+  assert.throws(withWindows([{ hours: [22, 8], weight: 2, extra: 1 }], "weighted"), /invalid routing weightWindows/)
+  assert.throws(withWindows([], "weighted"), /invalid routing weightWindows/)
+  assert.throws(withWindows([{ hours: [22, 8], weight: 2 }]), /needs a weighted tier/)
+  assert.doesNotThrow(withWindows([{ hours: [22, 8], weight: 2 }], "weighted"))
+})
+
+test("quotaWeighting scales weights by known remaining quota and leaves unknown feeds alone", async () => {
+  const day = new Date("2026-09-23T06:00:00Z") // 14:00 HKT
+  const quota = async (id: string) => ({ remainingPercent: id === "openai" ? 100 : 10 })
+  // openai 14 x1.5 = 21, xai 5 x0.6 = 3
+  const decision = await new ModelRouter(windowed({ quotaWeighting: true })).select({ role: "general", now: day, quota })
+  assert.deepEqual(decision.pool?.map((entry) => entry.weight), [21, 3])
+  assert.deepEqual(await tally(new ModelRouter(windowed({ quotaWeighting: true })), 24, { now: day, quota }), { openai: 21, xai: 3 })
+  // Off by default, and an unknown feed keeps the configured weight.
+  assert.deepEqual((await new ModelRouter(windowed()).select({ role: "general", now: day, quota })).pool?.map((entry) => entry.weight), [14, 5])
+  assert.deepEqual((await new ModelRouter(windowed({ quotaWeighting: true })).select({ role: "general", now: day })).pool?.map((entry) => entry.weight), [14, 5])
+  assert.throws(() => windowed({ quotaWeighting: "yes" }), /quotaWeighting must be a boolean/)
 })

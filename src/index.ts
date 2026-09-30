@@ -37,8 +37,15 @@ import {
 import { loadOptions } from "./config.ts"
 import { capacityFeed } from "./quota-command.ts"
 import { defaultProviderQuarantineDir } from "./provider-quarantine.ts"
-import { estimateRequestInput } from "./child-context.ts"
-import { CATALOG_RUN_LIMIT, CATALOG_RUN_SCAN, buildCatalog } from "./catalog.ts"
+import {
+  OWNER_HEARTBEAT_INTERVAL_MS,
+  maybeRefreshOwnerLiveness,
+  ownerLivenessProbe,
+  removeOwnerLiveness,
+  writeOwnerLiveness,
+} from "./owner-liveness.ts"
+import { estimateAndRecordRequestInput } from "./child-context.ts"
+import { CATALOG_RUN_LIMIT, CATALOG_RUN_SCAN, buildCatalog, routingSummary } from "./catalog.ts"
 import { applyResumeRemember, controlRun, controlToolContent } from "./control.ts"
 import {
   applyOverlay,
@@ -54,20 +61,27 @@ import { ULTRACODE_RPC } from "./rpc-definition.ts"
 import { steerRun } from "./steer.ts"
 import {
   agentStatusKey,
+  collectRemoteRunChanges,
   collectRunStatus,
   hasRpcRegister,
   isFinalRunStatus,
+  persistedActivityFor,
   runStateTransition,
   settingsPayload,
+  stepEventContext,
+  stripUndefined,
 } from "./run-status.ts"
 import { agentUsable, collectAgentPins, lookupAgentPin, normalizeModelRef, parseModelPin, readDisabledProviders } from "./agent-pins.ts"
 import { RegistryImpl } from "./registry.ts"
+import { REMOTE_DEADLINE_GRACE_MS } from "./registry.ts"
+import type { OrphanPlan, RunRecord } from "./types.ts"
+import { harvestOrphanedRun } from "./harvest.ts"
 import { emptyToolEventState } from "./run-events.ts"
 import { EMPTY_CATALOG, SKILL_CONTENT, SKILL_DESCRIPTION, SKILL_NAME, buildSkillContent } from "./skill-content.ts"
 import { compileGraphSpec, validateGraphSpec } from "./graph.ts"
 import type { GraphSpec } from "./graph.ts"
 import { SCRIPT_TEMPLATES, scriptTemplate } from "./script-templates.ts"
-import { StorageImpl, normalizePath, readProjectWorkflowFile, resolveContainedPath, sha256 } from "./storage.ts"
+import { StorageImpl, normalizePath, readProjectWorkflowFile, refreshRunsIfStale, resolveContainedPath, sha256 } from "./storage.ts"
 import {
   resolveBackground,
   validateCatalogToolInput,
@@ -536,6 +550,10 @@ export default Plugin.define({
     const projectID = String(ctx.location?.project?.id ?? projectRoot)
     const installDir = pluginInstallDir()
     const bootID = randomBootID()
+    // Machine-wide owner liveness: lets sibling processes tell "owner still
+    // running elsewhere" from "owner died with the last restart" when they
+    // reconcile persisted runs at startup. Removed on graceful dispose.
+    writeOwnerLiveness(bootID)
     const personalWorkflowDir = normalizePath(
       `${process.env["HOME"] ?? homedir()}/.config/opencode/workflows`,
     )
@@ -660,6 +678,9 @@ export default Plugin.define({
     const registry = new RegistryImpl({
       persist: (record) => {
         storage.saveRun(record)
+        // Piggyback the owner-liveness refresh on run persists (throttled):
+        // an idle-but-alive lane keeps its marker fresh without a timer.
+        maybeRefreshOwnerLiveness(bootID)
         const prev = emitPrev.get(record.id)
         const event = runStateTransition(prev, record)
         if (isFinalRunStatus(record.status)) emitPrev.delete(record.id)
@@ -668,30 +689,187 @@ export default Plugin.define({
         if (event && emit) {
           let runningCount = 0
           for (const agent of record.agents) if (agent.status === "running") runningCount++
-          void emit("runState", {
+          void emit("runState", stripUndefined({
             ...event,
             parentSessionID: record.parentSessionID,
             projectID,
             directory: record.directory ?? ctx.location.directory,
             runningCount,
-          }).catch(() => {})
+          })).catch(() => {})
         }
       },
       loader: () => storage.loadRuns(),
       bootID,
+      ownerProbe: ownerLivenessProbe(),
     })
+
+    /**
+     * Owner heartbeat, independent of child progress: refresh this boot's
+     * machine-wide marker and every active owned run's `owner.updatedAt` on a
+     * fixed cadence. Before this existed both refreshed only on run persists,
+     * so one legitimately silent long-running child starved the heartbeat —
+     * live owners rendered "ext stale" and drifted toward the orphan window.
+     * Unref'd: the timer must never hold the event loop open.
+     */
+    const heartbeatTimer = setInterval(() => {
+      try {
+        writeOwnerLiveness(bootID)
+        registry.touchActiveOwned()
+      } catch {
+        // best effort — never throw from the event loop
+      }
+    }, OWNER_HEARTBEAT_INTERVAL_MS)
+    heartbeatTimer.unref?.()
+
+    /**
+     * Refresh-if-stale persisted runs before a panel/command read and push a
+     * runState event for every remote-owned run that moved on the refresh.
+     * `isLive` means OWNED by this process (registry.ownsRun), not merely
+     * present: a run adopted at reconcile from a live remote owner is
+     * readable in this registry but its owner's writes still arrive via the
+     * KV, so those changes push here too. This process's own runs emit
+     * through their persist callback instead. `emitRunState` is assigned
+     * after RPC registration; handlers run later, so it is populated by call
+     * time (a missing channel just skips the push).
+     */
+    const refreshPersistedRuns = async (): Promise<void> => {
+      const before = storage.loadRuns()
+      if (!(await refreshRunsIfStale(storage))) return
+      const emit = emitRunState
+      if (!emit) return
+      const changes = collectRemoteRunChanges({
+        before,
+        after: storage.loadRuns(),
+        isLive: (id) => registry.ownsRun(id),
+        projectID,
+        directory: ctx.location.directory,
+      })
+      for (const data of changes) {
+        void emit("runState", data).catch(() => {})
+      }
+    }
+
+    // Persisted-activity fallback (stalledMs across restarts): the live map
+    // dies with the owner process; the throttled record does not.
+    const persistedActivity = persistedActivityFor(registry)
 
     const controller = new AbortController()
     const registrations: RegistrationLike[] = []
 
+    /**
+     * One reconcile pass (startup AND periodic): refresh persisted runs from
+     * the KV, then re-classify every active record this process does NOT
+     * supervise. Runs whose owner is provably gone (dead pid after SIGKILL,
+     * dead/absent marker, or a pid-less marker past the orphan heartbeat
+     * window) flip to `interrupted` carrying a resume hint. Locally
+     * supervised runs are never touched here — their live RunState and run
+     * watchdog are authoritative — and mirrors of provably live remote owners
+     * are left to that owner. This is the fix for the frozen-`running` wedge:
+     * reconcile used to run at startup only, so an adopted record outlived
+     * every TTL as a zombie.
+     */
+    const reconcileOnce = async (): Promise<number> => {
+      try {
+        await refreshPersistedRuns()
+      } catch {
+        // best effort — a refresh failure must not block classification
+      }
+      let plans: OrphanPlan[] = []
+      try {
+        plans = registry.classifyOrphans({ recheckAdopted: true })
+      } catch {
+        return 0
+      }
+      let flipped = 0
+      for (const plan of plans) {
+        // Harvest BEFORE flipping: salvage children the dead owner's sessions
+        // finished on their own (OpenCode recovery completes mid-flight
+        // children). Validated successes become warm-replayable rows; the
+        // flip then interrupts only what genuinely never finished.
+        try {
+          const report = await harvestOrphanedRun(plan.record, {
+            sessions,
+            updateAgent: (runID, agentID, patch) => registry.updateAgent(runID, agentID, patch),
+          })
+          if (report.harvested > 0) {
+            warn(`harvested ${report.harvested} succeeded child(ren) from ${plan.record.id} before interrupt (warm-resumable)`)
+          }
+          registry.appendEvent(
+            plan.record.id,
+            "harvest",
+            `${report.harvested} succeeded, ${report.unresolvable} unresolvable`,
+          )
+        } catch {
+          // best effort — the flip below still bounds the record
+        }
+        if (registry.applyOrphanInterrupt(plan)) {
+          registry.appendEvent(plan.record.id, "reconcile", `owner dead — interrupted`)
+          flipped++
+        }
+      }
+      // Deadline enforcement for records whose owner is ALIVE but stopped
+      // enforcing its own timeout (wedged watchdog — the heartbeat timer
+      // outlives it): the run's 90-minute timeout must fire even when the
+      // arming process died with the timer (the second incident's zombie).
+      // The grace makes the owner's own watchdog win whenever it works.
+      let expired: Array<{ record: RunRecord; deadlineAt: number }> = []
+      try {
+        expired = registry.expiredRemoteRuns(Date.now(), REMOTE_DEADLINE_GRACE_MS)
+      } catch {
+        expired = []
+      }
+      for (const item of expired) {
+        const overdueMs = Date.now() - item.deadlineAt
+        const reason =
+          `timeout — run deadline passed ${Math.round(overdueMs / 1000)}s ago while its owner stopped enforcing it; ` +
+          `resumable via /ultracode rerun ${item.record.id} --warm`
+        try {
+          await harvestOrphanedRun(item.record, {
+            sessions,
+            updateAgent: (runID, agentID, patch) => registry.updateAgent(runID, agentID, patch),
+          })
+        } catch {
+          // best effort
+        }
+        if (registry.applyOrphanInterrupt({ record: item.record, reason })) {
+          registry.appendEvent(
+            item.record.id,
+            "reconcile",
+            `deadline passed ${Math.round(overdueMs / 1000)}s ago, owner unresponsive — interrupted`,
+          )
+          flipped++
+          warn(`periodic reconcile timed out run ${item.record.id} (deadline passed, owner unresponsive)`)
+        }
+      }
+      return flipped
+    }
+
     // Async warm-up (never blocks setup on session admission; kv only).
     const runsReconciled = storage
       .loadRunsAsync()
-      .then(() => {
-        const flipped = registry.reconcileOrphans()
-        if (flipped > 0) warn(`marked ${flipped} orphaned run(s) as interrupted (server restart)`)
+      .then(async () => {
+        const flipped = await reconcileOnce()
+        if (flipped > 0) warn(`marked ${flipped} orphaned run(s) as interrupted (owner gone; resumable via /ultracode rerun --warm)`)
       })
       .catch((err) => warn("failed to reconcile persisted runs", err))
+
+    // Periodic reconcile: no active record may stay `running` without a live
+    // owner, no matter how long this process lives. Unref'd; 0 disables.
+    // (baseOptions: the runtime overlay never carries this key.)
+    let reconcileTimer: ReturnType<typeof setInterval> | undefined
+    if (baseOptions.reconcileIntervalMs > 0) {
+      reconcileTimer = setInterval(
+        () => {
+          void reconcileOnce()
+            .then((flipped) => {
+              if (flipped > 0) warn(`periodic reconcile marked ${flipped} orphaned run(s) as interrupted`)
+            })
+            .catch(() => {})
+        },
+        baseOptions.reconcileIntervalMs,
+      )
+      reconcileTimer.unref?.()
+    }
 
     void (async () => {
       try {
@@ -1195,7 +1373,7 @@ export default Plugin.define({
             name: "status",
             options: { namespace: "ultracode" },
             description:
-              "Read-only status of an ultracode run owned by this conversation. Input { runID?, waitMs? } (omit runID → single active owned run). Returns { runID, status, agents: { done, total, failed }, startedAt, elapsedMs, children: [{ agentID, sessionID?, label?, phase?, status, contextTokens? (input+cache of the child's LAST completed request — the statusline-style current context), tokens? (cumulative), toolCalls?, stalledMs?, waitingForPermission? }] } and, once settled, the full result inline when it fits the size cap, else resultPreview + resultTruncated + resultChars (fetch the rest with ultracode_result). While RUNNING the payload carries retryAfterMs + hint: do NOT busy-poll — a settle notice wakes this session on completion; pass waitMs to block, or wait ≥ retryAfterMs between checks. Re-polls faster than retryAfterMs are throttled (throttled: true).",
+              "Read-only status of an ultracode run owned by this conversation. Input { runID?, waitMs? } (omit runID → single active owned run). Returns { runID, status, agents: { done, total, failed }, startedAt, elapsedMs, children: [{ agentID, sessionID?, label?, phase?, status, contextTokens? (input+cache of the child's most recent request that exposed usage — the statusline-style current context), tokens? (cumulative), toolCalls?, stalledMs?, waitingForPermission? }] } and, once settled, the full result inline when it fits the size cap, else resultPreview + resultTruncated + resultChars (fetch the rest with ultracode_result). While RUNNING the payload carries retryAfterMs + hint: do NOT busy-poll — a settle notice wakes this session on completion; pass waitMs to block, or wait ≥ retryAfterMs between checks. Re-polls faster than retryAfterMs are throttled (throttled: true).",
             input: STATUS_TOOL_INPUT_SCHEMA,
             execute: async (rawInput: unknown, tool) => {
               try {
@@ -1219,7 +1397,7 @@ export default Plugin.define({
                     registry.get(runID),
                     Date.now(),
                     options.maxResultChars,
-                    (sid) => supervisor?.childActivity(sid),
+                     (sid) => supervisor?.childActivity(sid) ?? persistedActivity(sid),
                   )
                   const children = await Promise.all(
                     (payload.children as Array<StatusChildView & { sessionID?: string }>).map(async (c) =>
@@ -1346,7 +1524,7 @@ export default Plugin.define({
           name: "catalog",
           options: { namespace: "ultracode" },
           description:
-            "Read-only discovery of what this project can run: saved workflows (kind, params (names always; JSON types only when declared — explicit params, a // Tool input: header, or a saved run's real args; graph-derived params are names only), phases, required agents, trust state, last-run stats from THIS conversation), the available agent ids, the live caps (concurrency, maxAgents, timeoutMs, maxLoopDepth, maxLoopIterations), graph templates to adapt, and script templates (staged-delivery, verify-fix) for loop-shaped work graphs cannot express. Call it BEFORE choosing a saved workflow or authoring from a blank page — cheaper than reading workflow files, and it executes nothing. Input { workflow? | template? | templates? | scriptTemplate? | scriptTemplates? }: no input returns the whole bounded catalog; one view per call. A workflow listed as trusted can be run immediately; an untrusted one needs the user's /ultracode trust first (relay that, never work around it).",
+            "Read-only discovery of what this project can run: saved workflows (kind, params (names always; JSON types only when declared — explicit params, a // Tool input: header, or a saved run's real args; graph-derived params are names only), phases, required agents, trust state, last-run stats from THIS conversation), the available agent ids, the live caps (concurrency, maxAgents, timeoutMs, maxLoopDepth, maxLoopIterations, and — when the user configured model routing — caps.routing: the difficulty tiers cheapest first with the user's description of each, plus agent → default tier roles), graph templates to adapt, and script templates (staged-delivery, verify-fix) for loop-shaped work graphs cannot express. Call it BEFORE choosing a saved workflow or authoring from a blank page — cheaper than reading workflow files, and it executes nothing. Input { workflow? | template? | templates? | scriptTemplate? | scriptTemplates? }: no input returns the whole bounded catalog; one view per call. A workflow listed as trusted can be run immediately; an untrusted one needs the user's /ultracode trust first (relay that, never work around it).",
           input: CATALOG_TOOL_INPUT_SCHEMA,
           execute: async (rawInput: unknown, tool) => {
             try {
@@ -1381,22 +1559,7 @@ export default Plugin.define({
                   // input may tighten below (never raise).
                   maxLoopDepth: options.maxLoopDepth,
                   maxLoopIterations: MAX_LOOP_ITERATIONS,
-                  // Routing summary for authoring-time tier hints: only
-                  // non-empty tiers are hintable (an explicit hint on an empty
-                  // tier without a fallback throws at spawn).
-                  ...(options.routing
-                    ? {
-                        routing: {
-                          tiers: Object.entries(options.routing.tiers)
-                            .filter(([, tier]) => tier.plans.length > 0 || tier.payg.length > 0)
-                            .map(([name, tier]) => ({
-                              name,
-                              models: tier.plans.flat().length + tier.payg.flat().length,
-                            })),
-                          roles: { ...options.routing.roles },
-                        },
-                      }
-                    : {}),
+                  ...(options.routing ? { routing: routingSummary(options.routing) } : {}),
                 },
                 ...(parsed.templates !== undefined ? { templates: parsed.templates } : {}),
                 ...(parsed.template !== undefined ? { template: parsed.template } : {}),
@@ -1423,6 +1586,7 @@ export default Plugin.define({
               supervisor: supervisor ?? undefined,
               supervisorError,
               reconciled: runsReconciled,
+              reconcileNow: () => reconcileOnce(),
               rememberFallback: rememberFallbackEntry,
             }),
         })
@@ -1437,8 +1601,23 @@ export default Plugin.define({
           execute: async (raw, tool) => {
             try {
               const input = raw as { runID: string; text: string; agentID?: string }
-              const target = await steerRun(registry.get(input.runID), tool.sessionID, input, (request) => ctx.session.prompt(request))
-              return { content: JSON.stringify({ ...target, accepted: true, delivery: "steer" }) }
+              // On-demand reconcile first: an orphaned run must read
+              // interrupted here, so the refusal is truthful immediately.
+              await runsReconciled
+              await reconcileOnce().catch(() => {})
+              const target = await steerRun(registry.get(input.runID), tool.sessionID, input, {
+                prompt: (request) => ctx.session.prompt(request),
+                sessionState: async (sessionID) => {
+                  try {
+                    const info = await sessions.get({ sessionID })
+                    return { outcome: info.outcome }
+                  } catch {
+                    return undefined // unreadable ⇒ no evidence of idle: never block on a probe failure
+                  }
+                },
+                isLocallyLive: (runID) => supervisor?.hasLiveState?.(runID) === true,
+              })
+              return { content: JSON.stringify({ ...target, accepted: true }) }
             } catch (error) {
               return { content: `error: ${describeError(error)}` }
             }
@@ -1461,6 +1640,7 @@ export default Plugin.define({
           say,
           projectRoot,
           personalWorkflowDir,
+          bootID,
           pendingPermissions,
           prepare: async () => {
             await runsReconciled
@@ -1565,6 +1745,7 @@ export default Plugin.define({
             input: { action?: unknown; runID?: unknown; model?: unknown; remember?: unknown } | undefined,
           ) => {
             await runsReconciled
+            await reconcileOnce().catch(() => {})
             const parsed = validateControlToolInput(input)
             if (!parsed.ok) throw new Error(parsed.error)
             if (!supervisor) throw new Error(supervisorError ?? "workflow tool unavailable")
@@ -1601,11 +1782,19 @@ export default Plugin.define({
             includeFinished?: boolean
           } | undefined) => {
             await runsReconciled
+            // Cross-process visibility: runs owned by another opencode process
+            // live only in the KV, so refresh-if-stale before serving (and push
+            // runState for any remote run that moved since the last scan).
+            await refreshPersistedRuns()
             const runID = typeof input?.runID === "string" && input.runID !== "" ? input.runID : undefined
             const sessionID = typeof input?.sessionID === "string" && input.sessionID !== "" ? input.sessionID : undefined
             const limit = typeof input?.limit === "number" && Number.isFinite(input.limit) ? input.limit : undefined
             const includeFinished = typeof input?.includeFinished === "boolean" ? input.includeFinished : undefined
             return {
+              // stripUndefined: the host validates this object against the RPC
+              // output schema as a live JS value; any key present with value
+              // undefined (e.g. contextTokens on an agent that never completed
+              // a request) fails the whole call with rpc.invalid_output.
               runs: collectRunStatus({
                 runID,
                 sessionID,
@@ -1616,8 +1805,9 @@ export default Plugin.define({
                 persistedList: () => storage.loadRuns(),
                 projectID,
                 directory: ctx.location.directory,
-                activityFor: (sid) => supervisor?.childActivity(sid),
-              }),
+                bootID,
+                activityFor: (sid) => supervisor?.childActivity(sid) ?? persistedActivity(sid),
+              }).map(stripUndefined),
             }
           },
           settings: async (input: { runID?: string } | undefined) => {
@@ -1647,7 +1837,12 @@ export default Plugin.define({
         if (!registry.isOwnedActive(event.sessionID)) return
         const limit = supervisor?.contextLimitFor?.(event.sessionID, event.model)
         if (!limit) return
-        const estimate = estimateRequestInput(event.system, event.messages, event.tools)
+        // Calibration is per provider/model: a variant picks a different limit
+        // entry but not a different bytes->context ratio for the same model.
+        // The hook stores the serialized bytes for the measured sample that
+        // lands in primitives.ts once this request settles.
+        const pin = `${event.model.providerID}/${event.model.id}`
+        const estimate = estimateAndRecordRequestInput(event.sessionID, pin, event.system, event.messages, event.tools)
         if (estimate >= limit.hardInput) {
           // Message contract, not a class: the worker bridge serializes errors to
           // e.message, so the stable greppable prefix is the typing.
@@ -1661,6 +1856,40 @@ export default Plugin.define({
       })
       registrations.push(reg as unknown as RegistrationLike)
     } catch (err) { warn("child context guard unavailable", err) }
+
+    // ---- live per-request context feed: session.step.ended → contextTokens ----
+    // Every completed model step carries its own usage; requestContext() of it
+    // is the statusline-style "current context" of the child's latest request.
+    // Feeding it live means RUNNING children show a real number (not "-") and
+    // INTERRUPTED children keep the last one — registry patches merge, so the
+    // terminal status write never clears it. Only primary agent-loop steps fire
+    // this event (title/compaction have their own event types), so the value is
+    // taken as-is; a step with no usable usage is skipped by stepEventContext.
+    try {
+      const stream = (ctx as unknown as {
+        event?: { subscribe?: () => AsyncIterable<unknown> }
+      }).event?.subscribe?.()
+      if (stream && typeof stream[Symbol.asyncIterator] === "function") {
+        void (async () => {
+          try {
+            for await (const ev of stream) {
+              if (disposed) break
+              const step = stepEventContext(ev)
+              if (step === undefined) continue
+              const owned = registry.agentForSession(step.sessionID)
+              if (owned === undefined) continue
+              const agent = registry.getAgent(owned.runID, owned.agentID)
+              if (agent === undefined || agent.status !== "running") continue
+              registry.updateAgent(owned.runID, owned.agentID, { contextTokens: step.contextTokens })
+            }
+          } catch {
+            // stream ended or transport dropped — terminal paths still record context
+          }
+        })()
+      }
+    } catch (err) {
+      warn("step context feed unavailable", err)
+    }
 
     // ---- prompt hook: attach the authoring skill on a standalone "ultracode" keyword ----
     try {
@@ -1934,6 +2163,8 @@ export default Plugin.define({
       disposed = true
       skillInstalled = false
       controller.abort()
+      clearInterval(heartbeatTimer)
+      if (reconcileTimer !== undefined) clearInterval(reconcileTimer)
       for (const timer of stallTimers.values()) clearTimeout(timer)
       stallTimers.clear()
       for (const reg of registrations) {
@@ -1944,6 +2175,7 @@ export default Plugin.define({
         }
       }
       registry.dispose()
+      removeOwnerLiveness(bootID)
       if (supervisor) void supervisor.dispose()
     }
   },

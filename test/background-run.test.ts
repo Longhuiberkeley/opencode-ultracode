@@ -167,11 +167,11 @@ test("pause interaction with a background run: pause gates agent(); stop interru
   assert.equal(body.status, "running")
   const runID = body.runID
   await waitFor(() => ctx.registry.activeRuns().some((r) => r.id === runID), "background run creation")
-  assert.equal(ctx.supervisor.pause(runID), true)
+  assert.deepEqual(ctx.supervisor.pause(runID), { ok: true })
   assert.equal(ctx.registry.get(runID)?.status, "paused")
   await tick(200)
   assert.equal(ctx.sessions.sessions.size, 0, "queued agent() stays gated while paused")
-  assert.equal(ctx.supervisor.stop(runID, "user requested (/ultracode stop)"), true)
+  assert.deepEqual(ctx.supervisor.stop(runID, "user requested (/ultracode stop)"), { ok: true, mode: "local" })
   await waitFor(() => {
     const status = ctx.registry.get(runID)?.status
     return status === "stopped" || status === "interrupted"

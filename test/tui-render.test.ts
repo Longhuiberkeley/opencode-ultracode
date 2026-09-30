@@ -8,6 +8,7 @@ import { agentCells } from "../src/run-format.ts"
 import type { AgentRecord, AgentStatus, TokenUsage } from "../src/types.ts"
 import {
   STATUS_DOT,
+  agentDetailLines,
   agentRows,
   applySettleTick,
   blockedSessionIDs,
@@ -35,6 +36,7 @@ import {
   inspectPhaseList,
   inspectSelFromSelection,
   markBlockedTreeRows,
+  mergeAuthoritativeRuns,
   moveTree,
   nextSettlePrev,
   buildInspectTree,
@@ -76,6 +78,7 @@ import {
   toggleFollowPin,
   treePaneTitle,
   twoColumn,
+  type AuthoritativeSnapshot,
   type InspectPane,
   type InspectSelection,
   type PendingPermissionView,
@@ -946,9 +949,9 @@ test("phase aggregate status, dots, and detail status line (phase-row color mode
     settled: true,
     counts: { total: 3, done: 3, failed: 1 },
     agents: [
-      mk("succeeded", "s1", "scan"),
-      mk("failed", "s2", "fix"),
-      mk("succeeded", "s3", "fix"),
+      { ...mk("succeeded", "s1", "scan"), contextTokens: 84_000 },
+      { ...mk("failed", "s2", "fix"), contextTokens: 12_000 },
+      { ...mk("succeeded", "s3", "fix"), contextTokens: 200_000 },
     ],
   }
   const tree = buildInspectTree(run, { scan: true, fix: true })
@@ -958,9 +961,19 @@ test("phase aggregate status, dots, and detail status line (phase-row color mode
   const fixLine = lines.find((l) => l.includes("fix"))
   assert.ok(fixLine?.includes(MIXED_DOT), "mixed phase row carries the ◐ glyph")
   assert.ok(lines.some((l) => l.includes("scan") && l.includes(STATUS_DOT.succeeded)))
+  // Phase rows headline the MAX last-request context over their agents — the
+  // cumulative sum of turns never appears here.
+  assert.equal(tree.find((r) => r.kind === "phase" && r.id === "scan")?.label, "scan 1/1  ctx ≤ 84k")
+  assert.equal(tree.find((r) => r.kind === "phase" && r.id === "fix")?.label, "fix 2/2  ctx ≤ 200k")
+  assert.ok(lines.some((l) => l.includes("scan 1/1  ctx ≤ 84k")))
   const detail = phaseDetailLines(run, "fix")
   assert.ok(detail.some((l) => l.startsWith("status  ") && l.includes("mixed") && l.includes(MIXED_DOT)))
-  assert.ok(phaseDetailLines(run, "fix").includes("agents  2/2"))
+  assert.ok(detail.includes("agents  2/2"))
+  // Detail: max context replaces the cumulative tokens row; child chips carry
+  // each agent's own last-request context (never the cumulative sum).
+  assert.ok(detail.includes("context ≤ 200k"), detail.join(" | "))
+  assert.ok(detail.includes("✗ a1 · 12k"), detail.join(" | "))
+  assert.ok(detail.includes("✓ a1 · 200k"), detail.join(" | "))
 })
 
 test("inspectModel tree: cursor on phase ⇒ selectedSessionID is the phase's first child (Enter drills)", () => {
@@ -1020,7 +1033,7 @@ test("W3C expand/collapse: right expands then first child; left collapses / pare
   assert.equal(collapsedAgain.expanded.research, false)
 })
 
-test("phase detail lists its children (status, label, tokens) — a phase row is informative alone", () => {
+test("phase detail lists its children (status, label, last-request context) — a phase row is informative alone", () => {
   const model = inspectModel(
     TREE_SESSIONS,
     { offset: 0, selected: 0, parentSessionID: "ses_p", treeSel: { expanded: {}, cursor: { kind: "phase", id: "research" }, detailOffset: 0 } },
@@ -1030,9 +1043,54 @@ test("phase detail lists its children (status, label, tokens) — a phase row is
   assert.equal(lines[0], "research")
   assert.match(lines[1]!, /^status  /)
   assert.match(lines[2]!, /agents  \d+\/\d+/)
-  // child rows: status dot + label
+  // No child measured yet → the aggregate row has no number; the phase row's
+  // label drops the ctx fragment entirely.
+  assert.equal(lines[3], "context -")
+  // child rows: status dot + label + last-request context chip ("-" until measured)
   assert.ok(lines.slice(4).some((l) => l.includes("seeker")), "child labels appear in phase detail")
   assert.ok(lines.slice(4).some((l) => /✓|●|○|✗|■/.test(l)), "child status dots appear")
+  assert.ok(lines.slice(4).every((l) => l.endsWith(" · -")), `unknown context chips render "-": ${lines.join(" | ")}`)
+  assert.ok(!model.tree.find((r) => r.kind === "phase" && r.id === "research")!.label.includes("ctx"), "no ctx fragment without a measurement")
+})
+
+test("agentDetailLines: the statusline context is the one headline number; no cumulative spend row", () => {
+  const agent: RunAgentView = {
+    sessionID: "ses_ctx",
+    ord: "a3",
+    label: "seeker",
+    phase: "extract",
+    status: "running",
+    title: "t",
+    agent: "explore",
+    model: { providerID: "openrouter", id: "kimi" },
+    contextTokens: 18_000,
+    tokens: TOKENS_42_6K,
+    toolCalls: 4,
+  }
+  const lines = agentDetailLines(agent)
+  assert.deepEqual(lines, [
+    "a3 seeker",
+    `status  ${STATUS_DOT.running} running`,
+    "agent   explore",
+    "model   openrouter/kimi",
+    "context 18k",
+    "session ses_ctx",
+    "tools   4",
+  ])
+  // Cumulative spend never renders in the TUI (ultracode_status JSON keeps it).
+  assert.equal(lines.some((l) => l.startsWith("spent")), false)
+  const sparse: RunAgentView = { sessionID: "ses_new", status: "pending", title: "t" }
+  const sparseLines = agentDetailLines(sparse)
+  assert.equal(sparseLines.includes("context -"), true)
+  assert.equal(sparseLines.some((l) => l.startsWith("spent")), false)
+  // Drift inserts the spawn provenance line after model, before context.
+  const drifted = agentDetailLines({ ...agent, spawnModel: { providerID: "xai", id: "grok-4.7" } })
+  assert.deepEqual(drifted.slice(3, 7), [
+    "model   openrouter/kimi",
+    "spawn   xai/grok-4.7",
+    "context 18k",
+    "session ses_ctx",
+  ])
 })
 
 test("phase cursor drills into the phase's first child session (Enter works on phase rows)", () => {
@@ -1674,6 +1732,78 @@ test("runStripLines: visible picker marks follow-latest vs pinned", () => {
   const pinned = runStripLines(runs, "run_beta", { pinned: true })
   assert.match(pinned[0]!, /pinned/)
   assert.ok(pinned.some((l) => l.startsWith("* ") && l.includes("run_beta")))
+})
+
+test("runStripLines: ext/stale badges on running rows at the heartbeat boundary", () => {
+  const runningView = (runID: string, extra: Partial<RunView> = {}): RunView => ({
+    runID,
+    agents: [{ sessionID: `ses_${runID}`, status: "running", title: "t" }],
+    phases: [],
+    counts: { total: 1, done: 0, failed: 0 },
+    startedAt: 1,
+    settled: false,
+    status: "running",
+    ...extra,
+  })
+  const external = runningView("run_ext", { name: "ext-run", external: true, ownerUpdatedAt: 1_000 })
+  const plain = runningView("run_plain", { name: "plain-run" })
+  const settled = runningView("run_done", {
+    name: "done-run",
+    status: "succeeded",
+    settled: true,
+    external: true,
+    ownerUpdatedAt: 1_000,
+    agents: [{ sessionID: "ses_done", status: "succeeded", title: "t" }],
+    counts: { total: 1, done: 1, failed: 0 },
+  })
+
+  // 59s since the heartbeat: external only, no stale.
+  const fresh = runStripLines([external, plain, settled], "run_ext", undefined, 60_000)
+  assert.equal(fresh.find((l) => l.includes("run_ext")), "* run_ext ext-run ● running 0/1 ext")
+  // Exactly 60s is NOT stale (strictly greater).
+  assert.equal(
+    runStripLines([external], "run_ext", undefined, 61_000).find((l) => l.includes("run_ext")),
+    "* run_ext ext-run ● running 0/1 ext",
+  )
+  // 61s since the heartbeat: stale appears, after ext.
+  assert.equal(
+    runStripLines([external], "run_ext", undefined, 62_000).find((l) => l.includes("run_ext")),
+    "* run_ext ext-run ● running 0/1 ext stale",
+  )
+  // No ownership → compact row; settled rows never carry badges.
+  assert.equal(fresh.find((l) => l.includes("run_plain")), "  run_plain plain-run ● running 0/1")
+  assert.equal(fresh.find((l) => l.includes("run_done")), "  run_done done-run ○ succeeded 1/1")
+})
+
+test("inspectModel/twoColumn headers: ext/stale badges only while running", () => {
+  const snap: AuthoritativeSnapshot = {
+    runID: "run_ext",
+    status: "running",
+    startedAt: 1_000,
+    source: "live",
+    agents: { done: 0, total: 1, failed: 0 },
+    parentSessionID: "ses_p",
+    runningCount: 1,
+    external: true,
+    ownerUpdatedAt: 1_000,
+    agentDetails: [{ id: "a1", status: "running", sessionID: "ses_c1" }],
+  }
+  const stale = inspectModel([], { offset: 0, selected: 0, parentSessionID: "ses_p" }, 62_000, { live: [snap] })
+  assert.match(stale.header, / ext stale$/)
+  const fresh = inspectModel([], { offset: 0, selected: 0, parentSessionID: "ses_p" }, 60_000, { live: [snap] })
+  assert.match(fresh.header, / ext$/)
+  assert.doesNotMatch(fresh.header, /stale/)
+  // Snapshot ownership flows onto the RunView (and into the two-column inspect header).
+  const [view] = mergeAuthoritativeRuns([], [snap])
+  assert.equal(view?.external, true)
+  assert.equal(view?.ownerUpdatedAt, 1_000)
+  const two = twoColumn(view!, { width: 80, selectedPhase: 0, offset: 0, height: 5, now: 62_000 })
+  assert.match(two.header[0]!, / ext stale$/)
+  // Running-only: a settled snapshot keeps the header compact.
+  const settled = inspectModel([], { offset: 0, selected: 0, parentSessionID: "ses_p" }, 62_000, {
+    live: [{ ...snap, status: "succeeded", runningCount: 0 }],
+  })
+  assert.doesNotMatch(settled.header, / ext| stale/)
 })
 
 test("selectForOpen: pinned history sticks; unpinned follows latest after settle", () => {

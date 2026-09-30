@@ -219,10 +219,19 @@ test("CLI explain mirrors runtime on empty tiers; tier delete refuses a fallback
     } } } }] }
   try {
     await writeFile(file, JSON.stringify(original, null, 2) + "\n")
-    // An explicit hint on an empty tier fails exactly as a workflow run would.
-    const explicit = runIn(offline(dir), file, "explain", "general", "empty")
-    assert.notEqual(explicit.status, 0)
-    assert.match(explicit.stderr, /routing tier empty is empty — configure it or drop the tier hint/)
+    // An explicit hint on an empty tier degrades to the nearest populated tier, as a workflow run would...
+    const explicit = runIn(offline(dir), file, "explain", "general", "empty", "--at", "2026-09-23T23:00:00Z")
+    assert.equal(explicit.status, 0, explicit.stderr)
+    assert.match(explicit.stdout, /Selected: p\/x/)
+    assert.match(explicit.stdout, /empty empty -> frontier: plan frontier: p\/x/)
+    // ...and fails loud when that tier is populated but gated out.
+    const gated = runIn(offline(dir), file, "explain", "general", "empty", "--at", "2026-09-23T12:00:00Z")
+    assert.notEqual(gated.status, 0)
+    assert.match(gated.stderr, /empty empty -> frontier: no eligible frontier model for general: p\/x: outside allowed hours/)
+    // An unknown tier name is dropped in favour of the role default.
+    const unknown = runIn(offline(dir), file, "explain", "general", "not-a-tier")
+    assert.equal(unknown.status, 0, unknown.stderr)
+    assert.match(unknown.stdout, /unknown tier not-a-tier; using role default: tier empty is empty; use agent pin/)
     // A role mapped directly to an empty tier still reports the agent pin at exit 0.
     const role = runIn(offline(dir), file, "explain", "general")
     assert.equal(role.status, 0, role.stderr)
@@ -292,6 +301,45 @@ test("CLI refuses an invalid edit without claiming routing was disabled", async 
   } finally { await rm(dir, { recursive: true, force: true }) }
 })
 
+test("routing disable/enable round-trips the master switch; list and explain reflect it", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "ultracode-switch-"))
+  const file = path.join(dir, "opencode.json")
+  const original = { plugins: [{ package: "./plugins/ultracode", options: { routing: { timezone: "UTC",
+    roles: { general: "strong" }, tiers: { strong: { plans: [[{ model: "p/a" }]], payg: [] } } } } }] }
+  try {
+    await writeFile(file, JSON.stringify(original, null, 2) + "\n")
+    const on = runIn(offline(dir), file, "explain", "general", "--json")
+    assert.equal(on.status, 0, on.stderr)
+    assert.equal(JSON.parse(on.stdout).model.id, "a")
+    const disabled = runIn(offline(dir), file, "routing", "disable")
+    assert.equal(disabled.status, 0, disabled.stderr)
+    assert.equal(JSON.parse(await readFile(file, "utf8")).plugins[0].options.routing.enabled, false)
+    const listed = runIn(offline(dir), file, "list")
+    assert.equal(listed.status, 0, listed.stderr)
+    assert.match(listed.stdout, /routing disabled; every child keeps its agent pin/)
+    assert.match(listed.stdout, /general\s+strong/)
+    assert.equal(JSON.parse(runIn(offline(dir), file, "list", "--json").stdout).routing.enabled, false)
+    // A role mapping and an explicit tier hint both report the agent pin at exit 0.
+    const role = runIn(offline(dir), file, "explain", "general")
+    assert.equal(role.status, 0, role.stderr)
+    assert.match(role.stdout, /Selected: agent pin/)
+    assert.match(role.stdout, /routing disabled; use agent pin/)
+    const hint = runIn(offline(dir), file, "explain", "general", "strong")
+    assert.equal(hint.status, 0, hint.stderr)
+    assert.match(hint.stdout, /Selected: agent pin/)
+    assert.match(hint.stdout, /routing disabled; use agent pin/)
+    // enable clears the default key, restoring the original policy and routing.
+    assert.equal(runIn(offline(dir), file, "routing", "enable").status, 0)
+    const restored = JSON.parse(await readFile(file, "utf8")).plugins[0].options.routing
+    assert.equal(restored.enabled, undefined)
+    assert.equal(JSON.parse(runIn(offline(dir), file, "explain", "general", "--json").stdout).model.id, "a")
+    // The switch lives inside an existing policy: a policy-less config refuses.
+    const bare = path.join(dir, "bare.json")
+    await writeFile(bare, JSON.stringify({ plugins: [{ package: "./plugins/ultracode", options: {} }] }))
+    assert.notEqual(runIn(offline(dir), bare, "routing", "disable").status, 0)
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
+
 test("role defaults names the available tiers when a target tier is missing", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "ultracode-role-skip-"))
   const file = path.join(dir, "opencode.json")
@@ -308,5 +356,86 @@ test("role defaults names the available tiers when a target tier is missing", as
     assert.match(applied.stdout, /explore: tier lite is not configured; available: standard, strong/)
     assert.match(applied.stdout, /general -> standard/)
     assert.deepEqual(JSON.parse(await readFile(file, "utf8")).plugins[0].options.routing.roles, { general: "standard" })
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
+
+test("tier describe and routing ladder round-trip; init seeds descriptions; list shows ladder order", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "ultracode-ladder-"))
+  const file = path.join(dir, "opencode.json")
+  try {
+    await writeFile(file, JSON.stringify({ plugins: [{ package: "./plugins/ultracode", options: {} }] }))
+    assert.equal(runIn(offline(dir), file, "routing", "init", "UTC").status, 0)
+    const routing = () => readFile(file, "utf8").then((text) => JSON.parse(text).plugins[0].options.routing)
+    assert.equal((await routing()).tiers.strong.description, "hard coding, review, merging findings")
+    assert.equal(runIn(offline(dir), file, "tier", "describe", "strong", "opus-class:", "hard", "review").status, 0)
+    assert.equal((await routing()).tiers.strong.description, "opus-class: hard review")
+    assert.equal(runIn(offline(dir), file, "tier", "describe", "strong", "none").status, 0)
+    assert.equal((await routing()).tiers.strong.description, undefined)
+    assert.notEqual(runIn(offline(dir), file, "tier", "describe", "strong", "x".repeat(201)).status, 0)
+
+    assert.notEqual(runIn(offline(dir), file, "routing", "ladder", "lite", "nope").status, 0)
+    assert.equal(runIn(offline(dir), file, "routing", "ladder", "frontier", "lite").status, 0)
+    assert.deepEqual((await routing()).ladder, ["frontier", "lite"])
+    const listed = runIn(offline(dir), file, "list").stdout
+    assert.ok(listed.indexOf("  frontier:") < listed.indexOf("  lite:") && listed.indexOf("  lite:") < listed.indexOf("  standard:"), listed)
+    assert.match(listed, /lite: {2}ordered {2}— mechanical work/)
+    // Deleting a tier drops it from the ladder instead of leaving a dangling name.
+    assert.equal(runIn(offline(dir), file, "tier", "delete", "frontier").status, 0)
+    assert.deepEqual((await routing()).ladder, ["lite"])
+    assert.equal(runIn(offline(dir), file, "routing", "ladder", "none").status, 0)
+    assert.equal((await routing()).ladder, undefined)
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
+
+test("tier add warns, without refusing, when the live catalog lacks the model or variant", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "ultracode-catalog-warn-"))
+  const file = path.join(dir, "opencode.json")
+  const bin = path.join(dir, "fake-opencode2")
+  try {
+    await writeFile(file, JSON.stringify({ plugins: [{ package: "./plugins/ultracode", options: {
+      routing: { timezone: "UTC", roles: {}, tiers: { strong: { plans: [], payg: [] } } } } }] }))
+    await writeFile(bin, `#!/bin/sh\necho '{"data":[{"providerID":"p","id":"a","variants":["high"]}]}'\n`, { mode: 0o755 })
+    const env = { env: { OPENCODE_BIN: bin }, cwd: dir }
+    const known = runIn(env, file, "tier", "add", "strong", "plans", "p/a#high")
+    assert.equal(known.status, 0, known.stderr)
+    assert.doesNotMatch(known.stdout, /Warning/)
+    const variant = runIn(env, file, "tier", "add", "strong", "plans", "p/a#ultra")
+    assert.equal(variant.status, 0, variant.stderr)
+    assert.match(variant.stdout, /Warning: p\/a has no variant "ultra" \(available: high\)/)
+    const missing = runIn(env, file, "tier", "add", "strong", "payg", "p/zzz")
+    assert.equal(missing.status, 0, missing.stderr)
+    assert.match(missing.stdout, /Warning: p\/zzz is not in the live catalog/)
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
+
+test("CLI sets and clears weight windows and quota weighting; list shows both", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "ultracode-windows-"))
+  const file = path.join(dir, "opencode.json")
+  const original = { plugins: [{ package: "./plugins/ultracode", options: { routing: { timezone: "UTC", roles: {}, tiers: {
+    strong: { selection: "weighted", plans: [[{ model: "p/a", weight: 5 }]], payg: [] },
+    plain: { plans: [[{ model: "p/b" }]], payg: [] },
+  } } } }] }
+  const entry = async () => JSON.parse(await readFile(file, "utf8")).plugins[0].options.routing
+  try {
+    await writeFile(file, JSON.stringify(original, null, 2) + "\n")
+    assert.equal(run(file, "tier", "edit", "strong", "p/a", "--weight-window", "22-8=2,12-14=7.5").status, 0)
+    assert.deepEqual((await entry()).tiers.strong.plans[0][0].weightWindows, [{ hours: [22, 8], weight: 2 }, { hours: [12, 14], weight: 7.5 }])
+    assert.equal(run(file, "routing", "quota-weighting", "on").status, 0)
+    assert.equal((await entry()).quotaWeighting, true)
+    const listed = run(file, "list").stdout
+    assert.match(listed, /p\/a w5 \(100%\) \[22–8: w2, 12–14: w7\.5\]/)
+    assert.match(listed, /quota weighting on/)
+    // Invalid edits fail closed and never write.
+    const before = await readFile(file, "utf8")
+    assert.notEqual(run(file, "tier", "edit", "strong", "p/a", "--weight-window", "22-8").status, 0)
+    assert.notEqual(run(file, "tier", "edit", "strong", "p/a", "--weight-window", "22-8=0").status, 0)
+    assert.notEqual(run(file, "tier", "edit", "strong", "p/a", "--weight-window", "none=2").status, 0)
+    assert.notEqual(run(file, "tier", "edit", "plain", "p/b", "--weight-window", "22-8=2").status, 0)
+    assert.notEqual(run(file, "routing", "quota-weighting", "maybe").status, 0)
+    assert.equal(await readFile(file, "utf8"), before)
+    assert.equal(run(file, "tier", "edit", "strong", "p/a", "--weight-window", "none").status, 0)
+    assert.equal(run(file, "routing", "quota-weighting", "off").status, 0)
+    assert.equal((await entry()).tiers.strong.plans[0][0].weightWindows, undefined)
+    assert.equal((await entry()).quotaWeighting, undefined)
   } finally { await rm(dir, { recursive: true, force: true }) }
 })

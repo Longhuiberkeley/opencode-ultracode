@@ -7,17 +7,21 @@ import {
   FALLBACK_STALE_MS,
   agentStatusKey,
   authoritativeFromRecord,
+  collectRemoteRunChanges,
   collectRunStatus,
   hasRpcClientFactory,
   hasRpcRegister,
   isFallbackExpired,
   parseRunStatusResponse,
   parseSettingsResponse,
+  persistedActivityFor,
+  runLivenessSuffix,
   runStateTransition,
   selectAuthoritative,
   sessionActivityMs,
 } from "../src/run-status.ts"
 import { agentDetailLines, chipCounts, filterSnapshotsForChip, inspectModel, mergeAuthoritativeRuns, parsePermissionList, permissionsForRun, sessionToStatus, wrapPaneLines, type RunView } from "../src/tui-render.ts"
+import { RUNS_SCAN_TTL_MS, refreshRunsIfStale } from "../src/storage.ts"
 import type { RunRecord } from "../src/types.ts"
 import { RegistryImpl } from "../src/registry.ts"
 
@@ -334,6 +338,110 @@ test("runStateTransition: agent finished, run completed, run failed", () => {
   )
 })
 
+test("runStatus refresh flow: TTL-gated re-scan emits only a changed non-owned run", async () => {
+  const local = record({ id: "run_local", status: "running", agents: [] })
+  const remoteBefore = record({
+    id: "run_remote",
+    status: "running",
+    parentSessionID: "ses_remote",
+    agents: [{ id: "a1", status: "running" }],
+  })
+  const remoteAfter = record({
+    id: "run_remote",
+    status: "succeeded",
+    endedAt: 5_000,
+    parentSessionID: "ses_remote",
+    directory: "/repo",
+    agents: [{ id: "a1", status: "succeeded" }],
+  })
+  let cache: RunRecord[] = [local, remoteBefore]
+  let lastScan = 0
+  const source = {
+    loadRuns: () => cache,
+    async loadRunsAsync(): Promise<RunRecord[]> {
+      lastScan = 10_000
+      cache = [local, remoteAfter]
+      return cache
+    },
+    lastScanAt: () => lastScan,
+  }
+  const emitted: ReturnType<typeof collectRemoteRunChanges> = []
+  // Mirrors the runStatus RPC refresh closure in index.ts.
+  const handlerRefresh = async (now: number): Promise<void> => {
+    const before = source.loadRuns()
+    if (!(await refreshRunsIfStale(source, RUNS_SCAN_TTL_MS, now))) return
+    emitted.push(
+      ...collectRemoteRunChanges({
+        before,
+        after: source.loadRuns(),
+        isLive: (id) => id === "run_local",
+        projectID: "proj-1",
+        directory: "/fallback",
+      }),
+    )
+  }
+  await handlerRefresh(9_000) // never scanned → scan + emit
+  assert.equal(emitted.length, 1)
+  assert.deepEqual({ ...emitted[0] }, {
+    runID: "run_remote",
+    status: "succeeded",
+    reason: "run-completed",
+    parentSessionID: "ses_remote",
+    runningCount: 0,
+    projectID: "proj-1",
+    directory: "/repo",
+  })
+  await handlerRefresh(10_500) // inside the TTL → no second scan
+  assert.equal(emitted.length, 1)
+  await handlerRefresh(15_000) // past the TTL, nothing moved → no emit
+  assert.equal(emitted.length, 1)
+  // A locally-owned run never emits (its persist callback owns that push).
+  assert.deepEqual(
+    collectRemoteRunChanges({
+      before: [local],
+      after: [{ ...local, status: "succeeded" }],
+      isLive: (id) => id === "run_local",
+    }),
+    [],
+  )
+})
+
+test("collectRemoteRunChanges: moves runStateTransition does not model still emit (state-changed fallback)", () => {
+  const isLive = (id: string): boolean => id === "run_local"
+  // running -> paused with identical agents: no transition event, but a real move.
+  const paused = collectRemoteRunChanges({
+    before: [record({ id: "run_r1", status: "running", agents: [{ id: "a1", status: "running" }] })],
+    after: [record({ id: "run_r1", status: "paused", agents: [{ id: "a1", status: "running" }] })],
+    isLive,
+  })
+  assert.equal(paused.length, 1)
+  assert.equal(paused[0]!.reason, "state-changed")
+  assert.equal(paused[0]!.status, "paused")
+  // paused -> running: same.
+  const resumed = collectRemoteRunChanges({
+    before: [record({ id: "run_r1", status: "paused", agents: [{ id: "a1", status: "running" }] })],
+    after: [record({ id: "run_r1", status: "running", agents: [{ id: "a1", status: "running" }] })],
+    isLive,
+  })
+  assert.equal(resumed.length, 1)
+  assert.equal(resumed[0]!.reason, "state-changed")
+  // A pending agent appearing with status unchanged: agentKey moved — emit.
+  const grew = collectRemoteRunChanges({
+    before: [record({ id: "run_r1", status: "running", agents: [{ id: "a1", status: "running" }] })],
+    after: [record({ id: "run_r1", status: "running", agents: [{ id: "a1", status: "running" }, { id: "a2", status: "pending" }] })],
+    isLive,
+  })
+  assert.equal(grew.length, 1)
+  assert.equal(grew[0]!.reason, "state-changed")
+  // Nothing moved: silence.
+  const still = collectRemoteRunChanges({
+    before: [record({ id: "run_r1", status: "running", agents: [{ id: "a1", status: "running" }] })],
+    after: [record({ id: "run_r1", status: "running", agents: [{ id: "a1", status: "running" }] })],
+    isLive,
+  })
+  assert.deepEqual(still, [])
+})
+
 test("collectRunStatus: an EXPLICIT runID drops the session filter (subagent-owned runs resolve); the list keeps it", () => {
   // Regression (2026-09-24): runs spawned by a subagent session never matched
   // the panel session, so the TUI could not overlay authoritative state and
@@ -391,4 +499,241 @@ test("collectRunStatus: activityFor stamps stalledMs on running children only", 
   assert.equal(details[0]!.stalledMs, 120_000)
   assert.equal(details[1]!.stalledMs, undefined)
   assert.equal(details[2]!.stalledMs, undefined)
+})
+
+test("collectRunStatus: external/ownerUpdatedAt ownership honesty (and wire parse)", () => {
+  const foreign = record({ id: "run_ext", owner: { bootID: "boot-other", updatedAt: 5_000 } })
+  const foreignSnap = collectRunStatus({
+    runID: "run_ext",
+    bootID: "boot-me",
+    liveGet: () => undefined,
+    liveList: () => [],
+    persistedList: () => [foreign],
+  })[0]!
+  assert.equal(foreignSnap.external, true)
+  assert.equal(foreignSnap.ownerUpdatedAt, 5_000)
+
+  // Our own bootID but no live registry entry: still external, never "ours".
+  const orphan = record({ id: "run_orphan", owner: { bootID: "boot-me", updatedAt: 6_000 } })
+  const orphanSnap = collectRunStatus({
+    runID: "run_orphan",
+    bootID: "boot-me",
+    liveGet: () => undefined,
+    liveList: () => [],
+    persistedList: () => [orphan],
+  })[0]!
+  assert.equal(orphanSnap.external, true)
+
+  // Live record owned by this process: not external, heartbeat still rides along.
+  const mine = record({ id: "run_mine", owner: { bootID: "boot-me", updatedAt: 7_000 } })
+  const mineSnap = collectRunStatus({
+    runID: "run_mine",
+    bootID: "boot-me",
+    liveGet: (id) => (id === "run_mine" ? mine : undefined),
+    liveList: () => [mine],
+    persistedList: () => [],
+  })[0]!
+  assert.equal(mineSnap.external, undefined)
+  assert.equal(mineSnap.ownerUpdatedAt, 7_000)
+
+  // Owner-less records keep both fields absent.
+  const bare = record({ id: "run_bare" })
+  const bareSnap = collectRunStatus({
+    runID: "run_bare",
+    bootID: "boot-me",
+    liveGet: () => undefined,
+    liveList: () => [],
+    persistedList: () => [bare],
+  })[0]!
+  assert.equal(bareSnap.external, undefined)
+  assert.equal(bareSnap.ownerUpdatedAt, undefined)
+
+  // Wire round-trip: undefined-valued keys drop, parse restores the fields.
+  const parsed = parseRunStatusResponse(JSON.parse(JSON.stringify({ runs: [foreignSnap, bareSnap] })))!
+  assert.equal(parsed[0]!.external, true)
+  assert.equal(parsed[0]!.ownerUpdatedAt, 5_000)
+  assert.equal(parsed[1]!.external, undefined)
+  assert.equal(parsed[1]!.ownerUpdatedAt, undefined)
+
+  // Backward compatible: absent fields parse clean; wrong-typed values are ignored.
+  const tolerant = parseRunStatusResponse({
+    runs: [
+      {
+        runID: "run_z",
+        status: "running",
+        startedAt: 9,
+        source: "live",
+        agents: { done: 0, total: 0, failed: 0 },
+        external: "yes",
+        ownerUpdatedAt: "soon",
+      },
+    ],
+  })!
+  assert.equal(tolerant[0]!.external, undefined)
+  assert.equal(tolerant[0]!.ownerUpdatedAt, undefined)
+})
+
+test("runLivenessSuffix: running-only ext/stale at the 60s heartbeat boundary", () => {
+  const base = { status: "running", external: true, ownerUpdatedAt: 1_000 }
+  assert.equal(runLivenessSuffix(base, 60_000), " ext", "59s heartbeat stays fresh")
+  assert.equal(runLivenessSuffix(base, 61_000), " ext", "exactly 60s is not stale")
+  assert.equal(runLivenessSuffix(base, 62_000), " ext stale", "61s heartbeat goes stale")
+  assert.equal(runLivenessSuffix({ ...base, external: false }, 62_000), " stale")
+  assert.equal(runLivenessSuffix({ status: "succeeded", external: true, ownerUpdatedAt: 1_000 }, 1_000_000), "")
+  assert.equal(runLivenessSuffix({ status: "running" }, 1_000_000), "")
+})
+
+// ---------------------------------------------------------------------------
+// rpc.invalid_output regression (observed 2026-09-26): every field the
+// runStatus payload emits MUST be declared in the RPC output schema, or the
+// host rejects the WHOLE call with HTTP 500 once any record carries the field
+// (200k+ failed polls in production before this guard existed).
+// ---------------------------------------------------------------------------
+
+test("runStatus RPC output schema declares every field the payload emits", async () => {
+  const { ULTRACODE_RPC } = await import("../src/rpc-definition.ts")
+  const output = ULTRACODE_RPC.methods.runStatus.output as {
+    properties: { runs: { items: { properties: Record<string, unknown> } } }
+  }
+  const runProps = output.properties.runs!.items.properties!
+  const agentProps = (runProps.agentDetails as { items: { properties: Record<string, unknown> } }).items.properties
+  const tokenProps = (agentProps.tokens as { properties: Record<string, unknown> }).properties
+
+  // Build a record with EVERY optional agent field set (the richest payload).
+  const snaps = collectRunStatus({
+    runID: "run_rpc1",
+    liveGet: (id) =>
+      id === "run_rpc1"
+        ? record({
+            id: "run_rpc1",
+            owner: { bootID: "b2", updatedAt: 123 },
+            agents: [
+              {
+                id: "a1",
+                status: "running",
+                sessionID: "ses_rpc1",
+                phase: "scan",
+                label: "seeker",
+                requestedAgent: "explore",
+                effectiveAgent: "explore",
+                effectiveModel: { providerID: "openrouter", id: "kimi" },
+                spawnModel: { providerID: "openrouter", id: "kimi" },
+                tokens: { input: 10, output: 20, reasoning: 30, cache: { read: 40, write: 50 } },
+                contextTokens: 100,
+                toolCalls: 7,
+              },
+            ],
+          })
+        : undefined,
+    liveList: () => [],
+    persistedList: () => [],
+    bootID: "b1",
+    activityFor: () => 456,
+  })
+  const agent = snaps[0]!.agentDetails![0]!
+
+  // Top-level run fields.
+  for (const key of Object.keys(snaps[0]!)) {
+    if (key === "agentDetails" || key === "agents") continue
+    assert.ok(key in runProps, `payload run field "${key}" missing from runStatus output schema`)
+  }
+  // agentDetails item fields.
+  for (const key of Object.keys(agent)) {
+    assert.ok(key in agentProps, `payload agentDetails field "${key}" missing from runStatus output schema`)
+  }
+  // tokens sub-object fields (cache caused the same 500 class when undeclared).
+  for (const key of Object.keys(agent.tokens!)) {
+    assert.ok(key in tokenProps, `payload tokens field "${key}" missing from runStatus output schema`)
+  }
+
+  // The dual failure class (observed 2026-09-27): the host validates the LIVE
+  // object, so a key present with value undefined ("Expected number") fails
+  // even when declared. A sparse agent (pending, nothing measured) must carry
+  // NO present-undefined keys anywhere in its snapshot.
+  const sparse = collectRunStatus({
+    runID: "run_rpc2",
+    liveGet: (id) => (id === "run_rpc2" ? record({ id: "run_rpc2", agents: [{ id: "a1", status: "pending" }] }) : undefined),
+    liveList: () => [],
+    persistedList: () => [],
+  })
+  const sparseSnap = sparse[0]!
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(sparseSnap)),
+    sparseSnap,
+    "snapshot must survive an undefined-stripping round-trip unchanged (no present-undefined keys)",
+  )
+  assert.equal("contextTokens" in (sparseSnap.agentDetails![0] as object), false, "unmeasured agent has no contextTokens KEY at all")
+})
+
+test("stepEventContext: session.step.ended usage becomes the live context number", async () => {
+  const { stepEventContext } = await import("../src/run-status.ts")
+  // Real shape: input + cache read + write sum to the statusline context.
+  assert.deepEqual(
+    stepEventContext({
+      type: "session.step.ended",
+      data: { sessionID: "ses_a", tokens: { input: 1000, output: 9, reasoning: 0, cache: { read: 74000, write: 2000 } } },
+    }),
+    { sessionID: "ses_a", contextTokens: 77_000 },
+  )
+  // Other events, missing session, or zero/no usage are ignored.
+  assert.equal(stepEventContext({ type: "session.usage.updated", data: { sessionID: "s", tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } } } }), undefined)
+  assert.equal(stepEventContext({ type: "session.step.ended", data: { tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } } } }), undefined)
+  assert.equal(
+    stepEventContext({ type: "session.step.ended", data: { sessionID: "ses_a", tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } } } }),
+    undefined,
+    "all-zero usage exposes no request context",
+  )
+  assert.equal(stepEventContext(undefined), undefined)
+  assert.equal(stepEventContext("nope"), undefined)
+})
+
+test("persistedActivityFor: falls back to the agent row's lastActivityAt, adopted mirrors included; unknown stays unknown", () => {
+  const agents = new Map<string, { lastActivityAt?: number }>()
+  const registry = {
+    activityForSession: (sid: string) => {
+      if (sid === "ses_known" || sid === "ses_adopted") {
+        return agents.get(sid === "ses_known" ? "a1" : "a9")?.lastActivityAt
+      }
+      return undefined
+    },
+  }
+  const forFn = persistedActivityFor(registry as unknown as Parameters<typeof persistedActivityFor>[0])
+  assert.equal(forFn("ses_unknown"), undefined)
+  assert.equal(forFn("ses_known"), undefined, "no recorded activity stays unknown")
+  agents.set("a1", { lastActivityAt: 1234 })
+  assert.equal(forFn("ses_known"), 1234)
+  agents.set("a9", { lastActivityAt: 5678 })
+  assert.equal(forFn("ses_adopted"), 5678, "adopted (unbound) sessions resolve through the registry scan")
+})
+
+test("waitReason rides agentDetails (authoritative snapshot) and parses from an RPC payload", () => {
+  const record: RunRecord = {
+    id: "run_w", parentSessionID: "ses_p", status: "running", startedAt: 1, script: "s",
+    agents: [
+      { id: "a1", status: "pending", startedAt: 1, waitReason: "provider=anthropic; cap=1" },
+      { id: "a2", status: "running", startedAt: 1, sessionID: "ses_c" },
+    ],
+  }
+  const snap = authoritativeFromRecord(record, "persisted")
+  assert.equal(snap.agentDetails?.[0]?.waitReason, "provider=anthropic; cap=1")
+  assert.equal(snap.agentDetails?.[1]?.waitReason, undefined)
+
+  const parsed = parseRunStatusResponse({
+    runs: [{
+      runID: "run_w", status: "running", startedAt: 1, source: "live",
+      agents: { done: 0, total: 1, failed: 0 },
+      agentDetails: [{ id: "a1", status: "pending", waitReason: "pause gate (run paused)" }],
+    }],
+  })
+  assert.equal(parsed?.[0]?.agentDetails?.[0]?.waitReason, "pause gate (run paused)")
+})
+
+test("agentDetailLines shows the waiting gate for a pending child only", () => {
+  const base = { sessionID: "ses_c", ord: "a1", title: "t" }
+  const pending = agentDetailLines({ ...base, status: "pending", waitReason: "run queue (cap 4)" } as never)
+  assert.ok(pending.some((l) => l.includes("waiting") && l.includes("run queue (cap 4)")))
+  const started = agentDetailLines({ ...base, status: "running", waitReason: "stale reason" } as never)
+  assert.ok(!started.some((l) => l.includes("waiting")), "running rows never show an admission gate")
+  const plainPending = agentDetailLines({ ...base, status: "pending" } as never)
+  assert.ok(!plainPending.some((l) => l.includes("waiting")), "no reason recorded → no line")
 })

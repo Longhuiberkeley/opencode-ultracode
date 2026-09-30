@@ -13,6 +13,7 @@ import {
   parseAgentFrontmatterModel,
   parseModelPin,
   readDisabledProviders,
+  stripJsonComments,
 } from "../src/agent-pins.ts"
 import { AgentRunner } from "../src/primitives.ts"
 import { createSessionDriver } from "../src/sessions.ts"
@@ -378,4 +379,16 @@ await agent("c", { label: "model: x" })
   const found = scanModelRefs(src)
   assert.deepEqual(found, ["google/gemini-3.7-flash#lite", "openai/gpt-6"])
   assert.deepEqual(scanModelRefs("return 1"), [])
+})
+
+test("readDisabledProviders: opencode.jsonc is read too, comments and trailing commas included", async () => {
+  const fs = fakeFs({
+    "/h/.config/opencode/opencode.jsonc": `{
+      // taken offline by subagent-config
+      "disabled_providers": ["xai", /* quota */ "openai",],
+      "note": "https://example.com/a, }",
+    }`,
+  })
+  assert.deepEqual([...(await readDisabledProviders(fs, "/p", "/h"))].sort(), ["openai", "xai"])
+  assert.deepEqual(JSON.parse(stripJsonComments('{"a": "x // y, }", "b": [1, 2, ], }')), { a: "x // y, }", b: [1, 2] })
 })

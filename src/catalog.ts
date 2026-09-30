@@ -18,6 +18,8 @@
  * envelope and status payloads follow.
  */
 import { graphNodeCount, graphNodeIds } from "./graph.ts"
+import { tierLadder } from "./model-routing.ts"
+import type { ModelRouting } from "./model-routing.ts"
 import { GRAPH_TEMPLATES, graphTemplate, graphTemplateSummaries } from "./graph-templates.ts"
 import { paramsLine, parseParams } from "./params.ts"
 import {
@@ -67,16 +69,37 @@ export interface CatalogCaps {
   /** Hard per-loop iteration ceiling (200): the per-run maxLoopIterations input may tighten below any loop's budget, never raise it. */
   maxLoopIterations: number
   /**
-   * Routing policy summary for authoring-time tier hints. Only NON-EMPTY tiers
-   * are listed as hintable (an explicit hint on an empty tier throws at spawn
-   * unless the tier carries a fallback); roles stay visible either way because
-   * a role mapped to an empty tier silently keeps the agent pin. Absent when
-   * no routing policy is configured — then tier hints are inert and authors
-   * should not emit them.
+   * Routing policy summary for authoring-time tier hints: every tier, cheapest
+   * first, with the user's description of what it is for. A tier with
+   * `models: 0` is still hintable — the hint degrades to the nearest populated
+   * tier, then the agent pin. Absent when no routing policy is configured —
+   * then tier hints are inert. `enabled: false` means the master switch is
+   * off: tiers is empty (hints are inert), roles stay visible for later
+   * re-enable.
    */
-  routing?: {
-    tiers: Array<{ name: string; models: number }>
-    roles: Record<string, string>
+  routing?: CatalogRouting
+}
+
+// A type alias, not an interface: caps are emitted as Json, which needs an implicit index signature.
+export type CatalogRouting = {
+  enabled?: boolean
+  tiers: Array<{ name: string; models: number; description?: string }>
+  roles: Record<string, string>
+}
+
+/** The catalog's view of a routing policy (see CatalogCaps.routing). */
+export function routingSummary(routing: ModelRouting): CatalogRouting {
+  return {
+    ...(routing.enabled === false ? { enabled: false } : {}),
+    tiers: routing.enabled === false ? [] : tierLadder(routing).map((name) => {
+      const tier = routing.tiers[name]!
+      return {
+        name,
+        models: tier.plans.flat().length + tier.payg.flat().length,
+        ...(tier.description !== undefined ? { description: tier.description } : {}),
+      }
+    }),
+    roles: { ...routing.roles },
   }
 }
 

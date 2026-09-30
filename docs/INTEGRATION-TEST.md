@@ -39,7 +39,8 @@ Run after Builders A/B/C merge. Unit tests must be green first: `npm test`, `npx
 - [ ] autoEditsWorkflow: write inside project root allowed; write to `~/.config/opencode/agents/x.md` NOT auto-approved
 
 ## 7. Restart reconciliation
-- [ ] Kill the standalone server mid-run (SIGKILL), restart, assert the persisted run shows `interrupted` with stopReason "server restart" in `/ultracode` output; no auto-replay
+- [ ] Automated deterministic twin: `node --experimental-strip-types --test test/restart-sim.test.ts` — runtime A (registry + persisted fresh marker naming a genuinely SIGKILL'd pid, no graceful dispose) over a shared persistence seam; runtime B asserts: dead-pid classification despite fresh heartbeat, harvest of the recovered child, `interrupted` flip (durable, idempotent), truthful stop (finished → not-active; unclassified dead owner → orphan flip with hint; live remote owner → refusal naming boot/pid), deadline enforcement for a live-but-wedged owner, and warm resume replaying only the harvested child
+- [ ] Real SIGKILL leg: `scripts/live-test.sh restart` — boots a server with a run, `kill -9`s the process tree mid-run, loads a replacement (startup reconcile fires) and prints `/ultracode show <runID>`; expect `interrupted` with a stopReason naming the dead owner plus `rerun <runID> --warm`; no auto-replay, no row stays `running`
 
 ## 8. Global install (user-approved)
 - [ ] Backup `~/.config/opencode/opencode.json`, `scripts/install.sh --global --tui --write-config`, `opencode2 service restart`, `/api/plugin` shows ultracode in the user's home location, TUI loads with no "Cannot find module" toast

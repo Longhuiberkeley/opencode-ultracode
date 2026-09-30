@@ -10,6 +10,7 @@ import type {
   FsLike,
   Json,
   KvLike,
+  OrphanPlan,
   Registry,
   RunRecord,
   RunStatus,
@@ -538,6 +539,86 @@ export class FakeRegistry implements Registry {
         run.endedAt = Date.now()
       }
     }
+  }
+
+  /** Two-phase reconcile stub: every active run in the map is an orphan plan. */
+  classifyOrphans(opts?: { recheckAdopted?: boolean }): OrphanPlan[] {
+    void opts
+    const plans: OrphanPlan[] = []
+    for (const run of this.runs.values()) {
+      if (isActiveRunStatus(run.status)) {
+        plans.push({ record: run, reason: `server restart (fake) — resumable: /ultracode rerun ${run.id} --warm` })
+      }
+    }
+    return plans
+  }
+
+  applyOrphanInterrupt(plan: OrphanPlan, reasonOverride?: string): boolean {
+    const run = plan.record
+    if (!isActiveRunStatus(run.status)) return false
+    run.status = "interrupted"
+    run.stopReason = reasonOverride ?? plan.reason
+    if (run.endedAt === undefined) run.endedAt = Date.now()
+    for (const agent of run.agents) {
+      if (agent.status === "pending" || agent.status === "running") agent.status = "interrupted"
+    }
+    this.saveCalls.push(run)
+    return true
+  }
+
+  ownerStatus(runID: string):
+    | { kind: "not-found" }
+    | { kind: "local" | "remote-live" | "dead"; record: RunRecord; owner?: { bootID: string; pid?: number; updatedAt?: number }; detail?: string } {
+    const run = this.runs.get(runID)
+    if (!run) return { kind: "not-found" }
+    // The fake has no process identity: every run it holds counts as local.
+    return { kind: "local", record: run }
+  }
+
+  noteRunDeadline(runID: string, deadlineAt: number | undefined): void {
+    const run = this.runs.get(runID)
+    if (!run) return
+    if (deadlineAt === undefined) delete run.deadlineAt
+    else run.deadlineAt = deadlineAt
+  }
+
+  noteAgentActivity(runID: string, agentID: string, at: number): void {
+    this.updateAgent(runID, agentID, { lastActivityAt: at })
+  }
+
+  setPendingWaitReason(runID: string, reason: string | undefined): void {
+    const run = this.runs.get(runID)
+    if (!run) return
+    for (const agent of run.agents) {
+      if (agent.status !== "pending") continue
+      if (reason === undefined) delete agent.waitReason
+      else agent.waitReason = reason
+    }
+  }
+
+  appendEvent(runID: string, kind: string, detail?: string): void {
+    const run = this.runs.get(runID)
+    if (!run) return
+    run.events = run.events ?? []
+    run.events.push({ at: Date.now(), kind, ...(detail !== undefined && detail !== "" ? { detail } : {}) })
+    if (run.events.length > 256) run.events.splice(0, run.events.length - 256)
+  }
+
+  activityForSession(sessionID: string): number | undefined {
+    for (const run of this.runs.values()) {
+      for (const agent of run.agents) {
+        if (agent.sessionID !== sessionID) continue
+        if (typeof agent.lastActivityAt === "number" && Number.isFinite(agent.lastActivityAt)) {
+          return agent.lastActivityAt
+        }
+      }
+    }
+    return undefined
+  }
+
+  expiredRemoteRuns(_now: number, _graceMs: number): Array<{ record: RunRecord; deadlineAt: number }> {
+    // The fake holds only locally-created runs — nothing is remote.
+    return []
   }
 
   persistNow(runID: string): void {

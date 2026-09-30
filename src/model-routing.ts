@@ -15,6 +15,17 @@ export interface RouteCandidate {
   weight?: number
   /** Weighted selection: PAYG-only draw weight for the MAIN pool shared with eligible plans. */
   mainWeight?: number
+  /**
+   * Weighted selection: `weight` overrides by local hour in `timezone` (first matching
+   * window wins; outside every window `weight` applies). Never affects `mainWeight`.
+   */
+  weightWindows?: WeightWindow[]
+}
+
+export interface WeightWindow {
+  /** Same convention as `hours`: end exclusive, may wrap midnight. */
+  hours: [number, number]
+  weight: number
 }
 
 export interface RouteTier {
@@ -28,6 +39,8 @@ export interface RouteTier {
   selection?: "ordered" | "weighted"
   /** Tier to try with the same eligibility rules when this tier has no eligible candidate. */
   fallback?: string
+  /** The user's own words for what this tier is for; shown to the authoring agent via the catalog. */
+  description?: string
 }
 
 export interface ModelRouting {
@@ -36,10 +49,32 @@ export interface ModelRouting {
   /** Agent id -> default tier. Explicit per-call tier takes precedence. */
   roles: Record<string, string>
   tiers: Record<string, RouteTier>
+  /**
+   * Tiers from cheapest to strongest. Unlisted tiers follow in `tiers` key order
+   * (see tierLadder). An explicit hint on an empty tier degrades along this order.
+   */
+  ladder?: string[]
   /** Provider -> quota feed id. An absent feed never pretends to have headroom. */
   quotaIDs?: Record<string, string>
-  /** When quota is unknown, skip candidates with a reserve unless explicitly allowed. */
+  /**
+   * Omitted means true: an unknown feed is not evidence of exhaustion. With an
+   * explicit false, EVERY plans candidate (and any reserved PAYG) is skipped on
+   * an unknown feed.
+   */
   allowUnknownQuota?: boolean
+  /**
+   * Weighted selection (default false): scale a candidate's draw weight by its feed's
+   * KNOWN remaining quota, from x0.5 at 0% to x1.5 at 100% (see quotaFactor). An unknown
+   * feed, and PAYG without a reserve, keep the configured weight.
+   */
+  quotaWeighting?: boolean
+  /**
+   * Master switch (default true when omitted). false disables tier auto-selection:
+   * every child keeps its agent pin while roles and tiers stay configured for a
+   * later re-enable. Explicit per-call/run model overrides still win because they
+   * resolve above the router.
+   */
+  enabled?: boolean
 }
 
 export interface RouteObservation {
@@ -75,6 +110,8 @@ interface SelectInput {
   disabled?: ReadonlySet<string>
   /** Machine/quarantine knowledge in addition to `disabled` (distinct skip reason). */
   quarantined?: ReadonlySet<string>
+  /** Providers this child already died on; a failover re-select must leave them (distinct skip reason). */
+  failed?: ReadonlySet<string>
   available?: ReadonlySet<string>
   quota?: (id: string) => Promise<RouteObservation | undefined>
 }
@@ -105,10 +142,38 @@ function validWeight(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value > 0 && value <= 10000
 }
 
+/** Draw weight at this local hour: the first matching weightWindows entry, else `weight` (default 1). */
+function weightAt(entry: RouteCandidate, hour: number): number {
+  return entry.weightWindows?.find((window) => within(hour, window.hours))?.weight ?? entry.weight ?? 1
+}
+
+/** quotaWeighting multiplier: linear in the remaining percentage, x0.5 (empty) .. x1.5 (full). */
+export function quotaFactor(remainingPercent: number): number {
+  return 0.5 + Math.min(100, Math.max(0, remainingPercent)) / 100
+}
+
+/** Scaled weights are fractional; two decimals keep reasons and pool shares readable. */
+function round2(value: number): number {
+  return Math.round(value * 100) / 100
+}
+
+/** Longest tier description kept; it is prompt text for the authoring agent, not documentation. */
+export const MAX_TIER_DESCRIPTION = 200
+
+/** Effective cheapest-to-strongest order: the configured ladder, then unlisted tiers in key order. */
+export function tierLadder(config: Pick<ModelRouting, "tiers" | "ladder">): string[] {
+  const listed = config.ladder ?? []
+  return [...listed, ...Object.keys(config.tiers).filter((name) => !listed.includes(name))]
+}
+
 /** Stateless validation: reject bad routing at startup rather than silently using a wrong provider. */
 export function parseModelRouting(value: unknown): ModelRouting {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("routing must be an object")
   const r = value as Record<string, unknown>
+  // Same rule as tier and candidate keys below: a typo (e.g. "allowUnknownQuotas")
+  // is rejected rather than silently ignored.
+  const topKeys = new Set(["timezone", "roles", "tiers", "ladder", "quotaIDs", "allowUnknownQuota", "quotaWeighting", "enabled"])
+  for (const key of Object.keys(r)) if (!topKeys.has(key)) throw new Error(`unknown routing key ${key}`)
   const timezone = r.timezone
   if (typeof timezone !== "string") throw new Error("routing.timezone must be an IANA timezone")
   try { new Intl.DateTimeFormat("en-GB", { timeZone: timezone }) } catch { throw new Error(`invalid routing timezone: ${timezone}`) }
@@ -119,7 +184,7 @@ export function parseModelRouting(value: unknown): ModelRouting {
     const input = raw as Record<string, unknown>
     // The format is new and the CLI never writes unknown keys, so a typo (e.g.
     // "selections") is rejected rather than silently disabling the feature.
-    const tierKeys = new Set(["plans", "payg", "selection", "fallback"])
+    const tierKeys = new Set(["plans", "payg", "selection", "fallback", "description"])
     for (const key of Object.keys(input)) if (!tierKeys.has(key)) throw new Error(`unknown routing tier ${name} key ${key}`)
     const selection = input.selection
     if (selection !== undefined && selection !== "ordered" && selection !== "weighted") {
@@ -129,8 +194,12 @@ export function parseModelRouting(value: unknown): ModelRouting {
     if (fallback !== undefined && (typeof fallback !== "string" || !fallback.trim())) {
       throw new Error(`routing tier ${name}.fallback must name a defined tier`)
     }
+    const description = input.description
+    if (description !== undefined && (typeof description !== "string" || !description.trim() || description.length > MAX_TIER_DESCRIPTION)) {
+      throw new Error(`routing tier ${name}.description must be 1..${MAX_TIER_DESCRIPTION} characters`)
+    }
     const weighted = selection === "weighted"
-    const candidateKeys = new Set(["model", "capacityPool", "hours", "blockedWeekdayHours", "reservePercent", "weight", "mainWeight"])
+    const candidateKeys = new Set(["model", "capacityPool", "hours", "blockedWeekdayHours", "reservePercent", "weight", "mainWeight", "weightWindows"])
     const groups = (kind: "plans" | "payg"): RouteCandidate[][] => {
       if (!Array.isArray(input[kind])) throw new Error(`routing tier ${name}.${kind} must be an array of rotation groups`)
       return (input[kind] as unknown[]).map((group, i) => {
@@ -155,12 +224,20 @@ export function parseModelRouting(value: unknown): ModelRouting {
             if (kind === "plans") throw new Error(`routing mainWeight is only valid on payg candidates: ${candidate.model}`)
             if (!validWeight(candidate.mainWeight)) throw new Error(`invalid routing mainWeight for ${candidate.model}`)
           }
+          if (candidate.weightWindows !== undefined) {
+            // Ordered tiers never read a weight, so a window there would be silently inert.
+            if (!weighted) throw new Error(`routing weightWindows needs a weighted tier: ${candidate.model}`)
+            if (!Array.isArray(candidate.weightWindows) || !candidate.weightWindows.length || candidate.weightWindows.some((window) =>
+              !window || typeof window !== "object" || Array.isArray(window) || Object.keys(window).some((key) => key !== "hours" && key !== "weight") ||
+              !validHours(window.hours) || !validWeight(window.weight))) throw new Error(`invalid routing weightWindows for ${candidate.model}`)
+          }
           return { model: candidate.model, ...(candidate.hours ? { hours: candidate.hours } : {}),
             ...(candidate.capacityPool ? { capacityPool: candidate.capacityPool } : {}),
             ...(candidate.blockedWeekdayHours ? { blockedWeekdayHours: candidate.blockedWeekdayHours } : {}),
             ...(candidate.reservePercent !== undefined ? { reservePercent: candidate.reservePercent } : {}),
             ...(candidate.weight !== undefined ? { weight: candidate.weight } : {}),
-            ...(candidate.mainWeight !== undefined ? { mainWeight: candidate.mainWeight } : {}) }
+            ...(candidate.mainWeight !== undefined ? { mainWeight: candidate.mainWeight } : {}),
+            ...(candidate.weightWindows ? { weightWindows: candidate.weightWindows.map((window) => ({ hours: window.hours, weight: window.weight })) } : {}) }
         })
       })
     }
@@ -186,7 +263,8 @@ export function parseModelRouting(value: unknown): ModelRouting {
     }
     tiers[name] = { plans, payg,
       ...(selection !== undefined ? { selection: selection as "ordered" | "weighted" } : {}),
-      ...(fallback !== undefined ? { fallback: fallback as string } : {}) }
+      ...(fallback !== undefined ? { fallback: fallback as string } : {}),
+      ...(description !== undefined ? { description: (description as string).trim() } : {}) }
   }
   // Fallback targets may be declared after their referrer, so resolve the whole map first.
   for (const [name, tier] of Object.entries(tiers)) {
@@ -206,6 +284,9 @@ export function parseModelRouting(value: unknown): ModelRouting {
   const roles = r.roles
   if (!roles || typeof roles !== "object" || Array.isArray(roles) ||
     Object.values(roles).some((tier) => typeof tier !== "string" || !tiers[tier])) throw new Error("routing.roles must map agent ids to defined tiers")
+  const ladder = r.ladder
+  if (ladder !== undefined && (!Array.isArray(ladder) || ladder.some((name) => typeof name !== "string" || !tiers[name]) ||
+    new Set(ladder).size !== ladder.length)) throw new Error("routing.ladder must list defined tiers, cheapest first, without duplicates")
   const quotaIDs = r.quotaIDs
   if (quotaIDs !== undefined && (!quotaIDs || typeof quotaIDs !== "object" || Array.isArray(quotaIDs) ||
     Object.values(quotaIDs).some((id) => typeof id !== "string" || !id))) throw new Error("routing.quotaIDs must map providers to quota feed ids")
@@ -214,21 +295,33 @@ export function parseModelRouting(value: unknown): ModelRouting {
   // plans out whenever the feed command was missing — concentrating load on
   // unreserved plans that then died on the very quota the feed would have
   // shown. An explicit false keeps the fail-closed behavior for users who
-  // want a missing feed to never spend a paid plan.
+  // want a missing feed to never spend a paid plan: EVERY plans candidate is
+  // skipped on an unknown feed, reserved or not.
   if (r.allowUnknownQuota !== undefined && typeof r.allowUnknownQuota !== "boolean") {
     throw new Error("routing.allowUnknownQuota must be a boolean when present")
   }
+  if (r.quotaWeighting !== undefined && typeof r.quotaWeighting !== "boolean") {
+    throw new Error("routing.quotaWeighting must be a boolean when present")
+  }
+  // Master switch. Omitted enabled means true (current behavior); an explicit
+  // false keeps every child on its agent pin without touching roles or tiers.
+  if (r.enabled !== undefined && typeof r.enabled !== "boolean") {
+    throw new Error("routing.enabled must be a boolean when present")
+  }
   return { timezone, roles: roles as Record<string, string>, tiers,
+    ...(ladder !== undefined ? { ladder: ladder as string[] } : {}),
     ...(quotaIDs ? { quotaIDs: quotaIDs as Record<string, string> } : {}),
-    allowUnknownQuota: r.allowUnknownQuota === undefined ? true : r.allowUnknownQuota === true }
+    allowUnknownQuota: r.allowUnknownQuota === undefined ? true : r.allowUnknownQuota === true,
+    ...(r.quotaWeighting === true ? { quotaWeighting: true } : {}),
+    enabled: r.enabled === undefined ? true : r.enabled === true }
 }
 
 /** Counter shared by a supervisor, so parallel children do not all pick the first plan. */
 export class ModelRouter {
   private readonly uses = new Map<string, number>()
   /**
-   * Weighted-selection credits keyed `${tier}|${pool}|${modelPin}`. The tier is part of
-   * the key so the same pin in two tiers never shares SWRR state.
+   * Weighted-selection credits keyed by (tier, pool, modelPin) — see creditKey. The tier is
+   * part of the key so the same pin in two tiers never shares SWRR state.
    */
   private readonly credits = new Map<string, number>()
   private readonly config: ModelRouting
@@ -240,14 +333,53 @@ export class ModelRouter {
     now?: Date
     disabled?: ReadonlySet<string>
     quarantined?: ReadonlySet<string>
+    failed?: ReadonlySet<string>
     available?: ReadonlySet<string>
     quota?: (id: string) => Promise<RouteObservation | undefined>
   }): Promise<RouteDecision> {
-    const tier = input.tier ?? this.config.roles[input.role]
-    if (!tier) return { reason: "no tier configured; use agent pin", skipped: [] }
+    // Master switch FIRST: a disabled policy never resolves a tier, never reads
+    // a role, and never runs the empty-tier logic. Returning the same no-model
+    // decision as an unmapped agent lets every child keep its agent pin.
+    if (this.config.enabled === false) return { reason: "routing disabled; use agent pin", skipped: [] }
+    // A hint is a hint: a tier name this policy does not define (a shared workflow
+    // written against another user's tiers) is dropped, never fatal.
+    const unknownHint = input.tier !== undefined && !this.config.tiers[input.tier] ? input.tier : undefined
+    const hint = unknownHint === undefined ? input.tier : undefined
+    const note = (decision: RouteDecision): RouteDecision => unknownHint === undefined ? decision
+      : { ...decision, reason: `unknown tier ${unknownHint}; using role default: ${decision.reason}` }
+    const tier = hint ?? this.config.roles[input.role]
+    if (!tier) return note({ reason: "no tier configured; use agent pin", skipped: [] })
     const tierConfig = this.config.tiers[tier]
     if (!tierConfig) throw new Error(`unknown routing tier ${tier}`)
-    return this.selectTier(tier, tierConfig, input, [tier])
+    const routed = { ...input, tier }
+    const decision = await this.selectTier(tier, tierConfig, routed, [tier])
+    // Only an explicit hint walks the ladder: a role mapped to an empty tier keeps its pin.
+    if (decision.model !== undefined || hint === undefined) return note(decision)
+    return this.degrade(hint, routed, decision)
+  }
+
+  /**
+   * An explicitly hinted tier whose whole fallback chain is empty: take the nearest
+   * populated tier on the ladder, lower first ("unsure -> lower shelf"), then higher.
+   * A populated neighbour whose candidates are all gated still throws — the gates
+   * protect spend, and jumping past them to a stronger tier would defeat them.
+   */
+  private async degrade(hint: string, input: SelectInput, empty: RouteDecision): Promise<RouteDecision> {
+    const ladder = tierLadder(this.config)
+    const at = ladder.indexOf(hint)
+    const populated = (name: string): boolean => {
+      const tier = this.config.tiers[name]
+      return tier !== undefined && (tier.plans.length > 0 || tier.payg.length > 0)
+    }
+    const nearest = [...ladder.slice(0, at).reverse(), ...ladder.slice(at + 1)].find(populated)
+    if (nearest === undefined) return empty
+    let inner: RouteDecision
+    try {
+      inner = await this.selectTier(nearest, this.config.tiers[nearest]!, input, [nearest])
+    } catch (error) {
+      throw new Error(`${hint} empty -> ${nearest}: ${error instanceof Error ? error.message : String(error)}`)
+    }
+    return { ...inner, reason: `${hint} empty -> ${nearest}: ${inner.reason}`, fallbackChain: [hint, ...(inner.fallbackChain ?? [nearest])] }
   }
 
   /** Walk one tier, recursing through `fallback` links; `chain` carries the tiers walked. */
@@ -297,6 +429,7 @@ export class ModelRouter {
     const check = async (entry: RouteCandidate, pool: "plans" | "payg"): Promise<EligibleCandidate | undefined> => {
       const model = parseModelPin(entry.model)!
       if (input.available && !input.available.has(`${model.providerID}/${model.id}`)) { skipped.push(`${entry.model}: not in live catalog`); return }
+      if (input.failed?.has(model.providerID)) { skipped.push(`${entry.model}: provider failed over`); return }
       if (input.disabled?.has(model.providerID)) { skipped.push(`${entry.model}: provider offline`); return }
       if (input.quarantined?.has(model.providerID)) { skipped.push(`${entry.model}: provider quarantined`); return }
       if (!within(hour, entry.hours)) { skipped.push(`${entry.model}: outside allowed hours`); return }
@@ -309,7 +442,10 @@ export class ModelRouter {
       // reports exhausted is never tried, not even once (observed 2026-09-24:
       // children kept spawning onto a dead provider and burned whole turns).
       // A reserve still skips when KNOWN-low (1-2% left keeps trying unless a
-      // reservePercent says otherwise); UNKNOWN never blocks on its own.
+      // reservePercent says otherwise). UNKNOWN blocks only under explicit
+      // fail-closed (allowUnknownQuota: false): EVERY plans candidate skips —
+      // reserved or not — while PAYG stays blind unless it carries a reserve.
+      let factor = 1
       if (pool === "plans" || entry.reservePercent !== undefined) {
         const feed = entry.capacityPool ?? this.config.quotaIDs?.[model.providerID] ?? model.providerID
         if (!observed.has(feed)) {
@@ -320,9 +456,11 @@ export class ModelRouter {
         const remaining = observed.get(feed)?.remainingPercent
         if (pool === "plans" && remaining === 0) { skipped.push(`${entry.model}: quota exhausted`); return }
         if (remaining !== undefined && entry.reservePercent !== undefined && remaining <= entry.reservePercent) { skipped.push(`${entry.model}: quota reserve`); return }
-        if (remaining === undefined && entry.reservePercent !== undefined && !this.config.allowUnknownQuota) { skipped.push(`${entry.model}: quota unknown`); return }
+        if (remaining === undefined && !this.config.allowUnknownQuota && (pool === "plans" || entry.reservePercent !== undefined)) { skipped.push(`${entry.model}: quota unknown`); return }
+        // Rate awareness: headroom pulls the draw toward a candidate, a draining feed pushes it away.
+        if (this.config.quotaWeighting && remaining !== undefined) factor = quotaFactor(remaining)
       }
-      return { model, pin: entry.model, weight: entry.weight ?? 1 }
+      return { model, pin: entry.model, weight: round2(weightAt(entry, hour) * factor) }
     }
 
     if (tierConfig.selection !== "weighted") {
@@ -424,7 +562,7 @@ export class ModelRouter {
   private weighted(tier: string, pool: "main" | "fallback", members: Array<{ pin: string; weight: number }>, eligible: EligibleCandidate[], skipped: string[]): RouteDecision {
     const { pick, total } = this.draw(tier, pool, members, eligible)
     const entries: RoutePoolEntry[] = eligible.map((e) => ({ model: e.pin, weight: e.weight, percent: (e.weight / total) * 100 }))
-    return { model: pick.model, reason: `weighted ${tier}: ${pick.pin} (w${pick.weight} of ${total})`, skipped, pool: entries }
+    return { model: pick.model, reason: `weighted ${tier}: ${pick.pin} (w${pick.weight} of ${round2(total)})`, skipped, pool: entries }
   }
 
   private creditKey(tier: string, pool: "main" | "fallback", pin: string): string {

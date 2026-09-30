@@ -212,6 +212,37 @@ export async function agentConfigured(
 }
 
 /**
+ * JSONC -> JSON: drops line and block comments and trailing commas, leaving
+ * string contents (which may hold "//" in URLs) untouched.
+ */
+export function stripJsonComments(text: string): string {
+  let out = ""
+  // Code between strings; trailing commas are dropped per chunk so strings are never rewritten.
+  let code = ""
+  const flush = (): void => { out += code.replace(/,(\s*[}\]])/g, "$1"); code = "" }
+  let i = 0
+  while (i < text.length) {
+    const ch = text[i]!
+    if (ch === '"') {
+      flush()
+      const start = i++
+      while (i < text.length && text[i] !== '"') i += text[i] === "\\" ? 2 : 1
+      out += text.slice(start, ++i)
+    } else if (ch === "/" && text[i + 1] === "/") {
+      while (i < text.length && text[i] !== "\n") i++
+    } else if (ch === "/" && text[i + 1] === "*") {
+      const end = text.indexOf("*/", i + 2)
+      i = end < 0 ? text.length : end + 2
+    } else {
+      code += ch
+      i++
+    }
+  }
+  flush()
+  return out
+}
+
+/**
  * Provider ids the user took offline (`disabled_providers` in the global or
  * project opencode.json — what `opencode2 subagent-config provider off`
  * writes). Best-effort disk read of the SAME documented config the client
@@ -222,16 +253,18 @@ export async function readDisabledProviders(
   projectRoot: string,
   homeDir: string,
 ): Promise<ReadonlySet<string>> {
+  // Both spellings: subagent-config writes whichever of opencode.json /
+  // opencode.jsonc the user has, so reading only .json would miss the list.
   const paths = [
-    `${homeDir}/.config/opencode/opencode.json`,
-    `${projectRoot}/opencode.json`,
-    `${projectRoot}/.opencode/opencode.json`,
-  ]
+    `${homeDir}/.config/opencode/opencode`,
+    `${projectRoot}/opencode`,
+    `${projectRoot}/.opencode/opencode`,
+  ].flatMap((base) => [`${base}.json`, `${base}.jsonc`])
   const out = new Set<string>()
   for (const path of paths) {
     try {
       if (!(await fs.exists(path))) continue
-      const raw = JSON.parse(await fs.readFile(path)) as unknown
+      const raw = JSON.parse(stripJsonComments(await fs.readFile(path))) as unknown
       if (raw === null || typeof raw !== "object" || Array.isArray(raw)) continue
       const list = (raw as { disabled_providers?: unknown }).disabled_providers
       if (!Array.isArray(list)) continue

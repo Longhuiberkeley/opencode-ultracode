@@ -119,12 +119,48 @@ test("opt-in tier route wins over pin; explicit override wins over route", async
   await second
 })
 
-test("an explicit tier hint on an empty tier names the empty tier", async () => {
+test("an explicit tier hint on an empty or unknown tier degrades instead of killing the child", async () => {
   const router = new ModelRouter(parseModelRouting({ timezone: "UTC", roles: {},
-    tiers: { frontier: { plans: [], payg: [] } } }))
-  const { runner } = makeRunner({
-    selectModel: (role, tier, excluded) => router.select({ role, ...(tier ? { tier } : {}), disabled: excluded }).then((choice) => choice.model) })
-  await assert.rejects(runner.call("general", { tier: "frontier" }), /routing tier frontier is empty — configure it or drop the tier hint/)
+    tiers: { standard: { plans: [[{ model: "xai/grok-4.7" }]], payg: [] }, frontier: { plans: [], payg: [] } } }))
+  const { runner, calls, registry, run } = makeRunner({
+    pinForAgent: async () => ({ providerID: "anthropic", id: "claude-pin" }),
+    selectModel: (role, tier, failed) => router.select({ role, ...(tier ? { tier } : {}), failed }).then((choice) => choice.model) })
+  // Empty tier: the nearest populated tier on the ladder.
+  const empty = runner.call("general", { tier: "frontier" })
+  await tick()
+  assert.deepEqual(registry.getAgent(run.id, "a1")!.spawnModel, { providerID: "xai", id: "grok-4.7", source: "route" })
+  calls[0]!.resolve(okResult("ses_degraded"))
+  await empty
+  // Unknown tier, no role mapping: the agent pin.
+  const unknown = runner.call("general", { tier: "someone-elses-tier" })
+  await tick()
+  assert.deepEqual(registry.getAgent(run.id, "a2")!.spawnModel, { providerID: "anthropic", id: "claude-pin", source: "pin" })
+  calls[1]!.resolve(okResult("ses_unknown"))
+  await unknown
+})
+
+test("a tier hint without a router is reported once and the child keeps its pin", async () => {
+  const { runner, calls, reports } = makeRunner({ pinForAgent: async () => ({ providerID: "anthropic", id: "claude-pin" }) })
+  const first = runner.call("one", { tier: "strong" })
+  const second = runner.call("two", { tier: "strong" })
+  await tick()
+  assert.equal(calls[0]!.input.model?.id, "claude-pin")
+  calls[0]!.resolve(okResult("ses_hint_one"))
+  calls[1]!.resolve(okResult("ses_hint_two"))
+  await Promise.all([first, second])
+  assert.equal(reports.filter((line) => line.startsWith("tier hints ignored")).length, 1)
+})
+
+test("an unknown agent is not routed: rotation state and quota stay untouched", async () => {
+  let selections = 0
+  const { runner, calls } = makeRunner({ availableAgents: ["general"],
+    selectModel: async () => { selections++; return { providerID: "xai", id: "grok-4.7" } } })
+  const pending = runner.call("x", { agent: "ghost" })
+  await tick()
+  assert.equal(selections, 0)
+  assert.equal(calls[0]!.input.model, undefined)
+  calls[0]!.resolve(okResult("ses_ghost"))
+  await pending
 })
 
 test("a role mapped to an empty tier that falls back to another empty tier spawns on the agent pin", async () => {
@@ -139,9 +175,12 @@ test("a role mapped to an empty tier that falls back to another empty tier spawn
   assert.equal(registry.getAgent(run.id, "a1")!.spawnModel?.source, "pin")
   calls[0]!.resolve(okResult("ses_empty_pin"))
   await pending
-  // The same empty chain reached by an EXPLICIT hint is a caller mistake, not a pin.
-  await assert.rejects(runner.call("general", { tier: "frontier" }),
-    /routing tier frontier is empty — configure it or drop the tier hint/)
+  // The same empty chain reached by an EXPLICIT hint has no populated tier to degrade to: the pin.
+  const hinted = runner.call("general", { tier: "frontier" })
+  await tick()
+  assert.equal(registry.getAgent(run.id, "a2")!.spawnModel?.source, "pin")
+  calls[1]!.resolve(okResult("ses_empty_hint"))
+  await hinted
 })
 
 test("a routed spawn records its model source as route", async () => {
@@ -724,6 +763,31 @@ test("AgentRunner warm cache: same key + different prompt (digest mismatch) spaw
   assert.equal(rec.key, "scout")
   assert.equal(rec.promptDigest, agentCacheDigest("a DIFFERENT prompt", {}, "general"))
   assert.equal(rec.resultText, "done")
+})
+
+test("AgentRunner: replay identity + schema persist AT START, while the child is still running", async () => {
+  // Harvest precondition: a crash between spawn and success must leave the
+  // row with its key, digest and schema already durable — the post-restart
+  // harvest validates the recovered session against exactly this schema.
+  const schema = { type: "object", required: ["summary"], properties: { summary: { type: "string" } } }
+  const { registry, run, calls, runner } = makeRunner()
+  const pending = runner.call("scout the area", { key: "scout:1", schema })
+  await tick()
+  assert.equal(calls.length, 1)
+  calls[0]!.hooks.onSessionID("ses_inflight")
+  // STILL in flight: the row already carries replay identity + schema.
+  const mid = registry.getAgent(run.id, "a1")!
+  assert.equal(mid.status, "running")
+  assert.equal(mid.key, "scout:1")
+  assert.equal(mid.promptDigest, agentCacheDigest("scout the area", { schema }, "general"))
+  assert.deepEqual(mid.schema, schema)
+  assert.equal(mid.resultText, undefined, "no result text before completion")
+  // And an in-flight row is NOT warm-replayable — buildWarmCache gates on
+  // succeeded status, so persisting early never fakes a replayable row.
+  const cache = buildWarmCache(registry.get(run.id))
+  assert.equal(cache.size, 0)
+  calls[0]!.resolve(okResult("ses_inflight"))
+  await pending
 })
 
 test("AgentRunner: keyed real-path success persists replay identity; unkeyed does not", async () => {
@@ -1588,17 +1652,23 @@ test("AgentRunner breaker: a routed child honours the ask-mode resume override",
 })
 
 test("AgentRunner breaker: a routed child stays inside the routing policy for implicit rungs", async () => {
+  const selections: Array<{ failed: string[]; recordID: string | undefined }> = []
   const router = new ModelRouter(parseModelRouting({ timezone: "UTC", roles: { general: "strong" },
     tiers: { strong: { plans: [[{ model: "xai/grok-4.6" }], [{ model: "google/gemini-3.7-flash" }]], payg: [] } } }))
   const { runner, calls } = makeRunner({
     providerHealth: quarantinedXai(),
     modelFallbacks: { "xai/grok-4.6": ["anthropic/claude-x"] },
     pinPool: async () => [{ agentID: "general", pin: "anthropic/claude-x" }],
-    selectModel: (role, tier, excluded) => router.select({ role, ...(tier ? { tier } : {}), disabled: excluded }).then((choice) => choice.model),
+    selectModel: (role, tier, failed, recordID) => {
+      selections.push({ failed: [...(failed ?? [])], recordID })
+      return router.select({ role, ...(tier ? { tier } : {}), failed }).then((choice) => choice.model)
+    },
   })
   const pending = runner.call("routed")
   await tick()
   assert.deepEqual(calls[0]!.input.model, { providerID: "google", id: "gemini-3.7-flash" }, "the router re-picks; implicit rungs do not leak")
+  assert.deepEqual(selections, [{ failed: [], recordID: "a1" }, { failed: ["xai"], recordID: "a1" }],
+    "the re-select carries the dead provider and the child's record id")
   calls[0]!.resolve(okResult("ses_policy"))
   await pending
 })
@@ -1742,4 +1812,87 @@ test("AgentRunner failover: abort during permit swap leaves no partial holds", a
   await assert.rejects(pending, (err: unknown) => err instanceof AgentCallError && err.kind === "abort")
   assert.equal(registry.getAgent(run.id, "a1")!.status, "interrupted")
   assert.equal(held.size, 0, "run stop during the swap leaves no partial holds")
+})
+
+// ---------------------------------------------------------------------------
+// waitReason: every admission gate names itself on the pending row (P2-1)
+// ---------------------------------------------------------------------------
+
+test("waitReason: a queued child's pending row names the run queue; start clears it", async () => {
+  const { registry, run, calls, runner } = makeRunner({ concurrency: 1 })
+  const first = runner.call("a")
+  await tick()
+  assert.equal(calls.length, 1)
+  assert.equal(registry.getAgent(run.id, "a1")?.status, "pending")
+  assert.equal(registry.getAgent(run.id, "a1")?.waitReason, "run queue (cap 1)")
+
+  const second = runner.call("b")
+  await tick()
+  assert.equal(calls.length, 1, "second child queues behind the run semaphore")
+  assert.equal(registry.getAgent(run.id, "a2")?.status, "pending")
+  assert.equal(registry.getAgent(run.id, "a2")?.waitReason, "run queue (cap 1)")
+
+  calls[0]!.hooks.onSessionID("ses_a")
+  assert.equal(registry.getAgent(run.id, "a1")?.waitReason, undefined, "start clears the reason")
+  calls[0]!.resolve(okResult("ses_a"))
+  await first
+  await tick()
+  assert.equal(calls.length, 2, "second child acquires after the first settles")
+  calls[1]!.hooks.onSessionID("ses_b")
+  assert.equal(registry.getAgent(run.id, "a2")?.waitReason, undefined)
+  calls[1]!.resolve(okResult("ses_b"))
+  await second
+})
+
+test("waitReason: a child parked on the provider permit names provider and cap", async () => {
+  const limiter: ProviderLimiter = {
+    async acquire(_providerID, _cap, signal) {
+      await new Promise<void>((resolve, reject) => {
+        const onAbort = () => reject(new Error("run stopping"))
+        if (signal?.aborted) {
+          reject(new Error("run stopping"))
+          return
+        }
+        signal?.addEventListener("abort", onAbort, { once: true })
+        setTimeout(resolve, 40)
+      })
+      return { release: async () => {} }
+    },
+  }
+  const { registry, run, calls, runner } = makeRunner({
+    concurrency: 4,
+    pinForAgent: async () => ({ providerID: "anthropic", id: "claude" }),
+    providerLimiter: limiter,
+    providerConcurrency: { anthropic: 1 },
+  })
+  const first = runner.call("a")
+  const second = runner.call("b")
+  await tick(60) // first acquires; second parks on the permit
+  assert.match(String(registry.getAgent(run.id, "a2")?.waitReason), /^provider=anthropic; cap=1$/)
+  calls[0]!.hooks.onSessionID("ses_a")
+  calls[0]!.resolve(okResult("ses_a"))
+  await first
+  await tick(60)
+  calls[1]!.hooks.onSessionID("ses_b")
+  calls[1]!.resolve(okResult("ses_b"))
+  await second
+  assert.equal(registry.getAgent(run.id, "a2")?.waitReason, undefined)
+})
+
+test("waitReason: abort while queued lands a terminal row, never a pending zombie", async () => {
+  const ctrl = new AbortController()
+  const { registry, run, calls, runner } = makeRunner({ concurrency: 1, signal: ctrl.signal })
+  const first = runner.call("a")
+  await tick()
+  const second = runner.call("b")
+  await tick()
+  assert.equal(registry.getAgent(run.id, "a2")?.status, "pending")
+  ctrl.abort()
+  await assert.rejects(second, /run stopping/)
+  const row = registry.getAgent(run.id, "a2")
+  assert.equal(row?.status, "failed")
+  assert.match(String(row?.error), /aborted while queued/)
+  calls[0]!.hooks.onSessionID("ses_a")
+  calls[0]!.resolve(okResult("ses_a"))
+  await first
 })

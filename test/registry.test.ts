@@ -17,6 +17,9 @@ function makeRegistry(overrides: {
   loader?: () => RunRecord[]
   throttleMs?: number
   now?: () => number
+  bootID?: string
+  ownerAlive?: (bootID: string) => boolean
+  ownerProbe?: (bootID: string) => "alive-pid" | "alive-marker" | "dead-pid" | "dead"
 } = {}) {
   const persisted: RunRecord[] = []
   const persist = overrides.persist ?? ((r: RunRecord) => persisted.push(r))
@@ -25,6 +28,9 @@ function makeRegistry(overrides: {
     loader: overrides.loader,
     throttleMs: overrides.throttleMs,
     now: overrides.now,
+    bootID: overrides.bootID,
+    ownerAlive: overrides.ownerAlive,
+    ownerProbe: overrides.ownerProbe,
   })
   return { registry, persisted }
 }
@@ -359,17 +365,18 @@ test("reconcileOrphans flips running|stopping|paused runs to interrupted (server
 
   const a = registry.get("run_a")
   assert.equal(a?.status, "interrupted")
-  assert.equal(a?.stopReason, "server restart")
+  assert.match(a?.stopReason ?? "", /^server restart/)
+  assert.match(a?.stopReason ?? "", new RegExp(`rerun ${a?.id} --warm`))
   assert.equal(typeof a?.endedAt, "number")
   assert.deepEqual(a?.agents.map((x) => x.status), ["succeeded", "interrupted", "interrupted"])
 
   const b = registry.get("run_b")
   assert.equal(b?.status, "interrupted")
-  assert.equal(b?.stopReason, "server restart")
+  assert.match(b?.stopReason ?? "", /^server restart/)
 
   const p = registry.get("run_p")
   assert.equal(p?.status, "interrupted")
-  assert.equal(p?.stopReason, "server restart")
+  assert.match(p?.stopReason ?? "", /^server restart/)
 
   const c = registry.get("run_c")
   assert.equal(c?.status, "succeeded") // untouched
@@ -395,8 +402,277 @@ test("reconcileOrphans without a loader, or with a throwing loader, is a no-op",
   assert.equal(throwing.registry.reconcileOrphans(), 0)
 })
 
-test("reconcileOrphans never overwrites live in-memory runs", () => {
-  let clock = 1000
+test("reconcileOrphans adopts a remote-owned run only with fresh heartbeat AND live marker; flips otherwise", () => {
+  let clock = 10_000_000
+  const alive = persistedRun({
+    id: "run_alive",
+    status: "running",
+    startedAt: 1,
+    owner: { bootID: "boot_alive_elsewhere", updatedAt: clock - 60_000 },
+  })
+  const deadMarker = persistedRun({
+    id: "run_dead_marker",
+    status: "running",
+    startedAt: 1,
+    owner: { bootID: "boot_dead_marker", updatedAt: clock - 60_000 },
+  })
+  const staleHeartbeat = persistedRun({
+    id: "run_stale",
+    status: "running",
+    startedAt: 1,
+    owner: { bootID: "boot_alive_elsewhere", updatedAt: clock - (30 * 60_000 + 1) },
+  })
+  const { registry, persisted } = makeRegistry({
+    now: () => clock,
+    throttleMs: 0,
+    loader: () => [alive, deadMarker, staleHeartbeat],
+    ownerAlive: (bootID) => bootID === "boot_alive_elsewhere",
+  })
+
+  const flipped = registry.reconcileOrphans()
+  assert.equal(flipped, 2)
+
+  // Fresh heartbeat + live owner-liveness marker: the owner process is alive
+  // in another lane — adopt as-is, no write-back.
+  const a = registry.get("run_alive")
+  assert.equal(a?.status, "running")
+  assert.equal(a?.stopReason, undefined)
+  // Fresh heartbeat but the marker says the boot is dead (or absent):
+  // legacy flip-on-restart semantics.
+  const d = registry.get("run_dead_marker")
+  assert.equal(d?.status, "interrupted")
+  assert.match(d?.stopReason ?? "", /^server restart/)
+  assert.match(d?.stopReason ?? "", new RegExp(`rerun ${d?.id} --warm`))
+  // Live marker cannot outvote a heartbeat stale beyond the orphan window.
+  const s = registry.get("run_stale")
+  assert.equal(s?.status, "interrupted")
+  assert.match(s?.stopReason ?? "", /^server restart/)
+  // Only flipped records are written back to storage.
+  assert.deepEqual(persisted.map((r) => r.id), ["run_dead_marker", "run_stale"])
+})
+
+test("reconcileOrphans (pid-aware): a pid-verified live owner is NEVER flipped, even on a stale heartbeat", () => {
+  let clock = 10_000_000
+  // The 2026-09-27 wedge shape inverted: a live owner whose single child sat
+  // in one long silent provider request for >30 min starved the heartbeat and
+  // the old logic flipped a LIVE run. A pid-verified boot must outvote the
+  // stale heartbeat.
+  const silentChild = persistedRun({
+    id: "run_silent_child",
+    status: "running",
+    startedAt: 1,
+    owner: { bootID: "boot_alive_pid", updatedAt: clock - (30 * 60_000 + 60_000) },
+    agents: [{ id: "a1", status: "running", sessionID: "ses_child" }],
+  })
+  const { registry, persisted } = makeRegistry({
+    now: () => clock,
+    throttleMs: 0,
+    loader: () => [silentChild],
+    ownerProbe: (bootID) => (bootID === "boot_alive_pid" ? "alive-pid" : "dead"),
+  })
+  assert.equal(registry.reconcileOrphans(), 0)
+  assert.equal(registry.get("run_silent_child")?.status, "running")
+  assert.equal(persisted.length, 0, "no write-back for an adopted live run")
+})
+
+test("reconcileOrphans (pid-aware): a dead pid flips IMMEDIATELY despite fresh marker and heartbeat (the SIGKILL case)", () => {
+  let clock = 10_000_000
+  const killed = persistedRun({
+    id: "run_killed",
+    status: "running",
+    startedAt: 1,
+    owner: { bootID: "boot_killed", updatedAt: clock - 1_000, pid: 4312 },
+    agents: [
+      { id: "a1", status: "running", sessionID: "ses_a" },
+      { id: "a2", status: "pending" },
+      { id: "a3", status: "succeeded" },
+    ],
+  })
+  const { registry, persisted } = makeRegistry({
+    now: () => clock,
+    throttleMs: 0,
+    loader: () => [killed],
+    ownerProbe: () => "dead-pid",
+  })
+  assert.equal(registry.reconcileOrphans(), 1)
+  const run = registry.get("run_killed")!
+  assert.equal(run.status, "interrupted")
+  assert.match(run.stopReason ?? "", /^server restart \(owner boot_killed pid 4312 gone\)/)
+  assert.match(run.stopReason ?? "", new RegExp(`rerun ${run.id} --warm`))
+  assert.equal(run.agents.find((a) => a.id === "a1")?.status, "interrupted")
+  assert.equal(run.agents.find((a) => a.id === "a2")?.status, "interrupted")
+  assert.equal(run.agents.find((a) => a.id === "a3")?.status, "succeeded", "terminal children untouched")
+  assert.equal(typeof run.endedAt, "number")
+  assert.deepEqual(persisted.map((r) => r.id), ["run_killed"])
+})
+
+test("reconcileOrphans (pid-aware): alive-marker still falls back to the heartbeat window", () => {
+  let clock = 10_000_000
+  const freshHeartbeat = persistedRun({
+    id: "run_fresh",
+    status: "running",
+    startedAt: 1,
+    owner: { bootID: "boot_marker_only", updatedAt: clock - 60_000 },
+  })
+  const staleHeartbeat = persistedRun({
+    id: "run_over",
+    status: "running",
+    startedAt: 1,
+    owner: { bootID: "boot_marker_only", updatedAt: clock - (30 * 60_000 + 1) },
+  })
+  const { registry } = makeRegistry({
+    now: () => clock,
+    throttleMs: 0,
+    loader: () => [freshHeartbeat, staleHeartbeat],
+    ownerProbe: () => "alive-marker",
+  })
+  assert.equal(registry.reconcileOrphans(), 1)
+  assert.equal(registry.get("run_fresh")?.status, "running")
+  assert.equal(registry.get("run_over")?.status, "interrupted")
+})
+
+test("persistNow stamps the full owner identity (bootID, pid, updatedAt); touchActiveOwned refreshes only active owned runs", () => {
+  let clock = 5_000
+  const snapshots: RunRecord[] = []
+  const { registry } = makeRegistry({
+    bootID: "boot_me",
+    now: () => clock,
+    throttleMs: 0,
+    persist: (r) => snapshots.push({ ...r, owner: r.owner ? { ...r.owner } : undefined, agents: [...r.agents] }),
+  })
+  const active = registry.create({ parentSessionID: "ses", script: "s" })
+  const finished = registry.create({ parentSessionID: "ses", script: "s" })
+  registry.finish(finished.id, { status: "succeeded" })
+
+  clock = 9_000
+  const touched = registry.touchActiveOwned()
+  assert.equal(touched, 1, "only the active run created by this registry")
+  const last = snapshots.filter((r) => r.id === active.id).at(-1)!
+  assert.equal(last.owner?.bootID, "boot_me")
+  assert.equal(last.owner?.pid, process.pid)
+  assert.equal(last.owner?.updatedAt, 9_000)
+  // A finished run keeps its last snapshot; no new persist for it.
+  const finishedSnaps = snapshots.filter((r) => r.id === finished.id)
+  assert.equal(finishedSnaps.at(-1)!.owner?.updatedAt, 5_000)
+})
+
+test("ownsRun is provenance, not presence: created runs own, adopted remote runs do not", () => {
+  let clock = 10_000_000
+  const remote = persistedRun({
+    id: "run_adopted",
+    status: "running",
+    startedAt: 1,
+    owner: { bootID: "boot_elsewhere", updatedAt: clock - 1_000 },
+  })
+  const { registry } = makeRegistry({
+    now: () => clock,
+    throttleMs: 0,
+    loader: () => [remote],
+    ownerAlive: () => true,
+  })
+  assert.equal(registry.reconcileOrphans(), 0)
+  // Adopted: readable in this registry but owned by the other process.
+  assert.equal(registry.get("run_adopted") !== undefined, true)
+  assert.equal(registry.ownsRun("run_adopted"), false)
+
+  const created = registry.create({ parentSessionID: "ses_p", script: "return 1" })
+  assert.equal(registry.ownsRun(created.id), true)
+  registry.finish(created.id, { status: "succeeded" })
+  // Durable past completion — the persist-vs-live freshness decisions rely on it.
+  assert.equal(registry.ownsRun(created.id), true)
+})
+
+test("two-phase reconcile: classify -> harvest window -> apply keeps salvaged children as succeeded", () => {
+  let clock = 10_000_000
+  const orphan = persistedRun({
+    id: "run_two_phase",
+    status: "running",
+    startedAt: 1,
+    owner: { bootID: "boot_dead2", updatedAt: clock - 1_000, pid: 4312 },
+    agents: [
+      { id: "a1", status: "running", sessionID: "ses_done" },
+      { id: "a2", status: "running", sessionID: "ses_lost" },
+      { id: "a3", status: "pending" },
+    ],
+  })
+  const { registry, persisted } = makeRegistry({
+    now: () => clock,
+    throttleMs: 0,
+    loader: () => [orphan],
+    ownerProbe: () => "dead-pid",
+  })
+  const plans = registry.classifyOrphans({ recheckAdopted: true })
+  assert.equal(plans.length, 1)
+  assert.equal(plans[0]!.record.id, "run_two_phase")
+  // Between classify and apply, the harvest pass salvages one child.
+  registry.updateAgent("run_two_phase", "a1", { status: "succeeded", data: { ok: true }, endedAt: clock })
+  assert.equal(registry.applyOrphanInterrupt(plans[0]!), true)
+  const run = registry.get("run_two_phase")!
+  assert.equal(run.status, "interrupted")
+  assert.equal(run.agents.find((a) => a.id === "a1")?.status, "succeeded", "salvaged work survives the flip")
+  assert.equal(run.agents.find((a) => a.id === "a2")?.status, "interrupted")
+  assert.equal(run.agents.find((a) => a.id === "a3")?.status, "interrupted")
+  // Two persists: the salvaged-child update, then the flip.
+  assert.deepEqual(persisted.map((r) => r.id), ["run_two_phase", "run_two_phase"])
+})
+
+test("classifyOrphans recheckAdopted re-classifies a previously adopted mirror but never a locally supervised run", () => {
+  let clock = 10_000_000
+  let aliveOwner = true
+  const remote = persistedRun({
+    id: "run_remote_mirror",
+    status: "running",
+    startedAt: 1,
+    owner: { bootID: "boot_remote", updatedAt: clock - 1_000 },
+  })
+  const { registry } = makeRegistry({
+    now: () => clock,
+    throttleMs: 0,
+    loader: () => [remote],
+    ownerProbe: () => (aliveOwner ? "alive-pid" : "dead-pid"),
+  })
+  // Pass 1: owner alive — record adopted as running, no plan.
+  assert.equal(registry.classifyOrphans({ recheckAdopted: true }).length, 0)
+  assert.equal(registry.get("run_remote_mirror")?.status, "running")
+  // The owner dies; the persisted view never changes. The old startup-only
+  // reconcile would have frozen this record forever (the 2026-09-27 wedge).
+  aliveOwner = false
+  clock += 5_000
+  const plans = registry.classifyOrphans({ recheckAdopted: true })
+  assert.equal(plans.length, 1)
+  assert.equal(registry.applyOrphanInterrupt(plans[0]!), true)
+  assert.equal(registry.get("run_remote_mirror")?.status, "interrupted")
+
+  // A run this process created is never re-classified, even with a stale
+  // everything: its live supervisor state is authoritative.
+  const local = registry.create({ parentSessionID: "ses", script: "s" })
+  clock += 60_000
+  assert.equal(registry.classifyOrphans({ recheckAdopted: true }).length, 0)
+  assert.equal(registry.get(local.id)?.status, "running")
+})
+
+test("applyOrphanInterrupt is idempotent when the record finalized between classify and apply", () => {
+  let clock = 10_000_000
+  const orphan = persistedRun({
+    id: "run_raced",
+    status: "running",
+    startedAt: 1,
+    owner: { bootID: "boot_raced", updatedAt: clock - 1_000 },
+  })
+  const { registry } = makeRegistry({
+    now: () => clock,
+    throttleMs: 0,
+    loader: () => [orphan],
+    ownerProbe: () => "dead-pid",
+  })
+  const plans = registry.classifyOrphans()
+  // The owner finished the run between classify and apply.
+  registry.setStatus("run_raced", "succeeded")
+  assert.equal(registry.applyOrphanInterrupt(plans[0]!), false)
+  assert.equal(registry.get("run_raced")?.status, "succeeded")
+})
+
+test("reconcileOrphans never overwrites live in-memory runs", () => {  let clock = 1000
   const { registry } = makeRegistry({ now: () => clock, throttleMs: 0 })
   const live = registry.create({ parentSessionID: "ses", script: "live" })
   const stale = persistedRun({ id: live.id, status: "running", script: "stale", startedAt: 1 })
@@ -426,4 +702,184 @@ test("addCheckpoint: unknown run and blank names are ignored", () => {
   registry.addCheckpoint(run.id, "   ")
   registry.addCheckpoint(run.id, "ok")
   assert.equal(registry.get(run.id)!.checkpoints!.length, 1)
+})
+
+// ---------------------------------------------------------------------------
+// expiredRemoteRuns (deadline enforcement input)
+// ---------------------------------------------------------------------------
+
+test("expiredRemoteRuns: active remote records past deadline+grace only", () => {
+  const now = 1_000_000
+  const mk = (id: string, over: Partial<RunRecord> = {}): RunRecord =>
+    persistedRun({ id, status: "running", startedAt: 1, ...over })
+  const past = mk("run_past", { deadlineAt: now - 10 * 60_000 })
+  const insideGrace = mk("run_grace", { deadlineAt: now - 60_000 })
+  const paused = mk("run_paused", { status: "paused", deadlineAt: now - 10 * 60_000 })
+  const noDeadline = mk("run_nodeadline")
+  const finished = mk("run_done", { status: "succeeded", deadlineAt: now - 10 * 60_000 })
+  const { registry } = makeRegistry({
+    now: () => now,
+    throttleMs: 0,
+    loader: () => [past, insideGrace, paused, noDeadline, finished],
+  })
+  const expired = registry.expiredRemoteRuns(now, 5 * 60_000)
+  assert.deepEqual(expired.map((e) => e.record.id), ["run_past"])
+  assert.equal(expired[0]!.deadlineAt, now - 10 * 60_000)
+})
+
+test("expiredRemoteRuns skips runs this process created (its own watchdog owns them)", () => {
+  const now = 1_000_000
+  const other = persistedRun({ id: "run_remote2", status: "running", startedAt: 1, deadlineAt: now - 10 * 60_000 })
+  const { registry } = makeRegistry({ now: () => now, throttleMs: 0, loader: () => [other] })
+  const local = registry.create({ parentSessionID: "ses", script: "s" })
+  registry.noteRunDeadline(local.id, now - 10 * 60_000)
+  const expired = registry.expiredRemoteRuns(now, 5 * 60_000)
+  assert.deepEqual(expired.map((e) => e.record.id), ["run_remote2"])
+})
+
+test("noteRunDeadline / noteAgentActivity persist onto the record", () => {
+  const { registry } = makeRegistry({ throttleMs: 0 })
+  const run = registry.create({ parentSessionID: "ses", script: "s" })
+  registry.addAgent(run.id, { status: "running", sessionID: "ses_c" })
+  registry.noteRunDeadline(run.id, 42_000)
+  assert.equal(registry.get(run.id)?.deadlineAt, 42_000)
+  registry.noteRunDeadline(run.id, undefined)
+  assert.equal(registry.get(run.id)?.deadlineAt, undefined)
+  registry.noteAgentActivity(run.id, "a1", 77_000)
+  assert.equal(registry.getAgent(run.id, "a1")?.lastActivityAt, 77_000)
+})
+
+test("setPendingWaitReason stamps only pending rows; clear deletes the key", () => {
+  const { registry } = makeRegistry({ throttleMs: 0 })
+  const run = registry.create({ parentSessionID: "ses", script: "s" })
+  registry.addAgent(run.id, { status: "pending", startedAt: 1 })
+  registry.addAgent(run.id, { status: "running", startedAt: 1, sessionID: "ses_r" })
+  registry.setPendingWaitReason(run.id, "pause gate (run paused)")
+  const rows = registry.get(run.id)!.agents
+  assert.equal(rows[0]!.waitReason, "pause gate (run paused)")
+  assert.equal(rows[1]!.waitReason, undefined, "running rows keep their own story")
+  registry.setPendingWaitReason(run.id, undefined)
+  assert.equal(rows[0]!.waitReason, undefined)
+})
+
+test("appendEvent keeps a bounded ring and piggybacks the persist throttle", () => {
+  const { registry, persisted } = makeRegistry({ throttleMs: 0 })
+  const run = registry.create({ parentSessionID: "ses", script: "s" })
+  registry.appendEvent(run.id, "first", "first detail")
+  for (let i = 1; i < 300; i++) registry.appendEvent(run.id, `kind${i}`)
+  const events = registry.get(run.id)!.events!
+  assert.equal(events.length, 256)
+  assert.equal(events[0]!.kind, "kind44", "oldest dropped")
+  assert.equal(events[255]!.kind, "kind299")
+  const last = events.at(-1)!
+  assert.deepEqual(Object.keys(last).sort(), ["at", "kind"], "no detail key when absent")
+  assert.ok(persisted.some((r) => r.id === run.id && (r.events?.length ?? 0) > 0), "events persisted")
+})
+
+// ---------------------------------------------------------------------------
+// Freshness-safe reconciliation (review P1): a stale adopted mirror must
+// never overwrite a run the owner COMPLETED after adoption.
+// ---------------------------------------------------------------------------
+
+test("recheckAdopted: owner finished after adoption — mirror syncs, no plan, result preserved", () => {
+  let clock = 10_000_000
+  // Pass 1: adopt the running mirror.
+  let persistedRuns = [persistedRun({
+    id: "run_finished_late",
+    status: "running",
+    startedAt: 1,
+    owner: { bootID: "boot_owner2", updatedAt: clock, pid: 4321 },
+    agents: [{ id: "a1", status: "running", sessionID: "ses_c", startedAt: 1 }],
+  })]
+  const { registry } = makeRegistry({
+    now: () => clock,
+    throttleMs: 0,
+    loader: () => persistedRuns,
+    ownerProbe: () => "dead-pid",
+  })
+  assert.equal(registry.classifyOrphans().length, 1, "first pass: owner dead, plan produced")
+  // Decline to apply (simulating harvest time); the OWNER meanwhile finishes
+  // the run and persists succeeded, then exits.
+  persistedRuns = [persistedRun({
+    id: "run_finished_late",
+    status: "succeeded",
+    startedAt: 1,
+    endedAt: clock + 1,
+    result: { done: true },
+    owner: { bootID: "boot_owner2", updatedAt: clock + 1, pid: 4321 },
+    agents: [{ id: "a1", status: "succeeded", sessionID: "ses_c", startedAt: 1, endedAt: clock + 1, resultText: "work" }],
+  })]
+  // Periodic pass 2 with recheckAdopted: the mirror still says running.
+  assert.equal(registry.get("run_finished_late")?.status, "running", "mirror is stale")
+  assert.deepEqual(registry.classifyOrphans({ recheckAdopted: true }), [], "no plan for a run finished in persistence")
+  const synced = registry.get("run_finished_late")!
+  assert.equal(synced.status, "succeeded", "mirror synced from the owner's final write")
+  assert.deepEqual(synced.result, { done: true })
+  assert.equal(synced.agents[0]?.status, "succeeded")
+})
+
+test("applyOrphanInterrupt: a final persisted status outranks a stale running mirror (no result burial)", () => {
+  let clock = 10_000_000
+  const running = persistedRun({
+    id: "run_flip_race",
+    status: "running",
+    startedAt: 1,
+    owner: { bootID: "boot_owner3", updatedAt: clock, pid: 4322 },
+    agents: [{ id: "a1", status: "running", sessionID: "ses_c", startedAt: 1 }],
+  })
+  const { registry, persisted } = makeRegistry({
+    now: () => clock,
+    throttleMs: 0,
+    loader: () => [running],
+    ownerProbe: () => "dead-pid",
+  })
+  const plans = registry.classifyOrphans()
+  assert.equal(plans.length, 1)
+  // The owner finishes BETWEEN classify and apply; the loader now returns it.
+  running.status = "succeeded"
+  running.result = { keep: "me" }
+  running.agents[0]!.status = "succeeded"
+  assert.equal(registry.applyOrphanInterrupt(plans[0]!), false, "final persisted status declines the flip")
+  assert.equal(registry.get("run_flip_race")?.status, "succeeded", "mirror synced to the truth")
+  assert.deepEqual(registry.get("run_flip_race")?.result, { keep: "me" })
+  assert.equal(persisted.length, 0, "nothing written — the completed record was never touched")
+})
+
+test("expiredRemoteRuns enforces the PERSISTED deadline even when the mirror is stale", () => {
+  let clock = 10_000_000
+  const raw = persistedRun({
+    id: "run_deadline_fresh",
+    status: "running",
+    startedAt: 1,
+    owner: { bootID: "boot_live2", updatedAt: clock, pid: 4999 },
+    deadlineAt: clock - 10 * 60_000,
+    agents: [{ id: "a1", status: "running", sessionID: "ses_c", startedAt: 1 }],
+  })
+  const { registry } = makeRegistry({ now: () => clock, throttleMs: 0, loader: () => [raw] })
+  registry.classifyOrphans() // adopts the mirror
+  // The owner re-arms a LATER deadline; the persisted copy says so.
+  raw.deadlineAt = clock + 60_000
+  const expired = registry.expiredRemoteRuns(clock, 5 * 60_000)
+  assert.deepEqual(expired, [], "persisted (not mirrored) deadline decides")
+})
+
+test("activityForSession resolves adopted mirrors' lastActivityAt (never bound locally)", () => {
+  const { registry } = makeRegistry({ throttleMs: 0, loader: () => [] })
+  const local = registry.create({ parentSessionID: "ses", script: "s" })
+  registry.addAgent(local.id, { status: "running", sessionID: "ses_local", startedAt: 1 })
+  registry.noteAgentActivity(local.id, "a1", 1_111)
+  // Adopt a remote running record with persisted activity.
+  const adopted = persistedRun({
+    id: "run_remote_activity", status: "running", startedAt: 1,
+    owner: { bootID: "boot_far", updatedAt: 9_999 },
+    agents: [{ id: "a9", status: "running", sessionID: "ses_adopted", startedAt: 1, lastActivityAt: 9_777 }],
+  })
+  const reg2 = new RegistryImpl({
+    persist: () => {}, loader: () => [adopted], throttleMs: 0,
+    now: () => 10_000, ownerProbe: () => "alive-pid",
+  })
+  reg2.classifyOrphans() // adopts the mirror without binding sessions
+  assert.equal(reg2.activityForSession("ses_adopted"), 9_777, "adopted mirror row found by scan")
+  assert.equal(registry.activityForSession("ses_local"), 1_111, "bound index path intact")
+  assert.equal(registry.activityForSession("ses_nope"), undefined)
 })

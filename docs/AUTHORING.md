@@ -112,9 +112,9 @@ for warm reruns:
   `routing`; see `docs/MODEL-ROUTING.md`). The value is a literal tier name or exactly one
   whole-string template ref — `tier: "{{plan.tier}}"` — resolved against a node defined earlier,
   which makes it a data edge for wave scheduling just like a prompt interpolation; absent or
-  non-string evidence degrades to the agent's role default. A hint naming an undefined tier fails
-  (`unknown routing tier X`), and a hint naming an empty tier fails by design — configure the tier
-  or drop the field.
+  non-string evidence degrades to the agent's role default. A hint never fails the child: an
+  undefined tier falls back to the role default, and an empty tier to the nearest filled tier on
+  the user's ladder, then the agent pin. Only a tier whose models are all gated out fails.
 - **Refs:** `"$scout.items"`, `"$args.angles"`, `"$lanes.length"` — a node's *primary value* is
   its `.data` when a schema was given, else its `.text`; fanout/merge primaries are arrays / joined
   text. Refs must flow forward (spec order is the topological order); back-references are

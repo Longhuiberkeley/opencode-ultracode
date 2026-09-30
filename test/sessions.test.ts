@@ -46,6 +46,10 @@ test("runAgent: happy path — create, register sessionID immediately, extract t
   assert.equal(result.agent, "general")
   assert.deepEqual(result.model, { providerID: "openrouter", id: "m/1" })
   assert.deepEqual(result.tokens, TOKENS)
+  // The final assistant message exposes usage => requestTokens come from it,
+  // so the sample is not stale (calibration may fold it).
+  assert.deepEqual(result.requestTokens, TOKENS)
+  assert.equal(result.requestTokensStale, undefined)
 
   const session = fake.sessions.get(result.sessionID)
   assert.ok(session)
@@ -238,6 +242,17 @@ test("runAgent: happy path extracts the last assistant text", async () => {
   assert.equal(result.text, "first")
 })
 
+// ---------------------------------------------------------------------------
+// Request-token resolution (most recent assistant message exposing usage)
+// ---------------------------------------------------------------------------
+
+test("runAgent: no assistant message exposes usage => requestTokens stays undefined", async () => {
+  const { driver } = makeDriver([{ text: "no usage here" }])
+  const result = await driver.runAgent(input(), ["general"], hooks())
+  assert.equal(result.text, "no usage here")
+  assert.equal(result.requestTokens, undefined)
+})
+
 test("text extraction: concatenated multi-part text parts (verified rule)", async () => {
   const { assistantText } = await import("../src/sessions.ts")
   const message = {
@@ -309,6 +324,25 @@ test("runAgent: schema repair refreshes text/model/tokens from the REPAIRED resp
   assert.equal(result.text, '{"answer": "42"}')
   assert.deepEqual(result.model, { providerID: "p", id: "attempt-2" })
   assert.deepEqual(result.tokens, { input: 99, output: 5, reasoning: 0, cache: { read: 0, write: 0 } })
+  // The repaired reply exposes usage => requestTokens describe it, like .tokens.
+  assert.deepEqual(result.requestTokens, { input: 99, output: 5, reasoning: 0, cache: { read: 0, write: 0 } })
+  assert.equal(result.requestTokensStale, undefined)
+})
+
+test("runAgent: schema repair — repaired reply without usage keeps requestTokens from the latest reply that exposed it", async () => {
+  const attempt1: TokenUsage = { input: 11, output: 7, reasoning: 1, cache: { read: 5, write: 2 } }
+  const { driver } = makeDriver([
+    { text: "not json at all", tokens: attempt1 },
+    { text: '{"answer": "42"}' }, // repaired reply exposes no usage
+  ])
+  const result = await driver.runAgent(input({ schema: SCHEMA }), ["general"], hooks())
+  assert.deepEqual(result.data, { answer: "42" })
+  // .tokens stays session-cumulative (the fake's session total is attempt1).
+  assert.deepEqual(result.tokens, attempt1)
+  // .requestTokens fall back past the usage-less repaired reply, marked stale
+  // so calibration never pairs the older usage with the repaired request bytes.
+  assert.deepEqual(result.requestTokens, attempt1)
+  assert.equal(result.requestTokensStale, true)
 })
 
 test("runAgent: schema mode — valid first reply keeps attempt-1 metadata", async () => {
@@ -695,6 +729,27 @@ test("continueAgent: continues the SAME session — no create, history reused, n
   assert.match(userMsgs[1]!.text ?? "", /Original request:\ndo it/)
 })
 
+test("continueAgent: usage-less final reply keeps requestTokens from the earlier turn", async () => {
+  const earlier: TokenUsage = { input: 50, output: 7, reasoning: 1, cache: { read: 10, write: 2 } }
+  const { fake, driver } = makeDriver([
+    { text: "first", tokens: earlier },
+    { text: "second" }, // continued (final) assistant message exposes no usage
+  ])
+  const first = await driver.runAgent(input(), ["general"], hooks())
+  const result = await driver.continueAgent(
+    { sessionID: first.sessionID, continuationPrompt: "keep going" },
+    { signal: CONTINUE_SIGNAL },
+  )
+  assert.equal(result.text, "second")
+  // `tokens` stays session-cumulative; requestTokens fall back to the most
+  // recent assistant message that exposed usage — flagged stale, because that
+  // was an EARLIER turn than the final (usage-less) one.
+  assert.deepEqual(result.tokens, earlier)
+  assert.deepEqual(result.requestTokens, earlier)
+  assert.equal(result.requestTokensStale, true)
+  assert.equal(fake.sessions.get(first.sessionID)!.prompts, 2)
+})
+
 test("continueAgent: requested model is switched BEFORE the continuation prompt", async () => {
   const { fake, driver } = makeDriver([
     {
@@ -832,4 +887,131 @@ test("continueAgent: abort mid-wait interrupts the SAME session", async () => {
     (err: unknown) => err instanceof AgentCallError && err.kind === "abort" && /run stopping/.test(err.message),
   )
   assert.deepEqual(fake.interrupts, [first.sessionID])
+})
+
+// ---------------------------------------------------------------------------
+// Per-await deadlines (P1-1): a hung RPC lands typed + terminal, never a wedge
+// ---------------------------------------------------------------------------
+
+test("runAgent: a hung wait() hits the await deadline — typed timeout error + best-effort interrupt", async () => {
+  const fake = new FakeSessionCtx()
+  fake.push({ text: "never reached" })
+  fake.hangWait = true
+  const driver = createSessionDriver(fake, { awaitTimeoutMs: 40 })
+  await assert.rejects(
+    driver.runAgent(input(), ["general"], hooks()),
+    (err: unknown) =>
+      err instanceof AgentCallError && err.kind === "timeout" && /session\.wait .* exceeded 40ms/.test(err.message),
+  )
+  assert.ok(fake.interrupts.length >= 1, "hung wait best-effort interrupted")
+  // Release so nothing dangles into other tests.
+  fake.hangWait = false
+  fake.releaseHangs()
+})
+
+test("runAgent: a hung session.create() hits the control deadline with a typed timeout", async () => {
+  const inner = new FakeSessionCtx()
+  inner.push({ text: "x" })
+  const hanging: SessionCtx = {
+    create: () => new Promise(() => {}),
+    get: (i) => inner.get(i),
+    prompt: (i) => inner.prompt(i),
+    wait: (i) => inner.wait(i),
+    context: (i) => inner.context(i),
+    interrupt: (i) => inner.interrupt(i),
+  }
+  const driver = createSessionDriver(hanging, { controlTimeoutMs: 30 })
+  await assert.rejects(
+    driver.runAgent(input(), ["general"], hooks()),
+    (err: unknown) => err instanceof AgentCallError && err.kind === "timeout" && /session\.create exceeded 30ms/.test(err.message),
+  )
+})
+
+test("runAgent: a hung session.get() after a successful turn hits the control deadline", async () => {
+  const inner = new FakeSessionCtx()
+  inner.push({ text: "done text" })
+  const hanging: SessionCtx = {
+    create: (i) => inner.create(i),
+    // The very first get (the outcome read after the turn) hangs forever.
+    get: () => new Promise(() => {}),
+    prompt: (i) => inner.prompt(i),
+    wait: (i) => inner.wait(i),
+    context: (i) => inner.context(i),
+    interrupt: (i) => inner.interrupt(i),
+  }
+  const driver = createSessionDriver(hanging, { controlTimeoutMs: 30 })
+  await assert.rejects(
+    driver.runAgent(input(), ["general"], hooks()),
+    (err: unknown) => err instanceof AgentCallError && err.kind === "timeout" && /session\.get .* exceeded 30ms/.test(err.message),
+  )
+})
+
+test("deadlines are off at <=0: a slow-but-honest RPC never times out", async () => {
+  const fake = new FakeSessionCtx()
+  fake.push({ text: "slow ok" })
+  const driver = createSessionDriver(fake, { awaitTimeoutMs: 0, controlTimeoutMs: 0 })
+  const result = await driver.runAgent(input(), ["general"], hooks())
+  assert.equal(result.text, "slow ok")
+})
+
+test("a timeout-kind failure is terminal for the runner — no same-model retry, row lands failed", async () => {
+  // Timeout is not kind "outcome": the runner's provider-shaped retry loop
+  // never re-prompts it; the child record reaches failed with the hung-RPC
+  // error. (Exercised through the fake driver the same way the runner sees
+  // a real timeout.)
+  const err = new AgentCallError("timeout", "session.wait on session s exceeded 15ms — the host session RPC appears hung")
+  assert.equal(err instanceof AgentCallError, true)
+  assert.equal((err as AgentCallError).kind, "timeout")
+})
+
+// ---------------------------------------------------------------------------
+// Lifecycle event tap: every RPC boundary is visible (post-mortem trail)
+// ---------------------------------------------------------------------------
+
+test("driver onEvent emits the full RPC sequence for a schema-validated child", async () => {
+  const kinds: string[] = []
+  const fake = new FakeSessionCtx()
+  fake.push({ text: '{"answer": "42"}' })
+  const driver = createSessionDriver(fake, {
+    onEvent: (event) => kinds.push(event.detail !== undefined ? `${event.kind}:${event.detail}` : event.kind),
+  })
+  await driver.runAgent(input({ schema: SCHEMA }), ["general"], hooks())
+  assert.deepEqual(kinds, [
+    "session.create",
+    "prompt.start",
+    "prompt.return",
+    "wait.start",
+    "wait.return",
+    "session.get",
+    "session.context",
+    "schema.validate:ok",
+  ])
+})
+
+test("driver onEvent emits schema.repair per round and validates after repair", async () => {
+  const kinds: string[] = []
+  const fake = new FakeSessionCtx()
+  fake.push({ text: "not json" })
+  fake.push({ text: '{"answer": "42"}' })
+  const driver = createSessionDriver(fake, {
+    onEvent: (event) => kinds.push(event.kind),
+  })
+  await driver.runAgent(input({ schema: SCHEMA }), ["general"], hooks())
+  assert.deepEqual(kinds, [
+    "session.create",
+    "prompt.start", "prompt.return", "wait.start", "wait.return", "session.get", "session.context",
+    "schema.repair",
+    "prompt.start", "prompt.return", "wait.start", "wait.return", "session.get", "session.context",
+    "schema.validate",
+  ])
+})
+
+test("driver onEvent never breaks the child when the emitter throws", async () => {
+  const fake = new FakeSessionCtx()
+  fake.push({ text: "hello" })
+  const driver = createSessionDriver(fake, {
+    onEvent: () => { throw new Error("emitter down") },
+  })
+  const result = await driver.runAgent(input(), ["general"], hooks())
+  assert.equal(result.text, "hello")
 })

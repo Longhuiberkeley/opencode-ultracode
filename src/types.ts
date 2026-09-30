@@ -143,6 +143,15 @@ export interface UltracodeOptions {
   quotaSources?: Record<string, { command: string[]; format: "capacity-v1" | "check-rate" }>
   /** Only models named here receive the approximate active-input guard. */
   childLimits?: Record<string, ChildContextLimit>
+  /**
+   * Periodic orphan-reconcile cadence in ms: refresh persisted runs and
+   * re-classify active records whose owner is gone (dead pid, dead marker, or
+   * a pid-less marker past the orphan heartbeat window), flipping them to
+   * `interrupted` with a resume hint and harvesting salvageable children.
+   * Startup always reconciles once regardless. 0 disables the periodic pass
+   * (startup-only, the historical behavior). Default 60_000.
+   */
+  reconcileIntervalMs?: number
 }
 
 export const DEFAULT_OPTIONS: Required<UltracodeOptions> = {
@@ -166,6 +175,7 @@ export const DEFAULT_OPTIONS: Required<UltracodeOptions> = {
   quotaCommand: null,
   quotaSources: {},
   childLimits: {},
+  reconcileIntervalMs: 60_000,
 }
 
 /** Local admission clamp (this repo default). Not a host API. */
@@ -419,7 +429,6 @@ export type ActiveRunStatus = "running" | "stopping" | "paused"
 export function isActiveRunStatus(s: RunStatus): s is ActiveRunStatus {
   return s === "running" || s === "stopping" || s === "paused"
 }
-
 export type AgentStatus = "pending" | "running" | "succeeded" | "failed" | "interrupted"
 
 export interface TokenUsage {
@@ -447,6 +456,8 @@ export interface AgentRecord {
    * `source` records precedence: "call" | "run" (explicit overrides) vs "pin".
    */
   spawnModel?: SpawnModel
+  /** Router decision at admission, including the candidates excluded before the draw. */
+  routing?: { reason: string; skipped: string[] }
   sessionID?: string
   status: AgentStatus
   error?: string
@@ -469,8 +480,30 @@ export interface AgentRecord {
   key?: string
   /** sha256 over prompt + schema + agent — warm-rerun cache identity. */
   promptDigest?: string
+  /**
+   * The opts.schema this child was spawned with, persisted AT START (not only
+   * on success) so a post-crash harvest pass can validate a recovered
+   * session's final assistant message against the exact contract the caller
+   * asked for before replaying it warm. Additive; absent for schema-less calls.
+   */
+  schema?: Json
   /** True when this record was replayed from a prior run (no session spawned). */
   cached?: boolean
+  /** True when a succeeded row was SALVAGED by the post-crash harvest pass (owner death), not returned by a live worker. */
+  harvested?: boolean
+  /**
+   * Last observed child activity (host events), persisted THROTTLED so any
+   * process reading the record can compute stalledMs across restarts — the
+   * in-memory activity map dies with the owner process.
+   */
+  lastActivityAt?: number
+  /**
+   * Why a PENDING child is not running yet: the admission gate it is parked
+   * at ("run queue (cap N)" | "provider=X; cap=N" | "quarantine window ..." |
+   * "pause gate"). Stamped by the gate, cleared the moment the child starts
+   * (onSessionID) — a pending row must never look like a mystery.
+   */
+  waitReason?: string
   /** Final text (stored only for keyed calls, so future warm reruns can replay it). */
   resultText?: string
 }
@@ -480,6 +513,20 @@ export interface CheckpointRecord {
   name: string
   at: number
   value?: Json
+}
+
+/**
+ * One lifecycle event in the run's bounded post-mortem ring: RPC boundaries
+ * (session.create / prompt.start|return / wait.start|return / session.get /
+ * session.context), admission (admit / attempt / provider-queue.acquire),
+ * schema.validate / schema.repair, watchdog / pause / resume / stop / settle,
+ * harvest, reconcile. `kind` is a stable dotted string; `detail` is a short
+ * human-readable one-liner (sessionID, provider, verdict).
+ */
+export interface RunEvent {
+  at: number
+  kind: string
+  detail?: string
 }
 
 export interface RunRecord {
@@ -551,9 +598,26 @@ export interface RunRecord {
   allowDisabledProviders?: boolean
   /**
    * Process ownership for orphan reconciliation. Optional/additive: records
-   * without owner keep the legacy "flip on restart" behavior.
+   * without owner keep the legacy "flip on restart" behavior. `pid` (additive)
+   * lets reconciliation prove a fresh-but-orphaned marker dead after SIGKILL.
    */
-  owner?: { bootID: string; updatedAt: number }
+  owner?: { bootID: string; updatedAt: number; pid?: number }
+  /**
+   * Absolute wall-clock deadline this run's watchdog enforced at last arm
+   * (additive). Present only while a deadline is actually burning — cleared
+   * on pause, re-armed on resume — so ANY process can enforce the run
+   * timeout for a record whose owner is alive-but-wedged (its heartbeat
+   * timer keeps running even when nothing else does) or dead. Absent on
+   * records predating this field and on final records.
+   */
+  deadlineAt?: number
+  /**
+   * Bounded lifecycle event ring (newest last, MAX_RUN_EVENTS): the
+   * post-mortem trail for "what was the last thing that actually happened"
+   * — RPC boundaries (session.create/prompt/wait/get/context), admission,
+   * schema validation/repair, watchdog/pause/stop, harvest, reconcile.
+   */
+  events?: RunEvent[]
 }
 
 export function emptyTokens(): TokenUsage {
@@ -667,12 +731,19 @@ export interface AgentResult {
   model?: { providerID: string; id: string } | null
   tokens?: TokenUsage
   /**
-   * Usage of the LAST model request only (message-level tokens: its input +
-   * cache.read + cache.write is the statusline-style "current request
-   * context"). Distinct from `tokens`, which is session-cumulative. Absent
-   * when the host exposes no message-level usage.
+   * Usage of the most recent model request that exposed usage (message-level
+   * tokens: its input + cache.read + cache.write is the statusline-style
+   * "current request context"). Distinct from `tokens`, which is
+   * session-cumulative. Absent when the host exposes no message-level usage.
    */
   requestTokens?: TokenUsage
+  /**
+   * True when `requestTokens` fell back to an earlier request because the
+   * final assistant message exposed no usage. Display surfaces still use the
+   * value; the child-context calibration fold skips such a sample because the
+   * stored bytes describe the LAST request, not the one this usage came from.
+   */
+  requestTokensStale?: boolean
   /** Parsed structured output (present when opts.schema was given and validation succeeded). */
   data?: Json
   /** Present when this result was replayed from a prior run's warm cache. */
@@ -683,12 +754,13 @@ export interface AgentResult {
    * actually finished, and why. Informational — the registry row keeps
    * spawnModel (intended) and effectiveModel (what ran) alongside it. `class`
    * is the triggering failure class: `"quota"` for quota/quarantine routing,
-   * `"burst"` when the same-model burst budget was exhausted and the ladder ran.
+   * `"burst"` when the same-model burst budget was exhausted and the ladder
+   * ran, `"refusal"` when a content-policy filter forced a provider switch.
    */
   failover?: {
     from: ModelRef
     to: ModelRef
-    class: "quota" | "burst"
+    class: "quota" | "burst" | "refusal"
     reason: string
   }
 }
@@ -990,6 +1062,28 @@ export interface Registry {
   getAgent(runID: string, agentID: string): AgentRecord | undefined
   /** Append a phase-boundary checkpoint (bounded — oldest dropped). */
   addCheckpoint(runID: string, name: string, value?: Json): void
+  /**
+   * Persist the run's wall-clock deadline as seen by its live watchdog
+   * (undefined = no deadline burning, e.g. paused). Called at every arm/clear
+   * so any process can enforce the timeout for an owner that stopped
+   * enforcing it.
+   */
+  noteRunDeadline(runID: string, deadlineAt: number | undefined): void
+  /**
+   * Persist a child's last-activity timestamp (callers throttle; cheap map
+   * write + throttled persist) so stalledMs survives restarts.
+   */
+  noteAgentActivity(runID: string, agentID: string, at: number): void
+  /** Stamp/clear why every PENDING child of the run is parked (pause gate). */
+  setPendingWaitReason(runID: string, reason: string | undefined): void
+  /** Append a bounded lifecycle event to the run's ring (piggybacked on the persist throttle). */
+  appendEvent(runID: string, kind: string, detail?: string): void
+  /**
+   * Persisted lastActivityAt for a child session (stalledMs input). Works
+   * for LOCALLY bound sessions AND adopted mirrors (whose session IDs are
+   * never bound here) — read-only lookup, no ownership semantics.
+   */
+  activityForSession(sessionID: string): number | undefined
   /** Record final result + totals. */
   finish(runID: string, outcome: {
     status: RunStatus
@@ -1012,10 +1106,39 @@ export interface Registry {
   bindAgentSession(runID: string, agentID: string, sessionID: string): void
   /** Reverse lookup for event routing. Survives finalize. */
   agentForSession(sessionID: string): { runID: string; agentID: string } | undefined
+  /**
+   * On plugin load AND periodically: seed + classify persisted records
+   * (two-phase so harvest can run between classify and apply). See
+   * RegistryImpl for the canonical implementation and semantics.
+   */
+  classifyOrphans(opts?: { recheckAdopted?: boolean }): OrphanPlan[]
+  /** Apply a classifyOrphans() plan: flip to interrupted + persist. */
+  applyOrphanInterrupt(plan: OrphanPlan, reasonOverride?: string): boolean
+  /**
+   * Who may speak for a run right now (local / remote-live / dead /
+   * not-found) — the input to truthful control on records without a local
+   * RunState.
+   */
+  ownerStatus(runID: string):
+    | { kind: "not-found" }
+    | { kind: "local" | "remote-live" | "dead"; record: RunRecord; owner?: { bootID: string; pid?: number; updatedAt?: number }; detail?: string }
   /** On plugin load: mark persisted running/stopping/paused runs as interrupted (no auto-replay). */
   reconcileOrphans(): void
+  /**
+   * Active records this process does NOT supervise whose persisted
+   * `deadlineAt` is older than `graceMs` — the owner may still be ALIVE
+   * (its heartbeat timer outlives its watchdog) but has stopped enforcing
+   * the run timeout. Harvest + flip candidates for the periodic pass.
+   */
+  expiredRemoteRuns(now: number, graceMs: number): Array<{ record: RunRecord; deadlineAt: number }>
   /** Persist the current in-memory record immediately (effective snapshot, etc.). */
   persistNow(runID: string): void
+}
+
+/** A classifyOrphans() output: an active record whose owner is gone. */
+export interface OrphanPlan {
+  record: RunRecord
+  reason: string
 }
 
 // ---------------------------------------------------------------------------
@@ -1117,7 +1240,8 @@ export interface RunOutcome {
 /**
  * Provider-failure class as the run-level breaker consumes it (a mirror of
  * `FailureClassification.class` values that matter to admission — "other" is
- * never reported).
+ * never reported, and "refusal" is deliberately excluded too: a content-
+ * policy rejection is prompt-specific, not provider health).
  */
 export type ProviderFailureClass = "quota" | "burst"
 
@@ -1172,6 +1296,23 @@ export interface ProviderHealth {
   }): void
 }
 
+/**
+ * Truthful stop outcome: exactly one of — accepted locally (a live RunState
+ * took the stop), accepted as an ORPHAN (no local worker; record marked
+ * interrupted with a resume hint), or refused with a reason (`not-found`,
+ * `not-active` with the current status, or `remote-owner` naming the live
+ * owning process so the caller can say WHERE to control the run).
+ */
+export type StopOutcome =
+  | { ok: true; mode: "local" }
+  | { ok: true; mode: "orphan"; stopReason: string }
+  | { ok: false; reason: "not-found" }
+  | { ok: false; reason: "not-active"; status: RunStatus }
+  | { ok: false; reason: "remote-owner"; owner: { bootID: string; pid?: number; updatedAt?: number } }
+
+/** Truthful pause/resume outcome: ok plus an actionable error when false. */
+export type PauseResumeOutcome = { ok: boolean; error?: string }
+
 export interface Supervisor {
   /** Child-only context guard. Undefined for ordinary sessions. */
   contextLimitFor?(sessionID: string, model: ModelRef): ChildContextLimit | undefined
@@ -1187,16 +1328,27 @@ export interface Supervisor {
   startDetached(input: RunLaunchInput, parent: ParentContext): { runID: string; done: Promise<RunOutcome> }
   /** Replace next-run defaults. In-flight runs keep their startDetached snapshot. */
   updateDefaults(next: Required<UltracodeOptions>): void
-  /** Idempotent stop. Returns false if runID unknown or already final. */
-  stop(runID: string, reason: string): boolean
-  /** Close admission of new agent() calls. Returns false if not running. */
-  pause(runID: string): boolean
   /**
-   * Reopen admission. Returns false if not paused. Ask mode: the optional
-   * `model` pin becomes the run-level fallback OVERRIDE — failovers (and
-   * quarantine routing) for this run prefer it over the configured ladder.
+   * Idempotent, truthful stop. Never returns a bare boolean lie for a run the
+   * record says is active: an orphaned run (owner dead, no local worker) is
+   * MARKED INTERRUPTED with a resume hint ({ mode: "orphan" }); a run owned by
+   * a live remote process is refused naming that owner.
    */
-  resume(runID: string, opts?: { model?: ModelRef }): boolean
+  stop(runID: string, reason: string): StopOutcome
+  /**
+   * Close admission of new agent() calls. Returns ok:false with an actionable
+   * error when the run is not locally live (orphaned, remote-owned, finished).
+   */
+  pause(runID: string): PauseResumeOutcome
+  /**
+   * Reopen admission. Returns ok:false with an actionable error when there is
+   * no local worker to reopen. Ask mode: the optional `model` pin becomes the
+   * run-level fallback OVERRIDE — failovers (and quarantine routing) for this
+   * run prefer it over the configured ladder.
+   */
+  resume(runID: string, opts?: { model?: ModelRef }): PauseResumeOutcome
+  /** True when this process supervises the run's worker (has a live RunState). Steer pre-flight. */
+  hasLiveState?(runID: string): boolean
   stopAll(reason: string): void
   /** Currently quarantined providers (ask-mode diagnostics + remember keying). */
   providerQuarantines(): ProviderQuarantineSnapshot[]

@@ -56,6 +56,16 @@ test("resolveFallbacks: quota excludes the dead provider entirely; burst allows 
   assert.deepEqual(models(burst), ["xai/grok-mini", "google/gemini-3.7-flash"])
 })
 
+test("resolveFallbacks: refusal excludes the dead provider (same-provider retry would hit the same filter)", () => {
+  const candidates = resolveFallbacks({
+    dead: DEAD,
+    failureClass: "refusal",
+    callFallbacks: ["xai/grok-mini", "google/gemini-3.7-flash"],
+    readOnly: false,
+  })
+  assert.deepEqual(models(candidates), ["google/gemini-3.7-flash"])
+})
+
 test("resolveFallbacks: the dead providerID+id is never a candidate, from any source", () => {
   const candidates = resolveFallbacks({
     dead: DEAD,

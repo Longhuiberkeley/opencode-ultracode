@@ -6,15 +6,17 @@ import { normalizeModelRef } from "./agent-pins.ts"
 import { agentCells, compactCount, compactElapsed, compactTokens, runHeaderCells } from "./run-format.ts"
 import { canonicalGraphSpec, graphNodeCount, graphToAscii, graphToMermaid, validateGraphSpec } from "./graph.ts"
 import type { GraphNode, GraphSpec } from "./graph.ts"
-import { MAX_CHECKPOINTS } from "./registry.ts"
+import { MAX_CHECKPOINTS, MAX_RUN_EVENTS } from "./registry.ts"
 import { compactStringify, safeSlice } from "./serialize.ts"
 import { reduceToolEvent, toolCallsFor, type ToolEvent, type ToolEventState } from "./run-events.ts"
-import { GRAPH_ARTIFACT_SUFFIX, WORKFLOW_NAME_RE, normalizePath, sha256 } from "./storage.ts"
+import { ownershipFields, runLivenessSuffix } from "./run-status.ts"
+import { GRAPH_ARTIFACT_SUFFIX, WORKFLOW_NAME_RE, normalizePath, refreshRunsIfStale, sha256 } from "./storage.ts"
 import { paramsFromArgs, paramsValue } from "./params.ts"
 import type {
   Json,
   ModelRef,
   ParentContext,
+  PauseResumeOutcome,
   Registry,
   RunEnvelope,
   RunLaunchInput,
@@ -23,6 +25,7 @@ import type {
   RunStatus,
   SaveWorkflowManifestInput,
   SavedWorkflow,
+  StopOutcome,
   Supervisor,
   UltracodeOptions,
   WorkflowKind,
@@ -96,7 +99,7 @@ export const NESTED_RUN_REFUSED =
   "cannot start a run from inside an active workflow session — use /ultracode from the parent"
 
 /** Plugin package version shown on the bare /ultracode dashboard. */
-export const PLUGIN_VERSION = "0.15.0"
+export const PLUGIN_VERSION = "0.17.0"
 /** Oldest OpenCode binary build the inspect TUI is gated on (A7 / D7). */
 export const MIN_SUPPORTED_BUILD = 19271
 
@@ -147,7 +150,7 @@ export const TOOL_DESCRIPTION: string = [
   "Graph = { nodes: [{ id, kind, ... }], returns? }; kinds: agent, fanout (over a ref, {{item}}), partition (token-budgeted lanes), merge (batched), gate (QC verdict, aborts on fail), checkpoint, workflow. Refs like \"$scout.items\" must flow forward; node ids are phases; every call is auto-keyed. /ultracode graph <name|runID> renders the DAG.",
   "",
   "Injected globals:",
-  "- agent(prompt, opts?) — spawn one subagent; opts: agent, label, phase, schema, key",
+  "- agent(prompt, opts?) — spawn one subagent; opts: agent, tier (difficulty hint from catalog caps.routing), label, phase, schema, key",
   "- parallel(thunks) — barrier; a thrown thunk resolves null",
   "- pipeline(items, ...stages) — per-item stages; a failing item becomes null",
   "- phase(name) — ambient phase label for progress grouping",
@@ -244,10 +247,16 @@ export function runStatusPayload(run: RunRecord): RunStatusPayload {
 }
 
 /** Compact human-facing `/ultracode status` line. */
-export function formatStatusRun(run: RunRecord, now = Date.now()): string {
+export function formatStatusRun(
+  run: RunRecord,
+  now = Date.now(),
+  ownership?: { isLive: boolean; bootID?: string },
+): string {
   const payload = runStatusPayload(run)
   const elapsed = compactElapsed((run.endedAt ?? now) - run.startedAt)
-  return `${payload.runID} · ${payload.status} · agents ${payload.agents.done}/${payload.agents.total} · ${elapsed}`
+  const fields = ownership ? ownershipFields(run, ownership) : {}
+  const suffix = runLivenessSuffix({ status: run.status, ...fields }, now)
+  return `${payload.runID} · ${payload.status} · agents ${payload.agents.done}/${payload.agents.total} · ${elapsed}${suffix}`
 }
 
 export function resolveRunStatus(
@@ -308,6 +317,8 @@ export const STATUS_CHILDREN_LIMIT = 50
 export type StatusChildView = {
   agentID: string
   status: string
+  /** Admission-time routing evidence; absent for explicit models and older runs. */
+  routing?: { reason: string; skipped: string[] }
   sessionID?: string
   label?: string
   phase?: string
@@ -325,6 +336,8 @@ export type StatusChildView = {
   stalledMs?: number
   /** True when this child was replayed from a prior run's warm cache. */
   cached?: boolean
+  /** Admission gate a pending child is parked at (queue/permit/quarantine/pause). */
+  waitReason?: string
 }
 
 /**
@@ -402,6 +415,8 @@ export function enrichStatusPayload(
     if (typeof a.contextTokens === "number" && Number.isFinite(a.contextTokens)) child.contextTokens = a.contextTokens
     if (typeof a.toolCalls === "number") child.toolCalls = a.toolCalls
     if (a.cached) child.cached = true
+    if (a.routing) child.routing = a.routing
+    if (a.waitReason) child.waitReason = a.waitReason
     if (a.status === "running" && a.sessionID) {
       const at = activityFor(a.sessionID)
       if (at !== undefined) child.stalledMs = Math.max(0, now - at)
@@ -444,6 +459,9 @@ export function enrichStatusPayload(
 
 /** Cap for the result brief inside the parent-session settle notice. */
 export const SETTLE_NOTICE_PREVIEW_CHARS = 300
+
+/** How many lifecycle events /ultracode show prints (tail of the ring). */
+export const SHOW_EVENTS_TAIL = 12
 
 /** One-line settle notice for a finished background run, delivered to the parent session. */
 export function formatSettleNotice(envelope: RunEnvelope): string {
@@ -639,6 +657,19 @@ export function formatShowRun(run: RunRecord, extra?: { pending?: readonly strin
       lines.push(`- \`${cp.name}\` (${at} UTC)${value}`)
     }
   }
+  if (run.events && run.events.length > 0) {
+    lines.push("")
+    // Tail only: the ring holds MAX_RUN_EVENTS for post-mortems, a chat
+    // message shows the last few — enough to see the wedge point without
+    // flooding the channel.
+    const tail = run.events.slice(-SHOW_EVENTS_TAIL)
+    lines.push(`### Events (last ${tail.length} of ${run.events.length}${run.events.length >= MAX_RUN_EVENTS ? ", capped" : ""})`)
+    lines.push("")
+    for (const ev of tail) {
+      const at = new Date(ev.at).toISOString().slice(11, 19)
+      lines.push(`- \`${ev.kind}\` (${at} UTC)${ev.detail ? ` — ${ev.detail}` : ""}`)
+    }
+  }
   if (run.result !== undefined && !run.resultTruncated) {
     lines.push("")
     lines.push("### Result")
@@ -826,13 +857,23 @@ export interface CommandStorage {
   workflowTrustState(name: string): "trusted" | "untrusted" | "unknown"
   refreshWorkflows(): Promise<void>
   loadResultArtifactFresh(key: string): Promise<Json | undefined>
+  /**
+   * Refresh-if-stale hooks for the status path (optional — test doubles omit):
+   * a run owned by another process exists only in the KV cache, so the status
+   * verb re-scans when `lastScanAt()` is older than the TTL before serving and
+   * falls back to `loadRuns()` when this registry does not own the run.
+   */
+  loadRunsAsync?(): Promise<readonly RunRecord[]>
+  lastScanAt?(): number
+  loadRuns?(): readonly RunRecord[]
 }
 
 export interface CommandSupervisor {
-  pause(runID: string): boolean
+  pause(runID: string): PauseResumeOutcome
   /** Ask-mode resume: an optional model becomes the run-level fallback override. */
-  resume(runID: string, opts?: { model?: ModelRef }): boolean
-  stop(runID: string, reason: string): boolean
+  resume(runID: string, opts?: { model?: ModelRef }): PauseResumeOutcome
+  /** Truthful stop: local / orphan-marked-interrupted / refusal naming a live remote owner. */
+  stop(runID: string, reason: string): StopOutcome
   startDetached(
     input: Parameters<Supervisor["startDetached"]>[0],
     parent: ParentContext,
@@ -894,6 +935,8 @@ export interface CommandDeps {
   say(sessionID: string, text: string): Promise<void>
   projectRoot: string
   personalWorkflowDir: string
+  /** This process's runtime bootID — ownership truth for runs served from the persisted view. */
+  bootID?: string
   pendingPermissions?: (sessionID: string) => Promise<string | undefined>
   prepare?: () => Promise<void>
   listAgents: () => Promise<AgentListResult>
@@ -1057,17 +1100,30 @@ export async function handleUltracodeCommand(invocation: CommandInvocation, deps
   }
 
   if (sub === "status") {
+    // A run owned by another process is not in this registry: refresh the
+    // persisted view (TTL-gated) and serve it when this process has no record.
+    await refreshRunsIfStale(deps.storage)
     const target = resolveActiveTarget(rest, activeList(deps))
     if (!target.ok) {
       await deps.say(sessionID, target.error)
       return
     }
-    const run = deps.registry.get(target.runID)
+    const persisted = deps.storage.loadRuns?.() ?? []
+    const live = deps.registry.get(target.runID)
+    // Newer record wins (owner.updatedAt, else startedAt): an ADOPTED remote
+    // run has a registry record here that never tracks its owner's later
+    // writes, so a fresher persisted snapshot must not be shadowed by it.
+    const persistedRun = persisted.find((r) => r.id === target.runID)
+    const freshness = (r: RunRecord): number => r.owner?.updatedAt ?? r.startedAt
+    const run =
+      live !== undefined && (persistedRun === undefined || freshness(live) >= freshness(persistedRun))
+        ? live
+        : persistedRun
     if (!run) {
       await deps.say(sessionID, `Run \`${target.runID}\` not found. See /ultracode for known runs.`)
       return
     }
-    await deps.say(sessionID, formatStatusRun(run))
+    await deps.say(sessionID, formatStatusRun(run, Date.now(), { isLive: live !== undefined && run === live, bootID: deps.bootID }))
     return
   }
 
@@ -1097,12 +1153,20 @@ export async function handleUltracodeCommand(invocation: CommandInvocation, deps
       return
     }
     const stopped = deps.supervisor.stop(target.runID, "user requested (/ultracode stop)")
-    await deps.say(
-      sessionID,
-      stopped
-        ? `Stopping run \`${target.runID}\` — in-flight agents will be interrupted.`
-        : `Run \`${target.runID}\` is unknown or already finished. See /ultracode for the list.`,
-    )
+    let message: string
+    if (stopped.ok && stopped.mode === "local") {
+      message = `Stopping run \`${target.runID}\` — in-flight agents will be interrupted.`
+    } else if (stopped.ok && stopped.mode === "orphan") {
+      message = `Run \`${target.runID}\` was orphaned (no local worker) — marked interrupted. Resume with \`/ultracode rerun ${target.runID} --warm\`.`
+    } else if (!stopped.ok && stopped.reason === "remote-owner") {
+      const pid = stopped.owner.pid !== undefined ? ` pid ${stopped.owner.pid}` : ""
+      message = `Run \`${target.runID}\` is owned by a live process (${stopped.owner.bootID}${pid}) — control it from that instance.`
+    } else if (!stopped.ok && stopped.reason === "not-active") {
+      message = `Run \`${target.runID}\` is already ${stopped.status}. See /ultracode for the list.`
+    } else {
+      message = `Run \`${target.runID}\` is unknown or already finished. See /ultracode for the list.`
+    }
+    await deps.say(sessionID, message)
     return
   }
 
@@ -1448,9 +1512,9 @@ async function pauseRun(deps: CommandDeps, sessionID: string, runID: string): Pr
     await deps.say(sessionID, `error: ${deps.supervisorError ?? "supervisor unavailable"}`)
     return
   }
-  const ok = deps.supervisor.pause(runID)
-  if (!ok) {
-    await deps.say(sessionID, `cannot pause run \`${runID}\` (status: ${run.status})`)
+  const outcome = deps.supervisor.pause(runID)
+  if (!outcome.ok) {
+    await deps.say(sessionID, outcome.error ?? `cannot pause run \`${runID}\` (status: ${run.status})`)
     return
   }
   const next = deps.registry.get(runID)
@@ -1492,9 +1556,9 @@ async function resumeRun(
     await deps.say(sessionID, "error: --remember requires --model <pin> — nothing to remember without one")
     return
   }
-  const ok = deps.supervisor.resume(runID, model !== undefined ? { model } : undefined)
-  if (!ok) {
-    await deps.say(sessionID, `cannot resume run \`${runID}\` (status: ${run.status})`)
+  const outcome = deps.supervisor.resume(runID, model !== undefined ? { model } : undefined)
+  if (!outcome.ok) {
+    await deps.say(sessionID, outcome.error ?? `cannot resume run \`${runID}\` (status: ${run.status})`)
     return
   }
   let line = `Resumed run \`${runID}\` — status: ${deps.registry.get(runID)?.status ?? "running"}`
