@@ -21,6 +21,8 @@ opencode2 ultracode-config tier add strong payg xiaomi/mimo-v2.6-pro --main-weig
 opencode2 ultracode-config tier edit strong xai/grok-4.7#high --hours 8-22
 opencode2 ultracode-config tier mode strong weighted
 opencode2 ultracode-config tier fallback frontier strong
+opencode2 ultracode-config tier describe strong "hard coding, review, merging findings"
+opencode2 ultracode-config routing ladder lite standard strong frontier
 opencode2 ultracode-config tier move strong xai/grok-4.7#high plans 2
 opencode2 ultracode-config role set reviewer strong
 opencode2 ultracode-config provider set xai 2
@@ -32,15 +34,46 @@ All writes validate the options, change only the Ultracode plugin entry in `~/.c
 
 Ordinary OpenCode sessions and `opencode2 subagent-config` pins are unchanged. Add `routing` to the Ultracode plugin **options** in your OpenCode config to route only workflow children. Without a matching role or an explicit `agent(..., { tier })` / graph-node `tier`, children continue to use their agent pins. Explicit per-call and run model overrides win. Within a tier, `selection` is `"ordered"` (the default, and what an absent key means) or `"weighted"`; a tier may also name a `fallback` tier. All of that is described below. The router does not call an AI model.
 
-On a fresh `routing init <IANA timezone>`, the CLI offers empty `lite`, `standard`, `strong` and `frontier` tiers without assigning any agent to them. Model choices, provider plans and usage sources are always chosen by the user; an empty tier never silently receives somebody else's paid model.
+On a fresh `routing init <IANA timezone>`, the CLI offers empty `lite`, `standard`, `strong` and `frontier` tiers, each with a one-line description, without assigning any agent to them. Model choices, provider plans and usage sources are always chosen by the user; an empty tier never silently receives somebody else's paid model.
+
+## Which model a workflow child gets
+
+One precedence order, highest first:
+
+| # | Source | Set by |
+| --- | --- | --- |
+| 1 | Per-call `agent(prompt, { model })` | the workflow, only when the user named a model |
+| 2 | Run-level `model` input | the same, for a whole run |
+| 3 | Tier hint `{ tier }` / graph-node `tier` | the workflow (difficulty of this step) |
+| 4 | Role tier `routing.roles[agent]` | `ultracode-config role set` |
+| 5 | The agent's pin | `subagent-config set` (agent file `model:`) |
+| 6 | The default agent's pin | the same |
+| 7 | Server default | OpenCode |
+
+Rows 3–4 are this document; they apply to workflow children only. Ordinary sessions use rows 5–7, and `ultracode-config` never edits a pin.
+
+## Tiers, the ladder and descriptions
+
+A tier is the user's name for a difficulty shelf; which models sit on it is the user's business. Two optional fields make a policy legible to the authoring agent and portable across users:
+
+- **`tiers.<name>.description`** — what the tier is for, in the user's words (`tier describe strong "hard coding and review"`, up to 200 characters). `ultracode_catalog` hands it to the authoring agent next to the tier name, so "use the strong tier for review" is a setting rather than something retyped into every prompt.
+- **`routing.ladder`** — the tiers from cheapest to strongest (`routing ladder lite standard strong frontier`). Omitted, it is the order the tiers appear in the config; tiers left out of an explicit ladder follow in that order.
 
 ## How a selection is made
 
-`select()` resolves the tier once: an explicit `{ tier }` hint (per call or graph node) wins, otherwise `routing.roles[agent]`. An agent with no mapping and no hint yields the no-model decision `no tier configured; use agent pin`, and the child keeps its pin.
+`select()` resolves the tier once: an explicit `{ tier }` hint (per call or graph node) wins, otherwise `routing.roles[agent]`. A hint never kills a child because of how the user's policy happens to be set up:
+
+- **Unknown tier name** (a shared workflow written against someone else's tiers): the hint is dropped and the role default applies — `unknown tier <name>; using role default: ...`.
+- **Empty tier** (its whole `fallback` chain has no model choices): the nearest tier with model choices on the ladder is used, cheaper first, then stronger — `<hint> empty -> <tier>: ...`. With no such tier the child keeps its pin.
+- **No routing, or `routing.enabled: false`**: hints are ignored and the run log says so once.
+
+What still fails loudly is a tier that *has* model choices when every one of them is gated out (see [Empty tiers](#empty-tiers)).
+
+ An agent with no mapping and no hint yields the no-model decision `no tier configured; use agent pin`, and the child keeps its pin.
 
 Every candidate then passes deterministic gates, in this order:
 
-- **Catalog and provider liveness** — skipped as `not in live catalog` when the model is not advertised by the running server, as `provider offline` when its provider is disabled, and as `provider quarantined` when the machine-wide breaker (below) knows the provider is quota-dead.
+- **Catalog and provider liveness** — skipped as `not in live catalog` when the model is not advertised by the running server (if the catalog itself cannot be fetched the check is skipped and the run log says so), as `provider failed over` when this child already died on that provider, as `provider offline` when its provider is disabled, and as `provider quarantined` when the machine-wide breaker (below) knows the provider is quota-dead.
 - **`hours`** — a `[start, end)` window in the policy timezone. The end is exclusive and the range may wrap midnight, so `[22, 8]` means 22:00–08:00 local.
 - **`blockedWeekdayHours`** — the same shape, applied only Monday–Friday (`weekday peak hours`). Weekends are never blocked.
 - **Quota layering** (plans entries consult the feed even without a reserve; PAYG only honors an explicit reserve):
@@ -67,7 +100,7 @@ When exactly one candidate is eligible it is simply picked and no credit changes
 
 Because the winner always gives back exactly what the field contributed, no one can run away with the pool. Proportions match the configured weights **exactly at cycle multiples** (draws equal to the eligible total weight) and **converge over any window with a stable eligible set** — they are not required to hit each weight every window. There is no `Math.random`: the credit map is the only state, so a fresh router's first draw is simply the eligible candidate with the largest weight (ties: earliest configured). This is what `explain` reports as the next pick.
 
-Credits are keyed `${tier}|${pool}|${modelPin}`. The same pin in two different tiers — or in the `main` and `fallback` pools of one tier — keeps independent state and is never shared. Because a credit key identifies one pool member, a `weighted` tier rejects the same pin listed twice inside one pool (`routing tier <name> lists <model> twice`), which would otherwise double-count its weight. `ordered` tiers stay permissive: a pin may appear in two groups with different `hours` or `reservePercent` windows, because ordered rotation uses a per-candidate use count and per-group order, both duplicate-safe.
+Credits are keyed by the (tier, pool, model pin) triple. The same pin in two different tiers — or in the `main` and `fallback` pools of one tier — keeps independent state and is never shared. Because a credit key identifies one pool member, a `weighted` tier rejects the same pin listed twice inside one pool (`routing tier <name> lists <model> twice`), which would otherwise double-count its weight. `ordered` tiers stay permissive: a pin may appear in two groups with different `hours` or `reservePercent` windows, because ordered rotation uses a per-candidate use count and per-group order, both duplicate-safe.
 
 ```sh
 # weights 15 / 6 / 2 interleave as a, b, a, a, c, a, b, ... and total exactly 15/6/2 over 23 draws
@@ -192,7 +225,7 @@ Notes on this policy:
 - **Night plan, day plans.** Each tier's Alibaba plan is night-only (`hours: [22, 8]`), so at 02:00 HKT the first `strong` draw is `alibaba-token-plan/qwen3.8-max#medium` (w12 of an eligible 26) and at midday — with the same healthy feed — the pool is `grok-4.7#high` w5, `gpt-6-sol#high` w5, `gpt-6-sol#medium` w3 and `mimo-v2.6-pro` main w1 (14 total).
 - **PAYG in MAIN.** `xiaomi/mimo-v2.6-pro` carries `mainWeight: 1` in `standard` and `strong`, so it competes for the last sliver of the MAIN pool while plans are available; its `weight` (5 and 1) is what it gets in the pure-PAYG fallback pool. `frontier` has no PAYG, so when every frontier plan is gated it walks down to `strong`.
 - **Weekday blocks.** `deepseek/deepseek-flash#high` is blocked 09:00–12:00 and 14:00–18:00 on weekdays (DeepSeek's published UTC peaks in Hong Kong time); it is always eligible on weekends.
-- **Gate interactions are real.** Every `reservePercent` above needs a working quota feed. If a provider's feed is missing, its reserved candidates are skipped, and the effective pool (and the percentages `explain` prints) shrinks. If *every* candidate in a non-empty tier is gated, the tier falls back or throws.
+- **Gate interactions are real.** Every `reservePercent` above needs a working quota feed. If a provider's feed is missing, its usage is unknown: by default the candidates still run with no reserve protection, and under `allowUnknownQuota: false` they are skipped, so the effective pool (and the percentages `explain` prints) shrinks. If *every* candidate in a non-empty tier is gated, the tier falls back or throws.
 
 ## keep% gates are the deterministic degrade mechanism
 
@@ -201,7 +234,7 @@ Notes on this policy:
 - A candidate is skipped when the provider's **lowest** reported window is at or below its keep percentage, so a higher-effort or higher-cost carrier can hold a bigger margin. In this policy, `frontier` holds 10–30%, `strong` holds 8–20%, and the cheap night carriers hold less.
 - Because the skip happens before the draw, tightening budgets simply renormalize the surviving pool; the same weights still govern who gets picked.
 - A cheap carrier on a **weekly-reset** pool can carry no keep (for example `gpt-6-luna#high` has none) so the subscription is used fully before the week resets, while **monthly** pools keep a margin (`alibaba-token-plan/qwen3.8-max` keeps 20–30%) because an overrun there is expensive until month end.
-- Keep is per-candidate, so a provider can be fully used at one effort and reserved at another. Setting `allowUnknownQuota: true` lets reserved candidates run while their feed is unknown — it does **not** protect a monthly budget, so prefer a real feed.
+- Keep is per-candidate, so a provider can be fully used at one effort and reserved at another. The default (`allowUnknownQuota` omitted or `true`) lets reserved candidates run while their feed is unknown — it does **not** protect a monthly budget, so prefer a real feed, or set `allowUnknownQuota: false` to skip them instead.
 
 Reserves react to the **percentage observed at admission**, not to the predicted spend of in-flight or ordinary sessions. `providerConcurrency` limits Ultracode children, not the main OpenCode session.
 
@@ -211,17 +244,17 @@ Per-call `{ tier }` hints are a workflow-authoring decision, the Claude-Code ana
 
 | Work | Lane | Why |
 | --- | --- | --- |
-| Lane extraction, inventory, fan-out enumeration, mechanical extraction | `lite` or the default | read-heavy, cheap by construction |
-| Merge, gate review, verdict drafting | `strong` | judgment over already-gathered evidence |
-| Final judgment, architecture, tie-breaks | `frontier` via explicit `{ tier: "frontier" }` | the expensive shelf, invoked deliberately and rarely |
+| Lane extraction, inventory, fan-out enumeration, mechanical extraction | the cheapest tier, or the default | read-heavy, cheap by construction |
+| Merge, gate review, verdict drafting | a stronger tier | judgment over already-gathered evidence |
+| Final judgment, architecture, tie-breaks | the strongest tier, by explicit hint | the expensive shelf, invoked deliberately and rarely |
 
-Because the hint is explicit, a cheap lane can never accidentally spend frontier money, and a frontier step can never silently degrade to a cheap model. Tiers without a role mapping stay reachable this way.
+The authoring skill names no tiers: it tells the agent to use the tiers the catalog lists, cheapest first, guided by each tier's description. With the seed policy those are `lite`, `standard`, `strong` and `frontier`. Because the hint is explicit, a cheap lane can never accidentally spend frontier money. Tiers without a role mapping stay reachable this way.
 
 ### Difficulty from evidence, not vibes
 
 Most workflows open with the cheap phases anyway — scout, plan, review of the plan — so let them set the shelf for everything after:
 
-- **Discovery.** `ultracode_catalog` caps carry `routing`: the **non-empty (hintable) tiers** and the `roles` map. Authoring models hint only listed tiers (an empty tier fails by design unless it carries a fallback); with no routing configured, hints are inert and should not be emitted.
+- **Discovery.** `ultracode_catalog` caps carry `routing`: every tier in ladder order with its `description` and model count, and the `roles` map. Authoring models hint only listed tiers; a tier listed with `models: 0` is still safe to hint (it degrades, see above). With no routing configured, hints are inert and should not be emitted.
 - **Evidence field.** Give scout/plan/plan-review schemas a `tier` property — an enum of the listed tiers. Later steps interpolate it: graphs use `tier: "{{plan.tier}}"` (exactly one whole-string ref, forward-only like a prompt ref, and a real data edge for wave scheduling); scripts pass `{ tier: plan.data.tier }`. Absent or non-string evidence degrades to the agent's role default rather than poisoning the call.
 - **Prior vs instruction.** Before evidence exists, the author's difficulty read is the prior; the user's difficulty instructions in the prompt always win; when unsure, pick the lower shelf unless the step is a final judgment.
 
@@ -229,7 +262,7 @@ Warm replay honours the hint: keyed digests include `tier`, so rerunning with a 
 
 ## Onboarding
 
-`routing init <IANA>` writes empty `lite`, `standard`, `strong` and `frontier` tiers and **no** roles: every child keeps its agent pin until the user adds a model and a mapping. Two shapes of install are both served:
+`routing init <IANA>` writes empty, described `lite`, `standard`, `strong` and `frontier` tiers and **no** roles: every child keeps its agent pin until the user adds a model and a mapping. Two shapes of install are both served:
 
 - **Bare `general` + `explore` users.** `role defaults` (or the menu path `5. Roles & tiers → Suggest role defaults`, offered right after `init`) proposes the canonical edges: `explore → lite` (read-only codebase search, cheap by construction) and `general → standard` (the default subagent and the agent used by shipped skeletons, including verifier and skeptic phases).
 - **Users with many custom roles.** `reviewer → strong` is offered only when a `reviewer` agent is detected (from the live catalog or scanned agent files) unless `--all-known` is passed; `--force` overrides an existing mapping. Custom roles are not guessed — map them explicitly with `role set <agent> <tier>`, and route a phase with a `{ tier }` hint.
@@ -244,18 +277,18 @@ Warm replay honours the hint: keyed digests include `tier`, so rerunning with a 
 
 A tier with **zero** configured candidates in both `plans` and `payg` still honours its own `fallback`: the router recurses into it with the same eligibility machinery and reports the walked chain (`lite empty -> strong: ...`), so `tier fallback frontier strong` works even before `frontier` has a model.
 
-With no `fallback`, an empty tier degrades only when it is the **requested** tier:
+With no `fallback`, an empty tier degrades when it is the **requested** tier:
 
 - `select()` returns `{ reason: "tier <name> is empty; use agent pin", skipped: [] }`. A role-mapped agent then keeps its agent pin through the existing primitives path, and an explicit run/call model override still wins.
-- An **explicit per-call tier hint** on an empty tier is treated as a caller mistake and throws from `primitives.ts`: `routing tier <name> is empty — configure it or drop the tier hint`. A configured `fallback` supersedes both this error and the pin-degrade: the walk continues into the fallback tier (and returns its model) before either can fire.
+- An **explicit per-call tier hint** on an empty tier walks the ladder to the nearest tier with model choices, cheaper first (`<hint> empty -> <tier>: ...`), and keeps the agent pin when there is none. A configured `fallback` is followed first; the ladder is only consulted when the whole fallback chain is empty.
 
-An empty tier reached **through a fallback hop** is never a silent pin: an all-gated tier whose fallback is empty is a hard error (`no eligible <tier> model for <role>: ...`), so the pin can never quietly spend the budget the gates were protecting. The `explain` CLI mirrors this: an explicit hint on an empty tier exits non-zero, while a role mapped directly to an empty tier still reports `Selected: agent pin` at exit 0.
+Degrading never bypasses a gate. An all-gated tier whose fallback is empty is a hard error (`no eligible <tier> model for <role>: ...`), and so is a ladder walk that lands on a tier whose candidates are all gated (`<hint> empty -> <tier>: no eligible ...`): the router does not jump past it to a stronger tier or to the pin, which is often the very PAYG model the gates were protecting. The `explain` CLI mirrors all of this.
 
 Contrast this with a non-empty tier whose candidates are all gated out (hours, keep, catalog, offline provider): that is a hard error with the skip reasons — `no eligible <tier> model for <role>: ...` — unless the tier has a `fallback`. When a fallback fires, the skip reasons from every hop are kept in `skipped`, so a successful walk still records why the earlier tier was gated.
 
 ## Capacity feeds
 
-`quotaCommand` is optional and never required by the plugin. The sample adapter accepts `opencode2 check-rate --json` and caches its output for one minute. It reads the lowest remaining percentage across OpenAI's reported five-hour/weekly windows, xAI's weekly pool and Z.ai's reported windows. Alibaba requires the helper's console login and the normalized monthly `raw.monthly.pct` field; without that field its quota is **unknown**, so any candidate with `reservePercent` is skipped. The worked example therefore cannot use Alibaba until that feed is available. `routing.allowUnknownQuota: true` allows unknown-reserve candidates explicitly, but cannot protect a monthly budget. Routing only reserves by *percentage observed at admission*, not by predicted spend of in-flight or ordinary sessions.
+`quotaCommand` is optional and never required by the plugin. The sample adapter accepts `opencode2 check-rate --json` and caches its output for one minute. It reads the lowest remaining percentage across OpenAI's reported five-hour/weekly windows, xAI's weekly pool and Z.ai's reported windows. Alibaba requires the helper's console login and the normalized monthly `raw.monthly.pct` field; without that field its quota is **unknown**: under `allowUnknownQuota: false` every plans candidate on that feed is skipped, and under the default it runs without reserve protection, which cannot protect a monthly budget. Routing only reserves by *percentage observed at admission*, not by predicted spend of in-flight or ordinary sessions.
 
 ### Other users' capacity checkers
 
@@ -265,7 +298,7 @@ Contrast this with a non-empty tier whose candidates are all gated out (hours, k
 {"pools":[{"id":"team-monthly","windows":[{"remainingPercent":67},{"remainingPercent":24}]}]}
 ```
 
-The router uses the *lowest* remaining percentage. A checker can optionally include `"status":"ok"` and an ISO `"expiresAt"` on a pool; expired, missing, malformed, or `status: "unknown"` pools stay unknown and reserved candidates are skipped. Configure a named checker and bind one model choice to it through the guided Capacity & usage menu, or use:
+The router uses the *lowest* remaining percentage. A checker can optionally include `"status":"ok"` and an ISO `"expiresAt"` on a pool; expired, missing, malformed, or `status: "unknown"` pools stay unknown (reserved candidates are then skipped only under `allowUnknownQuota: false`). Configure a named checker and bind one model choice to it through the guided Capacity & usage menu, or use:
 
 ```sh
 opencode2 ultracode-config capacity source team-monthly capacity-v1 /path/to/my-usage-checker --json
@@ -277,7 +310,7 @@ The candidate's `capacityPool` overrides the legacy provider→quota-id lookup; 
 
 ### Bring your own rules
 
-Tier names are arbitrary labels — `lite`/`standard`/`strong`/`frontier` are only the `routing init` seed — and any agent id can be mapped with `role set <agent> <tier>`. The router hardcodes no provider or model list: `quotaSources` / `capacity-v1` work for any provider or plan, a checker emits pool ids and percentages, `capacity bind` attaches a pool to a candidate, and all provider-specific parsing (auth, windows, plan-vs-PAYG classification) lives in your checker. Model choices, plans/PAYG labels, hours, reserves and weights are always user configuration.
+Tier names are arbitrary labels — `lite`/`standard`/`strong`/`frontier` are only the `routing init` seed, and nothing in the plugin or its authoring skill depends on them — and any agent id can be mapped with `role set <agent> <tier>`. The router hardcodes no provider or model list: `quotaSources` / `capacity-v1` work for any provider or plan, a checker emits pool ids and percentages, `capacity bind` attaches a pool to a candidate, and all provider-specific parsing (auth, windows, plan-vs-PAYG classification) lives in your checker. Model choices, plans/PAYG labels, hours, reserves and weights are always user configuration.
 
 `childLimits` is independent of routing: it applies to named models even if selected through an agent pin. It estimates the assembled request's input from serialized messages, system text and tools, not from cumulative session tokens or the provider's exact tokenizer. At target it removes tools for that model step and injects a sufficiency test: finish in place if the gathered evidence already answers the task, otherwise emit a continuation handoff that starts with a `HANDOFF:` line (original task, findings with evidence, gaps, exact next actions). At hard it refuses the request with a typed message contract — `ultracode context hard limit: …` carrying the estimate, threshold and session id — because the worker bridge serializes errors to their message text. A model response already in flight cannot be stopped by these step-boundary limits, and handoff results require the workflow to explicitly schedule any remaining work (seed the continuation with the original task plus the handoff, and cap the chain — one continuation before surfacing incompleteness).
 

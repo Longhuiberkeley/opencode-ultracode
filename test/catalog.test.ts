@@ -17,8 +17,10 @@ import {
   MAX_DETAIL_GRAPH_CHARS,
   MAX_DETAIL_SCRIPT_HEAD,
   buildCatalog,
+  routingSummary,
 } from "../src/catalog.ts"
 import { GRAPH_TEMPLATES } from "../src/graph-templates.ts"
+import { parseModelRouting } from "../src/model-routing.ts"
 import type { CatalogWorkflow } from "../src/catalog.ts"
 import type { Json, RunRecord, SavedWorkflow } from "../src/types.ts"
 
@@ -226,6 +228,19 @@ test("catalog: caps carry the routing summary — hintable (non-empty) tiers and
     tiers: [{ name: "standard", models: 4 }, { name: "strong", models: 3 }],
     roles: { general: "standard", reviewer: "strong" },
   })
+})
+
+test("catalog: routingSummary lists every tier in ladder order with its description", () => {
+  const routing = parseModelRouting({ timezone: "UTC", roles: { reviewer: "strong" }, ladder: ["lite", "strong"],
+    tiers: {
+      strong: { plans: [[{ model: "p/a" }, { model: "p/b" }]], payg: [[{ model: "q/c" }]], description: "hard review" },
+      lite: { plans: [], payg: [] },
+    } })
+  assert.deepEqual(routingSummary(routing), {
+    tiers: [{ name: "lite", models: 0 }, { name: "strong", models: 3, description: "hard review" }],
+    roles: { reviewer: "strong" },
+  })
+  assert.deepEqual(routingSummary({ ...routing, enabled: false }), { enabled: false, tiers: [], roles: { reviewer: "strong" } })
 })
 
 // ---------------------------------------------------------------------------

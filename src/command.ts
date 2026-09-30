@@ -150,7 +150,7 @@ export const TOOL_DESCRIPTION: string = [
   "Graph = { nodes: [{ id, kind, ... }], returns? }; kinds: agent, fanout (over a ref, {{item}}), partition (token-budgeted lanes), merge (batched), gate (QC verdict, aborts on fail), checkpoint, workflow. Refs like \"$scout.items\" must flow forward; node ids are phases; every call is auto-keyed. /ultracode graph <name|runID> renders the DAG.",
   "",
   "Injected globals:",
-  "- agent(prompt, opts?) — spawn one subagent; opts: agent, label, phase, schema, key",
+  "- agent(prompt, opts?) — spawn one subagent; opts: agent, tier (difficulty hint from catalog caps.routing), label, phase, schema, key",
   "- parallel(thunks) — barrier; a thrown thunk resolves null",
   "- pipeline(items, ...stages) — per-item stages; a failing item becomes null",
   "- phase(name) — ambient phase label for progress grouping",
@@ -317,6 +317,8 @@ export const STATUS_CHILDREN_LIMIT = 50
 export type StatusChildView = {
   agentID: string
   status: string
+  /** Admission-time routing evidence; absent for explicit models and older runs. */
+  routing?: { reason: string; skipped: string[] }
   sessionID?: string
   label?: string
   phase?: string
@@ -413,6 +415,7 @@ export function enrichStatusPayload(
     if (typeof a.contextTokens === "number" && Number.isFinite(a.contextTokens)) child.contextTokens = a.contextTokens
     if (typeof a.toolCalls === "number") child.toolCalls = a.toolCalls
     if (a.cached) child.cached = true
+    if (a.routing) child.routing = a.routing
     if (a.waitReason) child.waitReason = a.waitReason
     if (a.status === "running" && a.sessionID) {
       const at = activityFor(a.sessionID)

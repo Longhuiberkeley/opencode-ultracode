@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
-import { ModelRouter, parseModelRouting } from "../src/model-routing.ts"
+import { ModelRouter, parseModelRouting, tierLadder } from "../src/model-routing.ts"
 
 const profile = parseModelRouting({
   timezone: "Asia/Hong_Kong",
@@ -453,4 +453,64 @@ test("ordered tiers stay permissive about a pin repeated across groups and rotat
   assert.throws(() => parseModelRouting({ timezone: "UTC", roles: {}, tiers: {
     a: { selection: "weighted", plans: [[{ model: "p/dup" }, { model: "p/dup" }]], payg: [] },
   } }), /routing tier a lists p\/dup twice/)
+})
+
+const shelf = (model: string) => ({ plans: [[{ model }]], payg: [] })
+const bare = { plans: [], payg: [] }
+
+test("ladder: defaults to tier key order; a configured ladder leads and unlisted tiers follow", () => {
+  const tiers = { lite: bare, standard: bare, strong: bare }
+  assert.deepEqual(tierLadder(parseModelRouting({ timezone: "UTC", roles: {}, tiers })), ["lite", "standard", "strong"])
+  assert.deepEqual(tierLadder(parseModelRouting({ timezone: "UTC", roles: {}, tiers, ladder: ["strong", "lite"] })), ["strong", "lite", "standard"])
+  assert.throws(() => parseModelRouting({ timezone: "UTC", roles: {}, tiers, ladder: ["lite", "nope"] }), /routing\.ladder must list defined tiers/)
+  assert.throws(() => parseModelRouting({ timezone: "UTC", roles: {}, tiers, ladder: ["lite", "lite"] }), /routing\.ladder must list defined tiers/)
+})
+
+test("validation: unknown top-level routing keys and bad descriptions are rejected", () => {
+  assert.throws(() => parseModelRouting({ timezone: "UTC", roles: {}, tiers: {}, allowUnknownQuotas: false }), /unknown routing key allowUnknownQuotas/)
+  assert.throws(() => parseModelRouting({ timezone: "UTC", roles: {}, tiers: { a: { ...bare, description: "" } } }), /description must be 1\.\.200 characters/)
+  assert.equal(parseModelRouting({ timezone: "UTC", roles: {}, tiers: { a: { ...bare, description: " hard review " } } }).tiers.a!.description, "hard review")
+})
+
+test("an unknown tier hint falls back to the role default, or the pin without one", async () => {
+  const router = new ModelRouter(parseModelRouting({ timezone: "UTC", roles: { reviewer: "strong" }, tiers: { strong: shelf("p/strong") } }))
+  const mapped = await router.select({ role: "reviewer", tier: "opus-class" })
+  assert.equal(mapped.model?.id, "strong")
+  assert.equal(mapped.reason, "unknown tier opus-class; using role default: plan strong: p/strong")
+  assert.deepEqual(await router.select({ role: "general", tier: "opus-class" }),
+    { reason: "unknown tier opus-class; using role default: no tier configured; use agent pin", skipped: [] })
+})
+
+test("a hint on an empty tier takes the nearest populated tier: lower first, then higher", async () => {
+  const lowerFirst = new ModelRouter(parseModelRouting({ timezone: "UTC", roles: {},
+    tiers: { lite: shelf("p/lite"), standard: shelf("p/standard"), strong: bare, frontier: shelf("p/frontier") } }))
+  const down = await lowerFirst.select({ role: "general", tier: "strong" })
+  assert.equal(down.model?.id, "standard")
+  assert.equal(down.reason, "strong empty -> standard: plan standard: p/standard")
+  assert.deepEqual(down.fallbackChain, ["strong", "standard"])
+  const up = await new ModelRouter(parseModelRouting({ timezone: "UTC", roles: {},
+    tiers: { lite: bare, standard: bare, strong: shelf("p/strong") } })).select({ role: "general", tier: "lite" })
+  assert.equal(up.model?.id, "strong")
+  // The configured ladder, not key order, decides what "lower" means.
+  const reordered = await new ModelRouter(parseModelRouting({ timezone: "UTC", roles: {}, ladder: ["cheap", "mid", "top"],
+    tiers: { top: shelf("p/top"), mid: bare, cheap: shelf("p/cheap") } })).select({ role: "general", tier: "mid" })
+  assert.equal(reordered.model?.id, "cheap")
+})
+
+test("degrade is for explicit hints only and never jumps past a gated tier", async () => {
+  const router = new ModelRouter(parseModelRouting({ timezone: "UTC", roles: { general: "strong" },
+    tiers: { standard: shelf("p/standard"), strong: bare, frontier: shelf("q/frontier") } }))
+  // A role mapped to an empty tier keeps its pin.
+  assert.deepEqual(await router.select({ role: "general" }), { reason: "tier strong is empty; use agent pin", skipped: [] })
+  // The nearest populated tier is gated: fail loud rather than spend the stronger shelf.
+  await assert.rejects(router.select({ role: "general", tier: "strong", disabled: new Set(["p"]) }),
+    /strong empty -> standard: no eligible standard model for general: p\/standard: provider offline/)
+})
+
+test("a failover re-select names the provider the child died on", async () => {
+  const router = new ModelRouter(parseModelRouting({ timezone: "UTC", roles: { general: "a" },
+    tiers: { a: { plans: [[{ model: "p/x" }], [{ model: "q/y" }]], payg: [] } } }))
+  const decision = await router.select({ role: "general", failed: new Set(["p"]) })
+  assert.equal(decision.model?.providerID, "q")
+  assert.deepEqual(decision.skipped, ["p/x: provider failed over"])
 })

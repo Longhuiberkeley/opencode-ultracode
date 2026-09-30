@@ -28,6 +28,8 @@ export interface RouteTier {
   selection?: "ordered" | "weighted"
   /** Tier to try with the same eligibility rules when this tier has no eligible candidate. */
   fallback?: string
+  /** The user's own words for what this tier is for; shown to the authoring agent via the catalog. */
+  description?: string
 }
 
 export interface ModelRouting {
@@ -36,11 +38,17 @@ export interface ModelRouting {
   /** Agent id -> default tier. Explicit per-call tier takes precedence. */
   roles: Record<string, string>
   tiers: Record<string, RouteTier>
+  /**
+   * Tiers from cheapest to strongest. Unlisted tiers follow in `tiers` key order
+   * (see tierLadder). An explicit hint on an empty tier degrades along this order.
+   */
+  ladder?: string[]
   /** Provider -> quota feed id. An absent feed never pretends to have headroom. */
   quotaIDs?: Record<string, string>
   /**
-   * When quota is unknown, skip candidates with a reserve unless explicitly allowed.
-   * With an explicit false, EVERY plans candidate is skipped on an unknown feed.
+   * Omitted means true: an unknown feed is not evidence of exhaustion. With an
+   * explicit false, EVERY plans candidate (and any reserved PAYG) is skipped on
+   * an unknown feed.
    */
   allowUnknownQuota?: boolean
   /**
@@ -85,6 +93,8 @@ interface SelectInput {
   disabled?: ReadonlySet<string>
   /** Machine/quarantine knowledge in addition to `disabled` (distinct skip reason). */
   quarantined?: ReadonlySet<string>
+  /** Providers this child already died on; a failover re-select must leave them (distinct skip reason). */
+  failed?: ReadonlySet<string>
   available?: ReadonlySet<string>
   quota?: (id: string) => Promise<RouteObservation | undefined>
 }
@@ -115,10 +125,23 @@ function validWeight(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value > 0 && value <= 10000
 }
 
+/** Longest tier description kept; it is prompt text for the authoring agent, not documentation. */
+export const MAX_TIER_DESCRIPTION = 200
+
+/** Effective cheapest-to-strongest order: the configured ladder, then unlisted tiers in key order. */
+export function tierLadder(config: Pick<ModelRouting, "tiers" | "ladder">): string[] {
+  const listed = config.ladder ?? []
+  return [...listed, ...Object.keys(config.tiers).filter((name) => !listed.includes(name))]
+}
+
 /** Stateless validation: reject bad routing at startup rather than silently using a wrong provider. */
 export function parseModelRouting(value: unknown): ModelRouting {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("routing must be an object")
   const r = value as Record<string, unknown>
+  // Same rule as tier and candidate keys below: a typo (e.g. "allowUnknownQuotas")
+  // is rejected rather than silently ignored.
+  const topKeys = new Set(["timezone", "roles", "tiers", "ladder", "quotaIDs", "allowUnknownQuota", "enabled"])
+  for (const key of Object.keys(r)) if (!topKeys.has(key)) throw new Error(`unknown routing key ${key}`)
   const timezone = r.timezone
   if (typeof timezone !== "string") throw new Error("routing.timezone must be an IANA timezone")
   try { new Intl.DateTimeFormat("en-GB", { timeZone: timezone }) } catch { throw new Error(`invalid routing timezone: ${timezone}`) }
@@ -129,7 +152,7 @@ export function parseModelRouting(value: unknown): ModelRouting {
     const input = raw as Record<string, unknown>
     // The format is new and the CLI never writes unknown keys, so a typo (e.g.
     // "selections") is rejected rather than silently disabling the feature.
-    const tierKeys = new Set(["plans", "payg", "selection", "fallback"])
+    const tierKeys = new Set(["plans", "payg", "selection", "fallback", "description"])
     for (const key of Object.keys(input)) if (!tierKeys.has(key)) throw new Error(`unknown routing tier ${name} key ${key}`)
     const selection = input.selection
     if (selection !== undefined && selection !== "ordered" && selection !== "weighted") {
@@ -138,6 +161,10 @@ export function parseModelRouting(value: unknown): ModelRouting {
     const fallback = input.fallback
     if (fallback !== undefined && (typeof fallback !== "string" || !fallback.trim())) {
       throw new Error(`routing tier ${name}.fallback must name a defined tier`)
+    }
+    const description = input.description
+    if (description !== undefined && (typeof description !== "string" || !description.trim() || description.length > MAX_TIER_DESCRIPTION)) {
+      throw new Error(`routing tier ${name}.description must be 1..${MAX_TIER_DESCRIPTION} characters`)
     }
     const weighted = selection === "weighted"
     const candidateKeys = new Set(["model", "capacityPool", "hours", "blockedWeekdayHours", "reservePercent", "weight", "mainWeight"])
@@ -196,7 +223,8 @@ export function parseModelRouting(value: unknown): ModelRouting {
     }
     tiers[name] = { plans, payg,
       ...(selection !== undefined ? { selection: selection as "ordered" | "weighted" } : {}),
-      ...(fallback !== undefined ? { fallback: fallback as string } : {}) }
+      ...(fallback !== undefined ? { fallback: fallback as string } : {}),
+      ...(description !== undefined ? { description: (description as string).trim() } : {}) }
   }
   // Fallback targets may be declared after their referrer, so resolve the whole map first.
   for (const [name, tier] of Object.entries(tiers)) {
@@ -216,6 +244,9 @@ export function parseModelRouting(value: unknown): ModelRouting {
   const roles = r.roles
   if (!roles || typeof roles !== "object" || Array.isArray(roles) ||
     Object.values(roles).some((tier) => typeof tier !== "string" || !tiers[tier])) throw new Error("routing.roles must map agent ids to defined tiers")
+  const ladder = r.ladder
+  if (ladder !== undefined && (!Array.isArray(ladder) || ladder.some((name) => typeof name !== "string" || !tiers[name]) ||
+    new Set(ladder).size !== ladder.length)) throw new Error("routing.ladder must list defined tiers, cheapest first, without duplicates")
   const quotaIDs = r.quotaIDs
   if (quotaIDs !== undefined && (!quotaIDs || typeof quotaIDs !== "object" || Array.isArray(quotaIDs) ||
     Object.values(quotaIDs).some((id) => typeof id !== "string" || !id))) throw new Error("routing.quotaIDs must map providers to quota feed ids")
@@ -235,6 +266,7 @@ export function parseModelRouting(value: unknown): ModelRouting {
     throw new Error("routing.enabled must be a boolean when present")
   }
   return { timezone, roles: roles as Record<string, string>, tiers,
+    ...(ladder !== undefined ? { ladder: ladder as string[] } : {}),
     ...(quotaIDs ? { quotaIDs: quotaIDs as Record<string, string> } : {}),
     allowUnknownQuota: r.allowUnknownQuota === undefined ? true : r.allowUnknownQuota === true,
     enabled: r.enabled === undefined ? true : r.enabled === true }
@@ -244,8 +276,8 @@ export function parseModelRouting(value: unknown): ModelRouting {
 export class ModelRouter {
   private readonly uses = new Map<string, number>()
   /**
-   * Weighted-selection credits keyed `${tier}|${pool}|${modelPin}`. The tier is part of
-   * the key so the same pin in two tiers never shares SWRR state.
+   * Weighted-selection credits keyed by (tier, pool, modelPin) — see creditKey. The tier is
+   * part of the key so the same pin in two tiers never shares SWRR state.
    */
   private readonly credits = new Map<string, number>()
   private readonly config: ModelRouting
@@ -257,6 +289,7 @@ export class ModelRouter {
     now?: Date
     disabled?: ReadonlySet<string>
     quarantined?: ReadonlySet<string>
+    failed?: ReadonlySet<string>
     available?: ReadonlySet<string>
     quota?: (id: string) => Promise<RouteObservation | undefined>
   }): Promise<RouteDecision> {
@@ -264,11 +297,45 @@ export class ModelRouter {
     // a role, and never runs the empty-tier logic. Returning the same no-model
     // decision as an unmapped agent lets every child keep its agent pin.
     if (this.config.enabled === false) return { reason: "routing disabled; use agent pin", skipped: [] }
-    const tier = input.tier ?? this.config.roles[input.role]
-    if (!tier) return { reason: "no tier configured; use agent pin", skipped: [] }
+    // A hint is a hint: a tier name this policy does not define (a shared workflow
+    // written against another user's tiers) is dropped, never fatal.
+    const unknownHint = input.tier !== undefined && !this.config.tiers[input.tier] ? input.tier : undefined
+    const hint = unknownHint === undefined ? input.tier : undefined
+    const note = (decision: RouteDecision): RouteDecision => unknownHint === undefined ? decision
+      : { ...decision, reason: `unknown tier ${unknownHint}; using role default: ${decision.reason}` }
+    const tier = hint ?? this.config.roles[input.role]
+    if (!tier) return note({ reason: "no tier configured; use agent pin", skipped: [] })
     const tierConfig = this.config.tiers[tier]
     if (!tierConfig) throw new Error(`unknown routing tier ${tier}`)
-    return this.selectTier(tier, tierConfig, input, [tier])
+    const routed = { ...input, tier }
+    const decision = await this.selectTier(tier, tierConfig, routed, [tier])
+    // Only an explicit hint walks the ladder: a role mapped to an empty tier keeps its pin.
+    if (decision.model !== undefined || hint === undefined) return note(decision)
+    return this.degrade(hint, routed, decision)
+  }
+
+  /**
+   * An explicitly hinted tier whose whole fallback chain is empty: take the nearest
+   * populated tier on the ladder, lower first ("unsure -> lower shelf"), then higher.
+   * A populated neighbour whose candidates are all gated still throws — the gates
+   * protect spend, and jumping past them to a stronger tier would defeat them.
+   */
+  private async degrade(hint: string, input: SelectInput, empty: RouteDecision): Promise<RouteDecision> {
+    const ladder = tierLadder(this.config)
+    const at = ladder.indexOf(hint)
+    const populated = (name: string): boolean => {
+      const tier = this.config.tiers[name]
+      return tier !== undefined && (tier.plans.length > 0 || tier.payg.length > 0)
+    }
+    const nearest = [...ladder.slice(0, at).reverse(), ...ladder.slice(at + 1)].find(populated)
+    if (nearest === undefined) return empty
+    let inner: RouteDecision
+    try {
+      inner = await this.selectTier(nearest, this.config.tiers[nearest]!, input, [nearest])
+    } catch (error) {
+      throw new Error(`${hint} empty -> ${nearest}: ${error instanceof Error ? error.message : String(error)}`)
+    }
+    return { ...inner, reason: `${hint} empty -> ${nearest}: ${inner.reason}`, fallbackChain: [hint, ...(inner.fallbackChain ?? [nearest])] }
   }
 
   /** Walk one tier, recursing through `fallback` links; `chain` carries the tiers walked. */
@@ -318,6 +385,7 @@ export class ModelRouter {
     const check = async (entry: RouteCandidate, pool: "plans" | "payg"): Promise<EligibleCandidate | undefined> => {
       const model = parseModelPin(entry.model)!
       if (input.available && !input.available.has(`${model.providerID}/${model.id}`)) { skipped.push(`${entry.model}: not in live catalog`); return }
+      if (input.failed?.has(model.providerID)) { skipped.push(`${entry.model}: provider failed over`); return }
       if (input.disabled?.has(model.providerID)) { skipped.push(`${entry.model}: provider offline`); return }
       if (input.quarantined?.has(model.providerID)) { skipped.push(`${entry.model}: provider quarantined`); return }
       if (!within(hour, entry.hours)) { skipped.push(`${entry.model}: outside allowed hours`); return }

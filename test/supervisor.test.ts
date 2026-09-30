@@ -9,6 +9,7 @@ import { tmpdir } from "node:os"
 import path from "node:path"
 import { SupervisorImpl } from "../src/supervisor.ts"
 import { parseModelRouting } from "../src/model-routing.ts"
+import { enrichStatusPayload, runStatusPayload } from "../src/command.ts"
 import { RegistryImpl } from "../src/registry.ts"
 import type { Json, ParentContext, RunRecord, SessionCtx, UltracodeOptions } from "../src/types.ts"
 import { DEFAULT_OPTIONS } from "../src/types.ts"
@@ -25,6 +26,8 @@ function makeSupervisor(
     isProviderDisabled?: (providerID: string) => Promise<boolean>
     pinPool?: (agentIDs: readonly string[]) => Promise<ReadonlyArray<{ agentID: string; pin: string }>>
     disabledProviders?: () => Promise<ReadonlySet<string>>
+    quota?: (id: string) => Promise<{ remainingPercent?: number } | undefined>
+    availableModels?: () => Promise<ReadonlySet<string> | undefined>
     providerSlotsDir?: string
     providerSlotHeartbeatMs?: number
   } = {},
@@ -290,6 +293,48 @@ test("supervisor: a routing failure still reports its reason into the run log", 
     ctx.reports.some((r) => r.includes("routing general FAILED: no eligible a model")),
     `expected a failed-routing report, got: ${ctx.reports.join(" / ")}`,
   )
+})
+
+test("supervisor: a routing failure is kept on the child's row", async () => {
+  const routing = parseModelRouting({
+    timezone: "UTC", roles: { general: "a" }, allowUnknownQuota: false,
+    tiers: { a: { plans: [[{ model: "p/x", reservePercent: 50 }]], payg: [] } },
+  })
+  const ctx = makeSupervisor({ routing })
+  const outcome = await ctx.supervisor.start({ script: `await agent("q"); return 1;` }, ctx.parent)
+  assert.match(outcome.run.agents[0]?.routing?.reason ?? "", /^FAILED: no eligible a model for general: p\/x: quota unknown/)
+})
+
+test("supervisor: a live-catalog outage skips the catalog gate instead of failing routed children", async () => {
+  const routing = parseModelRouting({ timezone: "UTC", roles: { general: "a" }, tiers: { a: { plans: [[{ model: "p/x" }]], payg: [] } } })
+  const ctx = makeSupervisor({ routing }, {}, { availableModels: async () => { throw new Error("catalog down") } })
+  ctx.sessions.push({ text: "ok", model: { providerID: "p", id: "x" } })
+  const outcome = await ctx.supervisor.start({ script: `await agent("q"); return 1;` }, ctx.parent)
+  assert.equal(outcome.envelope.status, "succeeded")
+  assert.equal(outcome.run.agents[0]?.spawnModel?.id, "x")
+  assert.ok(ctx.reports.some((r) => r.includes("live catalog unavailable (catalog down); catalog check skipped")),
+    `expected a catalog report, got: ${ctx.reports.join(" / ")}`)
+})
+
+test("supervisor: persists per-child routing exclusions and exposes them in status", async () => {
+  const routing = parseModelRouting({
+    timezone: "UTC", roles: { general: "standard" }, allowUnknownQuota: false,
+    tiers: { standard: { selection: "weighted", plans: [[
+      { model: "openai/sol", weight: 14, reservePercent: 5 },
+      { model: "alibaba/max", weight: 10 },
+    ]], payg: [[{ model: "xiaomi/mimo", weight: 1, mainWeight: 1 }]] } },
+  })
+  const ctx = makeSupervisor({ routing }, {}, { quota: async (id) =>
+    id === "openai" ? { remainingPercent: 0 } : undefined })
+  ctx.sessions.push({ text: "ok", model: { providerID: "xiaomi", id: "mimo" } })
+  const outcome = await ctx.supervisor.start({ script: `await agent("check"); return 1;` }, ctx.parent)
+  assert.equal(outcome.run.agents[0]?.spawnModel?.providerID, "xiaomi")
+  assert.deepEqual(outcome.run.agents[0]?.routing, {
+    reason: "weighted standard: xiaomi/mimo (w1 of 1)",
+    skipped: ["openai/sol: quota exhausted", "alibaba/max: quota unknown"],
+  })
+  const status = enrichStatusPayload(runStatusPayload(outcome.run), outcome.run)
+  assert.deepEqual(status.children[0]?.routing, outcome.run.agents[0]?.routing)
 })
 
 test("supervisor: invalid script rejected before any run is created", async () => {

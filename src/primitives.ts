@@ -336,8 +336,11 @@ export interface AgentRunnerOptions {
    * missing from the map is unconfigured — no instance permit, no slot dir.
    */
   providerConcurrency?: Readonly<Record<string, number>>
-  /** Opt-in Ultracode-only selector; undefined preserves agent pins. */
-  selectModel?: (role: string, tier?: string, excluded?: ReadonlySet<string>) => Promise<ModelRef | undefined>
+  /**
+   * Opt-in Ultracode-only selector; undefined preserves agent pins. `failed` is
+   * the providers this child already died on (failover re-select only).
+   */
+  selectModel?: (role: string, tier?: string, failed?: ReadonlySet<string>, recordID?: string) => Promise<ModelRef | undefined>
 }
 
 /** Inputs shared by the runner's failover attempts (built once per agent call). */
@@ -494,6 +497,8 @@ export class AgentRunner {
   private readonly now: () => number
   private readonly windowWaitSliceMs: number
   private readonly maxWindowWaitMs: number
+  /** One report per run when tier hints arrive without a router. */
+  private tierHintNoticed = false
   /** Providers this runner already reported a window wait for (one report each). */
   private readonly windowWaitNotified = new Set<string>()
   private readonly providerLimiter: ProviderLimiter | undefined
@@ -633,8 +638,9 @@ export class AgentRunner {
     try {
       const titlePhase = opts.phase ?? this.ambientPhase()
       const requestedAgent = opts.agent ?? this.defaultAgent
-      // Model precedence: per-call override > run-level override > agent-config
-      // pin > server default. Explicit overrides skip pin lookup entirely (the
+      // Model precedence: per-call override > run-level override > routing (tier
+      // hint, then role tier) > agent-config pin > default agent's pin > server
+      // default. Explicit overrides skip routing and pin lookup entirely (the
       // caller asked for THIS model), and carry their source so drift reports
       // can tell an intentional override from a config pin.
       let model: { providerID: string; id: string; variant?: string } | undefined
@@ -646,11 +652,18 @@ export class AgentRunner {
         model = this.runModel
         modelSource = "run"
       } else if (this.selectModel) {
-        model = await this.selectModel(requestedAgent, opts.tier)
-        if (model !== undefined) modelSource = "route"
-        // An explicit tier that yields no model is an empty tier (unknown tiers and
-        // all-gated tiers throw inside the router), so name it for the caller.
-        else if (opts.tier !== undefined) throw new Error(`routing tier ${opts.tier} is empty — configure it or drop the tier hint`)
+        // An unknown agent fails in the driver with the roster; routing it first
+        // would advance rotation state and read quota for a child that never runs.
+        if (this.availableAgents === undefined || this.availableAgents.includes(requestedAgent)) {
+          // A hint is a hint: a tier the user's policy cannot satisfy (unknown or
+          // empty) degrades inside the router, down to the pin chain below. Only a
+          // populated tier with every candidate gated out throws.
+          model = await this.selectModel(requestedAgent, opts.tier, undefined, record.id)
+          if (model !== undefined) modelSource = "route"
+        }
+      } else if (opts.tier !== undefined && !this.tierHintNoticed) {
+        this.tierHintNoticed = true
+        this.safeReport("tier hints ignored: routing is not configured or disabled; children use their agent pins")
       }
       if (model === undefined && opts.model === undefined && this.runModel === undefined && this.pinForAgent) {
         try {
@@ -1293,7 +1306,7 @@ export class AgentRunner {
     if (context.routedTier !== undefined && this.selectModel &&
       context.callFallbacks === undefined && override === undefined) {
       try {
-        const next = await this.selectModel(context.requestedAgent, context.routedTier || undefined, new Set([context.dead.providerID]))
+        const next = await this.selectModel(context.requestedAgent, context.routedTier || undefined, new Set([context.dead.providerID]), context.recordID)
         return next ? [{ model: next, source: "option" }] : []
       } catch { return [] }
     }

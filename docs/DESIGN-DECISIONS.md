@@ -157,3 +157,35 @@ real-SIGKILL leg `scripts/live-test.sh restart` (docs/INTEGRATION-TEST.md §7).
 (revisit A2); OpenCode exposes richer session-busy signals (tighten the steer
 pre-flight beyond "outcome defined"); harvest needs schema inference for
 legacy rows (only with a way to prove the contract).
+
+## D3 — Tier hints degrade; gated tiers fail loud
+
+**Date:** 2026-09-30 · **Status:** accepted
+
+**Context.** A workflow expresses difficulty with a tier hint (`{ tier: "strong" }`). Tier names
+are the user's own, users have different plans, and saved workflows are shared. Before this
+decision a hint had three outcomes depending on the reader's setup: ignored in silence (no
+routing), child killed (`unknown routing tier`), child killed (`routing tier X is empty`). A
+workflow that ran for its author died for the next user.
+
+**Decision.**
+
+1. A hint is advice, never a precondition. An unknown tier name falls back to the agent's role
+   default. A tier with no model choices (after its own `fallback` chain) falls to the nearest
+   tier that has some, walking `routing.ladder` cheaper-first, then to the agent pin. Hints with
+   no router are ignored with one run-log line.
+2. A tier that has model choices which are all gated out (hours, reserve, quota, catalog,
+   offline provider) still fails the child, including when a ladder walk lands on it. Gates
+   exist to protect spend; stepping past them to a stronger tier or to the pin — often the very
+   PAYG model being protected — would spend what the user told the router not to.
+3. Tiers carry a user-written `description` and an order. The authoring skill names no tiers;
+   it reads both from the catalog.
+
+**Why cheaper-first.** The hint says "this step is about this hard". When the exact shelf is
+missing, under-spending and getting a weaker answer is recoverable (verification steps catch
+it); silently spending the most expensive plan is not.
+
+**Rejected.** A fixed four-tier vocabulary: portable by construction, but it forces a
+difficulty model on users whose plans do not split that way and would break existing custom
+policies. Strict failure with authoring-time validation: catches literal tier names only, not
+`{{plan.tier}}` evidence, and still leaves shared workflows non-portable.

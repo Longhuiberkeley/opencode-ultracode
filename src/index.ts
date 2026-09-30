@@ -45,7 +45,7 @@ import {
   writeOwnerLiveness,
 } from "./owner-liveness.ts"
 import { estimateAndRecordRequestInput } from "./child-context.ts"
-import { CATALOG_RUN_LIMIT, CATALOG_RUN_SCAN, buildCatalog } from "./catalog.ts"
+import { CATALOG_RUN_LIMIT, CATALOG_RUN_SCAN, buildCatalog, routingSummary } from "./catalog.ts"
 import { applyResumeRemember, controlRun, controlToolContent } from "./control.ts"
 import {
   applyOverlay,
@@ -1524,7 +1524,7 @@ export default Plugin.define({
           name: "catalog",
           options: { namespace: "ultracode" },
           description:
-            "Read-only discovery of what this project can run: saved workflows (kind, params (names always; JSON types only when declared — explicit params, a // Tool input: header, or a saved run's real args; graph-derived params are names only), phases, required agents, trust state, last-run stats from THIS conversation), the available agent ids, the live caps (concurrency, maxAgents, timeoutMs, maxLoopDepth, maxLoopIterations), graph templates to adapt, and script templates (staged-delivery, verify-fix) for loop-shaped work graphs cannot express. Call it BEFORE choosing a saved workflow or authoring from a blank page — cheaper than reading workflow files, and it executes nothing. Input { workflow? | template? | templates? | scriptTemplate? | scriptTemplates? }: no input returns the whole bounded catalog; one view per call. A workflow listed as trusted can be run immediately; an untrusted one needs the user's /ultracode trust first (relay that, never work around it).",
+            "Read-only discovery of what this project can run: saved workflows (kind, params (names always; JSON types only when declared — explicit params, a // Tool input: header, or a saved run's real args; graph-derived params are names only), phases, required agents, trust state, last-run stats from THIS conversation), the available agent ids, the live caps (concurrency, maxAgents, timeoutMs, maxLoopDepth, maxLoopIterations, and — when the user configured model routing — caps.routing: the difficulty tiers cheapest first with the user's description of each, plus agent → default tier roles), graph templates to adapt, and script templates (staged-delivery, verify-fix) for loop-shaped work graphs cannot express. Call it BEFORE choosing a saved workflow or authoring from a blank page — cheaper than reading workflow files, and it executes nothing. Input { workflow? | template? | templates? | scriptTemplate? | scriptTemplates? }: no input returns the whole bounded catalog; one view per call. A workflow listed as trusted can be run immediately; an untrusted one needs the user's /ultracode trust first (relay that, never work around it).",
           input: CATALOG_TOOL_INPUT_SCHEMA,
           execute: async (rawInput: unknown, tool) => {
             try {
@@ -1559,25 +1559,7 @@ export default Plugin.define({
                   // input may tighten below (never raise).
                   maxLoopDepth: options.maxLoopDepth,
                   maxLoopIterations: MAX_LOOP_ITERATIONS,
-                  // Routing summary for authoring-time tier hints: only
-                  // non-empty tiers are hintable (an explicit hint on an empty
-                  // tier without a fallback throws at spawn). With the master
-                  // switch off, list no hintable tiers and say so explicitly
-                  // so authoring agents stop emitting tier hints.
-                  ...(options.routing
-                    ? {
-                        routing: {
-                          ...(options.routing.enabled === false ? { enabled: false } : {}),
-                          tiers: options.routing.enabled === false ? [] : Object.entries(options.routing.tiers)
-                            .filter(([, tier]) => tier.plans.length > 0 || tier.payg.length > 0)
-                            .map(([name, tier]) => ({
-                              name,
-                              models: tier.plans.flat().length + tier.payg.flat().length,
-                            })),
-                          roles: { ...options.routing.roles },
-                        },
-                      }
-                    : {}),
+                  ...(options.routing ? { routing: routingSummary(options.routing) } : {}),
                 },
                 ...(parsed.templates !== undefined ? { templates: parsed.templates } : {}),
                 ...(parsed.template !== undefined ? { template: parsed.template } : {}),

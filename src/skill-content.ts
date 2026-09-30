@@ -246,14 +246,14 @@ const summary = await loop({
 3. **Return small JSON.** A few keys: a report string, counts, verdicts. Bigger values come back
    as a truncated preview — recover the full value with \`ultracode_result\` (offset paging), never
    by guessing past the cut.
-4. **Difficulty → \`opts.tier\`; model names → \`opts.model\`.** When catalog caps list routing tiers,
-   hint each step's shelf: mechanical extraction \`lite\` if listed; routine work no hint (role
-   default); judgment, review, merge \`strong\`; final calls and architecture \`frontier\` (rare; unsure
-   → lower shelf). Prefer evidence over vibes: give scout, plan and plan-review schemas a \`tier\` enum of
-   the listed tiers and interpolate it in later steps — graph \`tier: "{{plan.tier}}"\`, script
-   \`{ tier: plan.data.tier }\`. Before evidence exists your read is the prior; the user's difficulty
-   instructions always win. \`opts.model\` (or run input \`model\`) ONLY when the user asked for a
-   model — beats pins and tiers; a provider the user disabled stays locked.
+4. **Difficulty → \`opts.tier\`; model names → \`opts.model\`.** Catalog \`caps.routing.tiers\` lists THIS
+   user's shelves, cheapest first, each with their description — use those names, none from memory.
+   Mechanical extraction: the cheapest; routine work: no hint (role default); judgment, review,
+   merge: a stronger shelf; the strongest only for final calls (rare; unsure → lower; a tier the
+   user left empty degrades safely). Prefer evidence over vibes: give scout and plan schemas a \`tier\`
+   enum of the listed tiers and interpolate it — graph \`tier: "{{plan.tier}}"\`, script
+   \`{ tier: plan.data.tier }\`. The user's difficulty instructions always win. \`opts.model\` (or run input
+   \`model\`) ONLY when the user asked for a model — beats pins and tiers; a disabled provider stays locked.
 5. **Prompts are the entire world.** A child agent sees ONLY its prompt string, zero conversation
    context. Make every prompt self-contained: paths, pasted snippets, criteria, output format.
 6. **Serialize write agents.** A clean context is NOT filesystem isolation: two write agents

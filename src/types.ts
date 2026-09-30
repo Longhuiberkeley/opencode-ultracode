@@ -456,6 +456,8 @@ export interface AgentRecord {
    * `source` records precedence: "call" | "run" (explicit overrides) vs "pin".
    */
   spawnModel?: SpawnModel
+  /** Router decision at admission, including the candidates excluded before the draw. */
+  routing?: { reason: string; skipped: string[] }
   sessionID?: string
   status: AgentStatus
   error?: string

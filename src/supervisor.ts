@@ -809,8 +809,8 @@ export class SupervisorImpl implements Supervisor {
       // 3.-4. AgentRunner over a driver wrapper that tracks child sessions,
       // registry ownership (ambient phase tracked via state) and late children.
       // Master switch: routing.enabled === false wires no router at all, so a
-      // role mapping cannot select and an explicit tier hint degrades silently
-      // to the agent pin (primitives' empty-tier throw is never reached). The
+      // role mapping cannot select and an explicit tier hint degrades to the
+      // agent pin (the runner reports the ignored hints once per run). The
       // pin-path failover shelf is untouched.
       const routerForRun = state.effective.routing && state.effective.routing.enabled !== false
         ? (state.effective.routing === this.options.routing ? this.router : undefined) ?? new ModelRouter(state.effective.routing)
@@ -921,8 +921,8 @@ export class SupervisorImpl implements Supervisor {
         providerLimiter: this.providerLimiter,
         providerConcurrency: state.effective.providerConcurrency,
         ...(routerForRun ? {
-          selectModel: async (role: string, tier?: string, excluded?: ReadonlySet<string>) => {
-            const disabled = new Set(excluded)
+          selectModel: async (role: string, tier?: string, failed?: ReadonlySet<string>, recordID?: string) => {
+            const disabled = new Set<string>()
             if (this.disabledProviders) {
               try { for (const id of await this.disabledProviders()) disabled.add(id) } catch { /* existing disabled-provider behavior */ }
             }
@@ -935,19 +935,34 @@ export class SupervisorImpl implements Supervisor {
             // select() returns the no-model decision before reading it, so the
             // fetch would be wasted for unmapped children.
             const resolved = tier ?? state.effective.routing?.roles[role]
-            const available = resolved ? await this.availableModels?.() : undefined
+            let available: ReadonlySet<string> | undefined
+            if (resolved) {
+              // Fail open like every other lookup here: a catalog outage skips the
+              // catalog gate (the provider rejects a truly missing model) instead
+              // of killing every routed child.
+              try { available = await this.availableModels?.() } catch (error) {
+                this.safeParentReport(state,
+                  `routing ${role}${tier ? `/${tier}` : ""}: live catalog unavailable (${error instanceof Error ? error.message : String(error)}); catalog check skipped`.slice(0, 600))
+              }
+            }
             try {
               const decision = await routerForRun.select({ role, ...(tier ? { tier } : {}), disabled,
+                ...(failed && failed.size > 0 ? { failed } : {}),
                 ...(quarantined.size > 0 ? { quarantined } : {}),
                 ...(available ? { available } : {}), ...(this.quota ? { quota: this.quota } : {}) })
+              if (recordID) this.registry.updateAgent(runID, recordID, {
+                routing: { reason: decision.reason, skipped: decision.skipped },
+              })
               this.safeParentReport(state, `routing ${role}${tier ? `/${tier}` : ""}: ${decision.reason}` +
                 (decision.skipped.length ? `; skipped ${decision.skipped.join("; ").slice(0, 500)}` : ""))
               return decision.model
             } catch (error) {
               // A routing failure that kills a child must still be visible in the
-              // run log; rethrow so the caller sees the typed reason.
+              // run log and on the child's row; rethrow so the caller sees the typed reason.
+              const message = error instanceof Error ? error.message : String(error)
+              if (recordID) this.registry.updateAgent(runID, recordID, { routing: { reason: `FAILED: ${message}`.slice(0, 600), skipped: [] } })
               this.safeParentReport(state,
-                `routing ${role}${tier ? `/${tier}` : ""} FAILED: ${error instanceof Error ? error.message : String(error)}`.slice(0, 600))
+                `routing ${role}${tier ? `/${tier}` : ""} FAILED: ${message}`.slice(0, 600))
               throw error
             }
           },

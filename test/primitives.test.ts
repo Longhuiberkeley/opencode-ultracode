@@ -119,12 +119,48 @@ test("opt-in tier route wins over pin; explicit override wins over route", async
   await second
 })
 
-test("an explicit tier hint on an empty tier names the empty tier", async () => {
+test("an explicit tier hint on an empty or unknown tier degrades instead of killing the child", async () => {
   const router = new ModelRouter(parseModelRouting({ timezone: "UTC", roles: {},
-    tiers: { frontier: { plans: [], payg: [] } } }))
-  const { runner } = makeRunner({
-    selectModel: (role, tier, excluded) => router.select({ role, ...(tier ? { tier } : {}), disabled: excluded }).then((choice) => choice.model) })
-  await assert.rejects(runner.call("general", { tier: "frontier" }), /routing tier frontier is empty — configure it or drop the tier hint/)
+    tiers: { standard: { plans: [[{ model: "xai/grok-4.7" }]], payg: [] }, frontier: { plans: [], payg: [] } } }))
+  const { runner, calls, registry, run } = makeRunner({
+    pinForAgent: async () => ({ providerID: "anthropic", id: "claude-pin" }),
+    selectModel: (role, tier, failed) => router.select({ role, ...(tier ? { tier } : {}), failed }).then((choice) => choice.model) })
+  // Empty tier: the nearest populated tier on the ladder.
+  const empty = runner.call("general", { tier: "frontier" })
+  await tick()
+  assert.deepEqual(registry.getAgent(run.id, "a1")!.spawnModel, { providerID: "xai", id: "grok-4.7", source: "route" })
+  calls[0]!.resolve(okResult("ses_degraded"))
+  await empty
+  // Unknown tier, no role mapping: the agent pin.
+  const unknown = runner.call("general", { tier: "someone-elses-tier" })
+  await tick()
+  assert.deepEqual(registry.getAgent(run.id, "a2")!.spawnModel, { providerID: "anthropic", id: "claude-pin", source: "pin" })
+  calls[1]!.resolve(okResult("ses_unknown"))
+  await unknown
+})
+
+test("a tier hint without a router is reported once and the child keeps its pin", async () => {
+  const { runner, calls, reports } = makeRunner({ pinForAgent: async () => ({ providerID: "anthropic", id: "claude-pin" }) })
+  const first = runner.call("one", { tier: "strong" })
+  const second = runner.call("two", { tier: "strong" })
+  await tick()
+  assert.equal(calls[0]!.input.model?.id, "claude-pin")
+  calls[0]!.resolve(okResult("ses_hint_one"))
+  calls[1]!.resolve(okResult("ses_hint_two"))
+  await Promise.all([first, second])
+  assert.equal(reports.filter((line) => line.startsWith("tier hints ignored")).length, 1)
+})
+
+test("an unknown agent is not routed: rotation state and quota stay untouched", async () => {
+  let selections = 0
+  const { runner, calls } = makeRunner({ availableAgents: ["general"],
+    selectModel: async () => { selections++; return { providerID: "xai", id: "grok-4.7" } } })
+  const pending = runner.call("x", { agent: "ghost" })
+  await tick()
+  assert.equal(selections, 0)
+  assert.equal(calls[0]!.input.model, undefined)
+  calls[0]!.resolve(okResult("ses_ghost"))
+  await pending
 })
 
 test("a role mapped to an empty tier that falls back to another empty tier spawns on the agent pin", async () => {
@@ -139,9 +175,12 @@ test("a role mapped to an empty tier that falls back to another empty tier spawn
   assert.equal(registry.getAgent(run.id, "a1")!.spawnModel?.source, "pin")
   calls[0]!.resolve(okResult("ses_empty_pin"))
   await pending
-  // The same empty chain reached by an EXPLICIT hint is a caller mistake, not a pin.
-  await assert.rejects(runner.call("general", { tier: "frontier" }),
-    /routing tier frontier is empty — configure it or drop the tier hint/)
+  // The same empty chain reached by an EXPLICIT hint has no populated tier to degrade to: the pin.
+  const hinted = runner.call("general", { tier: "frontier" })
+  await tick()
+  assert.equal(registry.getAgent(run.id, "a2")!.spawnModel?.source, "pin")
+  calls[1]!.resolve(okResult("ses_empty_hint"))
+  await hinted
 })
 
 test("a routed spawn records its model source as route", async () => {
@@ -1613,17 +1652,23 @@ test("AgentRunner breaker: a routed child honours the ask-mode resume override",
 })
 
 test("AgentRunner breaker: a routed child stays inside the routing policy for implicit rungs", async () => {
+  const selections: Array<{ failed: string[]; recordID: string | undefined }> = []
   const router = new ModelRouter(parseModelRouting({ timezone: "UTC", roles: { general: "strong" },
     tiers: { strong: { plans: [[{ model: "xai/grok-4.6" }], [{ model: "google/gemini-3.7-flash" }]], payg: [] } } }))
   const { runner, calls } = makeRunner({
     providerHealth: quarantinedXai(),
     modelFallbacks: { "xai/grok-4.6": ["anthropic/claude-x"] },
     pinPool: async () => [{ agentID: "general", pin: "anthropic/claude-x" }],
-    selectModel: (role, tier, excluded) => router.select({ role, ...(tier ? { tier } : {}), disabled: excluded }).then((choice) => choice.model),
+    selectModel: (role, tier, failed, recordID) => {
+      selections.push({ failed: [...(failed ?? [])], recordID })
+      return router.select({ role, ...(tier ? { tier } : {}), failed }).then((choice) => choice.model)
+    },
   })
   const pending = runner.call("routed")
   await tick()
   assert.deepEqual(calls[0]!.input.model, { providerID: "google", id: "gemini-3.7-flash" }, "the router re-picks; implicit rungs do not leak")
+  assert.deepEqual(selections, [{ failed: [], recordID: "a1" }, { failed: ["xai"], recordID: "a1" }],
+    "the re-select carries the dead provider and the child's record id")
   calls[0]!.resolve(okResult("ses_policy"))
   await pending
 })

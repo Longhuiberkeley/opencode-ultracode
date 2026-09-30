@@ -8,7 +8,7 @@ import readline from "node:readline/promises"
 import { stdin, stdout } from "node:process"
 import { fileURLToPath } from "node:url"
 import { loadOptions } from "./config.ts"
-import { ModelRouter } from "./model-routing.ts"
+import { MAX_TIER_DESCRIPTION, ModelRouter, tierLadder } from "./model-routing.ts"
 import { capacityFeed } from "./quota-command.ts"
 import { parseModelPin } from "./agent-pins.ts"
 
@@ -26,8 +26,10 @@ No command opens the interactive menu. Edits apply to Ultracode plugin options o
   tier fallback <tier> <other-tier|none> tier to try when nothing in this tier is eligible
   tier remove <tier> <model>
   tier create <tier> | tier delete <tier> | tier show <tier>
+  tier describe <tier> <text...|none>    what the tier is for, in your words (shown to the authoring agent)
   role set <agent> <tier> | role remove <agent> | role defaults [--force] [--all-known]
   routing init <IANA timezone> | routing timezone <IANA timezone> | routing enable | routing disable
+  routing ladder <tier> [tier...] | routing ladder none   tier order, cheapest first (default: creation order)
   quota-id set <provider> <feed-id> | quota-id remove <provider>
   capacity source <pool> <capacity-v1|check-rate> <executable> [args...]
   capacity status [pool] | capacity remove <pool> | capacity bind <tier> <model> <pool|none>
@@ -38,10 +40,20 @@ Group indices are zero-based. Groups run in order; models within one group rotat
 --weight applies in weighted tiers; --main-weight lets a PAYG model join the plans draw.
 role defaults maps canonical agents (explore, general, reviewer) to lite/standard/strong.
 routing disable keeps every child on its agent pin; roles and tiers stay configured.
+A workflow's tier hint never kills a child: an unknown tier uses the role default, and an
+empty tier uses the nearest filled tier on the ladder (cheaper first), then the agent pin.
 Existing /ultracode set overlays for concurrency, maxAgents, timeoutMs, permissions
 and providerconcurrency take precedence over plugin defaults in their project.
 Changes to the copied plugin require an OpenCode service restart when safe.
 `
+
+/** Seeded by routing init; users rename, re-describe or delete them freely. */
+const TIER_SEEDS = [
+  ["lite", "mechanical work: search, extraction, formatting"],
+  ["standard", "routine coding and analysis"],
+  ["strong", "hard coding, review, merging findings"],
+  ["frontier", "the hardest calls: architecture and final judgment"],
+]
 
 const ROLE_DEFAULTS = [
   { agent: "explore", tier: "lite", always: true, why: "Every install has explore (read-only codebase search), so a cheap model is safe by construction." },
@@ -100,14 +112,20 @@ async function configure(opts, command) {
     if (verb === "init" && rest.length === 1) {
       if (opts.routing) fail("routing policy already exists")
       // Names are user labels; init never writes a role or a model. A pre-existing policy is never migrated.
-      opts.routing = { timezone: rest[0], roles: {}, tiers: Object.fromEntries(["lite", "standard", "strong", "frontier"].map((name) =>
-        [name, { plans: [], payg: [] }])) }
+      opts.routing = { timezone: rest[0], roles: {}, tiers: Object.fromEntries(TIER_SEEDS.map(([name, description]) =>
+        [name, { plans: [], payg: [], description }])) }
     } else if (verb === "timezone" && rest.length === 1) ensureRouting(opts).timezone = rest[0]
     else if (verb === "enable" && !rest.length) {
       // enabled is the default: clearing the key keeps pre-switch configs identical.
       delete ensureRouting(opts).enabled
     } else if (verb === "disable" && !rest.length) ensureRouting(opts).enabled = false
-    else fail("usage: routing init <timezone> | routing timezone <timezone> | routing enable | routing disable")
+    else if (verb === "ladder" && rest.length) {
+      const routing = ensureRouting(opts)
+      // Creation order is the default, so clearing the key keeps old configs identical.
+      if (rest.length === 1 && rest[0] === "none") delete routing.ladder
+      else { for (const name of rest) ensureTier(routing, name); routing.ladder = rest }
+    }
+    else fail("usage: routing init <timezone> | routing timezone <timezone> | routing enable | routing disable | routing ladder <tier...|none>")
     return
   }
   if (area === "quota-id") {
@@ -176,7 +194,19 @@ async function configure(opts, command) {
       if (Object.values(routing.roles).includes(rest[0])) fail("remove role mappings to this tier first")
       const referrers = Object.entries(routing.tiers).filter(([, tier]) => tier.fallback === rest[0]).map(([name]) => name)
       if (referrers.length) fail(`clear the fallback reference from ${referrers.join(", ")} first (tier fallback ${referrers[0]} none)`)
-      delete routing.tiers[rest[0]]; return
+      delete routing.tiers[rest[0]]
+      if (routing.ladder) routing.ladder = routing.ladder.filter((name) => name !== rest[0])
+      return
+    }
+    if (verb === "describe" && rest.length >= 2) {
+      const tier = ensureTier(routing, rest[0])
+      const text = rest.slice(1).join(" ").trim()
+      if (text === "none") delete tier.description
+      else {
+        if (!text || text.length > MAX_TIER_DESCRIPTION) fail(`tier description must be 1..${MAX_TIER_DESCRIPTION} characters`)
+        tier.description = text
+      }
+      return
     }
     if (verb === "mode" && rest.length === 2) {
       const tier = ensureTier(routing, rest[0])
@@ -206,7 +236,8 @@ async function configure(opts, command) {
       const entry = { model }
       editEntry(entry, f)
       if (group === tier[kind].length) tier[kind].push([entry]); else tier[kind][group].push(entry)
-      return
+      const warning = await catalogWarning(model)
+      return warning ? { lines: [warning] } : undefined
     }
     const model = first
     const location = candidateLocation(routing, name, model)
@@ -229,9 +260,25 @@ async function configure(opts, command) {
       group.splice(f.position === undefined ? group.length : number(f.position, "position", 0, group.length), 0, location.entry)
       return
     }
-    fail("tier: use add, edit, move, mode, fallback, remove, create or delete")
+    fail("tier: use add, edit, move, mode, fallback, describe, remove, create or delete")
   }
   fail("unknown command; run ultracode-config --help")
+}
+/**
+ * Advisory only: the runtime skips a model that is "not in live catalog" and never
+ * checks the #variant, so say so at edit time. An unreachable catalog says nothing.
+ */
+async function catalogWarning(pin) {
+  const parsed = parseModelPin(pin)
+  let models
+  try { models = await liveModels() } catch { return undefined }
+  const model = models.find((m) => m.providerID === parsed.providerID && m.id === parsed.id)
+  if (!model) return `Warning: ${parsed.providerID}/${parsed.id} is not in the live catalog — children skip it until it appears.`
+  const variants = (model.variants ?? []).map((v) => typeof v === "string" ? v : v.id).filter(Boolean)
+  if (parsed.variant && !variants.includes(parsed.variant)) {
+    return `Warning: ${parsed.providerID}/${parsed.id} has no variant "${parsed.variant}" (available: ${variants.join(", ") || "none"}).`
+  }
+  return undefined
 }
 function editEntry(entry, f) {
   if (f.hours !== undefined) {
@@ -310,7 +357,11 @@ async function applyRoleDefaults(routing, rest) {
 async function readConfig(file) {
   let document
   try { document = JSON.parse(await fs.readFile(file, "utf8")) }
-  catch (error) { fail(`cannot read JSON config ${file}: ${error.message}`) }
+  catch (error) {
+    // Saving rewrites the whole file as plain JSON, so comments cannot be kept: refuse rather than drop them.
+    if (file.endsWith(".jsonc") && error.code !== "ENOENT") fail(`${file} has comments or trailing commas, which a save would drop; remove them, or edit the routing options by hand`)
+    fail(`cannot read JSON config ${file}: ${error.message}`)
+  }
   const entries = (Array.isArray(document?.plugins) ? document.plugins : []).filter((entry) => entry && typeof entry === "object" &&
     typeof entry.package === "string" && /(^|\/)ultracode\/?$/.test(entry.package)) ?? []
   if (entries.length !== 1) fail(`expected exactly one Ultracode plugin entry in ${file}; found ${entries.length}`)
@@ -393,9 +444,10 @@ function formatSummary(opts) {
   for (const [role, tier] of Object.entries(roles)) lines.push(`  ${role.padEnd(20)} ${tier}`)
   if (!options.routing) lines.push("  (routing off; agent pins decide)")
   else if (!Object.keys(roles).length && options.routing.enabled !== false) lines.push("  (no roles mapped; agent pins decide)")
-  lines.push("", "Tiers (plans before payg; groups run in order, or weight-drawn when weighted)")
-  for (const [name, tier] of Object.entries(options.routing?.tiers ?? {})) {
-    lines.push(`  ${name}:  ${tierSelection(tier)}${tier.fallback ? `  fallback: ${tier.fallback}` : ""}`)
+  lines.push("", "Tiers, cheapest first (plans before payg; groups run in order, or weight-drawn when weighted)")
+  for (const name of options.routing ? tierLadder(options.routing) : []) {
+    const tier = options.routing.tiers[name]
+    lines.push(`  ${name}:  ${tierSelection(tier)}${tier.fallback ? `  fallback: ${tier.fallback}` : ""}${tier.description ? `  — ${tier.description}` : ""}`)
     if (!tier.plans.length && !tier.payg.length) {
       lines.push("    (no model choices — mapped agents keep their agent pins)")
       continue
@@ -414,7 +466,7 @@ function formatSummary(opts) {
   lines.push("", "Capacity sources")
   if (options.quotaCommand) lines.push(`  Legacy check-rate: ${options.quotaCommand.join(" ")}`)
   for (const [id, source] of Object.entries(options.quotaSources)) lines.push(`  ${id}: ${source.format} via ${source.command.join(" ")}`)
-  if (!options.quotaCommand && !Object.keys(options.quotaSources).length) lines.push("  (none; reserved plans with unknown usage are skipped)")
+  if (!options.quotaCommand && !Object.keys(options.quotaSources).length) lines.push(`  (none; usage is unknown, so plans are ${options.routing?.allowUnknownQuota === false ? "skipped (allowUnknownQuota: false)" : "tried without a usage check"})`)
   if (warnings.length) lines.push("", ...warnings.map((w) => `  Warning: ${w}`))
   lines.push("", "Project /ultracode set overrides may change panel settings and provider caps.")
   return lines.join("\n")
@@ -425,7 +477,8 @@ async function execute(file, args) {
   const opts = entry.options
   const [area, verb] = args
   if (area === "list" || !area || area === "tier" && verb === "show") {
-    if (area === "tier") console.log(JSON.stringify(ensureTier(ensureRouting(opts), args[2]), null, 2))
+    // The parsed policy, like list; a policy that fails validation still shows its raw tier.
+    if (area === "tier") console.log(JSON.stringify(ensureTier(loadOptions(opts).options.routing ?? ensureRouting(opts), args[2]), null, 2))
     else console.log(args.includes("--json") ? JSON.stringify(summary(opts)) : formatSummary(opts))
     return
   }
@@ -448,10 +501,6 @@ async function execute(file, args) {
     let available
     try { available = new Set((await liveModels()).map((m) => `${m.providerID}/${m.id}`)) } catch { /* offline explanation still useful */ }
     const decision = await new ModelRouter(policy).select({ role, ...(tier ? { tier } : {}), now: at, quota, ...(available ? { available } : {}) })
-    // Mirror primitives: an explicit hint that yields no model is an empty tier, and
-    // the same hint in a workflow is a hard error. A role-based empty tier stays exit 0.
-    // A disabled policy is neither: the hint degrades to the pin like every other call.
-    if (tier !== undefined && decision.model === undefined && policy.enabled !== false) fail(`routing tier ${tier} is empty — configure it or drop the tier hint`)
     if (json) console.log(JSON.stringify({ time: at.toISOString(), ...decision }))
     else {
       const pool = decision.pool ? `\nPool:\n${decision.pool.map((entry) => `  - ${entry.model}  w${entry.weight} (${Math.round(entry.percent)}%)`).join("\n")}` : ""
@@ -786,10 +835,15 @@ async function interactive(file) {
             if (zone) { await execute(file, ["routing", "init", zone]); await offerRoleDefaults(file, rl) }
           } else {
             const routing = ensureRouting(options)
-            const action = await pick(rl, "Action", ["Set role tier", "Remove role mapping", "Create tier", "Delete tier", "Set timezone", "Suggest role defaults"])
+            const action = await pick(rl, "Action", ["Set role tier", "Remove role mapping", "Create tier", "Describe tier", "Delete tier", "Set timezone", "Suggest role defaults"])
             if (action === "Create tier") {
               const name = (await rl.question("New tier name: ")).trim()
               if (name) await execute(file, ["tier", "create", name])
+            } else if (action === "Describe tier") {
+              const name = await pick(rl, "Tier", Object.keys(routing.tiers))
+              if (!name) continue
+              const text = (await rl.question(`What is ${name} for? [${routing.tiers[name].description ?? "none"}]: `)).trim()
+              if (text) await execute(file, ["tier", "describe", name, text])
             } else if (action === "Delete tier") {
               const name = await pick(rl, "Tier", Object.keys(routing.tiers))
               if (name) await execute(file, ["tier", "delete", name])
@@ -844,6 +898,7 @@ async function main(argv) {
     if (!argv[1]) fail("--config requires a JSON file path")
     file = path.resolve(argv[1]); argv = argv.slice(2)
   }
+  else if (!await fs.stat(file).catch(() => undefined) && await fs.stat(`${file}c`).catch(() => undefined)) file = `${file}c`
   if (!argv.length) await interactive(file)
   else await execute(file, argv)
 }
