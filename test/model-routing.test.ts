@@ -514,3 +514,52 @@ test("a failover re-select names the provider the child died on", async () => {
   assert.equal(decision.model?.providerID, "q")
   assert.deepEqual(decision.skipped, ["p/x: provider failed over"])
 })
+
+const windowed = (extra: Record<string, unknown> = {}) => parseModelRouting({
+  timezone: "Asia/Hong_Kong", roles: { general: "standard" }, ...extra,
+  tiers: { standard: { selection: "weighted", plans: [[
+    { model: "openai/a", weight: 14 },
+    { model: "xai/b", weight: 5, weightWindows: [{ hours: [22, 8], weight: 2 }, { hours: [0, 4], weight: 9 }] },
+  ]], payg: [] } },
+})
+const tally = async (router: ModelRouter, draws: number, input: { now: Date; quota?: (id: string) => Promise<{ remainingPercent?: number } | undefined> }) => {
+  const counts: Record<string, number> = {}
+  for (let i = 0; i < draws; i++) {
+    const id = (await router.select({ role: "general", ...input })).model!.providerID
+    counts[id] = (counts[id] ?? 0) + 1
+  }
+  return counts
+}
+
+test("weightWindows replace the weight inside the window (wrapping midnight); the first match wins", async () => {
+  const day = new Date("2026-09-23T06:00:00Z") // 14:00 HKT
+  const night = new Date("2026-09-23T18:00:00Z") // 02:00 HKT, inside both windows
+  assert.deepEqual(await tally(new ModelRouter(windowed()), 19, { now: day }), { openai: 14, xai: 5 })
+  assert.deepEqual(await tally(new ModelRouter(windowed()), 16, { now: night }), { openai: 14, xai: 2 })
+  const decision = await new ModelRouter(windowed()).select({ role: "general", now: night })
+  assert.deepEqual(decision.pool?.map((entry) => entry.weight), [14, 2])
+})
+
+test("routing validation rejects bad weightWindows and windows on an ordered tier", () => {
+  const withWindows = (weightWindows: unknown, selection?: string) => () => parseModelRouting({ timezone: "UTC", roles: {}, tiers: { t: {
+    ...(selection ? { selection } : {}), plans: [[{ model: "p/a", weightWindows }]], payg: [] } } })
+  assert.throws(withWindows([{ hours: [22, 22], weight: 2 }], "weighted"), /invalid routing weightWindows/)
+  assert.throws(withWindows([{ hours: [22, 8], weight: 0 }], "weighted"), /invalid routing weightWindows/)
+  assert.throws(withWindows([{ hours: [22, 8], weight: 2, extra: 1 }], "weighted"), /invalid routing weightWindows/)
+  assert.throws(withWindows([], "weighted"), /invalid routing weightWindows/)
+  assert.throws(withWindows([{ hours: [22, 8], weight: 2 }]), /needs a weighted tier/)
+  assert.doesNotThrow(withWindows([{ hours: [22, 8], weight: 2 }], "weighted"))
+})
+
+test("quotaWeighting scales weights by known remaining quota and leaves unknown feeds alone", async () => {
+  const day = new Date("2026-09-23T06:00:00Z") // 14:00 HKT
+  const quota = async (id: string) => ({ remainingPercent: id === "openai" ? 100 : 10 })
+  // openai 14 x1.5 = 21, xai 5 x0.6 = 3
+  const decision = await new ModelRouter(windowed({ quotaWeighting: true })).select({ role: "general", now: day, quota })
+  assert.deepEqual(decision.pool?.map((entry) => entry.weight), [21, 3])
+  assert.deepEqual(await tally(new ModelRouter(windowed({ quotaWeighting: true })), 24, { now: day, quota }), { openai: 21, xai: 3 })
+  // Off by default, and an unknown feed keeps the configured weight.
+  assert.deepEqual((await new ModelRouter(windowed()).select({ role: "general", now: day, quota })).pool?.map((entry) => entry.weight), [14, 5])
+  assert.deepEqual((await new ModelRouter(windowed({ quotaWeighting: true })).select({ role: "general", now: day })).pool?.map((entry) => entry.weight), [14, 5])
+  assert.throws(() => windowed({ quotaWeighting: "yes" }), /quotaWeighting must be a boolean/)
+})

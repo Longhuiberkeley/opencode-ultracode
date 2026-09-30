@@ -15,6 +15,17 @@ export interface RouteCandidate {
   weight?: number
   /** Weighted selection: PAYG-only draw weight for the MAIN pool shared with eligible plans. */
   mainWeight?: number
+  /**
+   * Weighted selection: `weight` overrides by local hour in `timezone` (first matching
+   * window wins; outside every window `weight` applies). Never affects `mainWeight`.
+   */
+  weightWindows?: WeightWindow[]
+}
+
+export interface WeightWindow {
+  /** Same convention as `hours`: end exclusive, may wrap midnight. */
+  hours: [number, number]
+  weight: number
 }
 
 export interface RouteTier {
@@ -51,6 +62,12 @@ export interface ModelRouting {
    * an unknown feed.
    */
   allowUnknownQuota?: boolean
+  /**
+   * Weighted selection (default false): scale a candidate's draw weight by its feed's
+   * KNOWN remaining quota, from x0.5 at 0% to x1.5 at 100% (see quotaFactor). An unknown
+   * feed, and PAYG without a reserve, keep the configured weight.
+   */
+  quotaWeighting?: boolean
   /**
    * Master switch (default true when omitted). false disables tier auto-selection:
    * every child keeps its agent pin while roles and tiers stay configured for a
@@ -125,6 +142,21 @@ function validWeight(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value > 0 && value <= 10000
 }
 
+/** Draw weight at this local hour: the first matching weightWindows entry, else `weight` (default 1). */
+function weightAt(entry: RouteCandidate, hour: number): number {
+  return entry.weightWindows?.find((window) => within(hour, window.hours))?.weight ?? entry.weight ?? 1
+}
+
+/** quotaWeighting multiplier: linear in the remaining percentage, x0.5 (empty) .. x1.5 (full). */
+export function quotaFactor(remainingPercent: number): number {
+  return 0.5 + Math.min(100, Math.max(0, remainingPercent)) / 100
+}
+
+/** Scaled weights are fractional; two decimals keep reasons and pool shares readable. */
+function round2(value: number): number {
+  return Math.round(value * 100) / 100
+}
+
 /** Longest tier description kept; it is prompt text for the authoring agent, not documentation. */
 export const MAX_TIER_DESCRIPTION = 200
 
@@ -140,7 +172,7 @@ export function parseModelRouting(value: unknown): ModelRouting {
   const r = value as Record<string, unknown>
   // Same rule as tier and candidate keys below: a typo (e.g. "allowUnknownQuotas")
   // is rejected rather than silently ignored.
-  const topKeys = new Set(["timezone", "roles", "tiers", "ladder", "quotaIDs", "allowUnknownQuota", "enabled"])
+  const topKeys = new Set(["timezone", "roles", "tiers", "ladder", "quotaIDs", "allowUnknownQuota", "quotaWeighting", "enabled"])
   for (const key of Object.keys(r)) if (!topKeys.has(key)) throw new Error(`unknown routing key ${key}`)
   const timezone = r.timezone
   if (typeof timezone !== "string") throw new Error("routing.timezone must be an IANA timezone")
@@ -167,7 +199,7 @@ export function parseModelRouting(value: unknown): ModelRouting {
       throw new Error(`routing tier ${name}.description must be 1..${MAX_TIER_DESCRIPTION} characters`)
     }
     const weighted = selection === "weighted"
-    const candidateKeys = new Set(["model", "capacityPool", "hours", "blockedWeekdayHours", "reservePercent", "weight", "mainWeight"])
+    const candidateKeys = new Set(["model", "capacityPool", "hours", "blockedWeekdayHours", "reservePercent", "weight", "mainWeight", "weightWindows"])
     const groups = (kind: "plans" | "payg"): RouteCandidate[][] => {
       if (!Array.isArray(input[kind])) throw new Error(`routing tier ${name}.${kind} must be an array of rotation groups`)
       return (input[kind] as unknown[]).map((group, i) => {
@@ -192,12 +224,20 @@ export function parseModelRouting(value: unknown): ModelRouting {
             if (kind === "plans") throw new Error(`routing mainWeight is only valid on payg candidates: ${candidate.model}`)
             if (!validWeight(candidate.mainWeight)) throw new Error(`invalid routing mainWeight for ${candidate.model}`)
           }
+          if (candidate.weightWindows !== undefined) {
+            // Ordered tiers never read a weight, so a window there would be silently inert.
+            if (!weighted) throw new Error(`routing weightWindows needs a weighted tier: ${candidate.model}`)
+            if (!Array.isArray(candidate.weightWindows) || !candidate.weightWindows.length || candidate.weightWindows.some((window) =>
+              !window || typeof window !== "object" || Array.isArray(window) || Object.keys(window).some((key) => key !== "hours" && key !== "weight") ||
+              !validHours(window.hours) || !validWeight(window.weight))) throw new Error(`invalid routing weightWindows for ${candidate.model}`)
+          }
           return { model: candidate.model, ...(candidate.hours ? { hours: candidate.hours } : {}),
             ...(candidate.capacityPool ? { capacityPool: candidate.capacityPool } : {}),
             ...(candidate.blockedWeekdayHours ? { blockedWeekdayHours: candidate.blockedWeekdayHours } : {}),
             ...(candidate.reservePercent !== undefined ? { reservePercent: candidate.reservePercent } : {}),
             ...(candidate.weight !== undefined ? { weight: candidate.weight } : {}),
-            ...(candidate.mainWeight !== undefined ? { mainWeight: candidate.mainWeight } : {}) }
+            ...(candidate.mainWeight !== undefined ? { mainWeight: candidate.mainWeight } : {}),
+            ...(candidate.weightWindows ? { weightWindows: candidate.weightWindows.map((window) => ({ hours: window.hours, weight: window.weight })) } : {}) }
         })
       })
     }
@@ -260,6 +300,9 @@ export function parseModelRouting(value: unknown): ModelRouting {
   if (r.allowUnknownQuota !== undefined && typeof r.allowUnknownQuota !== "boolean") {
     throw new Error("routing.allowUnknownQuota must be a boolean when present")
   }
+  if (r.quotaWeighting !== undefined && typeof r.quotaWeighting !== "boolean") {
+    throw new Error("routing.quotaWeighting must be a boolean when present")
+  }
   // Master switch. Omitted enabled means true (current behavior); an explicit
   // false keeps every child on its agent pin without touching roles or tiers.
   if (r.enabled !== undefined && typeof r.enabled !== "boolean") {
@@ -269,6 +312,7 @@ export function parseModelRouting(value: unknown): ModelRouting {
     ...(ladder !== undefined ? { ladder: ladder as string[] } : {}),
     ...(quotaIDs ? { quotaIDs: quotaIDs as Record<string, string> } : {}),
     allowUnknownQuota: r.allowUnknownQuota === undefined ? true : r.allowUnknownQuota === true,
+    ...(r.quotaWeighting === true ? { quotaWeighting: true } : {}),
     enabled: r.enabled === undefined ? true : r.enabled === true }
 }
 
@@ -401,6 +445,7 @@ export class ModelRouter {
       // reservePercent says otherwise). UNKNOWN blocks only under explicit
       // fail-closed (allowUnknownQuota: false): EVERY plans candidate skips —
       // reserved or not — while PAYG stays blind unless it carries a reserve.
+      let factor = 1
       if (pool === "plans" || entry.reservePercent !== undefined) {
         const feed = entry.capacityPool ?? this.config.quotaIDs?.[model.providerID] ?? model.providerID
         if (!observed.has(feed)) {
@@ -412,8 +457,10 @@ export class ModelRouter {
         if (pool === "plans" && remaining === 0) { skipped.push(`${entry.model}: quota exhausted`); return }
         if (remaining !== undefined && entry.reservePercent !== undefined && remaining <= entry.reservePercent) { skipped.push(`${entry.model}: quota reserve`); return }
         if (remaining === undefined && !this.config.allowUnknownQuota && (pool === "plans" || entry.reservePercent !== undefined)) { skipped.push(`${entry.model}: quota unknown`); return }
+        // Rate awareness: headroom pulls the draw toward a candidate, a draining feed pushes it away.
+        if (this.config.quotaWeighting && remaining !== undefined) factor = quotaFactor(remaining)
       }
-      return { model, pin: entry.model, weight: entry.weight ?? 1 }
+      return { model, pin: entry.model, weight: round2(weightAt(entry, hour) * factor) }
     }
 
     if (tierConfig.selection !== "weighted") {
@@ -515,7 +562,7 @@ export class ModelRouter {
   private weighted(tier: string, pool: "main" | "fallback", members: Array<{ pin: string; weight: number }>, eligible: EligibleCandidate[], skipped: string[]): RouteDecision {
     const { pick, total } = this.draw(tier, pool, members, eligible)
     const entries: RoutePoolEntry[] = eligible.map((e) => ({ model: e.pin, weight: e.weight, percent: (e.weight / total) * 100 }))
-    return { model: pick.model, reason: `weighted ${tier}: ${pick.pin} (w${pick.weight} of ${total})`, skipped, pool: entries }
+    return { model: pick.model, reason: `weighted ${tier}: ${pick.pin} (w${pick.weight} of ${round2(total)})`, skipped, pool: entries }
   }
 
   private creditKey(tier: string, pool: "main" | "fallback", pin: string): string {

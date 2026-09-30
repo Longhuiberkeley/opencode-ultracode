@@ -19,8 +19,8 @@ No command opens the interactive menu. Edits apply to Ultracode plugin options o
   explain <role> [tier] [--at ISO]       simulate deterministic selection (no model call)
   limits set <model> <target> <hard>     working-context limits (estimated input tokens)
   limits remove <model>
-  tier add <tier> <plans|payg> <model> [--group N] [--hours START-END] [--reserve PERCENT] [--blocked START-END,...] [--weight N] [--main-weight N]
-  tier edit <tier> <model> [--hours START-END|none] [--reserve PERCENT|none] [--blocked START-END,...|none] [--weight N|none] [--main-weight N|none]
+  tier add <tier> <plans|payg> <model> [--group N] [--hours START-END] [--reserve PERCENT] [--blocked START-END,...] [--weight N] [--main-weight N] [--weight-window START-END=N,...]
+  tier edit <tier> <model> [--hours START-END|none] [--reserve PERCENT|none] [--blocked START-END,...|none] [--weight N|none] [--main-weight N|none] [--weight-window START-END=N,...|none]
   tier move <tier> <model> <plans|payg> <group-index> [--position N]
   tier mode <tier> <ordered|weighted>    selection strategy (weighted draws by weight, not group order)
   tier fallback <tier> <other-tier|none> tier to try when nothing in this tier is eligible
@@ -29,6 +29,7 @@ No command opens the interactive menu. Edits apply to Ultracode plugin options o
   tier describe <tier> <text...|none>    what the tier is for, in your words (shown to the authoring agent)
   role set <agent> <tier> | role remove <agent> | role defaults [--force] [--all-known]
   routing init <IANA timezone> | routing timezone <IANA timezone> | routing enable | routing disable
+  routing quota-weighting <on|off>       weighted tiers: scale weights by remaining quota (x0.5 empty .. x1.5 full)
   routing ladder <tier> [tier...] | routing ladder none   tier order, cheapest first (default: creation order)
   quota-id set <provider> <feed-id> | quota-id remove <provider>
   capacity source <pool> <capacity-v1|check-rate> <executable> [args...]
@@ -38,6 +39,7 @@ No command opens the interactive menu. Edits apply to Ultracode plugin options o
 
 Group indices are zero-based. Groups run in order; models within one group rotate.
 --weight applies in weighted tiers; --main-weight lets a PAYG model join the plans draw.
+--weight-window overrides --weight during local hours, e.g. 22-8=2 (first matching window wins).
 role defaults maps canonical agents (explore, general, reviewer) to lite/standard/strong.
 routing disable keeps every child on its agent pin; roles and tiers stay configured.
 A workflow's tier hint never kills a child: an unknown tier uses the role default, and an
@@ -81,6 +83,13 @@ function hours(value) {
   if (start === end) fail("hours cannot have identical start and end")
   return [start, end]
 }
+function weightWindows(value) {
+  return value.split(",").map((part) => {
+    const [range, amount, ...extra] = part.split("=")
+    if (amount === undefined || extra.length) fail("weight windows must be START-END=WEIGHT (for example 22-8=2)")
+    return { hours: hours(range) ?? fail("a weight window needs START-END hours"), weight: weight(amount, "window weight") }
+  })
+}
 function flags(args, allowed) {
   const result = {}
   for (let i = 0; i < args.length; i += 2) {
@@ -119,13 +128,17 @@ async function configure(opts, command) {
       // enabled is the default: clearing the key keeps pre-switch configs identical.
       delete ensureRouting(opts).enabled
     } else if (verb === "disable" && !rest.length) ensureRouting(opts).enabled = false
+    else if (verb === "quota-weighting" && rest.length === 1 && ["on", "off"].includes(rest[0])) {
+      // Off is the default: clearing the key keeps older configs identical.
+      if (rest[0] === "on") ensureRouting(opts).quotaWeighting = true; else delete ensureRouting(opts).quotaWeighting
+    }
     else if (verb === "ladder" && rest.length) {
       const routing = ensureRouting(opts)
       // Creation order is the default, so clearing the key keeps old configs identical.
       if (rest.length === 1 && rest[0] === "none") delete routing.ladder
       else { for (const name of rest) ensureTier(routing, name); routing.ladder = rest }
     }
-    else fail("usage: routing init <timezone> | routing timezone <timezone> | routing enable | routing disable | routing ladder <tier...|none>")
+    else fail("usage: routing init <timezone> | routing timezone <timezone> | routing enable | routing disable | routing quota-weighting <on|off> | routing ladder <tier...|none>")
     return
   }
   if (area === "quota-id") {
@@ -231,7 +244,7 @@ async function configure(opts, command) {
       const kind = first, model = tail[0]
       if (!["plans", "payg"].includes(kind) || !parseModelPin(model ?? "")) fail("tier add <tier> <plans|payg> <provider/model[#variant]> [flags]")
       if (candidateLocation(routing, name, model)) fail(`${model} is already in ${name}; use tier edit or tier move`)
-      const f = flags(tail.slice(1), ["--group", "--hours", "--reserve", "--blocked", "--weight", "--main-weight"])
+      const f = flags(tail.slice(1), ["--group", "--hours", "--reserve", "--blocked", "--weight", "--main-weight", "--weight-window"])
       const group = f.group === undefined ? tier[kind].length : number(f.group, "group", 0, tier[kind].length)
       const entry = { model }
       editEntry(entry, f)
@@ -242,7 +255,7 @@ async function configure(opts, command) {
     const model = first
     const location = candidateLocation(routing, name, model)
     if (!location) fail(`${model} is not in tier ${name}`)
-    if (verb === "edit") { editEntry(location.entry, flags(tail, ["--hours", "--reserve", "--blocked", "--weight", "--main-weight"])); return }
+    if (verb === "edit") { editEntry(location.entry, flags(tail, ["--hours", "--reserve", "--blocked", "--weight", "--main-weight", "--weight-window"])); return }
     const remove = () => {
       const group = tier[location.kind][location.index]
       group.splice(location.position, 1)
@@ -299,6 +312,10 @@ function editEntry(entry, f) {
   if (f["main-weight"] !== undefined) {
     if (f["main-weight"] === "none") delete entry.mainWeight
     else entry.mainWeight = weight(f["main-weight"], "mainWeight")
+  }
+  if (f["weight-window"] !== undefined) {
+    if (f["weight-window"] === "none") delete entry.weightWindows
+    else entry.weightWindows = weightWindows(f["weight-window"])
   }
 }
 
@@ -401,6 +418,10 @@ function poolPercents(members) {
   const total = members.reduce((sum, member) => sum + member.weight, 0)
   return new Map(members.map((member) => [member.entry, total > 0 ? (member.weight / total) * 100 : 0]))
 }
+/** Time-varying weights, e.g. " [22–8: w2]"; percentages elsewhere stay base-weight shares. */
+function windowAnnotation(entry) {
+  return entry.weightWindows?.length ? ` [${entry.weightWindows.map((window) => `${window.hours[0]}–${window.hours[1]}: w${window.weight}`).join(", ")}]` : ""
+}
 /** Static pool share annotation, e.g. " w15 (43%)" or " w1* main (7%) / payg w5 (63%)". Only weighted tiers use weights. */
 function weightAnnotation(entry, kind, tier, mainPct, fallbackPct) {
   if (tier.selection !== "weighted") return ""
@@ -410,10 +431,10 @@ function weightAnnotation(entry, kind, tier, mainPct, fallbackPct) {
     const main = mainPct.get(entry)
     const payg = fallbackPct.get(entry)
     return ` w${entry.mainWeight}* main${main === undefined ? "" : ` (${Math.round(main)}%)`}` +
-      ` / payg w${entry.weight ?? 1}${payg === undefined ? "" : ` (${Math.round(payg)}%)`}`
+      ` / payg w${entry.weight ?? 1}${payg === undefined ? "" : ` (${Math.round(payg)}%)`}${windowAnnotation(entry)}`
   }
   const pct = (kind === "plans" ? mainPct : fallbackPct).get(entry)
-  return ` w${entry.weight ?? 1}${pct === undefined ? "" : ` (${Math.round(pct)}%)`}`
+  return ` w${entry.weight ?? 1}${pct === undefined ? "" : ` (${Math.round(pct)}%)`}${windowAnnotation(entry)}`
 }
 /** One-line tier contents for the confirm-each onboarding offer. */
 function describeTier(tier, name, agent) {
@@ -445,6 +466,7 @@ function formatSummary(opts) {
   if (!options.routing) lines.push("  (routing off; agent pins decide)")
   else if (!Object.keys(roles).length && options.routing.enabled !== false) lines.push("  (no roles mapped; agent pins decide)")
   lines.push("", "Tiers, cheapest first (plans before payg; groups run in order, or weight-drawn when weighted)")
+  if (options.routing?.quotaWeighting) lines.push("  (quota weighting on: weighted draws scale x0.5..x1.5 by remaining quota; shares below are unscaled)")
   for (const name of options.routing ? tierLadder(options.routing) : []) {
     const tier = options.routing.tiers[name]
     lines.push(`  ${name}:  ${tierSelection(tier)}${tier.fallback ? `  fallback: ${tier.fallback}` : ""}${tier.description ? `  — ${tier.description}` : ""}`)
@@ -704,7 +726,7 @@ async function editSelection(file, rl, name) {
     const tier = routing.tiers[name]
     console.log(`\n${name}: ${tierSelection(tier)}${tier.fallback ? `  fallback: ${tier.fallback}` : ""}`)
     for (const line of poolPreview(tier)) console.log(`  ${line}`)
-    const action = await pick(rl, "Weights & selection", ["Set selection mode", "Edit model weight", "Set fallback tier", "Back"])
+    const action = await pick(rl, "Weights & selection", ["Set selection mode", "Edit model weight", "Edit weight windows", "Set fallback tier", "Back"])
     if (!action || action === "Back") return
     if (action === "Set selection mode") {
       const mode = await pick(rl, "Mode", ["ordered", "weighted"])
@@ -713,6 +735,12 @@ async function editSelection(file, rl, name) {
       const others = Object.keys(routing.tiers).filter((candidate) => candidate !== name)
       const target = await pick(rl, "Fallback when nothing is eligible", ["none", ...others])
       if (target !== undefined) await execute(file, ["tier", "fallback", name, target])
+    } else if (action === "Edit weight windows") {
+      const model = await pick(rl, "Model", [...tier.plans.flat(), ...tier.payg.flat()].map((entry) => entry.model))
+      if (!model) continue
+      const current = candidateLocation(routing, name, model).entry.weightWindows
+      const raw = (await rl.question(`Weight by local hours [${current ? current.map((window) => `${window.hours.join("-")}=${window.weight}`).join(",") : "none"}], e.g. 22-8=2, or none: `)).trim()
+      if (raw) await execute(file, ["tier", "edit", name, model, "--weight-window", raw])
     } else {
       const model = await pick(rl, "Model", [...tier.plans.flat(), ...tier.payg.flat()].map((entry) => entry.model))
       if (!model) continue

@@ -119,6 +119,20 @@ There are two pools:
 
 The mental model: MAIN is the **subscriptions plus occasional paid spice** — a small `mainWeight` lets a metered model take a sliver alongside plans when it is faster or better at something, without letting it dominate. FALLBACK is **pure PAYG**. Because MAIN is considered first, a PAYG candidate **without** `mainWeight` is unreachable while any plan is eligible: it can never be drawn until every plan is gated out. A PAYG candidate may carry both keys (`mainWeight` for MAIN, `weight` for FALLBACK) and competes with different shares in each.
 
+## Weights that vary: by hour and by remaining quota
+
+Two optional dials adjust a draw weight without changing who is eligible. Both apply to `weighted` tiers only, and neither touches `mainWeight`.
+
+- **`weightWindows`** (per candidate) — a list of `{ "hours": [start, end], "weight": N }`. In the policy timezone, the first window containing the current hour replaces `weight`; outside every window `weight` applies. Hours follow the `hours` convention (end exclusive, may wrap midnight). Use it for "less at night" rather than "off at night": `{ "model": "xai/grok-4.7#high", "weight": 5, "weightWindows": [{ "hours": [22, 8], "weight": 2 }] }`. A window on an `ordered` tier is rejected, because ordered tiers never read a weight.
+- **`routing.quotaWeighting: true`** (whole policy, default off) — a candidate whose feed reports a known remaining percentage draws with `weight × (0.5 + remaining / 100)`: ×1.5 on a full window, ×1 at 50%, ×0.5 when nearly empty. A provider whose window was just reset is therefore favoured, and one that is draining is eased off before its reserve gate removes it. An unknown feed, and PAYG without a `reservePercent`, keep the configured weight. The reading is the same lowest-window percentage the reserve gate uses, so a short window running low pulls a provider down even when its weekly window is full.
+
+```sh
+opencode2 ultracode-config tier edit strong xai/grok-4.7#high --weight-window 22-8=2   # or: none
+opencode2 ultracode-config routing quota-weighting on                                  # or: off
+```
+
+`list` shows windows after the base share (`w5 (19%) [22–8: w2]`) and keeps printing unscaled base-weight shares; `explain --at` prints the weights actually drawn with at that time, windows and quota scaling included.
+
 ## Tier fallback
 
 `fallback` names another tier to try with the same eligibility machinery when the current tier has no eligible candidate — a “next shelf down” safety net rather than a second lottery. Each hop re-runs the gates against the same clock, catalog and quota, so the reason string shows the whole walk:

@@ -407,3 +407,35 @@ test("tier add warns, without refusing, when the live catalog lacks the model or
     assert.match(missing.stdout, /Warning: p\/zzz is not in the live catalog/)
   } finally { await rm(dir, { recursive: true, force: true }) }
 })
+
+test("CLI sets and clears weight windows and quota weighting; list shows both", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "ultracode-windows-"))
+  const file = path.join(dir, "opencode.json")
+  const original = { plugins: [{ package: "./plugins/ultracode", options: { routing: { timezone: "UTC", roles: {}, tiers: {
+    strong: { selection: "weighted", plans: [[{ model: "p/a", weight: 5 }]], payg: [] },
+    plain: { plans: [[{ model: "p/b" }]], payg: [] },
+  } } } }] }
+  const entry = async () => JSON.parse(await readFile(file, "utf8")).plugins[0].options.routing
+  try {
+    await writeFile(file, JSON.stringify(original, null, 2) + "\n")
+    assert.equal(run(file, "tier", "edit", "strong", "p/a", "--weight-window", "22-8=2,12-14=7.5").status, 0)
+    assert.deepEqual((await entry()).tiers.strong.plans[0][0].weightWindows, [{ hours: [22, 8], weight: 2 }, { hours: [12, 14], weight: 7.5 }])
+    assert.equal(run(file, "routing", "quota-weighting", "on").status, 0)
+    assert.equal((await entry()).quotaWeighting, true)
+    const listed = run(file, "list").stdout
+    assert.match(listed, /p\/a w5 \(100%\) \[22–8: w2, 12–14: w7\.5\]/)
+    assert.match(listed, /quota weighting on/)
+    // Invalid edits fail closed and never write.
+    const before = await readFile(file, "utf8")
+    assert.notEqual(run(file, "tier", "edit", "strong", "p/a", "--weight-window", "22-8").status, 0)
+    assert.notEqual(run(file, "tier", "edit", "strong", "p/a", "--weight-window", "22-8=0").status, 0)
+    assert.notEqual(run(file, "tier", "edit", "strong", "p/a", "--weight-window", "none=2").status, 0)
+    assert.notEqual(run(file, "tier", "edit", "plain", "p/b", "--weight-window", "22-8=2").status, 0)
+    assert.notEqual(run(file, "routing", "quota-weighting", "maybe").status, 0)
+    assert.equal(await readFile(file, "utf8"), before)
+    assert.equal(run(file, "tier", "edit", "strong", "p/a", "--weight-window", "none").status, 0)
+    assert.equal(run(file, "routing", "quota-weighting", "off").status, 0)
+    assert.equal((await entry()).tiers.strong.plans[0][0].weightWindows, undefined)
+    assert.equal((await entry()).quotaWeighting, undefined)
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
