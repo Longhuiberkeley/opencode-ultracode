@@ -1172,6 +1172,8 @@ test("childStallMs watchdog: stalled live child marked + interrupted; activity r
     >
     scanForStalledChildren(state: unknown): void
   }
+  // A slow CI runner can need more than the fixed tick to create the child: poll, bounded.
+  for (let waited = 0; waited < 5_000 && !internals.runs.get(started.runID)?.live.size; waited += 10) await tick(10)
   const state = internals.runs.get(started.runID)!
   assert.ok(state, "run state exists while a child is live")
   const sid = [...state.live][0]!
