@@ -44,7 +44,8 @@ const RANGES: Record<
   | "childStallMs"
   | "maxLoopDepth"
   | "askTimeoutMs"
-  | "reconcileIntervalMs",
+  | "reconcileIntervalMs"
+  | "quotaTimeoutMs",
   NumRange
 > = {
   concurrency: { min: 1, max: 64 },
@@ -65,6 +66,8 @@ const RANGES: Record<
   askTimeoutMs: { min: 0, max: 86_400_000 },
   // Periodic orphan reconcile: 0 = startup-only (historical behavior).
   reconcileIntervalMs: { min: 0, max: 3_600_000 },
+  // One quota checker invocation; see UltracodeOptions.quotaTimeoutMs.
+  quotaTimeoutMs: { min: 1_000, max: 120_000 },
 }
 
 const PERMISSION_MODES: ReadonlySet<string> = new Set(["ask", "autoEditsWorkflow", "noEditTools"])

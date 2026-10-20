@@ -5,6 +5,16 @@ import type { RouteObservation } from "./model-routing.ts"
 
 const run = promisify(execFile)
 
+/**
+ * Default wall-clock bound for one quota command invocation. `opencode2
+ * check-rate --json` probes several provider consoles and takes 8–15 s cold
+ * (observed 2026-10-20: a 5 s bound timed out every call, so every plans
+ * candidate read "quota unknown" and fail-closed routing had nothing to run).
+ */
+export const DEFAULT_QUOTA_TIMEOUT_MS = 20_000
+
+export type QuotaFeedError = (err: unknown, command: readonly string[]) => void
+
 export function parseQuotaSnapshot(parsed: { providers?: Array<{ id?: string; kind?: string; raw?: unknown }> }): Map<string, RouteObservation> {
   const result = new Map<string, RouteObservation>()
   for (const provider of parsed.providers ?? []) {
@@ -50,17 +60,28 @@ export function parseCapacitySnapshot(raw: unknown): Map<string, RouteObservatio
   return pools
 }
 
-export function commandQuotaFeed(command: readonly string[], ttlMs = 60_000, format: "check-rate" | "capacity-v1" = "check-rate"): (id: string) => Promise<RouteObservation | undefined> {
+export function commandQuotaFeed(
+  command: readonly string[],
+  ttlMs = 60_000,
+  format: "check-rate" | "capacity-v1" = "check-rate",
+  timeoutMs = DEFAULT_QUOTA_TIMEOUT_MS,
+  onError?: QuotaFeedError,
+): (id: string) => Promise<RouteObservation | undefined> {
   let expires = 0
   let pending: Promise<Map<string, RouteObservation>> | undefined
   let retry: Promise<Map<string, RouteObservation>> | undefined
   let missing = new Set<string>()
   const fetch = async (): Promise<Map<string, RouteObservation>> => {
     try {
-      const { stdout } = await run(command[0]!, command.slice(1), { timeout: 5_000, maxBuffer: 1_000_000 })
+      const { stdout } = await run(command[0]!, command.slice(1), { timeout: timeoutMs, maxBuffer: 1_000_000 })
       const parsed = JSON.parse(stdout) as { providers?: Array<{ id?: string; kind?: string; raw?: unknown }> }
       return format === "capacity-v1" ? parseCapacitySnapshot(parsed) : parseQuotaSnapshot(parsed)
-    } catch { /* missing command, expired login, malformed result: quota unknown */ }
+    } catch (err) {
+      // Missing command, timeout, expired login, malformed result: quota is
+      // unknown (never unlimited). Surface the cause — a silent empty snapshot
+      // is indistinguishable from an exhausted plan under fail-closed routing.
+      try { onError?.(err, command) } catch { /* reporter must never break routing */ }
+    }
     return new Map()
   }
   return async (id) => {
@@ -100,9 +121,11 @@ export function commandQuotaFeed(command: readonly string[], ttlMs = 60_000, for
 export function capacityFeed(options: {
   quotaCommand?: string[] | null
   quotaSources?: Record<string, { command: string[]; format: "capacity-v1" | "check-rate" }>
-}): (id: string) => Promise<RouteObservation | undefined> {
-  const legacy = options.quotaCommand ? commandQuotaFeed(options.quotaCommand) : undefined
+  quotaTimeoutMs?: number
+}, onError?: QuotaFeedError): (id: string) => Promise<RouteObservation | undefined> {
+  const timeoutMs = options.quotaTimeoutMs ?? DEFAULT_QUOTA_TIMEOUT_MS
+  const legacy = options.quotaCommand ? commandQuotaFeed(options.quotaCommand, 60_000, "check-rate", timeoutMs, onError) : undefined
   const sources = new Map(Object.entries(options.quotaSources ?? {}).map(([id, source]) =>
-    [id, commandQuotaFeed(source.command, 60_000, source.format)] as const))
+    [id, commandQuotaFeed(source.command, 60_000, source.format, timeoutMs, onError)] as const))
   return (id) => sources.get(id)?.(id) ?? legacy?.(id) ?? Promise.resolve(undefined)
 }

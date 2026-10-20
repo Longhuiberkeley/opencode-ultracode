@@ -101,6 +101,7 @@ export function freezeEffective(options: Required<UltracodeOptions>): Required<U
     routing: options.routing,
     quotaCommand: options.quotaCommand ? [...options.quotaCommand] : null,
     quotaSources: structuredClone(options.quotaSources),
+    quotaTimeoutMs: options.quotaTimeoutMs,
     childLimits: { ...options.childLimits },
     reconcileIntervalMs: options.reconcileIntervalMs,
   })

@@ -67,3 +67,20 @@ test("still-unknown quota stays unknown after retry", async () => {
     assert.equal(await feed("openai"), undefined)
   } finally { await rm(dir, { recursive: true, force: true }) }
 })
+
+test("quota command timeout is configurable and a failed probe is reported, not silent", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "ultracode-quota-timeout-"))
+  const script = path.join(dir, "slow-checker.mjs")
+  try {
+    await writeFile(script, `await new Promise((r) => setTimeout(r, 400));
+console.log(JSON.stringify({ providers: [{ id: "xai", kind: "live", raw: { creditUsagePercent: 25 } }] }))`)
+    const errors: unknown[] = []
+    const tight = commandQuotaFeed([process.execPath, script], 60_000, "check-rate", 50, (err) => errors.push(err))
+    assert.equal(await tight("xai"), undefined, "a probe slower than the bound reads unknown")
+    assert.ok(errors.length >= 1, "the timeout surfaces through onError")
+    const relaxed = commandQuotaFeed([process.execPath, script], 60_000, "check-rate", 5_000)
+    assert.equal((await relaxed("xai"))?.remainingPercent, 75)
+    const viaOptions = capacityFeed({ quotaCommand: [process.execPath, script], quotaTimeoutMs: 50 })
+    assert.equal(await viaOptions("xai"), undefined, "capacityFeed forwards quotaTimeoutMs")
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})

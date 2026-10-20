@@ -1001,7 +1001,8 @@ export default Plugin.define({
         storage,
         sessions,
         options,
-        quota: capacityFeed(options),
+        quota: capacityFeed(options, (err, command) =>
+          warn(`quota feed failed (${command.join(" ")}) — routing sees quota unknown for this snapshot`, err)),
         machineQuarantineDir: defaultProviderQuarantineDir(),
         availableModels: (() => {
           // The live catalog is large (thousands of entries, megabytes) and every

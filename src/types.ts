@@ -141,6 +141,14 @@ export interface UltracodeOptions {
   quotaCommand?: string[] | null
   /** Optional named, provider-agnostic capacity checkers. Legacy quotaCommand still works. */
   quotaSources?: Record<string, { command: string[]; format: "capacity-v1" | "check-rate" }>
+  /**
+   * Wall-clock bound (ms) for one quotaCommand / quotaSources invocation
+   * (1 000..120 000, default 20 000). A command that overruns it yields
+   * "quota unknown" for that snapshot — under `routing.allowUnknownQuota:
+   * false` that skips every plans candidate, so size it above the checker's
+   * cold run time.
+   */
+  quotaTimeoutMs?: number
   /** Only models named here receive the approximate active-input guard. */
   childLimits?: Record<string, ChildContextLimit>
   /**
@@ -174,6 +182,7 @@ export const DEFAULT_OPTIONS: Required<UltracodeOptions> = {
   routing: null,
   quotaCommand: null,
   quotaSources: {},
+  quotaTimeoutMs: 20_000,
   childLimits: {},
   reconcileIntervalMs: 60_000,
 }

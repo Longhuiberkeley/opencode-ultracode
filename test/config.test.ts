@@ -45,6 +45,7 @@ test("loadOptions: empty object gives all defaults", () => {
     routing: null,
     quotaCommand: null,
     quotaSources: {},
+    quotaTimeoutMs: 20_000,
     childLimits: {},
     reconcileIntervalMs: 60_000,
   })
@@ -72,6 +73,7 @@ test("loadOptions: fully valid options round-trip", () => {
     routing: null,
     quotaCommand: null,
     quotaSources: {},
+    quotaTimeoutMs: 45_000,
     childLimits: {},
     reconcileIntervalMs: 60_000,
   }
@@ -233,6 +235,21 @@ test("loadOptions: failover enum and askTimeoutMs range", () => {
     assert.equal(options.askTimeoutMs, DEFAULT_OPTIONS.askTimeoutMs)
     assert.equal(warnings.length, 1)
     assert.match(warnings[0]!, /askTimeoutMs/)
+  }
+})
+
+test("loadOptions: quotaTimeoutMs range (one checker invocation)", () => {
+  assert.equal(loadOptions({}).options.quotaTimeoutMs, 20_000, "default covers a cold check-rate run")
+  for (const ok of [1_000, 20_000, 120_000]) {
+    const { options, warnings } = loadOptions({ quotaTimeoutMs: ok })
+    assert.equal(options.quotaTimeoutMs, ok)
+    assert.deepEqual(warnings, [])
+  }
+  for (const bad of [0, 999, 120_001, 2.5, "20s"]) {
+    const { options, warnings } = loadOptions({ quotaTimeoutMs: bad })
+    assert.equal(options.quotaTimeoutMs, DEFAULT_OPTIONS.quotaTimeoutMs)
+    assert.equal(warnings.length, 1)
+    assert.match(warnings[0]!, /quotaTimeoutMs/)
   }
 })
 
