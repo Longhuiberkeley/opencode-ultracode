@@ -1,6 +1,15 @@
 {
   "name": "opencode-ultracode",
   "version": "0.17.1",
+  "files": [
+    "src",
+    "skills",
+    "scripts",
+    "examples",
+    "docs",
+    "README.md",
+    "LICENSE"
+  ],
   "description": "Claude Code-style dynamic workflows (ultracode) for OpenCode v2",
   "type": "module",
   "license": "MIT",

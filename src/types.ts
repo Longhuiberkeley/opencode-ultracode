@@ -137,7 +137,11 @@ export interface UltracodeOptions {
   providerConcurrency?: Record<string, number>
   /** Optional Ultracode-only role x tier policy. No effect on ordinary OpenCode agents. */
   routing?: ModelRouting | null
-  /** Opt-in machine-local JSON quota command, e.g. ["opencode2", "check-rate", "--json"]. */
+  /**
+   * Legacy single-command usage feed in the author's private `check-rate` JSON
+   * shape (argv array, no shell). New setups should use `quotaSources` with the
+   * portable `capacity-v1` format instead.
+   */
   quotaCommand?: string[] | null
   /** Optional named, provider-agnostic capacity checkers. Legacy quotaCommand still works. */
   quotaSources?: Record<string, { command: string[]; format: "capacity-v1" | "check-rate" }>

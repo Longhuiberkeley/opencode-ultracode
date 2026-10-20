@@ -1,4 +1,13 @@
-/** Optional quota feed. The plugin works without any external command. */
+/**
+ * Optional capacity feed. The plugin works without any external command.
+ *
+ * Two command formats are supported:
+ *  - `capacity-v1` (portable): `{ pools: [{ id, windows: [{ remainingPercent }], status?, expiresAt? }] }`
+ *    — see docs/MODEL-ROUTING.md "Capacity feeds" for the checker contract.
+ *  - `check-rate` (legacy): the author's private multi-provider usage dashboard;
+ *    `parseQuotaSnapshot` knows a handful of provider payload shapes. Kept for
+ *    existing configs; new setups should emit capacity-v1.
+ */
 import { execFile } from "node:child_process"
 import { promisify } from "node:util"
 import type { RouteObservation } from "./model-routing.ts"
@@ -13,7 +22,24 @@ const run = promisify(execFile)
  */
 export const DEFAULT_QUOTA_TIMEOUT_MS = 20_000
 
-export type QuotaFeedError = (err: unknown, command: readonly string[]) => void
+/** Why a feed reading is unknown, for operators' logs and the config CLI. */
+export type QuotaFeedFailure = {
+  /** spawn/exit/timeout/parse: the command did not yield a usable snapshot; missing-pool: it did, but not for this pool. */
+  kind: "spawn" | "timeout" | "exit" | "parse" | "missing-pool"
+  /** Pool id that was asked for (missing-pool only). */
+  pool?: string
+  /** Pool ids the checker did emit (missing-pool only) — the usual misconfiguration is a key/id mismatch. */
+  emitted?: string[]
+}
+export type QuotaFeedError = (err: unknown, command: readonly string[], failure: QuotaFeedFailure) => void
+
+function classify(err: unknown): QuotaFeedFailure["kind"] {
+  const e = err as { killed?: boolean; signal?: string; code?: unknown; syscall?: string } | undefined
+  if (e?.killed || e?.signal === "SIGTERM") return "timeout"
+  if (e?.syscall === "spawn" || e?.code === "ENOENT" || e?.code === "EACCES") return "spawn"
+  if (typeof e?.code === "number") return "exit"
+  return "parse"
+}
 
 export function parseQuotaSnapshot(parsed: { providers?: Array<{ id?: string; kind?: string; raw?: unknown }> }): Map<string, RouteObservation> {
   const result = new Map<string, RouteObservation>()
@@ -67,22 +93,31 @@ export function commandQuotaFeed(
   timeoutMs = DEFAULT_QUOTA_TIMEOUT_MS,
   onError?: QuotaFeedError,
 ): (id: string) => Promise<RouteObservation | undefined> {
+  type Snapshot = { pools: Map<string, RouteObservation>; failed: boolean }
   let expires = 0
-  let pending: Promise<Map<string, RouteObservation>> | undefined
-  let retry: Promise<Map<string, RouteObservation>> | undefined
+  let pending: Promise<Snapshot> | undefined
+  let retry: Promise<Snapshot> | undefined
   let missing = new Set<string>()
-  const fetch = async (): Promise<Map<string, RouteObservation>> => {
+  // One report per feed per TTL window: a dead checker is re-polled every 5 s
+  // while unknown, and an operator needs one line, not a log flood.
+  let lastReportAt = 0
+  const report = (err: unknown, failure: QuotaFeedFailure): void => {
+    if (!onError || Date.now() - lastReportAt < ttlMs) return
+    lastReportAt = Date.now()
+    try { onError(err, command, failure) } catch { /* reporter must never break routing */ }
+  }
+  const fetch = async (): Promise<Snapshot> => {
     try {
       const { stdout } = await run(command[0]!, command.slice(1), { timeout: timeoutMs, maxBuffer: 1_000_000 })
       const parsed = JSON.parse(stdout) as { providers?: Array<{ id?: string; kind?: string; raw?: unknown }> }
-      return format === "capacity-v1" ? parseCapacitySnapshot(parsed) : parseQuotaSnapshot(parsed)
+      return { pools: format === "capacity-v1" ? parseCapacitySnapshot(parsed) : parseQuotaSnapshot(parsed), failed: false }
     } catch (err) {
-      // Missing command, timeout, expired login, malformed result: quota is
+      // Missing command, timeout, non-zero exit, malformed result: quota is
       // unknown (never unlimited). Surface the cause — a silent empty snapshot
       // is indistinguishable from an exhausted plan under fail-closed routing.
-      try { onError?.(err, command) } catch { /* reporter must never break routing */ }
+      report(err, { kind: classify(err) })
+      return { pools: new Map(), failed: true }
     }
-    return new Map()
   }
   return async (id) => {
     if (!pending || Date.now() >= expires) {
@@ -92,20 +127,25 @@ export function commandQuotaFeed(
       missing = new Set()
     }
     const snapshot = await pending
-    if (snapshot.has(id)) return snapshot.get(id)
+    if (snapshot.pools.has(id)) return snapshot.pools.get(id)
     missing.add(id)
-    // A failed command or a partial provider snapshot is unknown, not zero.
-    // Retry once per shared snapshot so simultaneous children don't stampede
-    // the quota endpoint. Never use a previous positive reading in place of a
-    // confirmed zero or a still-unknown result.
+    if (snapshot.failed) {
+      // The command itself failed: running it again right away would only cost a
+      // second timeout and a second report. Unknown for this snapshot; re-poll soon.
+      expires = Math.min(expires, Date.now() + 5_000)
+      return undefined
+    }
+    // A partial snapshot is unknown, not zero. Retry once per shared snapshot so
+    // simultaneous children don't stampede the quota endpoint. Never use a
+    // previous positive reading in place of a confirmed zero or a still-unknown result.
     if (!retry) {
       const original = pending
       retry = fetch().then((fresh) => {
         if (pending === original) {
-          // Keep known readings from the first snapshot if only one provider
+          // Keep known readings from the first snapshot if only one pool
           // failed on the retry. Unknowns get a short TTL, not a full minute.
-          pending = Promise.resolve(new Map([...snapshot, ...fresh]))
-          if ([...missing].some((pool) => !fresh.has(pool) && !snapshot.has(pool))) {
+          pending = Promise.resolve({ pools: new Map([...snapshot.pools, ...fresh.pools]), failed: false })
+          if ([...missing].some((pool) => !fresh.pools.has(pool) && !snapshot.pools.has(pool))) {
             expires = Math.min(expires, Date.now() + 5_000)
           }
         }
@@ -113,8 +153,14 @@ export function commandQuotaFeed(
       })
     }
     const fresh = await retry
-    if (!fresh.has(id)) expires = Math.min(expires, Date.now() + 5_000)
-    return fresh.get(id) ?? snapshot.get(id)
+    if (!fresh.pools.has(id)) {
+      expires = Math.min(expires, Date.now() + 5_000)
+      if (!fresh.failed) {
+        const emitted = [...new Set([...snapshot.pools.keys(), ...fresh.pools.keys()])]
+        report(new Error(`capacity checker ran but emitted no pool "${id}" (emitted: ${emitted.length ? emitted.join(", ") : "none"})`), { kind: "missing-pool", pool: id, emitted })
+      }
+    }
+    return fresh.pools.get(id) ?? snapshot.pools.get(id)
   }
 }
 
@@ -125,7 +171,15 @@ export function capacityFeed(options: {
 }, onError?: QuotaFeedError): (id: string) => Promise<RouteObservation | undefined> {
   const timeoutMs = options.quotaTimeoutMs ?? DEFAULT_QUOTA_TIMEOUT_MS
   const legacy = options.quotaCommand ? commandQuotaFeed(options.quotaCommand, 60_000, "check-rate", timeoutMs, onError) : undefined
-  const sources = new Map(Object.entries(options.quotaSources ?? {}).map(([id, source]) =>
-    [id, commandQuotaFeed(source.command, 60_000, source.format, timeoutMs, onError)] as const))
+  // One checker process per distinct (format, command), however many pool ids it
+  // serves: a checker emitting five pools under five quotaSources keys runs once
+  // per TTL, not five times.
+  const shared = new Map<string, (id: string) => Promise<RouteObservation | undefined>>()
+  const sources = new Map(Object.entries(options.quotaSources ?? {}).map(([id, source]) => {
+    const key = JSON.stringify([source.format, source.command])
+    let feed = shared.get(key)
+    if (!feed) { feed = commandQuotaFeed(source.command, 60_000, source.format, timeoutMs, onError); shared.set(key, feed) }
+    return [id, feed] as const
+  }))
   return (id) => sources.get(id)?.(id) ?? legacy?.(id) ?? Promise.resolve(undefined)
 }

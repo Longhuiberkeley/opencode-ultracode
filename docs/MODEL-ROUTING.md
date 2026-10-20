@@ -149,9 +149,49 @@ Fallback is a **selection-time** decision: it is made before a child is spawned,
 - **Pin-path children keep their own shelf.** A child that neither carried an explicit model nor matched a role mapping fails over through the pin pool with its *own* agent's pin first (a `reviewer` child takes the reviewer pin before any other agent's).
 
 
-## Worked example: a Hong Kong policy
+## Example: a portable policy (capacity-v1, UTC)
 
-This is one user's final policy (timezone `Asia/Hong_Kong`, weighted tiers, keep% gates). Edit model ids, effort variants, weights and thresholds to match your catalog and account:
+A policy for someone with a subscription plan (metered by their own checker), a pay-as-you-go key with a monthly budget, and a second PAYG key used blind. Tier names, model ids, hours and weights are placeholders — use the ids your OpenCode catalog shows (`opencode2 models`):
+
+```jsonc
+{
+  "plugins": [{
+    "package": "./plugins/ultracode",
+    "options": {
+      "quotaSources": {
+        // one checker, two pools: the quotaSources key must equal a pools[].id it prints
+        "plan-weekly": { "format": "capacity-v1", "command": ["node", "/path/to/capacity-checker.mjs"] },
+        "openrouter":  { "format": "capacity-v1", "command": ["node", "/path/to/capacity-checker.mjs"] }
+      },
+      "quotaTimeoutMs": 10000,
+      "routing": {
+        "timezone": "UTC",
+        "roles": { "explore": "fast", "general": "fast", "reviewer": "deep" },
+        "tiers": {
+          "fast": {
+            "selection": "weighted",
+            "plans": [[{ "model": "anthropic/claude-sonnet-5-5", "weight": 8, "capacityPool": "plan-weekly", "reservePercent": 15 }]],
+            "payg":  [[{ "model": "google/gemini-3.7-flash", "weight": 2, "mainWeight": 2 }]]   // no feed: runs blind, no reserve
+          },
+          "deep": {
+            "selection": "weighted",
+            "fallback": "fast",
+            "plans": [[{ "model": "anthropic/claude-opus-5-5#high", "weight": 6, "capacityPool": "plan-weekly", "reservePercent": 30 }]],
+            // pool id == provider id, so no capacityPool needed; a reserve on PAYG makes the feed mandatory
+            "payg":  [[{ "model": "openrouter/deepseek/deepseek-v4-pro", "weight": 3, "reservePercent": 10 }]]
+          }
+        }
+      }
+    }
+  }]
+}
+```
+
+Weekday-only blocks (`blockedWeekdayHours`), night-only carriers (`hours`) and quota-scaled weights (`quotaWeighting`) are described above and are independent of which providers appear here.
+
+## Example: the author's policy (Hong Kong, legacy check-rate feed)
+
+This is one user's final policy (timezone `Asia/Hong_Kong`, weighted tiers, keep% gates, fed by the author's private `check-rate` adapter through `quotaCommand` + `routing.quotaIDs`). Edit model ids, effort variants, weights and thresholds to match your catalog and account — nothing in it is a default:
 
 ```jsonc
 {
@@ -302,25 +342,41 @@ Contrast this with a non-empty tier whose candidates are all gated out (hours, k
 
 ## Capacity feeds
 
-`quotaCommand` is optional and never required by the plugin. The sample adapter accepts `opencode2 check-rate --json` and caches its output for one minute. It reads the lowest remaining percentage across OpenAI's reported five-hour/weekly windows, xAI's weekly pool and Z.ai's reported windows. Alibaba requires the helper's console login and the normalized monthly `raw.monthly.pct` field; without that field its quota is **unknown**: under `allowUnknownQuota: false` every plans candidate on that feed is skipped, and under the default it runs without reserve protection, which cannot protect a monthly budget. Routing only reserves by *percentage observed at admission*, not by predicted spend of in-flight or ordinary sessions. Use `opencode2 check-rate --json --fast`: it answers from a snapshot written by every full `--json` run (served as-is up to 90 s old, served plus a detached background refresh up to 600 s, live beyond that), so children never wait on the 8–15 s console probes and the plugin's `quotaTimeoutMs` bound (default 20 s, was a fixed 5 s before 0.17.1) is only reached on a cold start. A checker that fails or overruns the bound is logged as `quota feed failed (<command>)` and that snapshot reads unknown.
+A capacity feed tells the router how much of a plan is left, so `reservePercent` gates and `quota exhausted` hard stops can work. It is optional: with no feed, every candidate runs blind (and `allowUnknownQuota: false` would skip every `plans` candidate, so only set that once a feed exists).
 
-### Other users' capacity checkers
+### Portable checkers: `quotaSources` + `capacity-v1`
 
-`quotaCommand` is a legacy adapter specifically for `opencode2 check-rate`. Other setups can supply named `quotaSources` independently; the checker is called with no model tokens, with no shell interpolation, and should print a single JSON object:
+Any executable that prints one JSON object in this shape is a checker:
 
 ```json
 {"pools":[{"id":"team-monthly","windows":[{"remainingPercent":67},{"remainingPercent":24}]}]}
 ```
 
-The router uses the *lowest* remaining percentage. A checker can optionally include `"status":"ok"` and an ISO `"expiresAt"` on a pool; expired, missing, malformed, or `status: "unknown"` pools stay unknown (reserved candidates are then skipped only under `allowUnknownQuota: false`). Configure a named checker and bind one model choice to it through the guided Capacity & usage menu, or use:
+Register it and bind candidates to its pools (or use the guided *Capacity & usage* menu):
 
 ```sh
 opencode2 ultracode-config capacity source team-monthly capacity-v1 /path/to/my-usage-checker --json
-opencode2 ultracode-config capacity bind strong xai/grok-4.7#high team-monthly
+opencode2 ultracode-config capacity bind strong anthropic/claude-opus-5-5#high team-monthly
 opencode2 ultracode-config capacity status team-monthly
 ```
 
-The candidate's `capacityPool` overrides the legacy provider→quota-id lookup; distinct subscription and PAYG accounts can therefore use distinct capacity pools. The existing `quotaCommand` and `routing.quotaIDs` keep working without migration. Checkers may report multiple windows for shared five-hour, weekly or monthly caps; they own their provider-specific authentication and normalization. Plan/PAYG classifications, hours and reserves remain user-editable choices rather than built-in provider assumptions.
+A shipped starting point is [`examples/capacity-checker.mjs`](../examples/capacity-checker.mjs): it reads a small budget file and emits capacity-v1; replace its `readBudgets` with calls to your providers' usage APIs. A pool whose id equals a provider id (for example `openrouter`) is picked up by that provider's candidates with no `capacity bind` at all, because the lookup order is `capacityPool` → `routing.quotaIDs[provider]` → the provider id itself.
+
+**Checker contract** — what the router guarantees and expects:
+
+- **Invocation:** argv only, no shell; stdout is read up to 1 MB; the process must exit on its own. A non-zero exit, a timeout (`quotaTimeoutMs`, default 20 s, per checker run) or malformed JSON makes **every** pool of that checker unknown for the snapshot. Exit promptly: a checker that wants a background refresh must detach it with stdout closed, or the router waits for it.
+- **Polling:** one process per distinct command per 60 s snapshot, however many `quotaSources` keys point at it. A command that failed is not re-run for 5 s (then re-polled); a command that succeeded but did not emit a requested pool gets one shared retry, and the mismatch is reported (`missing-pool`, with the pool ids it did emit). The `quotaSources` key (or `capacityPool`) must equal a `pools[].id` the checker prints — the usual misconfiguration.
+- **Pools and windows:** the router uses the **lowest** `remainingPercent` across a pool's windows (five-hour, weekly, monthly…). Values must be finite numbers in 0..100; one invalid window makes the whole pool unknown. There is no "exhausted" status: emit `remainingPercent: 0` for a hard stop, and emit `100` (or bind no feed and set no reserve) for unlimited / pay-as-you-go.
+- **`status`:** only `"ok"` or absent counts; anything else is unknown. **`expiresAt`** (ISO) can only shorten freshness: a pool past it is unknown.
+- **Unknown keys** on the object, a pool or a window are ignored — the forward-compatibility promise.
+- **Unknown vs zero:** unknown is never evidence of exhaustion, and a *known* zero or a known remaining at or below the candidate's reserve is never overridden by an unknown reading. Under `allowUnknownQuota: false` an unknown feed skips every `plans` candidate on that feed, reserved or not, and any PAYG candidate carrying a reserve; under the default they run without reserve protection.
+- **Reporting:** failures surface once per checker per minute as `quota feed <kind> (<command>)` in the OpenCode log (`kind` ∈ spawn, exit, timeout, parse, missing-pool); `ultracode-config explain` and `capacity status` print the same reasons.
+
+The candidate's `capacityPool` overrides the provider→quota-id lookup, so distinct subscription and PAYG accounts can use distinct pools. Checkers own their provider-specific authentication and normalization; plan/PAYG classification, hours and reserves remain user-editable choices rather than built-in provider assumptions.
+
+### Author's private `check-rate` adapter (legacy, not shipped)
+
+`quotaCommand` is a single-command feed in the output shape of the author's private multi-provider usage dashboard (`opencode2 check-rate --json`), kept so that existing configs keep working. The adapter understands a handful of provider payloads (OpenAI five-hour/weekly windows, xAI's weekly pool, Z.ai's windows, Alibaba's normalized monthly percentage) and keys them by provider id through `routing.quotaIDs`. It is not part of this repository and is not a reference implementation: new setups should write a capacity-v1 checker instead. For the record, that dashboard's `--fast` mode serves a cached snapshot so the probe returns in well under a second and `quotaTimeoutMs` is only reached on a cold start — a pattern any checker that talks to slow consoles should copy.
 
 ### Bring your own rules
 

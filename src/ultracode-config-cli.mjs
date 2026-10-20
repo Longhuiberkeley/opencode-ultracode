@@ -35,7 +35,7 @@ No command opens the interactive menu. Edits apply to Ultracode plugin options o
   capacity source <pool> <capacity-v1|check-rate> <executable> [args...]
   capacity status [pool] | capacity remove <pool> | capacity bind <tier> <model> <pool|none>
   provider set <provider> <1..16> | provider remove <provider>
-  setting set <agent|concurrency|maxAgents|timeoutMs|permissions|childStallMs|failover|quotaCommand> <JSON value>
+  setting set <agent|concurrency|maxAgents|timeoutMs|permissions|childStallMs|failover|quotaTimeoutMs|quotaCommand|quotaSources> <JSON value>
 
 Group indices are zero-based. Groups run in order; models within one group rotate.
 --weight applies in weighted tiers; --main-weight lets a PAYG model join the plans draw.
@@ -191,7 +191,7 @@ async function configure(opts, command) {
     return
   }
   if (area === "setting") {
-    const allowed = ["agent", "concurrency", "maxAgents", "timeoutMs", "permissions", "childStallMs", "failover", "quotaCommand"]
+    const allowed = ["agent", "concurrency", "maxAgents", "timeoutMs", "permissions", "childStallMs", "failover", "quotaTimeoutMs", "quotaCommand", "quotaSources"]
     if (verb !== "set" || rest.length < 2 || !allowed.includes(rest[0])) fail(`setting set <${allowed.join("|")}> <JSON value>`)
     try { opts[rest[0]] = JSON.parse(rest.slice(1).join(" ")) } catch { fail("setting value must be valid JSON, for example 4 or \"ask\"") }
     return
@@ -519,7 +519,7 @@ async function execute(file, args) {
     const validated = loadOptions(opts)
     if (validated.warnings.length) fail(validated.warnings.join("; "))
     const policy = ensureRouting(validated.options)
-    const quota = capacityFeed(validated.options)
+    const quota = capacityFeed(validated.options, reportFeedProblem)
     let available
     try { available = new Set((await liveModels()).map((m) => `${m.providerID}/${m.id}`)) } catch { /* offline explanation still useful */ }
     const decision = await new ModelRouter(policy).select({ role, ...(tier ? { tier } : {}), now: at, quota, ...(available ? { available } : {}) })
@@ -534,12 +534,13 @@ async function execute(file, args) {
   if (area === "capacity" && verb === "status") {
     const configured = loadOptions(opts).options
     const pools = args[2] ? [args[2]] : Object.keys(configured.quotaSources)
-    const quota = capacityFeed(configured)
+    const quota = capacityFeed(configured, reportFeedProblem)
     if (configured.quotaCommand && !pools.length) pools.push(...new Set(Object.values(configured.routing?.quotaIDs ?? {})))
     for (const id of pools) {
       const remaining = (await quota(id))?.remainingPercent
       console.log(`${id.padEnd(22)} ${remaining === undefined ? "unknown" : `${remaining}% remaining`}`)
     }
+    if (pools.length) console.log(`(bound ${configured.quotaTimeoutMs} ms per checker run; unknown means the checker failed, timed out, or emitted no such pool — reasons print above)`)
     if (!pools.length) console.log("No capacity sources configured.")
     return
   }
@@ -799,21 +800,36 @@ async function offerRoleDefaults(file, rl) {
   await execute(file, ["role", "defaults", ...selected.map((entry) => `${entry.agent}=${entry.tier}`)])
 }
 
+/** Explain/capacity-status reporter: a feed problem prints once, with the checker's own pool ids when it ran. */
+function reportFeedProblem(err, command, failure) {
+  const detail = failure.kind === "missing-pool"
+    ? `checker emitted pools [${(failure.emitted ?? []).join(", ") || "none"}], not "${failure.pool}" — the quotaSources key (or capacityPool) must equal a pool id the checker prints`
+    : `${failure.kind}: ${err instanceof Error ? err.message.split("\n")[0] : String(err)}`
+  console.log(`  feed problem (${command.join(" ")}): ${detail}`)
+}
+
 async function manageCapacity(file, rl) {
   const opts = (await readConfig(file)).entry.options
   console.log("Named pools provide remaining quota independently of a model or provider.")
-  if (opts.quotaCommand) console.log("  Existing check-rate adapter (legacy; preserved): " + opts.quotaCommand.join(" "))
+  if (opts.quotaCommand) console.log("  Legacy single-command feed (quotaCommand, check-rate format; preserved): " + opts.quotaCommand.join(" "))
   for (const [id, source] of Object.entries(opts.quotaSources ?? {})) console.log(`  ${id}: ${source.format} ${source.command.join(" ")}`)
   const action = await pick(rl, "Action", ["Add usage checker", "Bind a model to a pool", "Remove usage checker"])
   if (!action) return
   if (action === "Add usage checker") {
-    const format = await pick(rl, "Checker output", ["Portable capacity-v1", "My opencode2 check-rate --json"])
+    // capacity-v1 is the only format offered by default: any checker that prints
+    // { pools: [{ id, windows: [{ remainingPercent }] }] } works for any provider or plan.
+    // The legacy check-rate format is the author's private dashboard shape; it is
+    // only offered when such a feed is already configured.
+    const choices = ["Portable capacity-v1 (your checker)"]
+    if (opts.quotaCommand) choices.push("Legacy check-rate format (same shape as the configured quotaCommand)")
+    const format = choices.length === 1 ? choices[0] : await pick(rl, "Checker output", choices)
     if (!format) return
-    const id = (await rl.question(format === "Portable capacity-v1" ? "Pool id emitted by your checker: " : "Provider id in check-rate output (e.g. alibaba-token-plan): ")).trim()
+    const portable = format.startsWith("Portable")
+    const id = (await rl.question(portable ? "Pool id emitted by your checker (must match a pools[].id it prints): " : "Provider id in the check-rate output: ")).trim()
     if (!id) return
-    const command = format === "My opencode2 check-rate --json" ? ["opencode2", "check-rate", "--json"] :
-      [(await rl.question("Executable path: ")).trim(), ...(await rl.question("Arguments (space-separated; blank for none): ")).trim().split(/\s+/).filter(Boolean)]
-    await execute(file, ["capacity", "source", id, format === "Portable capacity-v1" ? "capacity-v1" : "check-rate", ...command])
+    const command = [(await rl.question("Executable path: ")).trim(), ...(await rl.question("Arguments (space-separated; blank for none): ")).trim().split(/\s+/).filter(Boolean)]
+    if (!command[0]) return
+    await execute(file, ["capacity", "source", id, portable ? "capacity-v1" : "check-rate", ...command])
     await execute(file, ["capacity", "status", id])
     console.log("Bind a tier's model to this pool under Capacity & usage → Bind a model to a pool.")
   } else if (action === "Remove usage checker") {
