@@ -80,7 +80,8 @@ test("skill content teaches difficulty-based tier routing", () => {
 
 test("skill content contains no provider or model ids", () => {
   // Dot-relative paths (.opencode/workflows/…) are config paths, not pins.
-  const stripped = SKILL_CONTENT.replace(/\S*opencode\S*/g, " ")
+  // The path-suffix list (.js/.mjs/.cjs/.ts/.mts/.cts) is an extension set, not a pin.
+  const stripped = SKILL_CONTENT.replace(/\S*opencode\S*/g, " ").replace(/\.js\/\.mjs\/\.cjs\/\.ts\/\.mts\/\.cts/g, " ")
   const modelRef = stripped.match(/[a-z-]+\/[a-z0-9.:-]+/)
   assert.equal(modelRef, null, `provider/model-looking ref in skill: ${modelRef?.[0]}`)
   assert.doesNotMatch(SKILL_CONTENT, /\b(opus|sonnet)\b|\b(gpt|claude)-/i, "model family name in skill")
@@ -130,6 +131,13 @@ test("skill content teaches graph review, saving and the graph handoff", () => {
   assert.match(SKILL_CONTENT, /\/ultracode graph <name>/, "render before trusting")
   assert.match(SKILL_CONTENT, /works before\s+trust/, "review is not trust-gated")
   assert.match(SKILL_CONTENT, /<name>\.graph\.json/, "the plan-mode graph artifact")
+  assert.match(SKILL_CONTENT, /not any workflow file/, "{ path } is a JS/TS script, not any workflow file")
+  assert.match(SKILL_CONTENT, /`\.js\/\.mjs\/\.cjs\/\.ts\/\.mts\/\.cts`/, "path suffixes are the script extensions")
+  assert.match(
+    SKILL_CONTENT,
+    /Run a `<name>\.graph\.json` spec as inline `\{ graph: <parsed spec> \}` or `\/ultracode save <name>` then `\{ workflow: "<name>" \}`, never `\{ path \}`\./,
+    "a graph spec is never run by path",
+  )
   assert.match(SKILL_CONTENT, /a graph run saves its spec, not the compiled script/, "no laundering")
 })
 

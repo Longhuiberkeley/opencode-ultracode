@@ -518,7 +518,25 @@ test("path input: absolute, home, traversal and non-js targets rejected precisel
   for (const path of ["/etc/passwd", "~/w.js", ".opencode/../../escape.js", "notes.txt"]) {
     const r = validateToolInput({ path })
     assert.equal(r.ok, false, `expected rejection for ${path}`)
-    if (!r.ok) assert.ok(r.error.includes('"path"'), `error names the key: ${r.error}`)
+    if (!r.ok) {
+      assert.ok(r.error.includes('"path"'), `error names the key: ${r.error}`)
+      assert.doesNotMatch(r.error, /rename/i, `non-script rejection must not say rename: ${r.error}`)
+    }
+  }
+})
+
+test("path input: .graph.json is rejected with graph/workflow remedy, not rename-to-js", () => {
+  for (const path of [".opencode/workflows/x.graph.json", ".opencode/workflows/X.GRAPH.JSON"]) {
+    const r = validateToolInput({ path })
+    assert.equal(r.ok, false, `expected rejection for ${path}`)
+    if (!r.ok) {
+      assert.match(r.error, /\{ graph/)
+      assert.match(r.error, /\{ workflow/)
+      assert.match(r.error, /JS\/TS script/)
+      assert.doesNotMatch(r.error, /rename/i)
+      // `.json` contains the characters `.js`; the remedy must not name a .js file.
+      assert.doesNotMatch(r.error, /\.js(?!on)/)
+    }
   }
 })
 

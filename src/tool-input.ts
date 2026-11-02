@@ -396,8 +396,22 @@ export function validateToolInput(raw: unknown): ToolInputResult {
     if (segments.some((s) => s === "..")) {
       return { ok: false, error: `"path" must stay inside the project root (".." segments rejected): ${JSON.stringify(path)}` }
     }
-    if (!/\.(js|mjs|cjs|ts|mts|cts)$/i.test(segments[segments.length - 1] ?? "")) {
-      return { ok: false, error: `"path" must point at a JavaScript/TypeScript workflow file (.js/.mjs/.cjs/.ts), got ${JSON.stringify(path)}` }
+    const leaf = segments[segments.length - 1] ?? ""
+    // Smaller path fix: do not accept or execute a graph spec by path. Do not
+    // widen the script-suffix regex, and do not tell the model to rename to .js.
+    if (/\.graph\.json$/i.test(leaf)) {
+      return {
+        ok: false,
+        error:
+          `"path" accepts only a JS/TS script, not a graph spec. ` +
+          `A .graph.json spec must be ultracode_run { graph: <parsed spec> } or /ultracode save <name> then { workflow: "<name>" }, got ${JSON.stringify(path)}`,
+      }
+    }
+    if (!/\.(js|mjs|cjs|ts|mts|cts)$/i.test(leaf)) {
+      return {
+        ok: false,
+        error: `"path" accepts only a JS/TS script (.js/.mjs/.cjs/.ts/.mts/.cts), not any workflow file, got ${JSON.stringify(path)}`,
+      }
     }
 
     const args = validateArgs(raw["args"])

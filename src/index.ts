@@ -316,7 +316,7 @@ const WORKFLOW_TOOL_INPUT_SCHEMA: Record<string, unknown> = {
         path: {
           type: "string",
           description:
-            "Project-root-relative workflow file (e.g. \".opencode/workflows/audit.js\"). PREFERRED for scripts longer than ~30 lines: author the file with your file-write tool, then run it by path — never embed long scripts as strings in tool input (generic execute sandboxes mangle escapes). Read at call time; trust level equals an inline { script }.",
+            "{ path } is a project-root-relative JS/TS script file (e.g. \".opencode/workflows/audit.js\"), not any workflow file and not a graph spec. PREFERRED for scripts longer than ~30 lines: author the file with your file-write tool, then run it by path — never embed long scripts as strings in tool input (generic execute sandboxes mangle escapes). Read at call time; trust level equals an inline { script }.",
         },
         args: { description: "JSON value exposed to the script as `args` (max 64 KB serialized)." },
         background: {
@@ -1270,10 +1270,12 @@ export default Plugin.define({
                   // uses — a link escaping the project root is refused.
                   const read = await readProjectWorkflowFile(fs, projectRoot, input.path)
                   if (!read.ok) {
+                    // A missing graph spec must not be told to become a .js script.
+                    const missingHint = /\.graph\.json$/i.test(input.path)
+                      ? 'A .graph.json spec must be ultracode_run { graph: <parsed spec> } or /ultracode save <name> then { workflow: "<name>" } — never { path }.'
+                      : 'Write it first (e.g. .opencode/workflows/<name>.js), then run { path: ".opencode/workflows/<name>.js" }.'
                     return {
-                      content:
-                        `error: ${read.error}. ` +
-                        'Write it first (e.g. .opencode/workflows/<name>.js), then run { path: ".opencode/workflows/<name>.js" }.',
+                      content: `error: ${read.error}. ${missingHint}`,
                     }
                   }
                   script = read.content

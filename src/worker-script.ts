@@ -729,10 +729,14 @@ function callHost(fn, args) {
     try {
       port.postMessage({ type: "call", id: id, fn: fn, args: args });
     } catch (e) {
-      // Structured-clone failure (uncloneable arg): drop the pending entry and
-      // reject so agent()/workflow() fail promptly instead of hanging forever.
+      // Structured-clone failure (uncloneable arg): fail the run here, before
+      // the script can catch and return success. finish's settled guard then
+      // blocks a later return from finish(true). Ordinary host onCall
+      // rejections arrive as result messages, not this throw, and stay catchable.
       pending.delete(id);
-      reject(new Error("ultracode: bridge call could not be delivered: " + errMsg(e)));
+      var delivered = "ultracode: bridge call could not be delivered: " + errMsg(e);
+      finish(false, undefined, delivered);
+      reject(new Error(delivered));
     }
   });
 }
