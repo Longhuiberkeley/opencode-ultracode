@@ -232,6 +232,17 @@ export const INTERRUPT_CONFIRM_MS = 3_000
  */
 export const SALVAGE_CONTEXT_MS = 3_000
 
+/**
+ * Continuation guidance for the failed-outcome/tool-calls shape (all tools
+ * completed, no exposed error). This string becomes the probe/failover reason
+ * (primitives) and can be echoed back in a retry's failure text, so it must
+ * never contain a quota or burst marker word ("quota", "usage limit",
+ * "rate limit", "429", "too many requests") — the classifier would then
+ * quarantine a healthy provider. Pinned by failure-classify tests.
+ */
+export const TOOL_CALLS_CONTINUATION_HINT =
+  "finish=tool-calls with completed tool results and no exposed error; continue using those results; treat this as a normal continuation, not a provider problem"
+
 /** Event-ring detail cap (registry slices at 300). Interrupt details must fit. */
 const INTERRUPT_EVENT_DETAIL_MAX = 300
 
@@ -400,7 +411,7 @@ export function createSessionDriver(sessions: SessionCtx, options: SessionDriver
         !first.message.content?.some((part) => part.type === "error") &&
         tools.length > 0 && tools.every((part) =>
           (part as { state?: { status?: string } }).state?.status === "completed")
-          ? "finish=tool-calls with completed tool results and no exposed error; continue using those results; do not treat this as provider quota"
+          ? TOOL_CALLS_CONTINUATION_HINT
           : undefined
       throw new AgentCallError(
         "outcome",

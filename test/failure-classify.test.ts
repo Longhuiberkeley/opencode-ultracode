@@ -6,6 +6,7 @@
 import test from "node:test"
 import assert from "node:assert/strict"
 import { classifyFailure, parseResetTimestamp } from "../src/failure-classify.ts"
+import { TOOL_CALLS_CONTINUATION_HINT } from "../src/sessions.ts"
 
 const MIN = 60_000
 const HOUR = 60 * MIN
@@ -53,6 +54,18 @@ test("classify: refusal markers — considered high-risk, usage policy, policy v
   // "usage policy" is a POLICY, not a usage LIMIT — it must not read as quota
   // even though both start with "usage".
   assert.notEqual(classifyFailure(undefined, "Your request violates our usage policy").class, "quota")
+})
+
+test("classify: the built-in tool-calls continuation hint never reads as quota or burst", () => {
+  // The hint becomes the probe/failover reason and can be echoed in a retry's
+  // failure text; a marker word here would quarantine a healthy provider.
+  const c = classifyFailure(undefined, TOOL_CALLS_CONTINUATION_HINT)
+  assert.notEqual(c.class, "quota")
+  assert.notEqual(c.class, "burst")
+  // Defensive: the echoed-hint scenario is the hint embedded in a real failure text.
+  const echoed = classifyFailure(undefined, `probe failed after continuation — ${TOOL_CALLS_CONTINUATION_HINT}`)
+  assert.notEqual(echoed.class, "quota")
+  assert.notEqual(echoed.class, "burst")
 })
 
 test("classify: refusal wins over quota-shaped wording in the same message", () => {

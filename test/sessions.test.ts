@@ -5,7 +5,7 @@
  */
 import test from "node:test"
 import assert from "node:assert/strict"
-import { createSessionDriver, buildChildTitle, parseChildTitle, describeSessionFailure, buildContinuationPrompt, SCHEMA_REPAIR_ROUNDS, INTERRUPT_CONFIRM_MS, SALVAGE_CONTEXT_MS, SESSION_CONTROL_TIMEOUT_MS } from "../src/sessions.ts"
+import { createSessionDriver, buildChildTitle, parseChildTitle, describeSessionFailure, buildContinuationPrompt, SCHEMA_REPAIR_ROUNDS, INTERRUPT_CONFIRM_MS, SALVAGE_CONTEXT_MS, SESSION_CONTROL_TIMEOUT_MS, TOOL_CALLS_CONTINUATION_HINT } from "../src/sessions.ts"
 import { AgentCallError, RunClosedError } from "../src/sessions.ts"
 import { FakeSessionCtx } from "./fakes.ts"
 import type { ScriptedReply } from "./fakes.ts"
@@ -891,8 +891,7 @@ test("continueAgent: completed tool results without an exposed error carry an ob
     assert.ok(err instanceof AgentCallError)
     assert.equal(err.kind, "outcome")
     assert.equal(err.failure?.class, "other")
-    assert.equal(err.continuationHint,
-      "finish=tool-calls with completed tool results and no exposed error; continue using those results; do not treat this as provider quota")
+    assert.equal(err.continuationHint, TOOL_CALLS_CONTINUATION_HINT)
     assert.doesNotMatch(err.continuationHint!, /host closed|provider failure/i)
     hint = err.continuationHint!
     return true

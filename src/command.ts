@@ -100,7 +100,7 @@ export const NESTED_RUN_REFUSED =
   "cannot start a run from inside an active workflow session — use /ultracode from the parent"
 
 /** Plugin package version shown on the bare /ultracode dashboard. */
-export const PLUGIN_VERSION = "0.17.1"
+export const PLUGIN_VERSION = "0.18.0"
 /** Oldest OpenCode binary build the inspect TUI is gated on (A7 / D7). */
 export const MIN_SUPPORTED_BUILD = 19271
 
