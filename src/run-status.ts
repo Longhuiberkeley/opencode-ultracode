@@ -4,6 +4,7 @@
  */
 import { countAgents, isActiveRunStatus, requestContext, type AgentRecord, type Registry, type RunRecord, type RunStatus, type TokenUsage } from "./types.ts"
 import { parsePanelSettings, type PanelSettings, type SettingsAck } from "./settings.ts"
+import { CHILD_ERROR_SNIPPET_CHARS, safeSlice } from "./serialize.ts"
 
 /** Bounded staleness window for session-derived "still running" heuristics. */
 export const FALLBACK_STALE_MS = 15 * 60 * 1000
@@ -16,7 +17,7 @@ export type AuthoritativeSource = "live" | "persisted"
 export type AuthoritativeSnapshot = {
   runID: string
   status: RunStatus
-  agents: { done: number; total: number; failed: number }
+  agents: { done: number; total: number; failed: number; succeeded?: number }
   startedAt: number
   source: AuthoritativeSource
   parentSessionID?: string
@@ -43,6 +44,7 @@ export type AuthoritativeSnapshot = {
       | "contextTokens"
       | "toolCalls"
       | "waitReason"
+      | "error"
     > & { stalledMs?: number }
   >
   queuedCount?: number
@@ -138,9 +140,12 @@ export function authoritativeFromRecord(
     runID: record.id,
     status: record.status,
     agents: {
+      // `done` stays the terminal sum (succeeded+failed+interrupted). `succeeded`
+      // is additive so existing clients that read `done` / `failed` do not change.
       done: counts.succeeded + counts.failed + counts.interrupted,
       total: counts.total,
       failed: counts.failed,
+      succeeded: counts.succeeded,
     },
     startedAt: record.startedAt,
     source,
@@ -171,6 +176,10 @@ export function authoritativeFromRecord(
       if (agent.contextTokens !== undefined) detail.contextTokens = agent.contextTokens
       if (agent.toolCalls !== undefined) detail.toolCalls = agent.toolCalls
       if (agent.waitReason !== undefined) detail.waitReason = agent.waitReason
+      // Non-empty only. A present-undefined `error` fails host RPC validation.
+      if (typeof agent.error === "string" && agent.error !== "") {
+        detail.error = safeSlice(agent.error, CHILD_ERROR_SNIPPET_CHARS)
+      }
       return detail
     }),
   }
@@ -528,12 +537,13 @@ function parseSnapshot(raw: unknown): AuthoritativeSnapshot | undefined {
   const total = agents.total
   const failed = agents.failed
   if (typeof done !== "number" || typeof total !== "number" || typeof failed !== "number") return undefined
+  const succeeded = optionalFiniteNumber(agents.succeeded)
   const snap: AuthoritativeSnapshot = {
     runID: rec.runID,
     status: rec.status as RunStatus,
     startedAt: rec.startedAt,
     source,
-    agents: { done, total, failed },
+    agents: succeeded !== undefined ? { done, total, failed, succeeded } : { done, total, failed },
   }
   const parentSessionID = optionalNonEmptyString(rec.parentSessionID)
   if (parentSessionID) snap.parentSessionID = parentSessionID
@@ -557,7 +567,7 @@ function parseSnapshot(raw: unknown): AuthoritativeSnapshot | undefined {
       if (!value || typeof value !== "object") return []
       const a = value as Record<string, unknown>
       if (typeof a.id !== "string" || !["pending", "running", "succeeded", "failed", "interrupted"].includes(String(a.status))) return []
-      return [{
+      const row: NonNullable<AuthoritativeSnapshot["agentDetails"]>[number] = {
         id: a.id,
         status: a.status as AgentRecord["status"],
         sessionID: optionalNonEmptyString(a.sessionID),
@@ -572,7 +582,11 @@ function parseSnapshot(raw: unknown): AuthoritativeSnapshot | undefined {
         toolCalls: optionalFiniteNumber(a.toolCalls),
         stalledMs: optionalFiniteNumber(a.stalledMs),
         waitReason: optionalNonEmptyString(a.waitReason),
-      }]
+      }
+      // Absent error must not be a key (host rejects present-undefined; tests lock this).
+      const error = optionalNonEmptyString(a.error)
+      if (error) row.error = safeSlice(error, CHILD_ERROR_SNIPPET_CHARS)
+      return [row]
     })
   }
   const projectID = optionalNonEmptyString(rec.projectID)

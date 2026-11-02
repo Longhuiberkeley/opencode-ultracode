@@ -243,6 +243,13 @@ export type CapturedSettings = {
    * passed maxLoopIterations. Absent = each loop ran its authored budget.
    */
   maxLoopIterations?: number
+  /**
+   * Live session.wait budget this process enforces (SESSION_AWAIT_TIMEOUT_MS).
+   * Not a panel key — set explicitly so panelSettingsFrom cannot drop it.
+   * Tool-terminal events may extend one wait up to 2× this; lastActivityAt
+   * does not.
+   */
+  awaitTimeoutMs?: number
 }
 
 /** Model reference as `session.create` expects it ({ providerID, id, variant? }). */
@@ -687,6 +694,26 @@ export interface RunEnvelope {
   stopReason?: string
   /** Source runID when this run warm-started from another (additive). */
   resumedFrom?: string
+  /**
+   * Failed and interrupted children, derived at read time from `agents[].error`.
+   * Never written into `error`, and never persisted on the run record.
+   */
+  badAgents?: ChildFailureView[]
+  /** Bad children omitted past the read-time cap (additive). */
+  badAgentsOmitted?: number
+}
+
+/**
+ * Read-time view of one failed or interrupted child. Source of truth is
+ * `AgentRecord.error`; this shape is derived, not stored.
+ */
+export interface ChildFailureView {
+  id: string
+  label?: string
+  phase?: string
+  status: "failed" | "interrupted"
+  /** Snippet of `AgentRecord.error` (empty omitted). */
+  error?: string
 }
 
 // ---------------------------------------------------------------------------
@@ -1373,6 +1400,13 @@ export interface Supervisor {
    * record marked with a stall error — runs fail visibly, no zombie rows.
    */
   noteChildActivity(sessionID: string): void
+  /**
+   * Push the live session.wait deadline after a terminal tool event
+   * (session.tool.success / session.tool.failed only). No-op when that
+   * session has no registered wait budget. Does not bump lastActivityAt
+   * and is not called for streaming, tool.progress, or tool.called.
+   */
+  noteToolTerminal(sessionID: string): void
   /**
    * Last-observed activity for a live child (epoch ms), for status surfaces
    * (stalledMs). Undefined when unknown — never rendered as stalled.

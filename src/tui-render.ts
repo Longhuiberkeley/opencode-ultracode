@@ -116,6 +116,8 @@ export type RunAgentView = {
   /** Admission gate a pending child is parked at (record provenance). */
   waitReason?: string
   toolCalls?: number
+  /** Child error, copied only when a non-empty string (never an undefined key). */
+  error?: string
 }
 
 export type RunView = {
@@ -125,7 +127,7 @@ export type RunView = {
   parent?: string
   agents: RunAgentView[]
   phases: string[]
-  counts: { total: number; done: number; failed: number }
+  counts: { total: number; done: number; failed: number; succeeded?: number }
   startedAt: number
   settled: boolean
   /** From run/ack state — not a process-local pause map. */
@@ -467,9 +469,11 @@ export function groupRuns(sessions: SessionView[], nowTs?: number): RunView[] {
     }
     let done = 0
     let failed = 0
+    let succeeded = 0
     let startedAt = Number.POSITIVE_INFINITY
     for (const a of agents) {
       if (isFinalStatus(a.status)) done++
+      if (a.status === "succeeded") succeeded++
       if (a.status === "failed") failed++
     }
     for (const session of sessions) {
@@ -485,7 +489,7 @@ export function groupRuns(sessions: SessionView[], nowTs?: number): RunView[] {
       parent: bucket.parent,
       agents,
       phases,
-      counts: { total: agents.length, done, failed },
+      counts: { total: agents.length, done, failed, succeeded },
       startedAt,
       settled,
     })
@@ -505,7 +509,7 @@ function snapshotAgents(snap: AuthoritativeSnapshot, cached: readonly RunAgentVi
     // Record provenance fills what the session-heuristic join cannot: a
     // warm-replayed (cached) child has no session in THIS run, so without
     // this fallback its detail rows render "-".
-    return {
+    const view: RunAgentView = {
       ...prev,
       sessionID: a.sessionID ?? "",
       ord: a.id,
@@ -522,6 +526,11 @@ function snapshotAgents(snap: AuthoritativeSnapshot, cached: readonly RunAgentVi
       waitReason: a.waitReason,
       toolCalls: a.toolCalls ?? prev?.toolCalls,
     }
+    // Copy only a non-empty string. Spreading `prev` must not leave a stale
+    // error, and a key whose value is undefined is never set.
+    if (typeof a.error === "string" && a.error !== "") view.error = a.error
+    else delete view.error
+    return view
   })
 }
 
@@ -552,7 +561,12 @@ function overlaySnapshot(run: RunView, snap: AuthoritativeSnapshot): RunView {
     ownerUpdatedAt: snap.ownerUpdatedAt ?? run.ownerUpdatedAt,
     paused,
     settled,
-    counts: { total: snap.agents.total, done: snap.agents.done, failed: snap.agents.failed },
+    counts: {
+      total: snap.agents.total,
+      done: snap.agents.done,
+      failed: snap.agents.failed,
+      succeeded: succeededFromSnapshot(snap),
+    },
     startedAt: snap.startedAt || run.startedAt,
     agents,
     source: snap.source,
@@ -578,7 +592,12 @@ function runViewFromSnapshot(snap: AuthoritativeSnapshot): RunView {
     ownerUpdatedAt: snap.ownerUpdatedAt,
     agents: snapshotAgents(snap),
     phases: [...new Set(snapshotAgents(snap).flatMap((a) => a.phase ? [a.phase] : []))],
-    counts: { total: snap.agents.total, done: snap.agents.done, failed: snap.agents.failed },
+    counts: {
+      total: snap.agents.total,
+      done: snap.agents.done,
+      failed: snap.agents.failed,
+      succeeded: succeededFromSnapshot(snap),
+    },
     startedAt: snap.startedAt,
     settled,
     paused,
@@ -629,8 +648,34 @@ export function phaseColumns(runView: RunView): PhaseColumn[] {
   })
 }
 
+function succeededFromSnapshot(snap: AuthoritativeSnapshot): number {
+  if (typeof snap.agents.succeeded === "number" && Number.isFinite(snap.agents.succeeded)) {
+    return snap.agents.succeeded
+  }
+  let n = 0
+  for (const a of snap.agentDetails ?? []) {
+    if (a.status === "succeeded") n++
+  }
+  return n
+}
+
+/** Display numerator: succeeded, not the folded terminal count. */
+function succeededNumerator(run: RunView): number {
+  if (typeof run.counts.succeeded === "number" && Number.isFinite(run.counts.succeeded)) {
+    return run.counts.succeeded
+  }
+  let n = 0
+  for (const a of run.agents) if (a.status === "succeeded") n++
+  return n
+}
+
+function displayFraction(run: RunView): string {
+  const fraction = `${succeededNumerator(run)}/${run.counts.total}`
+  return run.counts.failed > 0 ? `${fraction} failed ${run.counts.failed}` : fraction
+}
+
 function toAgentRecord(a: RunAgentView): AgentRecord {
-  return {
+  const rec: AgentRecord = {
     id: a.ord ?? "?",
     label: a.label,
     phase: a.phase,
@@ -644,6 +689,8 @@ function toAgentRecord(a: RunAgentView): AgentRecord {
     spawnModel: a.spawnModel,
     toolCalls: a.toolCalls,
   }
+  if (typeof a.error === "string" && a.error !== "") rec.error = a.error
+  return rec
 }
 
 /** Agents for a phase filter: `"all"` (default), `"-"` unphased, or a named phase. */
@@ -1126,7 +1173,7 @@ export function runStripLines(
     const name = run.name ?? run.workflowName ?? shortRunID(run.runID)
     const dot = run.paused ? "■" : run.settled ? "○" : runHasRunningAgent(run) ? "●" : "◌"
     const badges = runLivenessSuffix(run, now)
-    lines.push(`${mark} ${shortRunID(run.runID)} ${name} ${dot} ${run.status ?? (run.settled ? "finished" : "active")} ${run.counts.done}/${run.counts.total}${badges}`)
+    lines.push(`${mark} ${shortRunID(run.runID)} ${name} ${dot} ${run.status ?? (run.settled ? "finished" : "active")} ${displayFraction(run)}${badges}`)
   }
   if (runs.length > limit) lines.push(`  … +${runs.length - limit} more`)
   return lines
@@ -1334,6 +1381,7 @@ export function agentDetailLines(agent: RunAgentView): string[] {
   return [
     title,
     `status  ${STATUS_DOT[agent.status]} ${agent.status}${agent.stalledMs !== undefined && agent.stalledMs > 600_000 ? ` (stalled ${compactElapsed(agent.stalledMs)})` : ""}`,
+    ...(agent.status !== "succeeded" && rec.error ? [`error  ${rec.error}`] : []),
     // Admission gate a pending child is parked at — the answer to "why is
     // this child not running yet" (queue/permit/quarantine/pause).
     ...(agent.status === "pending" && agent.waitReason ? [`waiting  ${agent.waitReason}`] : []),
@@ -1547,9 +1595,8 @@ export function formatLiveStrip(
   const lines: string[] = []
   if (effective) {
     const running = run ? run.agents.filter((a) => a.status === "running").length : 0
-    const done = run?.counts.done ?? 0
-    const total = run?.counts.total ?? 0
-    lines.push(`conc ${effective.concurrency}/${CONCURRENCY_CAP} · running ${running} · agents ${done}/${total} · ${effective.permissions}`)
+    const fraction = run ? displayFraction(run) : "0/0"
+    lines.push(`conc ${effective.concurrency}/${CONCURRENCY_CAP} · running ${running} · agents ${fraction} · ${effective.permissions}`)
   } else {
     lines.push("selected run unknown")
   }
@@ -1835,7 +1882,7 @@ export function inspectModel(
   const more = page.window.length > 0 && page.offset + page.window.length < rows.length
   const pageLabel = more ? `${page.label} ↓` : page.label
   const elapsed = compactElapsed(Math.max(0, nowTs - run.startedAt))
-  const header = `${shortRunID(run.runID)} · run ${runIndex + 1}/${n} · ${run.counts.done}/${run.counts.total} agents · ${elapsed}${runLivenessSuffix(run, nowTs)}`
+  const header = `${shortRunID(run.runID)} · run ${runIndex + 1}/${n} · ${displayFraction(run)} agents · ${elapsed}${runLivenessSuffix(run, nowTs)}`
 
   const left: string[] = ["Phases"]
   for (let i = 0; i < phases.length; i++) {
@@ -1897,7 +1944,8 @@ export function inspectModel(
 }
 
 export function formatCounts(counts: RunView["counts"]): string {
-  return `${counts.done}/${counts.total}${counts.failed ? ` failed ${counts.failed}` : ""}`
+  const n = typeof counts.succeeded === "number" ? counts.succeeded : counts.done
+  return `${n}/${counts.total}${counts.failed ? ` failed ${counts.failed}` : ""}`
 }
 
 export function shortRunID(runID: string): string {
@@ -1997,7 +2045,7 @@ export function footerHints(bound: string[]): string {
 export function twoColumn(runView: RunView, opts: TwoColumnOpts): TwoColumnView {
   const now = opts.now ?? Date.now()
   const elapsed = compactElapsed(Math.max(0, now - runView.startedAt))
-  const headerLine = `${shortRunID(runView.runID)} · ${runView.counts.done}/${runView.counts.total} agents · ${elapsed}${runLivenessSuffix(runView, now)}`
+  const headerLine = `${shortRunID(runView.runID)} · ${displayFraction(runView)} agents · ${elapsed}${runLivenessSuffix(runView, now)}`
   const cols = phaseColumns(runView)
   const phaseCount = cols.length
   const selPh = phaseCount === 0 ? 0 : Math.min(Math.max(0, Math.floor(opts.selectedPhase)), phaseCount - 1)

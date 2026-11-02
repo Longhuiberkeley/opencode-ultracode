@@ -13,6 +13,7 @@ import type { GraphSpec } from "../src/graph.ts"
 import type { AgentRunnerOptions } from "../src/primitives.ts"
 import type { ProviderLimiter, ProviderPermit } from "../src/provider-slots.ts"
 import type { AgentResult } from "../src/types.ts"
+import { DEFAULT_OPTIONS } from "../src/types.ts"
 import type { Json, SavedWorkflow, Storage } from "../src/types.ts"
 import type { AgentRunHooks, AgentRunInput, SessionDriver } from "../src/sessions.ts"
 import { AgentCallError, createSessionDriver } from "../src/sessions.ts"
@@ -898,30 +899,62 @@ test("AgentRunner retry: quota failure throws immediately — no continue, no fr
   assert.equal(registry.getAgent(run.id, "a1")!.status, "failed")
 })
 
-test("AgentRunner retry: unclassified failure gets ONE same-model probe; a 0-progress re-failure promotes to quota", async () => {
-  const { calls, runner } = makeRunner({ retryAttempts: 3, retryBackoffMs: 0 })
-  const pending = runner.call("probe me", {})
+for (const failure of [undefined, { class: "other" as const, reason: "no exposed error" }]) {
+test(`AgentRunner retry: ${failure?.class ?? "undefined"} no-progress gets ONE probe without quota promotion`, async () => {
+  const health = new ProviderBreaker()
+  const reports: Parameters<ProviderHealth["report"]>[0][] = []
+  const report = health.report.bind(health)
+  health.report = (input) => { reports.push(input); report(input) }
+  const { calls, runner } = makeRunner({ retryAttempts: 3, retryBackoffMs: 0,
+    providerHealth: health, modelFallbacks: { "xai/grok-4.6": ["google/gemini-3.7-flash"] } })
+  const pending = runner.call("probe me", { model: { providerID: "xai", id: "grok-4.6" } })
   await tick()
   registerSession(calls[0]!, "ses_probe")
-  // No classification at all: policy allows exactly one same-model continue.
-  calls[0]!.reject(new AgentCallError("outcome", 'agent session outcome "failed"'))
+  calls[0]!.reject(new AgentCallError("outcome", 'agent session outcome "failed"', "", failure))
   await tick()
   assert.equal(calls.length, 2)
   assert.equal(calls[1]!.kind, "continue")
-  // The probe died instantly with 0 new work: promote to quota, stop probing.
-  calls[1]!.reject(
-    new AgentCallError("outcome", 'agent session outcome "failed"', "", { class: "burst", status: 429, reason: "rate-limit: status 429" }, true),
-  )
+  assert.equal(calls[1]!.sessionID, "ses_probe")
+  assert.equal(calls[1]!.model, undefined)
+  assert.match(calls[1]!.continuationPrompt ?? "", /unclassified failure — same-model probe/)
+  assert.doesNotMatch(calls[1]!.continuationPrompt ?? "", /provider.side failure|host closed/i)
+  const retryError = new AgentCallError("outcome", 'agent session outcome "failed"', "", failure, true)
+  calls[1]!.reject(retryError)
   await assert.rejects(pending, (err: unknown) => {
     assert.ok(err instanceof AgentCallError)
-    assert.equal(err.failure?.class, "quota", "0-progress re-failure must be promoted to quota")
+    assert.equal(err, retryError, "the original typed re-failure surfaces unchanged")
+    assert.equal(err.failure, failure)
     assert.equal(err.noProgress, true)
-    assert.match(err.message, /promoted to quota/)
-    assert.equal(err.failure?.status, 429, "original status survives promotion")
+    assert.doesNotMatch(err.message, /promoted to quota/)
     return true
   })
-  assert.equal(calls.length, 2, "promotion beats the configured retry budget (attempts=3)")
+  assert.equal(calls.length, 2, "unclassified failures stop after one probe even at attempts=3")
+  assert.deepEqual(reports, [], "no provider-health pollution")
+  assert.equal(health.isQuarantined("xai"), false)
 })
+}
+
+for (const attempts of [0, 1, 2, 3]) {
+test(`AgentRunner retry: zero-progress 429 stays burst through ${attempts} configured probes`, async () => {
+  const fake = fakeFailoverSession(Array.from({ length: attempts + 1 }, () =>
+    ({ text: "", outcome: "failed", finish: "error", failure: { status: 429 } })))
+  const { runner } = makeRunner({ driver: createSessionDriver(fake), retryAttempts: attempts, retryBackoffMs: 0 })
+  await assert.rejects(runner.call("bounded", { model: { providerID: "xai", id: "grok-4.6" } }), (err: unknown) => {
+    assert.ok(err instanceof AgentCallError)
+    assert.equal(err.failure?.class, "burst")
+    assert.equal(err.failure?.status, 429)
+    assert.doesNotMatch(err.message, /promoted to quota/)
+    return true
+  })
+  const session = [...fake.sessions.values()][0]!
+  assert.equal(session.prompts, attempts + 1)
+  assert.deepEqual(fake.switches, [])
+  for (const prompt of session.messages.filter((m) => m.type === "user").slice(1)) {
+    assert.match(prompt.text ?? "", /transient provider rate limit/)
+    assert.doesNotMatch(prompt.text ?? "", /account quota/)
+  }
+})
+}
 
 test("AgentRunner retry: an unclassified probe that produced work stops after ONE probe (no blind loop)", async () => {
   const { calls, runner } = makeRunner({ retryAttempts: 3, retryBackoffMs: 0 })
@@ -1246,6 +1279,9 @@ test("AgentRunner failover: quota switches the SAME session via modelFallbacks a
   assert.equal(res.failover?.to.variant, "lite")
   assert.equal(res.failover?.class, "quota")
   assert.match(res.failover?.reason ?? "", /quota/)
+  const failoverPrompt = fake.sessions.get(sessionID)!.messages.filter((m) => m.type === "user")[1]!.text ?? ""
+  assert.match(failoverPrompt, /account quota/)
+  assert.doesNotMatch(failoverPrompt, /rate.limit|content.policy/i)
   const rec = registry.getAgent(run.id, "a1")!
   assert.equal(run.agents.length, 1, "one registry row per agent() call")
   assert.equal(rec.status, "succeeded")
@@ -1308,18 +1344,11 @@ test("AgentRunner failover: pin pool picks a cross-provider pin and skips disabl
 
 test("AgentRunner failover: burst budget exhausted fails over on the same session", async () => {
   const burst = { text: "", outcome: "failed", finish: "error", failure: { type: "provider.rate-limit", message: "Rate limit reached for requests", status: 429 } }
-  // The same-model probe produced token growth (no 0-token promotion), so the
-  // exhausted BURST budget — not the instant-death promotion — is what routes
-  // this failure into the ladder.
-  const burstWithWork = {
-    ...burst,
-    tokens: { input: 5, output: 2, reasoning: 0, cache: { read: 0, write: 0 } },
-  }
-  const fake = fakeFailoverSession([burst, burstWithWork, { text: "burst recovered", model: { providerID: "google", id: "gemini-3.7-flash" } }])
+  const fake = fakeFailoverSession([burst, burst, { text: "burst recovered", model: { providerID: "xai", id: "grok-mini" } }])
   const { runner } = makeRunner({
     driver: createSessionDriver(fake),
-    modelFallbacks: { "xai/grok-4.6": ["google/gemini-3.7-flash"] },
-    retryAttempts: 1,
+    modelFallbacks: { "xai/grok-4.6": ["xai/grok-mini"] },
+    retryAttempts: DEFAULT_OPTIONS.agentRetryAttempts,
     retryBackoffMs: 0,
   })
   const res = await runner.call("go", { model: { providerID: "xai", id: "grok-4.6" } })
@@ -1328,8 +1357,29 @@ test("AgentRunner failover: burst budget exhausted fails over on the same sessio
   assert.match(res.failover?.reason ?? "", /burst/)
   assert.deepEqual(
     fake.switches.map((s) => `${s.model.providerID}/${s.model.id}`),
-    ["google/gemini-3.7-flash"],
+    ["xai/grok-mini"],
   )
+  const session = [...fake.sessions.values()][0]!
+  assert.equal(session.prompts, 3, "default: original + one probe + one ladder continuation")
+  const failoverPrompt = session.messages.filter((m) => m.type === "user")[2]!.text ?? ""
+  assert.match(failoverPrompt, /rate limiting/)
+  assert.doesNotMatch(failoverPrompt, /account quota|content.policy/i)
+})
+
+test("AgentRunner failover: refusal prompt names only content policy", async () => {
+  const fake = fakeFailoverSession([
+    { text: "", outcome: "failed", failure: { type: "provider.content-filter", message: "content policy violation" } },
+    { text: "recovered", model: { providerID: "google", id: "gemini-3.7-flash" } },
+  ])
+  const { runner } = makeRunner({ driver: createSessionDriver(fake), retryAttempts: 3, retryBackoffMs: 0,
+    modelFallbacks: { "xai/grok-4.6": ["google/gemini-3.7-flash"] } })
+  const result = await runner.call("go", { model: { providerID: "xai", id: "grok-4.6" } })
+  assert.equal(result.failover?.class, "refusal")
+  const session = [...fake.sessions.values()][0]!
+  assert.equal(session.prompts, 2, "refusal bypasses same-model probes")
+  const prompt = session.messages.filter((m) => m.type === "user")[1]!.text ?? ""
+  assert.match(prompt, /content-policy refusal/)
+  assert.doesNotMatch(prompt, /rate.limit|account quota/i)
 })
 
 test("AgentRunner failover: no eligible candidate rethrows the typed quota error, no switch, no retry", async () => {

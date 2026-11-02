@@ -126,7 +126,7 @@ test("groupRuns: joins by parseChildTitle.runID, ignores non-uc, orders by ord",
   assert.equal(runs[0]!.agents[1]!.status, "failed")
   assert.equal(runs[0]!.agents[2]!.status, "succeeded")
   assert.deepEqual(runs[0]!.phases, ["research", "extract"])
-  assert.deepEqual(runs[0]!.counts, { total: 3, done: 2, failed: 1 })
+  assert.deepEqual(runs[0]!.counts, { total: 3, done: 2, failed: 1, succeeded: 1 })
   assert.equal(runs[0]!.startedAt, 100)
   assert.equal(runs[0]!.settled, false)
   assert.equal(runs[1]!.runID, "run_other")
@@ -152,7 +152,7 @@ test("groupRuns: legacy [uc:<tag>] titles join; missing ord keeps appearance ord
   assert.equal(runs[0]!.agents[0]!.label, "seeker")
   assert.deepEqual(runs[0]!.phases, [])
   assert.equal(runs[0]!.settled, true)
-  assert.deepEqual(runs[0]!.counts, { total: 2, done: 2, failed: 1 })
+  assert.deepEqual(runs[0]!.counts, { total: 2, done: 2, failed: 1, succeeded: 1 })
 })
 
 test("groupRuns: empty / all non-uc → []", () => {
@@ -350,6 +350,25 @@ test("settleCandidate: quiet window + once-per-run dedupe", () => {
   assert.equal(settleCandidate(afterChange, changed, 5000, 12_000), true)
 })
 
+test("agentDetailLines prints a non-succeeded child's error", () => {
+  const failed = agentDetailLines({
+    sessionID: "ses_bad",
+    ord: "a2",
+    title: "dead",
+    status: "failed",
+    error: "child died: bridge exploded",
+  })
+  assert.ok(failed.some((l) => l === "error  child died: bridge exploded"))
+  const ok = agentDetailLines({
+    sessionID: "ses_ok",
+    ord: "a1",
+    title: "ok",
+    status: "succeeded",
+    error: "should not show",
+  })
+  assert.ok(!ok.some((l) => l.startsWith("error")))
+})
+
 test("runFingerprint + formatCounts", () => {
   const run: RunView = {
     runID: "run_x",
@@ -363,7 +382,8 @@ test("runFingerprint + formatCounts", () => {
     settled: true,
   }
   assert.equal(runFingerprint(run), "s1:succeeded|s2:failed")
-  assert.equal(formatCounts(run.counts), "2/2 failed 1")
+  run.counts.succeeded = 1
+  assert.equal(formatCounts(run.counts), "1/2 failed 1")
   assert.equal(formatCounts({ total: 3, done: 3, failed: 0 }), "3/3")
 })
 
@@ -440,7 +460,8 @@ test("twoColumn: phases left, D11 right, pagination ↓, header", () => {
   assert.equal(shortRunID(run.runID), "run_abc123def456")
 
   const page0 = twoColumn(run, { width: 80, selectedPhase: 0, offset: 0, height: 10, now: 2500 })
-  assert.deepEqual(page0.header, ["run_abc123def456 · 1/3 agents · 1.5s"])
+  // Numerator is succeeded (0), not the folded terminal count (the one failed row).
+  assert.deepEqual(page0.header, ["run_abc123def456 · 0/3 failed 1 agents · 1.5s"])
   assert.deepEqual(page0.left, ["Phases", "> 1 extract 0/1", "  2 verify 1/2"])
   assert.equal(page0.right[0]![0], "extract · 1 agents")
   assert.deepEqual(page0.right[1], ["●", "a3 seeker", "extract", "explore", "openrouter/kimi", "18k", "4"])

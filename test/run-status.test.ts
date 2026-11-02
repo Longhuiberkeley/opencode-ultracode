@@ -663,6 +663,59 @@ test("runStatus RPC output schema declares every field the payload emits", async
     "snapshot must survive an undefined-stripping round-trip unchanged (no present-undefined keys)",
   )
   assert.equal("contextTokens" in (sparseSnap.agentDetails![0] as object), false, "unmeasured agent has no contextTokens KEY at all")
+  assert.equal("error" in (sparseSnap.agentDetails![0] as object), false, "absent error must not be present as a key")
+})
+
+test("runStatus error and succeeded fields are declared and survive parse", async () => {
+  const { ULTRACODE_RPC } = await import("../src/rpc-definition.ts")
+  const output = ULTRACODE_RPC.methods.runStatus.output as {
+    properties: { runs: { items: { properties: Record<string, unknown> } } }
+  }
+  const runProps = output.properties.runs!.items.properties!
+  const agentProps = (runProps.agentDetails as { items: { properties: Record<string, unknown> } }).items.properties
+  const agentCountProps = (runProps.agents as { properties: Record<string, unknown> }).properties
+  assert.ok("error" in agentProps, "agentDetails.error must be declared or the host rejects the call")
+  assert.ok("succeeded" in agentCountProps, "agents.succeeded must be declared")
+
+  const death = "y".repeat(400)
+  const snap = authoritativeFromRecord(
+    record({
+      id: "run_err",
+      status: "succeeded",
+      agents: [
+        { id: "a1", status: "succeeded", sessionID: "ses_ok" },
+        { id: "a2", status: "failed", sessionID: "ses_bad", error: death },
+        { id: "a3", status: "interrupted", sessionID: "ses_int" },
+      ],
+    }),
+    "live",
+  )
+  assert.equal(snap.agents.succeeded, 1)
+  assert.equal(snap.agents.done, 3, "done stays the terminal sum")
+  assert.equal("error" in (snap.agentDetails![0] as object), false)
+  assert.equal(snap.agentDetails![1]!.error!.length, 300)
+  assert.equal("error" in (snap.agentDetails![2] as object), false)
+
+  const parsed = parseRunStatusResponse(JSON.parse(JSON.stringify({ runs: [snap] })))!
+  assert.equal(parsed[0]!.agents.succeeded, 1)
+  assert.equal(parsed[0]!.agents.done, 3)
+  assert.equal(parsed[0]!.agentDetails![1]!.error, snap.agentDetails![1]!.error)
+  assert.equal("error" in (parsed[0]!.agentDetails![0] as object), false)
+  assert.equal("error" in (parsed[0]!.agentDetails![2] as object), false)
+
+  const legacy = parseRunStatusResponse({
+    runs: [{
+      runID: "run_old",
+      status: "running",
+      startedAt: 1,
+      source: "live",
+      agents: { done: 0, total: 1, failed: 0 },
+      agentDetails: [{ id: "a1", status: "pending" }],
+    }],
+  })!
+  assert.equal(legacy[0]!.agents.succeeded, undefined)
+  assert.equal("succeeded" in legacy[0]!.agents, false)
+  assert.equal("error" in (legacy[0]!.agentDetails![0] as object), false)
 })
 
 test("stepEventContext: session.step.ended usage becomes the live context number", async () => {

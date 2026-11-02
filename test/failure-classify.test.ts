@@ -125,6 +125,10 @@ test("classify: no error object and no markers => other", () => {
   assert.match(c.reason, /no quota or rate-limit/)
 })
 
+test("classify: finish tool-calls without an exposed error stays other", () => {
+  assert.equal(classifyFailure(undefined, "finish: tool-calls").class, "other")
+})
+
 test("classify: quota markers beat rate-limit markers (quota wins)", () => {
   const c = classifyFailure({
     type: "provider.rate-limit",

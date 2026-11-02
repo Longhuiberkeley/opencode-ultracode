@@ -8,6 +8,7 @@ import { mkdtemp, readdir, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { SupervisorImpl } from "../src/supervisor.ts"
+import { SESSION_AWAIT_TIMEOUT_MS } from "../src/sessions.ts"
 import { parseModelRouting } from "../src/model-routing.ts"
 import { enrichStatusPayload, runStatusPayload } from "../src/command.ts"
 import { RegistryImpl } from "../src/registry.ts"
@@ -143,6 +144,49 @@ test("supervisor: script throw => failed envelope with error", async () => {
   const outcome = await ctx.supervisor.start({ script: `throw new Error("script kaboom");` }, ctx.parent)
   assert.equal(outcome.envelope.status, "failed")
   assert.match(outcome.envelope.error ?? "", /script kaboom/)
+})
+
+test("supervisor: script accepts a failed child — succeeded, no error, badAgents names it", async () => {
+  const ctx = makeSupervisor({ agentRetryAttempts: 0 })
+  ctx.sessions.push({
+    text: "",
+    outcome: "failed",
+    finish: "error",
+    failure: { type: "provider.error", message: "child died: bridge exploded", status: 500 },
+  })
+  const outcome = await ctx.supervisor.start(
+    {
+      script: `try { await agent("do the thing", { label: "dead" }); return { missed: true }; } catch (e) { return { caught: String(e && e.message || e) }; }`,
+    },
+    ctx.parent,
+  )
+  assert.equal(outcome.envelope.status, "succeeded")
+  assert.equal(outcome.envelope.error, undefined)
+  assert.equal(outcome.run.error, undefined)
+  assert.equal(outcome.run.status, "succeeded")
+  assert.equal(outcome.envelope.badAgents?.length, 1)
+  assert.match(outcome.envelope.badAgents?.[0]?.error ?? "", /bridge exploded/)
+  assert.equal(outcome.run.agents[0]?.status, "failed")
+})
+
+test("supervisor: thrown script error is preserved and badAgents is still attached", async () => {
+  const ctx = makeSupervisor({ agentRetryAttempts: 0 })
+  ctx.sessions.push({
+    text: "",
+    outcome: "failed",
+    finish: "error",
+    failure: { type: "provider.error", message: "child died: gate row", status: 500 },
+  })
+  const outcome = await ctx.supervisor.start(
+    {
+      script: `try { await agent("do the thing"); } catch (e) {} throw new Error("script kaboom");`,
+    },
+    ctx.parent,
+  )
+  assert.equal(outcome.envelope.status, "failed")
+  assert.match(outcome.envelope.error ?? "", /script kaboom/)
+  assert.equal(outcome.envelope.badAgents?.length, 1)
+  assert.match(outcome.envelope.badAgents?.[0]?.error ?? "", /gate row/)
 })
 
 test("supervisor: burst failure retries as a same-session continue — one session, one row", async () => {
@@ -746,6 +790,8 @@ test("supervisor: run record keeps permissionStallMs for the stall watchdog", as
   const effective = ctx.registry.get(runID)?.effective
   assert.equal(effective?.permissions, DEFAULT_OPTIONS.permissions)
   assert.equal(effective?.permissionStallMs, DEFAULT_OPTIONS.permissionStallMs, "panelSettingsFrom must not drop it")
+  assert.equal(effective?.awaitTimeoutMs, 900_000)
+  assert.equal(effective?.awaitTimeoutMs, SESSION_AWAIT_TIMEOUT_MS, "panelSettingsFrom must not drop the live await budget")
   await done
 })
 

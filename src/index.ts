@@ -2080,6 +2080,16 @@ export default Plugin.define({
                 } catch {
                   // never throw from the event loop
                 }
+                // Await-budget extend is tool-terminal only. progress, called,
+                // streaming, and permission events bump stall liveness above
+                // and must not move the session.wait deadline.
+                if (ev.type === "session.tool.success" || ev.type === "session.tool.failed") {
+                  try {
+                    supervisor.noteToolTerminal(sid)
+                  } catch {
+                    // never throw from the event loop
+                  }
+                }
               }
               if (ev.type === "permission.asked") handlePermissionAsked(ev.data)
               else if (ev.type === "permission.replied") handlePermissionReplied(ev.data)

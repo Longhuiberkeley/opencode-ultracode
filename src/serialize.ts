@@ -3,7 +3,7 @@
  *
  * Builder B module. Pure functions only — no plugin imports, no IO.
  */
-import type { Json, RunEnvelope, RunRecord } from "./types.ts"
+import type { AgentRecord, ChildFailureView, Json, RunEnvelope, RunRecord } from "./types.ts"
 import { countAgents } from "./types.ts"
 
 // ---------------------------------------------------------------------------
@@ -292,6 +292,36 @@ export function boundedStringify(value: Json | undefined, maxChars = Number.MAX_
   return safeSlice(compactStringify(value), maxChars)
 }
 
+/** How many failed/interrupted children a read-time view names before omitting. */
+export const CHILD_FAILURE_CAP = 8
+/** Cap for a copied child error (RPC and status views). Surrogate-safe via safeSlice. */
+export const CHILD_ERROR_SNIPPET_CHARS = 300
+
+/**
+ * Failed and interrupted children, derived at read time. Empty optionals are
+ * omitted; `error` is snipped. Not stored on the run record — `agents[].error`
+ * is the source of truth. `omitted` is the count past `cap`, so callers can
+ * print an omitted-aware total (`badAgents.length + omitted`).
+ */
+export function childFailures(
+  run: RunRecord,
+  cap = CHILD_FAILURE_CAP,
+): { badAgents: ChildFailureView[]; omitted: number } {
+  const bad = run.agents.filter(
+    (a): a is AgentRecord & { status: "failed" | "interrupted" } =>
+      a.status === "failed" || a.status === "interrupted",
+  )
+  const limit = Number.isFinite(cap) ? Math.max(0, Math.floor(cap)) : CHILD_FAILURE_CAP
+  const badAgents: ChildFailureView[] = bad.slice(0, limit).map((a) => {
+    const row: ChildFailureView = { id: a.id, status: a.status }
+    if (a.label) row.label = a.label
+    if (a.phase) row.phase = a.phase
+    if (typeof a.error === "string" && a.error !== "") row.error = safeSlice(a.error, CHILD_ERROR_SNIPPET_CHARS)
+    return row
+  })
+  return { badAgents, omitted: Math.max(0, bad.length - badAgents.length) }
+}
+
 /** True when the compact serialization of `value` fits within `maxChars`. */
 export function resultFits(value: Json | undefined, maxChars: number): boolean {
   if (value === undefined) return true
@@ -355,5 +385,9 @@ export function buildEnvelope(run: RunRecord, maxChars: number): RunEnvelope {
       if (run.resultArtifactKey !== undefined) envelope.resultArtifactKey = run.resultArtifactKey
     }
   }
+  // Visibility only: name dead children without touching status or run.error.
+  const failures = childFailures(run)
+  envelope.badAgents = failures.badAgents
+  envelope.badAgentsOmitted = failures.omitted
   return envelope
 }
