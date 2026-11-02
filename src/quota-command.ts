@@ -22,6 +22,12 @@ const run = promisify(execFile)
  */
 export const DEFAULT_QUOTA_TIMEOUT_MS = 20_000
 
+/**
+ * How soon the next admission re-probes after a failed snapshot, or after a
+ * timeout that reused a still-fresh last-good snapshot. Not the success TTL.
+ */
+const QUOTA_REPROBE_MS = 5_000
+
 /** Why a feed reading is unknown, for operators' logs and the config CLI. */
 export type QuotaFeedFailure = {
   /** spawn/exit/timeout/parse: the command did not yield a usable snapshot; missing-pool: it did, but not for this pool. */
@@ -92,6 +98,8 @@ export function commandQuotaFeed(
   format: "check-rate" | "capacity-v1" = "check-rate",
   timeoutMs = DEFAULT_QUOTA_TIMEOUT_MS,
   onError?: QuotaFeedError,
+  // Test clock. Production callers omit this; age and expiry use Date.now.
+  now: () => number = Date.now,
 ): (id: string) => Promise<RouteObservation | undefined> {
   type Snapshot = { pools: Map<string, RouteObservation>; failed: boolean }
   let expires = 0
@@ -101,27 +109,45 @@ export function commandQuotaFeed(
   // One report per feed per TTL window: a dead checker is re-polled every 5 s
   // while unknown, and an operator needs one line, not a log flood.
   let lastReportAt = 0
+  // Last successful command output, including a parsed remainingPercent of 0.
+  // seq is the fetch start order so a confirmed zero is never overwritten by an older positive.
+  let lastGood: { pools: Map<string, RouteObservation>; fetchedAt: number; seq: number } | undefined
+  let fetchSeq = 0
   const report = (err: unknown, failure: QuotaFeedFailure): void => {
-    if (!onError || Date.now() - lastReportAt < ttlMs) return
-    lastReportAt = Date.now()
+    if (!onError || now() - lastReportAt < ttlMs) return
+    lastReportAt = now()
     try { onError(err, command, failure) } catch { /* reporter must never break routing */ }
   }
   const fetch = async (): Promise<Snapshot> => {
+    const seq = ++fetchSeq
     try {
       const { stdout } = await run(command[0]!, command.slice(1), { timeout: timeoutMs, maxBuffer: 1_000_000 })
       const parsed = JSON.parse(stdout) as { providers?: Array<{ id?: string; kind?: string; raw?: unknown }> }
-      return { pools: format === "capacity-v1" ? parseCapacitySnapshot(parsed) : parseQuotaSnapshot(parsed), failed: false }
+      const pools = format === "capacity-v1" ? parseCapacitySnapshot(parsed) : parseQuotaSnapshot(parsed)
+      if (!lastGood || seq >= lastGood.seq) lastGood = { pools, fetchedAt: now(), seq }
+      return { pools, failed: false }
     } catch (err) {
-      // Missing command, timeout, non-zero exit, malformed result: quota is
-      // unknown (never unlimited). Surface the cause — a silent empty snapshot
-      // is indistinguishable from an exhausted plan under fail-closed routing.
-      report(err, { kind: classify(err) })
+      // Missing command, non-zero exit, malformed result: quota is unknown
+      // (never unlimited). A timeout may reuse a snapshot younger than ttlMs.
+      // Age is measured when the timeout fires, not when the fetch started.
+      // classify() treats SIGTERM/killed as timeout, so an operator kill can
+      // reuse last-good within ttlMs. Accepted — do not special-case it.
+      const kind = classify(err)
+      report(err, { kind })
+      const good = lastGood
+      if (kind === "timeout" && good && now() - good.fetchedAt < ttlMs) {
+        // Overwrite the ttlMs expiry armed at fetch start so the next admission
+        // re-probes within 5s. Pools ride this resolved snapshot so concurrent
+        // waiters share them; failed skips the missing-pool retry.
+        expires = now() + QUOTA_REPROBE_MS
+        return { pools: good.pools, failed: true }
+      }
       return { pools: new Map(), failed: true }
     }
   }
   return async (id) => {
-    if (!pending || Date.now() >= expires) {
-      expires = Date.now() + ttlMs
+    if (!pending || now() >= expires) {
+      expires = now() + ttlMs
       pending = fetch()
       retry = undefined
       missing = new Set()
@@ -132,7 +158,7 @@ export function commandQuotaFeed(
     if (snapshot.failed) {
       // The command itself failed: running it again right away would only cost a
       // second timeout and a second report. Unknown for this snapshot; re-poll soon.
-      expires = Math.min(expires, Date.now() + 5_000)
+      expires = Math.min(expires, now() + QUOTA_REPROBE_MS)
       return undefined
     }
     // A partial snapshot is unknown, not zero. Retry once per shared snapshot so
@@ -146,7 +172,7 @@ export function commandQuotaFeed(
           // failed on the retry. Unknowns get a short TTL, not a full minute.
           pending = Promise.resolve({ pools: new Map([...snapshot.pools, ...fresh.pools]), failed: false })
           if ([...missing].some((pool) => !fresh.pools.has(pool) && !snapshot.pools.has(pool))) {
-            expires = Math.min(expires, Date.now() + 5_000)
+            expires = Math.min(expires, now() + QUOTA_REPROBE_MS)
           }
         }
         return fresh
@@ -154,7 +180,7 @@ export function commandQuotaFeed(
     }
     const fresh = await retry
     if (!fresh.pools.has(id)) {
-      expires = Math.min(expires, Date.now() + 5_000)
+      expires = Math.min(expires, now() + QUOTA_REPROBE_MS)
       if (!fresh.failed) {
         const emitted = [...new Set([...snapshot.pools.keys(), ...fresh.pools.keys()])]
         report(new Error(`capacity checker ran but emitted no pool "${id}" (emitted: ${emitted.length ? emitted.join(", ") : "none"})`), { kind: "missing-pool", pool: id, emitted })

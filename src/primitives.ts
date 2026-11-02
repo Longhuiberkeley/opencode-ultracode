@@ -696,9 +696,10 @@ export class AgentRunner {
       // backoff; quota-shaped failures are NEVER retried on the same provider —
       // they fail over to the ordered fallback ladder in the SAME session (or
       // surface the typed error when nothing eligible remains). A continue that
-      // dies with 0 new work is promoted to quota. Aborts, schema errors and
-      // agent-resolution errors are never retried or failed over. Retries and
-      // failovers reuse the SAME registry record (one row per agent() call).
+      // dies with 0 new work keeps its typed class (quota only when a quota
+      // marker exists). Aborts, schema errors and agent-resolution errors are
+      // never retried or failed over. Retries and failovers reuse the SAME
+      // registry record (one row per agent() call).
       const attempts = clampRetryAttempts(opts.retry?.attempts, this.retryAttempts)
       const baseBackoffMs = clampRetryBackoffMs(opts.retry?.backoffMs, this.retryBackoffMs)
       const continueFn = this.driver.continueAgent
@@ -908,40 +909,6 @@ export class AgentRunner {
             }
             throw err
           }
-          // A continue that died with 0 new work is the observed 0-token
-          // instant-death shape: treat it as quota and stop probing.
-          if (attempt > 0 && err.noProgress === true) {
-            const promoted = promoteQuotaFailure(err)
-            this.reportProviderFailure(activeModel, promoted.failure)
-            if (failoverOn && this.explicitLiteral(failoverContext)) {
-              const recovered = await this.explicitQuotaRecovery(promoted, failoverContext, windowBudget, () =>
-                continuedSessionID !== undefined && continueFn !== undefined
-                  ? continueFn.call(
-                      this.driver,
-                      {
-                        sessionID: continuedSessionID,
-                        continuationPrompt: buildContinuationPrompt(prompt, windowWaitReason(promoted)),
-                        ...(opts.schema !== undefined ? { schema: opts.schema } : {}),
-                      },
-                      { signal: this.signal ?? NEVER_ABORTED.signal },
-                    )
-                  : spawnAttempt(),
-              )
-              if (recovered.kind === "result") {
-                result = recovered.result
-                break
-              }
-              if (recovered.kind === "exhausted") throw promoted
-            }
-            const failedOver = failoverOn
-              ? await this.tryFailover(promoted, "quota", failoverContext, continuedSessionID, providerHold)
-              : undefined
-            if (failedOver !== undefined) {
-              result = failedOver
-              break
-            }
-            throw promoted
-          }
           // Burst-shaped failures may use the configured retry budget; without
           // a burst classification the policy allows exactly ONE same-model
           // continue probe — never a blind retry loop.
@@ -1098,7 +1065,7 @@ export class AgentRunner {
           this.driver,
           {
             sessionID,
-            continuationPrompt: buildContinuationPrompt(context.prompt, failoverReason(from, candidate.model)),
+            continuationPrompt: buildContinuationPrompt(context.prompt, failoverReason(from, candidate.model, failureClass)),
             model: { ...candidate.model },
             ...(context.schema !== undefined ? { schema: context.schema } : {}),
           },
@@ -1204,9 +1171,9 @@ export class AgentRunner {
   /**
    * Explicit-model quota recovery: wait out the provider window, then retry —
    * continuing the SAME session when one exists, re-running the spawn when the
-   * quota failure raced session creation. A retry that dies quota-shaped (or
-   * as a 0-token no-progress promotion) re-quarantines the provider and the
-   * loop waits again, all bounded by the per-call budget. Returns:
+   * quota failure raced session creation. Only a retry classified as quota
+   * re-quarantines the provider and waits again, bounded by the per-call
+   * budget; any other re-failure surfaces unchanged. Returns:
    *  - "result"    — the child finished on the explicit model;
    *  - "authorized" — an authorized substitute appeared mid-wait (ask-mode
    *    resume override): the caller falls through to the normal ladder, which
@@ -1229,14 +1196,8 @@ export class AgentRunner {
       } catch (retryErr) {
         if (retryErr instanceof AgentCallError && retryErr.kind === "abort") throw retryErr
         if (!(retryErr instanceof AgentCallError) || retryErr.kind !== "outcome") throw retryErr
-        const failure =
-          retryErr.failure?.class === "quota"
-            ? retryErr.failure
-            : retryErr.noProgress === true
-              ? promoteQuotaFailure(retryErr).failure
-              : undefined
-        if (failure === undefined) throw retryErr
-        this.reportProviderFailure(context.dead, failure)
+        if (retryErr.failure?.class !== "quota") throw retryErr
+        this.reportProviderFailure(context.dead, retryErr.failure)
       }
     }
   }
@@ -1537,8 +1498,7 @@ function errorMessage(err: unknown): string {
  */
 function continuationReason(err: AgentCallError): string {
   if (err.failure?.class === "burst") return "transient provider rate limit (burst) — retrying on the same model"
-  if (err.failure?.class === "other") return "provider-side failure — retrying on the same model"
-  return "provider failure — same-model probe"
+  return err.continuationHint ?? "unclassified failure — same-model probe"
 }
 
 /**
@@ -1558,33 +1518,9 @@ function windowWaitReason(err: AgentCallError): string {
  * re-anchors the original request; the schema instruction is appended by the
  * driver when the call had one.
  */
-function failoverReason(from: ModelRef, to: ModelRef): string {
-  return `provider ${from.providerID} hit a rate limit/account quota on ${from.id} — continuing on ${to.providerID}/${to.id}`
-}
-
-/**
- * Promote a no-progress continue re-failure to a quota-shaped typed error.
- * Production showed 0-token instant deaths when a throttled/quota-exhausted
- * provider was re-prompted, so failover must see `class: "quota"` even when
- * the raw signal was only rate-limit shaped. Message/status/resetAt are
- * preserved; the reason records the promotion.
- */
-function promoteQuotaFailure(err: AgentCallError): AgentCallError {
-  const base = err.failure
-  const failure: FailureClassification = {
-    class: "quota",
-    ...(base?.message !== undefined ? { message: base.message } : {}),
-    ...(base?.status !== undefined ? { status: base.status } : {}),
-    ...(base?.resetAt !== undefined ? { resetAt: base.resetAt } : {}),
-    reason: `0-token instant re-failure after a same-session continue — treated as quota (${base?.reason ?? "unclassified"})`,
-  }
-  return new AgentCallError(
-    "outcome",
-    `${err.message} [promoted to quota: the continued turn produced no progress]`,
-    err.text,
-    failure,
-    true,
-  )
+function failoverReason(from: ModelRef, to: ModelRef, failureClass: "quota" | "burst" | "refusal"): string {
+  const cause = failureClass === "quota" ? "account quota" : failureClass === "burst" ? "rate limiting" : "content-policy refusal"
+  return `provider ${from.providerID} hit ${cause} on ${from.id} — continuing on ${to.providerID}/${to.id}`
 }
 
 /**

@@ -369,7 +369,8 @@ test("status transitions: running → paused → running → interrupted via /ul
   run.endedAt = now
   assert.equal(registry.setStatus("run_bg", "interrupted"), true)
   const doneCmd = await invoke("status run_bg", { registry })
-  assert.match(doneCmd.texts[0]!, /^run_bg · interrupted · agents 2\/2 · /)
+  // Numerator is succeeded, not the folded terminal sum (1 succeeded + 1 interrupted).
+  assert.match(doneCmd.texts[0]!, /^run_bg · interrupted · agents 1\/2 · interrupted 1 · /)
   const doneTool = resolveRunStatus(registry, "run_bg", registry.activeRuns())
   assert.equal(doneTool.ok, true)
   if (doneTool.ok) {
@@ -1389,7 +1390,7 @@ test("show reports the graph size and marks the script as compiled output", asyn
 // Orchestrator status enrichment + settle notice (v0.5.0 control plane)
 // ---------------------------------------------------------------------------
 
-import { buildResultChunk, enrichStatusPayload, formatSettleNotice } from "../src/command.ts"
+import { buildResultChunk, enrichStatusPayload, formatSettleNotice, formatStatusRun } from "../src/command.ts"
 
 const payloadOf = (run: RunRecord) => ({
   runID: run.id,
@@ -1591,6 +1592,154 @@ test("formatSettleNotice: truncated result points at the recovery paths", () => 
   assert.match(line, /full result: ultracode_result \{ runID: "run_abc", offset, maxLength \}/)
   assert.match(line, /\/ultracode result run_abc/)
   assert.match(line, /detail: ultracode_status \/ ctrl\+g/)
+})
+
+test("settle truth: succeeded run with a failed child names the child without setting run.error", () => {
+  const death = "child died: exceeded 900000ms"
+  const run = baseRun({
+    status: "succeeded",
+    result: { priceOk: [1, 2, 3] },
+    agents: [
+      { id: "a1", status: "succeeded", label: "ok" },
+      { id: "a2", status: "failed", label: "dead", phase: "scan", error: death },
+    ],
+  })
+  const out = enrichStatusPayload(payloadOf(run), run, 5_000)
+  assert.equal(out.error, undefined)
+  assert.equal("error" in out, false)
+  assert.equal(run.error, undefined)
+  assert.equal(out.badAgents.length, 1)
+  assert.equal(out.badAgentsOmitted, 0)
+  assert.equal(out.badAgents[0]!.id, "a2")
+  assert.equal(out.badAgents[0]!.label, "dead")
+  assert.equal(out.badAgents[0]!.phase, "scan")
+  assert.equal(out.badAgents[0]!.error, death)
+  assert.equal(out.children[1]!.error, death)
+  assert.equal("error" in (out.children[0] as object), false)
+
+  const gated = baseRun({
+    status: "failed",
+    error: "priceOk.length < 6",
+    agents: [{ id: "a9", status: "failed", error: "session.wait exceeded 900000ms" }],
+  })
+  const gatedOut = enrichStatusPayload(payloadOf(gated), gated, 5_000)
+  assert.equal(gatedOut.error, "priceOk.length < 6")
+  assert.equal(gatedOut.badAgents[0]!.error, "session.wait exceeded 900000ms")
+})
+
+test("formatSettleNotice names a failed child even when envelope.error is unset", () => {
+  const open = formatSettleNotice({
+    runID: "run_h4",
+    status: "succeeded",
+    durationMs: 10,
+    agents: { total: 26, succeeded: 25, failed: 1, interrupted: 0 },
+    truncated: false,
+    result: { ok: true },
+    badAgents: [{ id: "a7", label: "scout", status: "failed", error: "child died: bridge exploded" }],
+    badAgentsOmitted: 0,
+  })
+  assert.match(open, /agents 25\/26/)
+  assert.match(open, /failed 1/)
+  assert.match(open, /child died: bridge exploded/)
+  assert.doesNotMatch(open, /error:/)
+
+  const gated = formatSettleNotice({
+    runID: "run_offr",
+    status: "failed",
+    durationMs: 10,
+    agents: { total: 6, succeeded: 1, failed: 5, interrupted: 0 },
+    truncated: false,
+    error: "priceOk.length < 6",
+    badAgents: [{ id: "a3", status: "failed", error: "exceeded 900000ms" }],
+  })
+  assert.match(gated, /error: priceOk\.length < 6/)
+  assert.match(gated, /failed 1/)
+  assert.match(gated, /exceeded 900000ms/)
+})
+
+test("formatStatusRun and the list line use succeeded/total, not the terminal sum", async () => {
+  const run = baseRun({
+    id: "run_h4i6hqhfilgi",
+    name: "h4",
+    status: "succeeded",
+    endedAt: 2_000,
+    agents: [
+      { id: "a1", status: "succeeded" },
+      { id: "a2", status: "failed", error: "child died: bridge exploded" },
+    ],
+  })
+  const line = formatStatusRun(run, 2_000)
+  assert.match(line, /agents 1\/2/)
+  assert.match(line, /failed 1/)
+  assert.doesNotMatch(line, /agents 2\/2/)
+
+  const registry = new FakeRegistry()
+  seed(registry, run)
+  const { texts } = await invoke("", { registry })
+  assert.match(texts[0]!, /agents 1\/2/)
+  assert.match(texts[0]!, /failed 1/)
+  assert.doesNotMatch(texts[0]!, /agents 2\/2/)
+})
+
+test("buildResultChunk keeps the death string off the compact chunk", () => {
+  const death = "child died: bridge exploded"
+  const result = { priceOk: [1, 2, 3, 4, 5] }
+  const run = baseRun({
+    status: "succeeded",
+    result,
+    agents: [
+      { id: "a1", status: "succeeded" },
+      { id: "a2", status: "failed", label: "dead", error: death },
+    ],
+  })
+  const out = buildResultChunk(run, undefined, {})
+  assert.ok(out.ok)
+  assert.deepEqual(JSON.parse(out.view.chunk), result)
+  assert.equal(out.view.chunk.includes(death), false)
+  assert.equal(out.view.childFailures.length, 1)
+  assert.equal(out.view.childFailures[0]!.error, death)
+  assert.equal(out.view.childFailuresOmitted, 0)
+  assert.equal(out.view.status, "succeeded")
+})
+
+test("formatShowRun lists the failed child's error outside the status cell", () => {
+  const agent: AgentRecord = {
+    id: "a3",
+    label: "seeker",
+    phase: "extract",
+    status: "failed",
+    error: "child died: bridge exploded",
+    sessionID: "ses_1",
+  }
+  const run = baseRun({
+    id: "run_show",
+    status: "succeeded",
+    agents: [agent, { id: "a1", status: "succeeded", sessionID: "ses_ok" }],
+    script: "return 1",
+  })
+  const text = formatShowRun(run)
+  const row = [...agentCells(agent), "ses_1"].join(" | ")
+  assert.ok(text.includes(`| ${row} |`), text)
+  assert.equal(row.split(" | ").length, 8, "show table stays 7 agent cells + session")
+  assert.match(text, /### Failed children/)
+  assert.match(text, /`a3` seeker — failed — child died: bridge exploded/)
+  assert.doesNotMatch(text.split("### Failed children")[0]!, /bridge exploded/)
+})
+
+test("badAgents is not clipped by the children slice and snippets long errors", () => {
+  const long = "x".repeat(400)
+  const agents = [
+    ...Array.from({ length: 50 }, (_, i) => ({ id: `a${i + 1}`, status: "succeeded" as const })),
+    { id: "a51", status: "failed" as const, label: "tail", error: long },
+  ]
+  const run = baseRun({ status: "succeeded", agents })
+  const out = enrichStatusPayload(payloadOf(run), run)
+  assert.equal(out.children.length, 50)
+  assert.equal(out.children.some((c) => c.agentID === "a51"), false)
+  assert.equal(out.badAgents.length, 1)
+  assert.equal(out.badAgents[0]!.id, "a51")
+  assert.equal(out.badAgents[0]!.error!.length, 300)
+  assert.equal(out.badAgentsOmitted, 0)
 })
 
 test("formatSettleNotice: failed run surfaces the error; long results are capped", () => {

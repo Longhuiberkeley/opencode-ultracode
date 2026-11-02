@@ -36,7 +36,7 @@ import { addTokens, emptyTokens, isActiveRunStatus } from "./types.ts"
 import { modelPinString, normalizeModelRef } from "./agent-pins.ts"
 import { freezeEffective, panelSettingsFrom, remainingTimeoutMs } from "./settings.ts"
 import { buildEnvelope, resultFits } from "./serialize.ts"
-import { createSessionDriver } from "./sessions.ts"
+import { createSessionDriver, SESSION_AWAIT_TIMEOUT_MS } from "./sessions.ts"
 import type { SessionDriver } from "./sessions.ts"
 import {
   AgentRunner,
@@ -612,6 +612,8 @@ export class SupervisorImpl implements Supervisor {
   private readonly availableModels: SupervisorDeps["availableModels"]
   private router: ModelRouter | undefined
   private readonly runs = new Map<string, RunState>()
+  /** session.wait budgets, keyed by sessionID. Present only while that wait is in flight. */
+  private readonly waitBudgets = new Map<string, { extend: () => void }>()
   private disposed = false
 
   /** Frozen per-run guard, scoped to a child actually owned by this supervisor. */
@@ -647,6 +649,11 @@ export class SupervisorImpl implements Supervisor {
         const owned = this.registry.agentForSession(event.sessionID)
         if (!owned) return
         this.registry.appendEvent(owned.runID, event.kind, `${event.sessionID}${event.detail ? ` ${event.detail}` : ""}`)
+      },
+      // Wait-arm only. noteToolTerminal calls extend; noteChildActivity does not.
+      onWaitBudget: (sessionID, ctl) => {
+        if (ctl) this.waitBudgets.set(sessionID, ctl)
+        else this.waitBudgets.delete(sessionID)
       },
     })
     // Composition seam: injected fresh loader wins; else prefer
@@ -726,10 +733,12 @@ export class SupervisorImpl implements Supervisor {
     // but the permission stall watchdog reads it off this record — keep it.
     // Same for the loop caps: a run must always answer "what cap did this
     // run enforce?" — the nesting cap even without an override, the iteration
-    // ceiling only when one was passed.
+    // ceiling only when one was passed. awaitTimeoutMs is the live constant,
+    // not a panel key — set it explicitly (panelSettingsFrom drops it).
     record.effective = {
       ...panelSettingsFrom(effective),
       permissionStallMs: effective.permissionStallMs,
+      awaitTimeoutMs: SESSION_AWAIT_TIMEOUT_MS,
       maxLoopDepth: effective.maxLoopDepth,
       ...(input.maxLoopIterations !== undefined ? { maxLoopIterations: input.maxLoopIterations } : {}),
     }
@@ -1548,6 +1557,16 @@ export class SupervisorImpl implements Supervisor {
         if (owned) this.registry.noteAgentActivity(owned.runID, owned.agentID, now)
       }
     }
+  }
+
+  /**
+   * Push the live session.wait deadline after a terminal tool event.
+   * No-op when no wait budget is registered, the wait has settled, or the
+   * 2× hard cap is already reached. Does not read or bump lastActivityAt —
+   * silence detection stays on noteChildActivity.
+   */
+  noteToolTerminal(sessionID: string): void {
+    this.waitBudgets.get(sessionID)?.extend()
   }
 
   /** Per-child cadence for persisting lastActivityAt (cheap, throttled). */

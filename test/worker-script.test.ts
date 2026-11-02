@@ -380,7 +380,7 @@ test("worker: return value with throwing getter fails fast (completion payload g
   assert.ok(Date.now() - started < 2000, "fails fast — no watchdog wait")
 })
 
-test("worker: uncloneable bridge arg rejects agent() promptly (no hang)", async () => {
+test("worker: uncloneable bridge arg fails the run even if the script catches (no hang)", async () => {
   const started = Date.now()
   const result = await runInWorker(`
     try {
@@ -390,9 +390,38 @@ test("worker: uncloneable bridge arg rejects agent() promptly (no hang)", async 
       return "caught: " + e.message;
     }
   `)
-  assert.equal(result.ok, true)
-  assert.match(String(result.value), /ultracode: bridge call could not be delivered/)
+  assert.equal(result.ok, false)
+  assert.match(result.error ?? "", /bridge call could not be delivered/)
   assert.ok(Date.now() - started < 2000, "rejected promptly — no hang")
+})
+
+test("worker: uncloneable arg inside parallel() fails the run, not a null slot", async () => {
+  const result = await runInWorker(`
+    const slots = await parallel([() => agent("hi", { weird: function () {} })]);
+    return slots;
+  `)
+  assert.equal(result.ok, false)
+  assert.match(result.error ?? "", /bridge call could not be delivered/)
+})
+
+test("worker: a caught host onCall rejection still returns ok", async () => {
+  const result = await runInWorker(
+    `
+    try {
+      await agent("hi");
+      return "no-throw";
+    } catch (e) {
+      return "caught: " + e.message;
+    }
+  `,
+    {
+      onCall: async () => {
+        throw new Error("child failed")
+      },
+    },
+  )
+  assert.equal(result.ok, true)
+  assert.match(String(result.value), /caught: child failed/)
 })
 
 // ---------------------------------------------------------------------------

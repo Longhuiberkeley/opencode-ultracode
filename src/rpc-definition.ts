@@ -156,6 +156,9 @@ export const ULTRACODE_RPC = {
                       // queue/permit/quarantine/pause visibility).
                       waitReason: { type: "string" as const },
                       toolCalls: NUMBER,
+                      // Child death text. Undeclared keys fail the whole runStatus
+                      // call (rpc.invalid_output). Absent must stay absent.
+                      error: { type: "string" as const },
                     },
                   },
                 },
@@ -168,6 +171,8 @@ export const ULTRACODE_RPC = {
                     done: NUMBER,
                     total: NUMBER,
                     failed: NUMBER,
+                    // Additive. `done` stays the terminal sum for existing clients.
+                    succeeded: NUMBER,
                   },
                 },
               },

@@ -30,12 +30,12 @@ export class AgentCallError extends Error {
   readonly failure?: FailureClassification
   /**
    * CONTINUATION-ONLY signal: the continued turn produced no usable progress —
-   * empty assistant text and no token growth (production: instant 0-token
-   * provider deaths). The runner promotes such a re-failure to quota-shaped
-   * handling instead of burning more same-model probes. Undefined on the
-   * first (created-session) turn.
+   * empty assistant text and no token growth. This is an observable, not
+   * evidence of provider quota. Undefined on the first (created-session) turn.
    */
   readonly noProgress?: boolean
+  /** Observable-only guidance for the existing same-session probe. */
+  readonly continuationHint?: string
 
   constructor(
     kind: AgentErrorKind,
@@ -43,6 +43,7 @@ export class AgentCallError extends Error {
     text?: string,
     failure?: FailureClassification,
     noProgress?: boolean,
+    continuationHint?: string,
   ) {
     super(message)
     this.name = "AgentCallError"
@@ -50,6 +51,7 @@ export class AgentCallError extends Error {
     this.text = text
     this.failure = failure
     this.noProgress = noProgress
+    this.continuationHint = continuationHint
   }
 }
 
@@ -151,19 +153,45 @@ export interface SessionDriverOptions {
    */
   controlTimeoutMs?: number
   /**
-   * Per-RPC deadline for prompt/wait in ms — the backstop for a hung session
-   * RPC on a child that is legitimately ALLOWED to run for minutes. The
-   * childStallMs watchdog owns "silent child" intervention; this owns
-   * "transport never returned". Default SESSION_AWAIT_TIMEOUT_MS (15 min).
-   * <=0 disables.
+   * Per-RPC deadline for prompt/wait in ms. The session.prompt arm is the
+   * backstop for a host RPC that never returned ("transport never returned").
+   * The session.wait arm is an await budget on a live session: session.wait
+   * staying open after session.prompt returned is the host idle-wait contract,
+   * not a dead socket. childStallMs owns silent-child intervention and only
+   * fires on silence; it does not bound a wait that is still running tools.
+   * Default SESSION_AWAIT_TIMEOUT_MS (900_000). <=0 disables.
    */
   awaitTimeoutMs?: number
   /**
+   * Wait-arm only. Called with `{ extend }` when session.wait starts and with
+   * `undefined` when that wait settles (resolve, reject, or abort). `extend`
+   * reschedules the single await-budget timer. Do not call it for streaming,
+   * session.tool.progress, session.tool.called, permission events, or a raw
+   * last-activity bump. Emitter failures are swallowed.
+   */
+  onWaitBudget?: (sessionID: string, ctl: { extend: () => void } | undefined) => void
+  /**
+   * Deadline-only interrupt confirm window in ms. The deadline races
+   * `session.interrupt` against this bound and then continues — a settled
+   * promise is confirmation, a timeout is abandoned (RPC detached, not
+   * awaited). Distinct from SESSION_CONTROL_TIMEOUT_MS (60s). Default
+   * INTERRUPT_CONFIRM_MS (3s), which must stay under SETTLE_GRACE_MS (15s).
+   * Abort does not use this window. <=0 confirms only if interrupt has
+   * already settled; otherwise it abandons on the next timer turn.
+   */
+  interruptConfirmMs?: number
+  /**
+   * Wait-arm only: one bounded `session.context` read after interrupt
+   * confirm. Default SALVAGE_CONTEXT_MS (3s). Never the 60s control
+   * timeout. Hang or throw suffixes `salvage=unavailable` and still rejects.
+   */
+  salvageContextMs?: number
+  /**
    * Lifecycle event tap (optional): the driver emits one event per RPC
    * boundary (session.create, prompt.start/return, wait.start/return,
-   * session.get, session.context, schema.validate/repair) so the caller can
-   * maintain the run's bounded post-mortem ring. Never throws into the
-   * driver: emitter failures are swallowed.
+   * session.get, session.context, schema.validate/repair, interrupt.*) so
+   * the caller can maintain the run's bounded post-mortem ring. Never
+   * throws into the driver: emitter failures are swallowed.
    */
   onEvent?: (event: { kind: string; sessionID?: string; detail?: string }) => void
 }
@@ -175,12 +203,51 @@ export interface SessionDriverOptions {
 export const SESSION_CONTROL_TIMEOUT_MS = 60_000
 
 /**
- * Default prompt/wait deadline. 15 minutes: comfortably above a normal long
- * child turn (the childStallMs scanner interrupts silent children well before
- * this), while guaranteeing a genuinely hung RPC lands in a TERMINAL child
- * status instead of wedging the run until the wall-clock watchdog.
+ * Default prompt/wait deadline (900_000ms). Equals the childStallMs default,
+ * but that watchdog only fires on silence — session.wait staying open is
+ * normal while tools run, so this deadline is not "transport never returned"
+ * for the wait arm. A wait with no tool-terminal extend still rejects here.
+ * Tool-terminal events may push that one deadline, never past
+ * SESSION_AWAIT_HARD_CAP_MS from wait start.
  */
 export const SESSION_AWAIT_TIMEOUT_MS = 15 * 60_000
+
+/**
+ * Hard cap for one session.wait arm: 2× the default await budget (30 min).
+ * Each wait (including each schema-repair prompt) has its own cap. There is
+ * no per-child-lifetime cap.
+ */
+export const SESSION_AWAIT_HARD_CAP_MS = 2 * SESSION_AWAIT_TIMEOUT_MS
+
+/**
+ * Deadline-path interrupt confirm (3s). Not SESSION_CONTROL_TIMEOUT_MS.
+ * Must stay under SETTLE_GRACE_MS (15_000) so a hung interrupt cannot hold
+ * supervisor.settle past the grace window. Abort does not wait this long.
+ */
+export const INTERRUPT_CONFIRM_MS = 3_000
+
+/**
+ * One bounded session.context read after a wait-arm deadline (3s). Not the
+ * 60s control timeout. Confirm + salvage (6s) stays under SETTLE_GRACE_MS.
+ */
+export const SALVAGE_CONTEXT_MS = 3_000
+
+/**
+ * Continuation guidance for the failed-outcome/tool-calls shape (all tools
+ * completed, no exposed error). This string becomes the probe/failover reason
+ * (primitives) and can be echoed back in a retry's failure text, so it must
+ * never contain a quota or burst marker word ("quota", "usage limit",
+ * "rate limit", "429", "too many requests") — the classifier would then
+ * quarantine a healthy provider. Pinned by failure-classify tests.
+ */
+export const TOOL_CALLS_CONTINUATION_HINT =
+  "finish=tool-calls with completed tool results and no exposed error; continue using those results; treat this as a normal continuation, not a provider problem"
+
+/** Event-ring detail cap (registry slices at 300). Interrupt details must fit. */
+const INTERRUPT_EVENT_DETAIL_MAX = 300
+
+/** How many runtime tool parts a deadline error names. */
+const SALVAGE_TOOL_CAP = 8
 
 /** Result of structured-output resolution (fields present when repaired). */
 interface StructuredOutcome {
@@ -220,6 +287,8 @@ export function createSessionDriver(sessions: SessionCtx, options: SessionDriver
   const snippetChars = options.errorTextSnippetChars ?? 500
   const controlMs = options.controlTimeoutMs ?? SESSION_CONTROL_TIMEOUT_MS
   const awaitMs = options.awaitTimeoutMs ?? SESSION_AWAIT_TIMEOUT_MS
+  const confirmMs = finiteMs(options.interruptConfirmMs, INTERRUPT_CONFIRM_MS)
+  const salvageMs = finiteMs(options.salvageContextMs, SALVAGE_CONTEXT_MS)
   // Best-effort lifecycle tap: an emitter failure must never break a child.
   const emit = (kind: string, sessionID?: string, detail?: string): void => {
     if (options.onEvent === undefined) return
@@ -315,7 +384,14 @@ export function createSessionDriver(sessions: SessionCtx, options: SessionDriver
     signal: AbortSignal,
     turn: TurnContext = {},
   ): Promise<AgentResult> {
-    await promptAndWait(sessions, sessionID, promptText, signal, awaitMs, emit)
+    await promptAndWait(sessions, sessionID, promptText, signal, {
+      awaitMs,
+      confirmMs,
+      salvageMs,
+      snippetChars,
+      emit,
+      onWaitBudget: options.onWaitBudget,
+    })
 
     // Outcome + last assistant message. A failed outcome is the primary
     // error; a succeeded outcome with a missing/unreadable assistant message
@@ -326,6 +402,17 @@ export function createSessionDriver(sessions: SessionCtx, options: SessionDriver
     if (info.outcome !== "succeeded") {
       const detail = describeSessionFailure(info, first.message)
       const tokens = info.tokens ?? first.message?.tokens
+      // Runtime tool parts pass through context without widening ContextMessage.
+      // Describe only what is exposed; completed tools do not identify the cause.
+      const tools = first.message?.content?.filter((part) => part.type === "tool") ?? []
+      const continuationHint =
+        info.outcome === "failed" && !info.error && first.message?.error === undefined &&
+        first.message?.finish === "tool-calls" &&
+        !first.message.content?.some((part) => part.type === "error") &&
+        tools.length > 0 && tools.every((part) =>
+          (part as { state?: { status?: string } }).state?.status === "completed")
+          ? TOOL_CALLS_CONTINUATION_HINT
+          : undefined
       throw new AgentCallError(
         "outcome",
         `agent session outcome "${info.outcome ?? "unknown"}"${detail ? `: ${snippet(detail, snippetChars)}` : ""}` +
@@ -333,6 +420,7 @@ export function createSessionDriver(sessions: SessionCtx, options: SessionDriver
         first.text,
         classifySessionFailure(info, first.message, first.text),
         turn.continuation === true ? !turnProgressed(turn.beforeTokens, tokenTotal(tokens), first.text) : undefined,
+        continuationHint,
       )
     }
     const result: AgentResult = {
@@ -512,7 +600,14 @@ export function createSessionDriver(sessions: SessionCtx, options: SessionDriver
             ? "\nStart your reply with { or [ and end with the matching closing bracket. No prose, no markdown fences, no trailing commas, no comments."
             : "\nOutput the bare JSON value only — a quoted string, a number, true/false, or null. No prose, no markdown fences."
           : "")
-      await promptAndWait(sessions, sessionID, buildPromptText(repairPrompt, schema), signal, awaitMs, emit)
+      await promptAndWait(sessions, sessionID, buildPromptText(repairPrompt, schema), signal, {
+        awaitMs,
+        confirmMs,
+        salvageMs,
+        snippetChars,
+        emit,
+        onWaitBudget: options.onWaitBudget,
+      })
       const info = await withDeadline("session.get", sessionID, sessions.get({ sessionID }), controlMs)
       emit("session.get", sessionID)
       reply = await readAssistantReply(sessions, sessionID, info.outcome)
@@ -674,7 +769,7 @@ export function buildPromptText(prompt: string, schema?: Json): string {
  */
 export function buildContinuationPrompt(originalPrompt: string, reason: string): string {
   return [
-    "The previous turn of this session was interrupted by a provider failure before it completed.",
+    "The previous turn of this session did not complete.",
     `Reason: ${reason}`,
     "Your previous turn may be EMPTY — if it produced no usable output, do the original task now from the start.",
     "If you already produced partial work, do not repeat it; finish the task and reply with the final result only.",
@@ -703,38 +798,100 @@ function turnProgressed(before: number | undefined, after: number | undefined, t
   return after !== undefined && after > 0
 }
 
+interface PromptWaitOpts {
+  awaitMs: number
+  confirmMs: number
+  salvageMs: number
+  snippetChars: number
+  emit: (kind: string, sessionID?: string, detail?: string) => void
+  onWaitBudget?: SessionDriverOptions["onWaitBudget"]
+}
+
 async function promptAndWait(
   sessions: SessionCtx,
   sessionID: string,
   text: string,
   signal: AbortSignal,
-  awaitMs: number = SESSION_AWAIT_TIMEOUT_MS,
-  emit: (kind: string, sessionID?: string, detail?: string) => void = () => {},
+  opts: PromptWaitOpts,
 ): Promise<void> {
-  const interrupt = () => {
+  // Abort stays immediate best-effort. Do not await interruptSafe here, and
+  // do not run the deadline confirm helper on this path (a settled promise is
+  // not confirmation, and abort must not wait INTERRUPT_CONFIRM_MS).
+  const abortInterrupt = () => {
     void interruptSafe(sessions, sessionID)
   }
-  // Per-await deadline: a hung prompt/wait RPC rejects typed (`timeout`) and
-  // best-effort interrupts the session, so the child lands in a TERMINAL
-  // status instead of wedging the run until the wall-clock watchdog. The
-  // signal and the deadline race in ONE combinator so an abort clears the
-  // deadline timer — an abandoned timer would hold the loop for its full
-  // window.
-  emit("prompt.start", sessionID)
-  await raceDeadline("session.prompt", sessionID, sessions.prompt({ sessionID, text }), signal, awaitMs, interrupt)
-  emit("prompt.return", sessionID)
-  emit("wait.start", sessionID)
-  await raceDeadline("session.wait", sessionID, sessions.wait({ sessionID }), signal, awaitMs, interrupt)
-  emit("wait.return", sessionID)
+  const confirm: DeadlineConfirm = {
+    sessions,
+    confirmMs: opts.confirmMs,
+    salvageMs: opts.salvageMs,
+    snippetChars: opts.snippetChars,
+    emit: opts.emit,
+  }
+  // Per-await deadline: a hung prompt RPC rejects typed (`timeout`, hung-RPC
+  // sentence) after a bounded interrupt confirm. The wait arm starts only
+  // after prompt.return — session.wait staying open is the host idle
+  // contract, so that arm uses the await-budget sentence, a single
+  // reschedulable timer, and a bounded context salvage. The signal and the
+  // deadline race in ONE combinator so an abort clears the deadline timer —
+  // an abandoned timer would hold the loop for its full window.
+  opts.emit("prompt.start", sessionID)
+  await raceDeadline(
+    "session.prompt",
+    sessionID,
+    sessions.prompt({ sessionID, text }),
+    signal,
+    opts.awaitMs,
+    abortInterrupt,
+    "hung",
+    undefined,
+    confirm,
+  )
+  opts.emit("prompt.return", sessionID)
+  opts.emit("wait.start", sessionID)
+  await raceDeadline(
+    "session.wait",
+    sessionID,
+    sessions.wait({ sessionID }),
+    signal,
+    opts.awaitMs,
+    abortInterrupt,
+    "await-budget",
+    opts.onWaitBudget,
+    confirm,
+  )
+  opts.emit("wait.return", sessionID)
+}
+
+/**
+ * Hard cap for one wait arm. Production (default await budget) uses the named
+ * constant. An injected awaitTimeoutMs keeps the same 2× ratio so a unit test
+ * can reach the cap without sleeping SESSION_AWAIT_HARD_CAP_MS.
+ */
+function awaitBudgetHardCapMs(awaitMs: number): number {
+  return awaitMs === SESSION_AWAIT_TIMEOUT_MS ? SESSION_AWAIT_HARD_CAP_MS : 2 * awaitMs
 }
 
 /**
  * Race a session promise against BOTH an AbortSignal and a deadline. On
- * abort: the typed abort error (existing semantics). On deadline: the typed
- * timeout error. Either way `onFire` runs best-effort FIRST (interrupt) and
- * every arm is cleared on any settle — a ref'd deadline timer must never be
- * abandoned by an early abort rejection (it would hold the event loop for
- * the full window).
+ * abort: the typed abort error plus immediate best-effort interrupt (not the
+ * confirm helper, and not a 3s wait). On deadline: clear the timer and close
+ * `extend()` BEFORE confirm, then a bounded interrupt confirm. A ref'd
+ * deadline timer must never be abandoned by an early abort rejection (it
+ * would hold the event loop for the full window).
+ *
+ * If abort arrives during confirm, reject `abort` immediately and detach
+ * confirm — do not wait out the confirm window. If the session promise
+ * settles during confirm, ignore it. Do not flip a deadline into
+ * `kind: outcome`.
+ *
+ * `hung` (session.prompt) rejects with "the host session RPC appears hung"
+ * plus the interrupt token. No salvage on that arm. `await-budget`
+ * (session.wait only) rejects with the live-session sentence plus the
+ * interrupt token plus the salvage suffix. Elapsed is time since this wait
+ * arm started — never a label read from lastActivityAt. The wait arm has
+ * one timer; `extend()` clears it before arming the next, and is a no-op
+ * once the wait has settled, the deadline handler has started, or now is
+ * already at the hard cap.
  */
 function raceDeadline<T>(
   label: string,
@@ -742,46 +899,355 @@ function raceDeadline<T>(
   p: Promise<T>,
   signal: AbortSignal,
   ms: number,
-  onFire: () => void,
+  onAbortFire: () => void,
+  mode: "hung" | "await-budget" = "hung",
+  onWaitBudget?: SessionDriverOptions["onWaitBudget"],
+  confirm?: DeadlineConfirm,
 ): Promise<T> {
-  if (!(ms > 0)) return raceAbort(p, signal, onFire)
+  if (!(ms > 0)) return raceAbort(p, signal, onAbortFire)
   return new Promise<T>((resolve, reject) => {
     let timer: ReturnType<typeof setTimeout> | undefined
-    const cleanup = () => {
+    let settled = false
+    let deadlineStarted = false
+    let budgetOpen = false
+    let detachConfirm: () => void = () => {}
+    const waitStartedAt = Date.now()
+    const hardCapAt = waitStartedAt + (mode === "await-budget" ? awaitBudgetHardCapMs(ms) : ms)
+    const closeBudget = () => {
+      if (!budgetOpen) return
+      budgetOpen = false
+      try {
+        onWaitBudget?.(sessionID, undefined)
+      } catch {
+        // tap must not break the wait
+      }
+    }
+    const clearTimer = () => {
       if (timer !== undefined) clearTimeout(timer)
+      timer = undefined
+    }
+    const finish = (fn: () => void) => {
+      if (settled) return
+      settled = true
+      clearTimer()
+      detachConfirm()
       signal.removeEventListener("abort", onAbortFn)
+      closeBudget()
+      fn()
     }
     const onAbortFn = () => {
-      cleanup()
-      onFire()
-      reject(new AgentCallError("abort", "agent aborted: run stopping"))
+      // Confirm already called interrupt. A second awaited interrupt would
+      // re-introduce the unbounded wait this path exists to remove.
+      const alreadyConfirming = deadlineStarted
+      finish(() => {
+        if (!alreadyConfirming) onAbortFire()
+        reject(new AgentCallError("abort", "agent aborted: run stopping"))
+      })
+    }
+    const onTimeout = () => {
+      if (settled || deadlineStarted) return
+      deadlineStarted = true
+      // Close extend() before confirm so a tool.success during the confirm
+      // window cannot reschedule a second interrupt.
+      clearTimer()
+      closeBudget()
+      const elapsed = Date.now() - waitStartedAt
+      const run = confirmDeadline(sessionID, label, mode, ms, elapsed, confirm, () => settled, (detach) => {
+        detachConfirm = detach
+      })
+      void run.then(
+        (message) => {
+          if (settled) return
+          finish(() => {
+            reject(new AgentCallError("timeout", message))
+          })
+        },
+        () => {
+          if (settled) return
+          const token = "interrupt error"
+          const base =
+            mode === "await-budget"
+              ? `session.wait on session ${sessionID} exceeded ${elapsed}ms — await budget exceeded on a live session (session.prompt already returned)`
+              : `${label} on session ${sessionID} exceeded ${ms}ms — the host session RPC appears hung`
+          const salvage = mode === "await-budget" ? "salvage=unavailable" : ""
+          finish(() => {
+            reject(new AgentCallError("timeout", joinParts([base, token, salvage])))
+          })
+        },
+      )
+    }
+    // clearTimeout the previous timer before arming the next one. Forgetting
+    // the clear means the original deadline still interrupts after extend().
+    const armTimer = (delay: number) => {
+      clearTimer()
+      timer = setTimeout(onTimeout, Math.max(0, delay))
+    }
+    const extend = () => {
+      if (mode !== "await-budget" || settled || deadlineStarted) return
+      const now = Date.now()
+      if (now >= hardCapAt) return
+      const deadline = Math.min(now + ms, hardCapAt)
+      armTimer(deadline - now)
     }
     if (signal.aborted) {
       onAbortFn()
       return
     }
     signal.addEventListener("abort", onAbortFn, { once: true })
-    timer = setTimeout(() => {
-      cleanup()
-      onFire()
-      reject(
-        new AgentCallError(
-          "timeout",
-          `${label} on session ${sessionID} exceeded ${ms}ms — the host session RPC appears hung`,
-        ),
-      )
-    }, ms)
+    // Arm first so a synchronous extend() during registration reschedules
+    // this timer instead of being cleared by the initial arm.
+    armTimer(mode === "await-budget" ? Math.min(ms, Math.max(0, hardCapAt - Date.now())) : ms)
+    if (mode === "await-budget" && onWaitBudget !== undefined) {
+      budgetOpen = true
+      try {
+        onWaitBudget(sessionID, { extend })
+      } catch {
+        // tap must not break the wait
+      }
+    }
     p.then(
       (v) => {
-        cleanup()
-        resolve(v)
+        // Deadline already won. A late session.wait must not become kind outcome.
+        if (deadlineStarted) return
+        finish(() => resolve(v))
       },
       (err) => {
-        cleanup()
-        reject(err)
+        if (deadlineStarted) {
+          // Swallow: the deadline rejection is the contract, and an unhandled
+          // late rejection must not escape.
+          return
+        }
+        finish(() => reject(err))
       },
     )
   })
+}
+
+interface DeadlineConfirm {
+  sessions: SessionCtx
+  confirmMs: number
+  salvageMs: number
+  snippetChars: number
+  emit: (kind: string, sessionID?: string, detail?: string) => void
+}
+
+type InterruptOutcome = "confirmed" | "error" | "abandoned"
+
+function finiteMs(value: number | undefined, fallback: number): number {
+  if (value === undefined || !Number.isFinite(value)) return fallback
+  return Math.max(0, value)
+}
+
+function joinParts(parts: string[]): string {
+  return parts.filter((part) => part !== "").join("; ")
+}
+
+type BoundResult<T> =
+  | { status: "ok"; value: T }
+  | { status: "error"; error: unknown }
+  | { status: "abandoned" }
+
+/** Race `p` against `ms`. Detach swallows a later settle so it cannot reject unhandled. */
+function raceBound<T>(p: Promise<T>, ms: number): { promise: Promise<BoundResult<T>>; detach: () => void } {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let settled = false
+  let resolve!: (result: BoundResult<T>) => void
+  const promise = new Promise<BoundResult<T>>((res) => {
+    resolve = res
+  })
+  const finish = (result: BoundResult<T>) => {
+    if (settled) return
+    settled = true
+    if (timer !== undefined) clearTimeout(timer)
+    timer = undefined
+    resolve(result)
+  }
+  const swallow = () => {
+    p.then(
+      () => {},
+      () => {},
+    )
+  }
+  const detach = () => {
+    swallow()
+    finish({ status: "abandoned" })
+  }
+  timer = setTimeout(() => {
+    swallow()
+    finish({ status: "abandoned" })
+  }, Math.max(0, ms))
+  p.then(
+    (value) => finish({ status: "ok", value }),
+    (error) => finish({ status: "error", error }),
+  )
+  return { promise, detach }
+}
+
+function asPromise<T>(work: () => Promise<T> | T): Promise<T> {
+  try {
+    return Promise.resolve(work())
+  } catch (err) {
+    return Promise.reject(err)
+  }
+}
+
+/**
+ * Deadline-only confirm. Not used for abort. Interrupt is raced against
+ * confirmMs (not SESSION_CONTROL_TIMEOUT_MS). Wait-arm then does one context
+ * read against salvageMs. Neither read is awaited past its bound.
+ */
+async function confirmDeadline(
+  sessionID: string,
+  label: string,
+  mode: "hung" | "await-budget",
+  ms: number,
+  elapsed: number,
+  confirm: DeadlineConfirm | undefined,
+  isSettled: () => boolean,
+  setDetach: (detach: () => void) => void,
+): Promise<string> {
+  const sessions = confirm?.sessions
+  const confirmMs = confirm?.confirmMs ?? INTERRUPT_CONFIRM_MS
+  const salvageMs = confirm?.salvageMs ?? SALVAGE_CONTEXT_MS
+  const snippetChars = confirm?.snippetChars ?? 500
+  const emit = confirm?.emit ?? (() => {})
+  let outcome: InterruptOutcome = "abandoned"
+  let interruptErr: unknown
+  if (sessions !== undefined) {
+    const bound = raceBound(
+      asPromise(() => sessions.interrupt({ sessionID, continue: false })),
+      confirmMs,
+    )
+    setDetach(bound.detach)
+    const result = await bound.promise
+    if (isSettled()) return ""
+    if (result.status === "ok") outcome = "confirmed"
+    else if (result.status === "error") {
+      outcome = "error"
+      interruptErr = result.error
+    }
+  }
+  const token = `interrupt ${outcome}`
+  emit(`interrupt.${outcome}`, sessionID, interruptEventDetail(outcome, interruptErr))
+  let salvage = ""
+  if (mode === "await-budget" && sessions !== undefined) {
+    const bound = raceBound(asPromise(() => sessions.context({ sessionID })), salvageMs)
+    setDetach(bound.detach)
+    const result = await bound.promise
+    if (isSettled()) return ""
+    try {
+      salvage = result.status === "ok" ? salvageSuffix(result.value, snippetChars) : "salvage=unavailable"
+    } catch {
+      salvage = "salvage=unavailable"
+    }
+  }
+  const base =
+    mode === "await-budget"
+      ? `session.wait on session ${sessionID} exceeded ${elapsed}ms — await budget exceeded on a live session (session.prompt already returned)`
+      : `${label} on session ${sessionID} exceeded ${ms}ms — the host session RPC appears hung`
+  return joinParts([base, token, salvage])
+}
+
+function interruptEventDetail(outcome: InterruptOutcome, err: unknown): string {
+  if (outcome !== "error" || err === undefined) return `interrupt ${outcome}`
+  return `interrupt error: ${errorMessage(err)}`.slice(0, INTERRUPT_EVENT_DETAIL_MAX)
+}
+
+interface RuntimeToolPart {
+  type?: string
+  name?: unknown
+  tool?: unknown
+  state?: {
+    status?: unknown
+    content?: unknown
+    output?: unknown
+    title?: unknown
+    error?: unknown
+  }
+}
+
+/**
+ * Name runtime tool parts on the last assistant message. Does not widen
+ * assistantText or ContextMessage — `type: "tool"` / `state.status` /
+ * `state.content` are read locally (host cast already lets them through).
+ * `state.output` is the host completed-tool text when content is absent.
+ */
+function salvageSuffix(messages: unknown, snippetChars: number): string {
+  if (!Array.isArray(messages)) return "salvage=unavailable"
+  let last: { type?: string; content?: ReadonlyArray<{ type?: string }> } | undefined
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i] as { type?: string; content?: ReadonlyArray<{ type?: string }> } | undefined
+    if (message?.type === "assistant") {
+      last = message
+      break
+    }
+  }
+  const tools = (last?.content ?? []).filter((part) => part?.type === "tool").map((part) => part as RuntimeToolPart)
+  if (tools.length === 0) return ""
+  let shown = tools.slice(-SALVAGE_TOOL_CAP)
+  const errorPart = [...tools].reverse().find(isInFlightErrorPart)
+  if (errorPart !== undefined && !shown.includes(errorPart)) {
+    shown = [...shown.slice(-(SALVAGE_TOOL_CAP - 1)), errorPart]
+  }
+  const named = shown.map((part) => `${toolPartName(part)}:${toolPartStatus(part)}`).join(", ")
+  let suffix = `last tools: ${named}`
+  const completed = [...tools].reverse().find((part) => toolPartStatus(part) === "completed")
+  if (completed !== undefined) {
+    const text = toolPartText(completed)
+    if (text !== "") suffix += ` | ${snippet(text, snippetChars)}`
+  }
+  return suffix
+}
+
+function isInFlightErrorPart(part: RuntimeToolPart): boolean {
+  const status = toolPartStatus(part)
+  if (status === "error") return true
+  const err = part.state?.error
+  const hasError = typeof err === "string" ? err.trim() !== "" : err !== undefined && err !== null
+  return (status === "running" || status === "pending") && hasError
+}
+
+function toolPartStatus(part: RuntimeToolPart): string {
+  const status = part.state?.status
+  if (typeof status === "string" && status.trim() !== "") return clipToken(status, 40)
+  return "unknown"
+}
+
+function toolPartName(part: RuntimeToolPart): string {
+  for (const candidate of [part.name, part.tool, part.state?.title]) {
+    if (typeof candidate === "string" && candidate.trim() !== "") return clipToken(candidate, 80)
+  }
+  return "tool"
+}
+
+function clipToken(value: string, max: number): string {
+  const flat = value.replace(/[\r\n]+/g, " ").trim()
+  return flat.length <= max ? flat : flat.slice(0, max)
+}
+
+function toolPartText(part: RuntimeToolPart): string {
+  const fromContent = textOf(part.state?.content)
+  if (fromContent !== "") return fromContent
+  if (typeof part.state?.output === "string") return part.state.output
+  return ""
+}
+
+function textOf(value: unknown): string {
+  if (typeof value === "string") return value
+  if (Array.isArray(value)) {
+    let out = ""
+    for (const item of value) {
+      if (typeof item === "string") out += item
+      else if (item && typeof item === "object" && typeof (item as { text?: unknown }).text === "string") {
+        out += (item as { text: string }).text
+      }
+    }
+    return out
+  }
+  if (value && typeof value === "object" && typeof (value as { text?: unknown }).text === "string") {
+    return (value as { text: string }).text
+  }
+  return ""
 }
 
 /**

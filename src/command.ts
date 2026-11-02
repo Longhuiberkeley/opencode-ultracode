@@ -7,12 +7,13 @@ import { agentCells, compactCount, compactElapsed, compactTokens, runHeaderCells
 import { canonicalGraphSpec, graphNodeCount, graphToAscii, graphToMermaid, validateGraphSpec } from "./graph.ts"
 import type { GraphNode, GraphSpec } from "./graph.ts"
 import { MAX_CHECKPOINTS, MAX_RUN_EVENTS } from "./registry.ts"
-import { compactStringify, safeSlice } from "./serialize.ts"
+import { CHILD_ERROR_SNIPPET_CHARS, childFailures, compactStringify, safeSlice } from "./serialize.ts"
 import { reduceToolEvent, toolCallsFor, type ToolEvent, type ToolEventState } from "./run-events.ts"
 import { ownershipFields, runLivenessSuffix } from "./run-status.ts"
 import { GRAPH_ARTIFACT_SUFFIX, WORKFLOW_NAME_RE, normalizePath, refreshRunsIfStale, sha256 } from "./storage.ts"
 import { paramsFromArgs, paramsValue } from "./params.ts"
 import type {
+  ChildFailureView,
   Json,
   ModelRef,
   ParentContext,
@@ -99,7 +100,7 @@ export const NESTED_RUN_REFUSED =
   "cannot start a run from inside an active workflow session — use /ultracode from the parent"
 
 /** Plugin package version shown on the bare /ultracode dashboard. */
-export const PLUGIN_VERSION = "0.17.1"
+export const PLUGIN_VERSION = "0.18.0"
 /** Oldest OpenCode binary build the inspect TUI is gated on (A7 / D7). */
 export const MIN_SUPPORTED_BUILD = 19271
 
@@ -246,17 +247,28 @@ export function runStatusPayload(run: RunRecord): RunStatusPayload {
   }
 }
 
+/**
+ * Human count phrase: succeeded/total, never the folded terminal sum.
+ * `runStatusPayload.agents.done` stays the terminal sum for JSON consumers.
+ */
+function agentCountPhrase(run: RunRecord): string {
+  const counts = countAgents(run)
+  const bits = [`agents ${counts.succeeded}/${counts.total}`]
+  if (counts.failed > 0) bits.push(`failed ${counts.failed}`)
+  if (counts.interrupted > 0) bits.push(`interrupted ${counts.interrupted}`)
+  return bits.join(" · ")
+}
+
 /** Compact human-facing `/ultracode status` line. */
 export function formatStatusRun(
   run: RunRecord,
   now = Date.now(),
   ownership?: { isLive: boolean; bootID?: string },
 ): string {
-  const payload = runStatusPayload(run)
   const elapsed = compactElapsed((run.endedAt ?? now) - run.startedAt)
   const fields = ownership ? ownershipFields(run, ownership) : {}
   const suffix = runLivenessSuffix({ status: run.status, ...fields }, now)
-  return `${payload.runID} · ${payload.status} · agents ${payload.agents.done}/${payload.agents.total} · ${elapsed}${suffix}`
+  return `${run.id} · ${run.status} · ${agentCountPhrase(run)} · ${elapsed}${suffix}`
 }
 
 export function resolveRunStatus(
@@ -338,6 +350,8 @@ export type StatusChildView = {
   cached?: boolean
   /** Admission gate a pending child is parked at (queue/permit/quarantine/pause). */
   waitReason?: string
+  /** Child error snippet. Present only on non-succeeded rows that recorded one. */
+  error?: string
 }
 
 /**
@@ -379,12 +393,16 @@ export function enrichStatusPayload(
   /** Recovery pointer when resultTruncated is true. */
   resultHint?: string
   error?: string
+  /** Failed/interrupted children (capped). Always set — not gated on run.error. */
+  badAgents: ChildFailureView[]
+  /** Bad children omitted past the cap. Always set. */
+  badAgentsOmitted: number
   /** Poll pacing floor, present while the run is active. */
   retryAfterMs?: number
   /** Poll guidance, present while the run is active. */
   hint?: string
 } {
-  if (!run) return { ...payload, elapsedMs: 0, children: [] }
+  if (!run) return { ...payload, elapsedMs: 0, children: [], badAgents: [], badAgentsOmitted: 0 }
   const out: Record<string, unknown> = { ...payload }
   if (run.name) out["name"] = run.name
   if (run.workflowName) out["workflowName"] = run.workflowName
@@ -417,6 +435,9 @@ export function enrichStatusPayload(
     if (a.cached) child.cached = true
     if (a.routing) child.routing = a.routing
     if (a.waitReason) child.waitReason = a.waitReason
+    if (a.status !== "succeeded" && typeof a.error === "string" && a.error !== "") {
+      child.error = safeSlice(a.error, CHILD_ERROR_SNIPPET_CHARS)
+    }
     if (a.status === "running" && a.sessionID) {
       const at = activityFor(a.sessionID)
       if (at !== undefined) child.stalledMs = Math.max(0, now - at)
@@ -428,6 +449,11 @@ export function enrichStatusPayload(
     out["childrenTruncated"] = true
     out["childrenOmitted"] = run.agents.length - STATUS_CHILDREN_LIMIT
   }
+  // Separate from the children slice: a death past index 50 is still named.
+  // Never copied into out.error — a gate string on run.error stays intact.
+  const failures = childFailures(run)
+  out["badAgents"] = failures.badAgents
+  out["badAgentsOmitted"] = failures.omitted
   if (run.checkpoints && run.checkpoints.length > 0) {
     out["checkpoints"] = run.checkpoints.map((cp) => ({ name: cp.name, at: cp.at }))
   }
@@ -463,6 +489,20 @@ export const SETTLE_NOTICE_PREVIEW_CHARS = 300
 /** How many lifecycle events /ultracode show prints (tail of the ring). */
 export const SHOW_EVENTS_TAIL = 12
 
+/**
+ * Settle-notice fragment for dead children. Count is omitted-aware
+ * (`listed + omitted`), not just the capped slice. Undefined when none.
+ */
+function badAgentsNotice(envelope: RunEnvelope): string | undefined {
+  const bad = envelope.badAgents
+  if (!bad || bad.length === 0) return undefined
+  const n = bad.length + (envelope.badAgentsOmitted ?? 0)
+  const first = bad[0]!
+  const who = first.label ? `${first.id} ${first.label}` : first.id
+  const detail = first.error ? `${who}: ${first.error}` : who
+  return `failed ${n} · ${detail}`
+}
+
 /** One-line settle notice for a finished background run, delivered to the parent session. */
 export function formatSettleNotice(envelope: RunEnvelope): string {
   const agents = envelope.agents
@@ -470,6 +510,8 @@ export function formatSettleNotice(envelope: RunEnvelope): string {
     `[ultracode] background run ${envelope.runID}${envelope.name ? ` (${envelope.name})` : ""} ${envelope.status}`,
     `agents ${agents.succeeded}/${agents.total}`,
   ]
+  const bad = badAgentsNotice(envelope)
+  if (bad) parts.push(bad)
   if (envelope.tokens) {
     const t = envelope.tokens
     parts.push(
@@ -518,6 +560,13 @@ export type ResultChunkView = {
   /** Next pair-safe offset to request, or null when complete. */
   nextOffset: number | null
   resultArtifactKey?: string
+  /**
+   * Failed/interrupted children, derived at read time. Sibling of `chunk` —
+   * never injected into the compact serialization (chunk concatenation must
+   * still parse as the script return).
+   */
+  childFailures: ChildFailureView[]
+  childFailuresOmitted: number
 }
 
 /**
@@ -565,6 +614,7 @@ export function buildResultChunk(
   )
   const requestedOffset = Math.max(0, Math.floor(opts.offset ?? 0))
   const offset = Math.min(pairSafeOffset(compact, requestedOffset), compact.length)
+  const failures = childFailures(run)
   const view: ResultChunkView = {
     runID: run.id,
     status: run.status,
@@ -575,6 +625,8 @@ export function buildResultChunk(
     chunk: safeSlice(compact.slice(offset), maxLength),
     complete: false,
     nextOffset: null,
+    childFailures: failures.badAgents,
+    childFailuresOmitted: failures.omitted,
   }
   // Progress guarantee: an incomplete page must return a non-empty chunk.
   // safeSlice can legally return "" when maxLength would split a surrogate
@@ -637,6 +689,17 @@ export function formatShowRun(run: RunRecord, extra?: { pending?: readonly strin
     for (const a of run.agents) {
       const cells = [...agentCells(a), a.sessionID ?? "-"]
       lines.push(`| ${cells.join(" | ")} |`)
+    }
+  }
+  const failedChildren = run.agents.filter((a) => a.status === "failed" || a.status === "interrupted")
+  if (failedChildren.length > 0) {
+    lines.push("")
+    lines.push("### Failed children")
+    lines.push("")
+    for (const a of failedChildren) {
+      const label = a.label ? ` ${a.label}` : ""
+      const error = typeof a.error === "string" && a.error !== "" ? a.error : "(no error recorded)"
+      lines.push(`- \`${a.id}\`${label} — ${a.status} — ${error}`)
     }
   }
   if (extra?.pending && extra.pending.length > 0) {
@@ -1031,12 +1094,11 @@ function describeError(err: unknown): string {
 }
 
 function summarizeRun(run: RunRecord): string {
-  const counts = countAgents(run)
   const bits = [
     `\`${run.id}\``,
     run.name ?? run.workflowName ?? "(unnamed)",
     `[${run.status}]`,
-    `agents ${counts.succeeded + counts.failed + counts.interrupted}/${counts.total}`,
+    agentCountPhrase(run),
   ]
   const tokens = run.totalTokens
   if (tokens) bits.push(`~${compactTokens(tokens)} tok`)

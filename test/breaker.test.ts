@@ -438,18 +438,10 @@ test("ask mode: askTimeoutMs > 0 auto-resumes in auto-mode policy after the time
 
 test("ask mode: burst throttle does not pause the run", async () => {
   const ctx = makeSupervisor({ failover: "ask", agentRetryAttempts: 2, agentRetryBackoffMs: 0 })
-  // Token growth on continues so they stay burst-class (0-token re-failures
-  // promote to quota, which WOULD pause). Three strikes engage the throttle.
-  const burstWork = {
-    ...BURST_REPLY,
-    tokens: { input: 5, output: 2, reasoning: 0, cache: { read: 0, write: 0 } },
-  }
+  // Even zero-growth 429 continues stay burst-class. Three strikes throttle.
   ctx.sessions.push(BURST_REPLY)
-  ctx.sessions.push(burstWork)
-  ctx.sessions.push({
-    ...burstWork,
-    tokens: { input: 10, output: 4, reasoning: 0, cache: { read: 0, write: 0 } },
-  })
+  ctx.sessions.push(BURST_REPLY)
+  ctx.sessions.push(BURST_REPLY)
   const { runID, done } = ctx.supervisor.startDetached(
     { script: `await agent("one", { model: "xai/grok-4.6" }); return "nope"` },
     ctx.parent,
@@ -458,7 +450,51 @@ test("ask mode: burst throttle does not pause the run", async () => {
   assert.equal(outcome.envelope.status, "failed")
   assert.notEqual(ctx.registry.get(runID)?.status, "paused")
   assert.equal(ctx.reports.some((r) => r.includes("provider ask —")), false)
+  assert.deepEqual(ctx.supervisor.providerQuarantines(), [])
+  assert.equal([...ctx.sessions.sessions.values()][0]!.prompts, 3)
 })
+
+for (const failover of ["auto", "ask"] as const) {
+test(`${failover} mode: markerless tool-calls no-progress probe never quarantines or pauses; next child stays admitted`, async () => {
+  const ctx = makeSupervisor({ failover, agentRetryAttempts: 3, agentRetryBackoffMs: 0,
+    modelFallbacks: { "xai/grok-4.6": ["google/gemini-3.7-flash"] } })
+  ctx.sessions.push({ text: "", outcome: "failed", finish: "tool-calls" })
+  ctx.sessions.push({ text: "", outcome: "failed" })
+  ctx.sessions.push(ok("LATER", "xai", "grok-4.6"))
+  const prompt = ctx.sessions.prompt.bind(ctx.sessions)
+  ctx.sessions.prompt = async (input) => {
+    const result = await prompt(input)
+    const session = ctx.sessions.sessions.get(input.sessionID)!
+    if (ctx.sessions.sessions.size === 1) {
+      if (session.prompts === 1) {
+        const completedTool = { type: "tool", state: { status: "completed", content: "small retained result" } }
+        session.messages.at(-1)!.content = [completedTool]
+      }
+      if (session.prompts === 2) session.messages.pop() // no new assistant, no token growth
+    }
+    return result
+  }
+  const outcome = await ctx.supervisor.start({ script: `
+try { await agent("first", { model: "xai/grok-4.6" }) } catch {}
+return (await agent("later", { model: "xai/grok-4.6" })).text;
+` }, ctx.parent)
+  assert.equal(outcome.envelope.status, "succeeded", outcome.run.error ?? "")
+  assert.equal(outcome.envelope.result, "LATER")
+  assert.deepEqual(outcome.run.agents.map((a) => a.status), ["failed", "succeeded"])
+  assert.doesNotMatch(outcome.run.agents[0]!.error ?? "", /promoted to quota/)
+  assert.deepEqual(ctx.supervisor.providerQuarantines(), [])
+  assert.equal(ctx.reports.some((r) => /provider ask —|quarantined \(quota/.test(r)), false)
+  assert.deepEqual(ctx.sessions.switches, [])
+  assert.deepEqual(ctx.sessions.createdModels, [
+    { providerID: "xai", id: "grok-4.6" }, { providerID: "xai", id: "grok-4.6" },
+  ])
+  const first = [...ctx.sessions.sessions.values()][0]!
+  assert.equal(first.prompts, 2, "only one same-session probe at attempts=3")
+  const continuation = first.messages.filter((m) => m.type === "user")[1]!.text ?? ""
+  assert.match(continuation, /finish=tool-calls with completed tool results/)
+  assert.doesNotMatch(continuation, /small retained result|host closed|provider failure/i)
+})
+}
 
 test("ask mode: explore-agent child in autoEditsWorkflow gets a proposal", async () => {
   const ctx = makeSupervisor({
@@ -568,6 +604,36 @@ test("explicit model: quota mid-flight waits for the window, then continues the 
   assert.equal(row.spawnModel?.providerID, "zai-coding-plan")
   assert.equal(row.effectiveModel?.providerID, "zai-coding-plan")
   assert.equal(row.effectiveModel?.id, "glm-5.3")
+})
+
+test("explicit model: quota window retry ending other/noProgress surfaces other without re-quarantine", async () => {
+  const ctx = makeSupervisor({ agentRetryAttempts: 3, agentRetryBackoffMs: 0 },
+    { windowWaitSliceMs: 2, maxWindowWaitMs: 200, breakerQuarantineTTLms: 10 })
+  ctx.sessions.push(QUOTA_REPLY)
+  ctx.sessions.push({ text: "", outcome: "failed", finish: "tool-calls" })
+  const outcome = await ctx.supervisor.start(
+    { script: `await agent("literal", { model: "xai/grok-4.6" })` }, ctx.parent)
+  assert.equal(outcome.envelope.status, "failed")
+  assert.match(outcome.run.error ?? "", /finish: tool-calls/)
+  assert.doesNotMatch(outcome.run.error ?? "", /Usage limit|promoted to quota/)
+  assert.deepEqual(ctx.supervisor.providerQuarantines(), [], "quota expired; other cannot start another quarantine")
+  assert.deepEqual(ctx.sessions.switches, [])
+  assert.equal([...ctx.sessions.sessions.values()][0]!.prompts, 2, "non-quota re-failure is terminal")
+  assert.equal(ctx.reports.filter((r) => r.includes("quota window closed — waiting")).length, 1)
+})
+
+test("explicit model: repeated genuine quota retries remain bounded by the window-wait budget", async () => {
+  const ctx = makeSupervisor({}, { windowWaitSliceMs: 2, maxWindowWaitMs: 45, breakerQuarantineTTLms: 10 })
+  // Keep the quota signal present on every continuation (the fake repeats its tail).
+  ctx.sessions.push(QUOTA_REPLY)
+  ctx.sessions.push(QUOTA_REPLY)
+  const outcome = await ctx.supervisor.start(
+    { script: `await agent("literal", { model: "xai/grok-4.6" })` }, ctx.parent)
+  assert.equal(outcome.envelope.status, "failed")
+  assert.match(outcome.run.error ?? "", /Usage limit reached/)
+  assert.ok(ctx.reports.some((r) => r.includes("window did not reopen within the wait budget")))
+  assert.equal(ctx.sessions.sessions.size, 1)
+  assert.deepEqual(ctx.sessions.switches, [])
 })
 
 test("explicit model: pre-create quarantine waits, then creates on the explicit model; authorized fallbacks still win", async () => {

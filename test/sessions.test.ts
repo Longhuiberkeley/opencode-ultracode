@@ -5,7 +5,7 @@
  */
 import test from "node:test"
 import assert from "node:assert/strict"
-import { createSessionDriver, buildChildTitle, parseChildTitle, describeSessionFailure, buildContinuationPrompt, SCHEMA_REPAIR_ROUNDS } from "../src/sessions.ts"
+import { createSessionDriver, buildChildTitle, parseChildTitle, describeSessionFailure, buildContinuationPrompt, SCHEMA_REPAIR_ROUNDS, INTERRUPT_CONFIRM_MS, SALVAGE_CONTEXT_MS, SESSION_CONTROL_TIMEOUT_MS, TOOL_CALLS_CONTINUATION_HINT } from "../src/sessions.ts"
 import { AgentCallError, RunClosedError } from "../src/sessions.ts"
 import { FakeSessionCtx } from "./fakes.ts"
 import type { ScriptedReply } from "./fakes.ts"
@@ -13,6 +13,17 @@ import type { ContextMessage, SessionCtx, TokenUsage } from "../src/types.ts"
 import type { AgentRunInput, SessionDriver } from "../src/sessions.ts"
 
 const tick = (ms = 5): Promise<void> => new Promise((r) => setTimeout(r, ms))
+
+/** Bound a deadline test so a missed timer fails fast instead of hanging the suite. */
+function rejectSoon<T>(p: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`deadline test exceeded ${ms}ms`)), ms)
+  })
+  return Promise.race([p, timeout]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer)
+  })
+}
 
 const TOKENS: TokenUsage = { input: 100, output: 20, reasoning: 3, cache: { read: 40, write: 0 } }
 
@@ -439,6 +450,7 @@ test("runAgent: abort mid-wait => interrupt recorded + typed abort error", async
   fake.hangWait = true
   const ctrl = new AbortController()
   let sessionID = ""
+  const started = Date.now()
   const pending = driver.runAgent(input(), ["general"], hooks((id) => (sessionID = id), ctrl.signal))
   await tick(20) // prompt in flight, wait hanging
   ctrl.abort()
@@ -446,6 +458,8 @@ test("runAgent: abort mid-wait => interrupt recorded + typed abort error", async
     pending,
     (err: unknown) => err instanceof AgentCallError && err.kind === "abort" && /run stopping/.test(err.message),
   )
+  // Default confirm is 3s. Abort must not use that helper.
+  assert.ok(Date.now() - started < 400, "abort mid-wait must not wait the interrupt confirm bound")
   assert.deepEqual(fake.interrupts, [sessionID])
 })
 
@@ -724,7 +738,7 @@ test("continueAgent: continues the SAME session — no create, history reused, n
   const session = fake.sessions.get(sessionID)!
   assert.equal(session.prompts, 2)
   const userMsgs = session.messages.filter((m) => m.type === "user")
-  assert.match(userMsgs[1]!.text ?? "", /interrupted by a provider failure/)
+  assert.match(userMsgs[1]!.text ?? "", /The previous turn of this session did not complete\./)
   assert.match(userMsgs[1]!.text ?? "", /may be EMPTY/)
   assert.match(userMsgs[1]!.text ?? "", /Original request:\ndo it/)
 })
@@ -855,6 +869,88 @@ test("continueAgent: the first turn never carries noProgress", async () => {
   )
 })
 
+test("continueAgent: completed tool results without an exposed error carry an observable hint and stay in history", async () => {
+  const { fake, driver } = makeDriver([
+    { text: "", outcome: "failed", finish: "tool-calls", tokens: TOKENS },
+    { text: "", outcome: "failed" },
+    { text: "recovered from retained results" },
+  ])
+  const prompt = fake.prompt.bind(fake)
+  const completedTool = { type: "tool", name: "read", state: { status: "completed", content: "retained tool payload" } }
+  fake.prompt = async (input) => {
+    const result = await prompt(input)
+    const session = fake.sessions.get(input.sessionID)!
+    if (session.prompts === 1) session.messages.at(-1)!.content = [completedTool]
+    // Replay the production shape: failed continuation, no new assistant,
+    // unchanged tokens, last assistant still ends with completed tool results.
+    if (session.prompts === 2) session.messages.pop()
+    return result
+  }
+  let hint = ""
+  const checkError = (err: unknown) => {
+    assert.ok(err instanceof AgentCallError)
+    assert.equal(err.kind, "outcome")
+    assert.equal(err.failure?.class, "other")
+    assert.equal(err.continuationHint, TOOL_CALLS_CONTINUATION_HINT)
+    assert.doesNotMatch(err.continuationHint!, /host closed|provider failure/i)
+    hint = err.continuationHint!
+    return true
+  }
+  await assert.rejects(driver.runAgent(input(), ["general"], hooks()), checkError)
+  const sessionID = [...fake.sessions.keys()][0]!
+  const session = fake.sessions.get(sessionID)!
+  const originalAssistant = session.messages.at(-1)!
+  await assert.rejects(driver.continueAgent(
+    { sessionID, continuationPrompt: buildContinuationPrompt("say hi", hint) }, { signal: CONTINUE_SIGNAL }),
+    (err: unknown) => { checkError(err); assert.equal((err as AgentCallError).noProgress, true); return true })
+  assert.equal(session.messages.filter((m) => m.type === "assistant").length, 1)
+  const result = await driver.continueAgent(
+    { sessionID, continuationPrompt: buildContinuationPrompt("say hi", hint) }, { signal: CONTINUE_SIGNAL })
+  assert.equal(result.text, "recovered from retained results")
+  assert.equal(result.sessionID, sessionID)
+  assert.equal(fake.sessions.size, 1)
+  assert.deepEqual(fake.switches, [])
+  assert.ok(session.messages.includes(originalAssistant), "original tool-result message retained by identity")
+  assert.equal(originalAssistant.content![0], completedTool)
+  for (const msg of session.messages.filter((m) => m.type === "user").slice(1)) {
+    assert.match(msg.text ?? "", /continue using those results/)
+    assert.doesNotMatch(msg.text ?? "", /retained tool payload/)
+  }
+})
+
+for (const shape of ["pending", "running", "error", "missing tools", "content error", "provider error", "session error", "succeeded", "other finish"]) {
+test(`runAgent: tool-result hint excludes ${shape}`, async () => {
+  const { fake, driver } = makeDriver([{ text: "", outcome: shape === "succeeded" ? "succeeded" : "failed", finish: "tool-calls" }])
+  const prompt = fake.prompt.bind(fake)
+  fake.prompt = async (input) => {
+    const result = await prompt(input)
+    const last = fake.sessions.get(input.sessionID)!.messages.at(-1)!
+    const tools = [{ type: "tool", state: { status: "completed" } }]
+    if (["pending", "running", "error"].includes(shape)) tools.push({ type: "tool", state: { status: shape } })
+    last.content = shape === "missing tools" ? [] : tools
+    if (shape === "content error") last.content = [...tools, { type: "error", text: "tool failed" }]
+    if (shape === "provider error") last.error = { status: 429, message: "Rate limit reached" }
+    if (shape === "other finish") last.finish = "error"
+    return result
+  }
+  if (shape === "session error") {
+    const get = fake.get.bind(fake)
+    fake.get = async (input) => ({ ...await get(input), error: "session error" })
+  }
+  if (shape === "succeeded") {
+    const result = await driver.runAgent(input(), ["general"], hooks())
+    assert.equal("continuationHint" in result, false)
+  } else {
+    await assert.rejects(driver.runAgent(input(), ["general"], hooks()), (err: unknown) => {
+      assert.ok(err instanceof AgentCallError)
+      assert.equal(err.continuationHint, undefined)
+      if (shape === "provider error") assert.equal(err.failure?.class, "burst")
+      return true
+    })
+  }
+})
+}
+
 test("continueAgent: schema mode reuses structured extraction (repair round included)", async () => {
   const { fake, driver } = makeDriver([
     { text: "died", outcome: "failed", failure: { status: 429, message: "Rate limit reached" } },
@@ -897,16 +993,212 @@ test("runAgent: a hung wait() hits the await deadline — typed timeout error + 
   const fake = new FakeSessionCtx()
   fake.push({ text: "never reached" })
   fake.hangWait = true
-  const driver = createSessionDriver(fake, { awaitTimeoutMs: 40 })
-  await assert.rejects(
-    driver.runAgent(input(), ["general"], hooks()),
-    (err: unknown) =>
-      err instanceof AgentCallError && err.kind === "timeout" && /session\.wait .* exceeded 40ms/.test(err.message),
+  const awaitMs = 80
+  const driver = createSessionDriver(fake, { awaitTimeoutMs: awaitMs, interruptConfirmMs: 8, salvageContextMs: 8 })
+  try {
+    await rejectSoon(
+      assert.rejects(driver.runAgent(input(), ["general"], hooks()), (err: unknown) => {
+        assert.ok(err instanceof AgentCallError)
+        assert.equal(err.kind, "timeout")
+        assert.match(
+          err.message,
+          /session\.wait on session .+ exceeded \d+ms — await budget exceeded on a live session \(session\.prompt already returned\)/,
+        )
+        assert.doesNotMatch(err.message, /appears hung/)
+        assert.match(err.message, /interrupt confirmed/)
+        const elapsed = Number(err.message.match(/exceeded (\d+)ms/)?.[1])
+        // No extend: die at the armed budget, not the 2× hard cap. 1.5× leaves
+        // timer slop without accepting a wait that ran to the cap.
+        assert.ok(elapsed >= awaitMs && elapsed < awaitMs * 1.5, `no-extend wait should die near awaitMs, got ${elapsed}`)
+        return true
+      }),
+      500,
+    )
+    assert.ok(fake.interrupts.length >= 1, "hung wait best-effort interrupted")
+  } finally {
+    fake.hangWait = false
+    fake.releaseHangs()
+  }
+})
+
+test("runAgent: a hung session.prompt() stays the hung-RPC arm", async () => {
+  const fake = new FakeSessionCtx()
+  fake.push({ text: "never reached" })
+  const sessions: SessionCtx = {
+    create: (i) => fake.create(i),
+    get: (i) => fake.get(i),
+    prompt: () => new Promise(() => {}),
+    wait: (i) => fake.wait(i),
+    context: (i) => fake.context(i),
+    interrupt: (i) => fake.interrupt(i),
+  }
+  let budgets = 0
+  const driver = createSessionDriver(sessions, {
+    awaitTimeoutMs: 40,
+    interruptConfirmMs: 8,
+    salvageContextMs: 8,
+    onWaitBudget: () => {
+      budgets++
+    },
+  })
+  try {
+    await rejectSoon(
+      assert.rejects(driver.runAgent(input(), ["general"], hooks()), (err: unknown) => {
+        assert.ok(err instanceof AgentCallError)
+        assert.equal(err.kind, "timeout")
+        assert.match(err.message, /session\.prompt .* appears hung/)
+        assert.match(err.message, /interrupt confirmed/)
+        assert.doesNotMatch(err.message, /await budget exceeded/)
+        assert.doesNotMatch(err.message, /salvage=/)
+        return true
+      }),
+      500,
+    )
+    assert.equal(budgets, 0, "prompt arm must not register a wait budget")
+    assert.ok(fake.interrupts.length >= 1, "hung prompt still best-effort interrupted")
+  } finally {
+    fake.releaseHangs()
+  }
+})
+
+test("onWaitBudget.extend() pushes a hung wait past awaitMs and does not also fire the original timer", async () => {
+  const fake = new FakeSessionCtx()
+  fake.push({ text: "released in time" })
+  fake.hangWait = true
+  const awaitMs = 120
+  let extend: (() => void) | undefined
+  let cleared = 0
+  const driver = createSessionDriver(fake, {
+    awaitTimeoutMs: awaitMs,
+    onWaitBudget: (_sessionID, ctl) => {
+      if (ctl) extend = ctl.extend
+      else cleared++
+    },
+  })
+  let settled = false
+  const pending = driver.runAgent(input(), ["general"], hooks()).then(
+    (result) => {
+      settled = true
+      return result
+    },
+    (err) => {
+      settled = true
+      throw err
+    },
   )
-  assert.ok(fake.interrupts.length >= 1, "hung wait best-effort interrupted")
-  // Release so nothing dangles into other tests.
-  fake.hangWait = false
-  fake.releaseHangs()
+  pending.catch(() => {})
+  try {
+    await tick(70)
+    assert.ok(extend, "wait arm registered extend")
+    assert.equal(settled, false, "original deadline has not fired yet")
+    extend()
+    // Past the original 120ms deadline, before the extended one (70+120).
+    // An uncleared original timer would have interrupted already.
+    await tick(70)
+    assert.equal(settled, false, "extend prevented rejection at awaitMs")
+    assert.deepEqual(fake.interrupts, [], "original timer must not also interrupt")
+    fake.hangWait = false
+    fake.releaseHangs()
+    const result = await rejectSoon(pending, 500)
+    assert.equal(result.text, "released in time")
+    assert.deepEqual(fake.interrupts, [], "a wait that settles before the hard cap does not interrupt")
+    assert.equal(cleared, 1, "wait budget cleared when the wait settles")
+    extend()
+    await tick(awaitMs + 20)
+    assert.deepEqual(fake.interrupts, [], "extend after settle is a no-op")
+  } finally {
+    fake.hangWait = false
+    fake.releaseHangs()
+  }
+})
+
+test("repeated extend() still rejects at the 2× hard cap with the await-budget string", async () => {
+  const fake = new FakeSessionCtx()
+  fake.push({ text: "never reached" })
+  fake.hangWait = true
+  const awaitMs = 50
+  let extend: (() => void) | undefined
+  const driver = createSessionDriver(fake, {
+    awaitTimeoutMs: awaitMs,
+    interruptConfirmMs: 5,
+    salvageContextMs: 5,
+    onWaitBudget: (_sessionID, ctl) => {
+      if (!ctl) return
+      extend = ctl.extend
+      // Before the original deadline, so the cap (not the first timer) is what fires.
+      setTimeout(() => ctl.extend(), 15)
+    },
+  })
+  const started = Date.now()
+  const pending = driver.runAgent(input(), ["general"], hooks())
+  const pump = setInterval(() => extend?.(), 15)
+  try {
+    await rejectSoon(
+      assert.rejects(pending, (err: unknown) => {
+        assert.ok(err instanceof AgentCallError)
+        assert.equal(err.kind, "timeout")
+        assert.match(err.message, /await budget exceeded/)
+        assert.doesNotMatch(err.message, /appears hung/)
+        const elapsed = Number(err.message.match(/exceeded (\d+)ms/)?.[1])
+        const wall = Date.now() - started
+        // 2× from waitStartedAt (100ms), not the original 50ms budget and not
+        // the 30-minute production constant.
+        assert.ok(elapsed >= 85 && elapsed < 180, `hard-cap elapsed ${elapsed}`)
+        assert.ok(wall >= 85 && wall < 500, `hard-cap wall ${wall}`)
+        return true
+      }),
+      500,
+    )
+    assert.equal(fake.interrupts.length, 1, "exactly one interrupt from the deadline path")
+    await tick(awaitMs + 30)
+    assert.equal(fake.interrupts.length, 1, "the original timer must not interrupt again after the cap")
+  } finally {
+    clearInterval(pump)
+    fake.hangWait = false
+    fake.releaseHangs()
+  }
+})
+
+test("a raw activity bump is not an extend — only extend() moves the await timer", async () => {
+  const fake = new FakeSessionCtx()
+  fake.push({ text: "never reached" })
+  fake.hangWait = true
+  const awaitMs = 80
+  let extend: (() => void) | undefined
+  const driver = createSessionDriver(fake, {
+    awaitTimeoutMs: awaitMs,
+    interruptConfirmMs: 8,
+    salvageContextMs: 8,
+    onWaitBudget: (_sessionID, ctl) => {
+      if (ctl) extend = ctl.extend
+    },
+  })
+  // Stand-ins for session.tool.progress and noteChildActivity: they can see
+  // the session, but they do not receive or call extend.
+  const noteChildActivity = () => {}
+  const noteToolProgress = () => {}
+  const pending = driver.runAgent(input(), ["general"], hooks())
+  try {
+    await tick(10)
+    assert.ok(extend, "ctl registered")
+    noteChildActivity()
+    noteToolProgress()
+    await rejectSoon(
+      assert.rejects(pending, (err: unknown) => {
+        assert.ok(err instanceof AgentCallError)
+        assert.equal(err.kind, "timeout")
+        assert.match(err.message, /await budget exceeded/)
+        assert.doesNotMatch(err.message, /appears hung/)
+        const elapsed = Number(err.message.match(/exceeded (\d+)ms/)?.[1])
+        assert.ok(elapsed >= awaitMs && elapsed < awaitMs * 1.5, `activity bump must not push past awaitMs, got ${elapsed}`)
+        return true
+      }),
+      500,
+    )
+  } finally {
+    fake.hangWait = false
+    fake.releaseHangs()
+  }
 })
 
 test("runAgent: a hung session.create() hits the control deadline with a typed timeout", async () => {
@@ -923,7 +1215,12 @@ test("runAgent: a hung session.create() hits the control deadline with a typed t
   const driver = createSessionDriver(hanging, { controlTimeoutMs: 30 })
   await assert.rejects(
     driver.runAgent(input(), ["general"], hooks()),
-    (err: unknown) => err instanceof AgentCallError && err.kind === "timeout" && /session\.create exceeded 30ms/.test(err.message),
+    (err: unknown) =>
+      err instanceof AgentCallError &&
+      err.kind === "timeout" &&
+      /session\.create exceeded 30ms/.test(err.message) &&
+      /appears hung/.test(err.message) &&
+      !/await budget exceeded/.test(err.message),
   )
 })
 
@@ -952,6 +1249,363 @@ test("deadlines are off at <=0: a slow-but-honest RPC never times out", async ()
   const driver = createSessionDriver(fake, { awaitTimeoutMs: 0, controlTimeoutMs: 0 })
   const result = await driver.runAgent(input(), ["general"], hooks())
   assert.equal(result.text, "slow ok")
+})
+
+test("deadline confirm: instant interrupt names the await budget and does not wait 60s", async () => {
+  const fake = new FakeSessionCtx()
+  fake.push({ text: "never reached" })
+  fake.hangWait = true
+  const awaitMs = 40
+  const confirmMs = 80
+  const events: Array<{ kind: string; detail?: string }> = []
+  let extend: (() => void) | undefined
+  const driver = createSessionDriver(fake, {
+    awaitTimeoutMs: awaitMs,
+    interruptConfirmMs: confirmMs,
+    salvageContextMs: 10,
+    onWaitBudget: (_sessionID, ctl) => {
+      if (ctl) extend = ctl.extend
+    },
+    onEvent: (event) => {
+      if (event.kind.startsWith("interrupt.")) events.push(event)
+    },
+  })
+  const started = Date.now()
+  try {
+    await rejectSoon(
+      assert.rejects(driver.runAgent(input(), ["general"], hooks()), (err: unknown) => {
+        assert.ok(err instanceof AgentCallError)
+        assert.equal(err.kind, "timeout")
+        assert.equal(err.text, undefined, "deadline must not write result text")
+        assert.match(err.message, /await budget exceeded/)
+        assert.match(err.message, /interrupt confirmed/)
+        assert.doesNotMatch(err.message, /appears hung/)
+        const wall = Date.now() - started
+        // Instant interrupt settles the confirm race; do not wait the full
+        // confirm window, the 60s control timeout, or the 900s RPC.
+        assert.ok(wall < 400, `instant confirm wall ${wall} (confirm bound ${confirmMs}, not 60s)`)
+        assert.ok(wall < SESSION_CONTROL_TIMEOUT_MS, "confirm must not be the 60s control timeout")
+        return true
+      }),
+      500,
+    )
+    assert.ok(fake.interrupts.length >= 1)
+    extend?.()
+    await tick(confirmMs + 20)
+    assert.equal(fake.interrupts.length, 1, "extend during confirm must not schedule a second interrupt")
+    assert.deepEqual(events.map((event) => event.kind), ["interrupt.confirmed"])
+    assert.ok((events[0]?.detail?.length ?? 0) <= 300)
+  } finally {
+    fake.hangWait = false
+    fake.releaseHangs()
+  }
+})
+
+test("deadline confirm: a hung interrupt RPC is abandoned inside the confirm bound", async () => {
+  const fake = new FakeSessionCtx()
+  fake.push({ text: "never reached" })
+  fake.hangWait = true
+  let rejectInterrupt: (err: Error) => void = () => {}
+  const hanging = new Promise<void>((_, reject) => {
+    rejectInterrupt = reject
+  })
+  const sessions: SessionCtx = {
+    create: (i) => fake.create(i),
+    get: (i) => fake.get(i),
+    prompt: (i) => fake.prompt(i),
+    wait: (i) => fake.wait(i),
+    context: (i) => fake.context(i),
+    interrupt: (i) => {
+      fake.interrupts.push(i.sessionID)
+      return hanging
+    },
+  }
+  const awaitMs = 30
+  const confirmMs = 40
+  const events: Array<{ kind: string; detail?: string }> = []
+  const driver = createSessionDriver(sessions, {
+    awaitTimeoutMs: awaitMs,
+    interruptConfirmMs: confirmMs,
+    salvageContextMs: 10,
+    onEvent: (event) => {
+      if (event.kind.startsWith("interrupt.")) events.push(event)
+    },
+  })
+  const started = Date.now()
+  const unhandled: unknown[] = []
+  const onUnhandled = (reason: unknown) => {
+    unhandled.push(reason)
+  }
+  process.on("unhandledRejection", onUnhandled)
+  try {
+    await rejectSoon(
+      assert.rejects(driver.runAgent(input(), ["general"], hooks()), (err: unknown) => {
+        assert.ok(err instanceof AgentCallError)
+        assert.equal(err.kind, "timeout")
+        assert.match(err.message, /interrupt abandoned/)
+        assert.match(err.message, /await budget exceeded/)
+        assert.doesNotMatch(err.message, /appears hung/)
+        const wall = Date.now() - started
+        // Abandon fires at the confirm bound, then a fast salvage. Not the hung RPC and not 60s.
+        assert.ok(wall >= confirmMs - 5, `abandoned confirm returned too fast (${wall}ms)`)
+        assert.ok(wall < 400, `abandoned confirm wall ${wall}`)
+        assert.ok(wall < SESSION_CONTROL_TIMEOUT_MS)
+        return true
+      }),
+      500,
+    )
+    assert.equal(events[0]?.kind, "interrupt.abandoned")
+    rejectInterrupt(new Error("dangling interrupt failed later"))
+    await tick(30)
+    assert.equal(unhandled.length, 0, "abandoned interrupt must not surface as an unhandled rejection")
+  } finally {
+    process.off("unhandledRejection", onUnhandled)
+    rejectInterrupt(new Error("dangling interrupt failed later"))
+    fake.hangWait = false
+    fake.releaseHangs()
+    await tick(10)
+  }
+})
+
+test("deadline confirm: a rejecting interrupt is interrupt error, detail capped at 300", async () => {
+  const fake = new FakeSessionCtx()
+  fake.push({ text: "never reached" })
+  fake.hangWait = true
+  const long = "x".repeat(400)
+  const events: Array<{ kind: string; detail?: string }> = []
+  const sessions: SessionCtx = {
+    create: (i) => fake.create(i),
+    get: (i) => fake.get(i),
+    prompt: (i) => fake.prompt(i),
+    wait: (i) => fake.wait(i),
+    context: (i) => fake.context(i),
+    interrupt: async (i) => {
+      fake.interrupts.push(i.sessionID)
+      throw new Error(long)
+    },
+  }
+  const driver = createSessionDriver(sessions, {
+    awaitTimeoutMs: 25,
+    interruptConfirmMs: 40,
+    salvageContextMs: 8,
+    onEvent: (event) => {
+      if (event.kind.startsWith("interrupt.")) events.push(event)
+    },
+  })
+  try {
+    await rejectSoon(
+      assert.rejects(driver.runAgent(input(), ["general"], hooks()), (err: unknown) => {
+        assert.ok(err instanceof AgentCallError)
+        assert.equal(err.kind, "timeout")
+        assert.match(err.message, /interrupt error/)
+        assert.doesNotMatch(err.message, /interrupt confirmed|interrupt abandoned/)
+        assert.doesNotMatch(err.message, new RegExp(long))
+        return true
+      }),
+      500,
+    )
+    assert.equal(events[0]?.kind, "interrupt.error")
+    assert.ok((events[0]?.detail?.length ?? 0) <= 300)
+    assert.match(events[0]?.detail ?? "", /interrupt error/)
+  } finally {
+    fake.hangWait = false
+    fake.releaseHangs()
+  }
+})
+
+test("deadline confirm: context tool parts are named and the call still rejects", async () => {
+  const fake = new FakeSessionCtx()
+  fake.push({ text: "never reached" })
+  fake.hangWait = true
+  const payload = "0123456789ABCDEFGHIJ"
+  const sessions: SessionCtx = {
+    create: (i) => fake.create(i),
+    get: (i) => fake.get(i),
+    prompt: (i) => fake.prompt(i),
+    wait: (i) => fake.wait(i),
+    context: async () => [
+      {
+        id: "msg_tools",
+        type: "assistant",
+        content: [
+          { type: "tool", name: "read", state: { status: "completed", content: payload } },
+          { type: "tool", name: "bash", state: { status: "error", content: "still in flight" } },
+        ],
+      } as unknown as ContextMessage,
+    ],
+    interrupt: (i) => fake.interrupt(i),
+  }
+  const driver = createSessionDriver(sessions, {
+    awaitTimeoutMs: 30,
+    interruptConfirmMs: 8,
+    salvageContextMs: 20,
+    errorTextSnippetChars: 8,
+  })
+  let rejected: AgentCallError | undefined
+  try {
+    await rejectSoon(
+      assert.rejects(driver.runAgent(input(), ["general"], hooks()), (err: unknown) => {
+        assert.ok(err instanceof AgentCallError)
+        rejected = err
+        assert.equal(err.kind, "timeout")
+        assert.equal(err.text, undefined)
+        assert.match(err.message, /interrupt confirmed/)
+        assert.match(err.message, /last tools: read:completed, bash:error/)
+        assert.match(err.message, /01234567…/)
+        assert.doesNotMatch(err.message, /0123456789ABCDEFGHIJ/)
+        assert.doesNotMatch(err.message, /appears hung/)
+        return true
+      }),
+      500,
+    )
+    assert.ok(rejected, "runAgent rejected — no AgentResult")
+    assert.equal("data" in (rejected as object), false)
+  } finally {
+    fake.hangWait = false
+    fake.releaseHangs()
+  }
+})
+
+test("deadline confirm: a hung context read suffixes salvage=unavailable inside confirm+salvage", async () => {
+  const fake = new FakeSessionCtx()
+  fake.push({ text: "never reached" })
+  fake.hangWait = true
+  const awaitMs = 25
+  const confirmMs = 20
+  const salvageMs = 30
+  const sessions: SessionCtx = {
+    create: (i) => fake.create(i),
+    get: (i) => fake.get(i),
+    prompt: (i) => fake.prompt(i),
+    wait: (i) => fake.wait(i),
+    context: () => new Promise(() => {}),
+    interrupt: (i) => fake.interrupt(i),
+  }
+  const driver = createSessionDriver(sessions, {
+    awaitTimeoutMs: awaitMs,
+    interruptConfirmMs: confirmMs,
+    salvageContextMs: salvageMs,
+  })
+  const started = Date.now()
+  try {
+    await rejectSoon(
+      assert.rejects(driver.runAgent(input(), ["general"], hooks()), (err: unknown) => {
+        assert.ok(err instanceof AgentCallError)
+        assert.equal(err.kind, "timeout")
+        assert.match(err.message, /salvage=unavailable/)
+        assert.match(err.message, /interrupt confirmed/)
+        assert.match(err.message, /await budget exceeded/)
+        const wall = Date.now() - started
+        const bound = awaitMs + confirmMs + salvageMs + 120
+        assert.ok(wall < bound, `salvage stall ${wall} exceeded confirm+salvage`)
+        assert.ok(wall < 15_000, "confirm+salvage must stay under SETTLE_GRACE_MS")
+        assert.ok(INTERRUPT_CONFIRM_MS + SALVAGE_CONTEXT_MS < 15_000)
+        assert.ok(INTERRUPT_CONFIRM_MS < SESSION_CONTROL_TIMEOUT_MS)
+        return true
+      }),
+      800,
+    )
+  } finally {
+    fake.hangWait = false
+    fake.releaseHangs()
+  }
+})
+
+test("deadline confirm: session.wait resolving during confirm stays kind timeout", async () => {
+  const fake = new FakeSessionCtx()
+  fake.push({ text: "late success must not win" })
+  fake.hangWait = true
+  let releaseInterrupt: () => void = () => {}
+  const interruptGate = new Promise<void>((resolve) => {
+    releaseInterrupt = resolve
+  })
+  const sessions: SessionCtx = {
+    create: (i) => fake.create(i),
+    get: (i) => fake.get(i),
+    prompt: (i) => fake.prompt(i),
+    wait: (i) => fake.wait(i),
+    context: (i) => fake.context(i),
+    interrupt: async (i) => {
+      fake.interrupts.push(i.sessionID)
+      await interruptGate
+    },
+  }
+  const driver = createSessionDriver(sessions, {
+    awaitTimeoutMs: 30,
+    interruptConfirmMs: 80,
+    salvageContextMs: 10,
+  })
+  const pending = driver.runAgent(input(), ["general"], hooks())
+  pending.catch(() => {})
+  try {
+    await tick(45)
+    fake.hangWait = false
+    fake.releaseHangs()
+    await tick(15)
+    releaseInterrupt()
+    await rejectSoon(
+      assert.rejects(pending, (err: unknown) => {
+        assert.ok(err instanceof AgentCallError)
+        assert.equal(err.kind, "timeout")
+        assert.notEqual(err.kind, "outcome")
+        assert.match(err.message, /interrupt confirmed/)
+        assert.match(err.message, /await budget exceeded/)
+        assert.doesNotMatch(err.message, /outcome/)
+        return true
+      }),
+      500,
+    )
+  } finally {
+    releaseInterrupt()
+    fake.hangWait = false
+    fake.releaseHangs()
+  }
+})
+
+test("deadline confirm: abort during confirm rejects abort immediately", async () => {
+  const fake = new FakeSessionCtx()
+  fake.push({ text: "never reached" })
+  fake.hangWait = true
+  let releaseInterrupt: () => void = () => {}
+  const interruptGate = new Promise<void>((resolve) => {
+    releaseInterrupt = resolve
+  })
+  const sessions: SessionCtx = {
+    create: (i) => fake.create(i),
+    get: (i) => fake.get(i),
+    prompt: (i) => fake.prompt(i),
+    wait: (i) => fake.wait(i),
+    context: (i) => fake.context(i),
+    interrupt: async (i) => {
+      fake.interrupts.push(i.sessionID)
+      await interruptGate
+    },
+  }
+  const ctrl = new AbortController()
+  const driver = createSessionDriver(sessions, {
+    awaitTimeoutMs: 30,
+    interruptConfirmMs: INTERRUPT_CONFIRM_MS,
+    salvageContextMs: 20,
+  })
+  const started = Date.now()
+  const pending = driver.runAgent(input(), ["general"], hooks(() => {}, ctrl.signal))
+  try {
+    await tick(50)
+    ctrl.abort()
+    await rejectSoon(
+      assert.rejects(
+        pending,
+        (err: unknown) => err instanceof AgentCallError && err.kind === "abort" && /run stopping/.test(err.message),
+      ),
+      300,
+    )
+    assert.ok(Date.now() - started < 400, "abort during confirm must not wait the 3s confirm bound")
+    assert.ok(fake.interrupts.length >= 1)
+  } finally {
+    releaseInterrupt()
+    fake.hangWait = false
+    fake.releaseHangs()
+  }
 })
 
 test("a timeout-kind failure is terminal for the runner — no same-model retry, row lands failed", async () => {

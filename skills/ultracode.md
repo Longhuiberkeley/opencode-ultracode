@@ -14,7 +14,7 @@ Two ways to author, and the order matters:
    bounded loops, retries, conditional re-planning, arithmetic over intermediates.
 
 Invoke `ultracode_run` with `{ graph, args? }`, `{ script, name?, meta?, args? }`, `{ path, args? }`
-(a project-root-relative workflow file you write with your file tool — preferred for anything over
+(a project-root-relative JS/TS script (`.js/.mjs/.cjs/.ts/.mts/.cts`), not any workflow file — preferred for scripts longer than
 ~30 lines), `{ template: "name", args? }` (served script template), or `{ workflow: "name", args? }`
 (saved). Every form also takes `background` and `resumeFrom` — a
 prior runID that warm-starts the run so keyed succeeded agents replay from cache and an
@@ -124,7 +124,7 @@ Author in Plan mode; run by name from Build mode. Do not call `ultracode_run` in
 
 1. Write ONE artifact into the project workflows directory: `<name>.graph.json` (a graph — pure
    JSON, no escaping hazards) or `<name>.js` (a script, async-function body, no module syntax).
-   Name: lowercase alphanumerics, `-` or `_`, max 64 chars.
+   Run a `<name>.graph.json` spec as inline `{ graph: <parsed spec> }` or `/ultracode save <name>` then `{ workflow: "<name>" }`, never `{ path }`. Name: lowercase alphanumerics, `-` or `_`, max 64 chars.
 2. `ultracode_save { name }` (one-token file save; `/ultracode save <name>` is the user's version).
    After a run settles, `ultracode_save { runID, name }` saves that run — a graph run saves its spec, not the compiled script.
 3. Review a graph with `/ultracode graph <name>` (waves, node table, mermaid — works before trust,
